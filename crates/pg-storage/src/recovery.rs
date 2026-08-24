@@ -516,7 +516,13 @@ mod tests {
             payload: Vec::new(),
         };
         let mut incomplete_splits = IncompleteSplitTracker::new();
-        let mut ctx = noop_ctx(&c.allocator, &clog, &mut att, &mut dpt, &mut incomplete_splits);
+        let mut ctx = noop_ctx(
+            &c.allocator,
+            &clog,
+            &mut att,
+            &mut dpt,
+            &mut incomplete_splits,
+        );
         registry.apply(&record, &mut ctx).unwrap();
         assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
@@ -553,7 +559,13 @@ mod tests {
             payload: Vec::new(),
         };
         let mut incomplete_splits = IncompleteSplitTracker::new();
-        let mut ctx = noop_ctx(&c.allocator, &clog, &mut att, &mut dpt, &mut incomplete_splits);
+        let mut ctx = noop_ctx(
+            &c.allocator,
+            &clog,
+            &mut att,
+            &mut dpt,
+            &mut incomplete_splits,
+        );
         let err = registry.apply(&record, &mut ctx).unwrap_err();
         assert!(matches!(
             err,

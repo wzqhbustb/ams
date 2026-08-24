@@ -144,8 +144,14 @@ fn row_lock_deadlock_via_exec_youngest_aborted_elder_commits() {
     assert_eq!(value_of(&engine, 2), 12);
     // The index-undo path ran on the victim's abort: both rows still
     // resolve through the index.
-    assert!(engine.index_lookup("accounts", "id", &Datum::Int4(1)).unwrap().is_some());
-    assert!(engine.index_lookup("accounts", "id", &Datum::Int4(2)).unwrap().is_some());
+    assert!(engine
+        .index_lookup("accounts", "id", &Datum::Int4(1))
+        .unwrap()
+        .is_some());
+    assert!(engine
+        .index_lookup("accounts", "id", &Datum::Int4(2))
+        .unwrap()
+        .is_some());
     // No wait edges, no leaked active XIDs.
     assert!(engine.txn_manager().wait_edges().is_empty());
     assert!(engine.txn_manager().active_xids().is_empty());

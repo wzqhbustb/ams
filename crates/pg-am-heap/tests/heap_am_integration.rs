@@ -230,8 +230,13 @@ fn heap_crash_recovery_after_update() {
         (first_page, new_tid)
     };
 
-    let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
+    let engine = StorageEngine::open_with_redo_handlers(
+        tmp.path(),
+        &config,
+        heap_redo_handlers(),
+        Vec::new(),
+    )
+    .unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),
@@ -280,8 +285,13 @@ fn heap_crash_recovery() {
     };
 
     // Phase 2: reopen with heap redo handlers; replay must reconstruct the rows.
-    let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
+    let engine = StorageEngine::open_with_redo_handlers(
+        tmp.path(),
+        &config,
+        heap_redo_handlers(),
+        Vec::new(),
+    )
+    .unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),
@@ -393,8 +403,13 @@ fn heap_cross_page_update_crash_recovery() {
     };
 
     // Reopen and replay: the relocated row must be reconstructed on the new page.
-    let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
+    let engine = StorageEngine::open_with_redo_handlers(
+        tmp.path(),
+        &config,
+        heap_redo_handlers(),
+        Vec::new(),
+    )
+    .unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),
@@ -467,8 +482,13 @@ fn rejected_delete_leaves_no_poison_wal_record() {
     };
 
     // Recovery must NOT choke on a poison HeapDelete record.
-    let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
+    let engine = StorageEngine::open_with_redo_handlers(
+        tmp.path(),
+        &config,
+        heap_redo_handlers(),
+        Vec::new(),
+    )
+    .unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),
@@ -721,8 +741,13 @@ fn multi_page_crash_recovery() {
         first_page
     };
 
-    let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
+    let engine = StorageEngine::open_with_redo_handlers(
+        tmp.path(),
+        &config,
+        heap_redo_handlers(),
+        Vec::new(),
+    )
+    .unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),

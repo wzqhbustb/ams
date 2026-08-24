@@ -44,7 +44,10 @@ fn insert_abort_removes_index_entry() {
     let txn = engine.begin_txn().unwrap();
     engine.exec(Some(&txn), "INSERT INTO t VALUES (1)").unwrap();
     txn.abort().unwrap();
-    assert!(!lookup(&engine, 1), "aborted insert left a dangling index entry");
+    assert!(
+        !lookup(&engine, 1),
+        "aborted insert left a dangling index entry"
+    );
     assert_eq!(scan_count(&engine), 0, "aborted insert visible to scan");
 }
 
@@ -55,10 +58,19 @@ fn delete_abort_restores_index_entry() {
     let (_tmp, engine) = setup();
     engine.exec(None, "INSERT INTO t VALUES (1)").unwrap();
     let txn = engine.begin_txn().unwrap();
-    engine.exec(Some(&txn), "DELETE FROM t WHERE id = 1").unwrap();
+    engine
+        .exec(Some(&txn), "DELETE FROM t WHERE id = 1")
+        .unwrap();
     txn.abort().unwrap();
-    assert!(lookup(&engine, 1), "aborted delete lost the live row's index entry");
-    assert_eq!(scan_count(&engine), 1, "aborted delete hid the row from scan");
+    assert!(
+        lookup(&engine, 1),
+        "aborted delete lost the live row's index entry"
+    );
+    assert_eq!(
+        scan_count(&engine),
+        1,
+        "aborted delete hid the row from scan"
+    );
 }
 
 /// UPDATE (key change) inside an explicit txn, then ABORT: the old key
@@ -69,10 +81,18 @@ fn update_abort_restores_old_key_entry() {
     let (_tmp, engine) = setup();
     engine.exec(None, "INSERT INTO t VALUES (1)").unwrap();
     let txn = engine.begin_txn().unwrap();
-    engine.exec(Some(&txn), "UPDATE t SET id = 2 WHERE id = 1").unwrap();
+    engine
+        .exec(Some(&txn), "UPDATE t SET id = 2 WHERE id = 1")
+        .unwrap();
     txn.abort().unwrap();
-    assert!(lookup(&engine, 1), "aborted update lost the old key's entry");
-    assert!(!lookup(&engine, 2), "aborted update left the new key's entry");
+    assert!(
+        lookup(&engine, 1),
+        "aborted update lost the old key's entry"
+    );
+    assert!(
+        !lookup(&engine, 2),
+        "aborted update left the new key's entry"
+    );
     assert_eq!(scan_count(&engine), 1);
 }
 
@@ -97,7 +117,10 @@ fn txn_handle_drop_auto_abort_undoes_index() {
         engine.exec(Some(&txn), "INSERT INTO t VALUES (3)").unwrap();
         // No commit/abort: drop triggers the best-effort auto-abort.
     }
-    assert!(!lookup(&engine, 3), "drop auto-abort left a dangling index entry");
+    assert!(
+        !lookup(&engine, 3),
+        "drop auto-abort left a dangling index entry"
+    );
     assert_eq!(scan_count(&engine), 0);
 }
 
@@ -108,8 +131,15 @@ fn auto_commit_failure_undoes_index() {
     let (_tmp, engine) = setup();
     let res = engine.exec(None, "INSERT INTO t VALUES (1), ('not-an-int')");
     assert!(res.is_err(), "type-mismatched row must fail the statement");
-    assert!(!lookup(&engine, 1), "failed statement left a dangling index entry");
-    assert_eq!(scan_count(&engine), 0, "failed statement left a visible row");
+    assert!(
+        !lookup(&engine, 1),
+        "failed statement left a dangling index entry"
+    );
+    assert_eq!(
+        scan_count(&engine),
+        0,
+        "failed statement left a visible row"
+    );
 }
 
 /// Duplicate keys (non-unique index): two rows share key 5; after one is
@@ -170,7 +200,9 @@ fn crash_mid_delete_compensates_index_entry() {
         engine.exec(None, "INSERT INTO t VALUES (1)").unwrap();
 
         let txn = engine.begin_txn().unwrap();
-        engine.exec(Some(&txn), "DELETE FROM t WHERE id = 1").unwrap();
+        engine
+            .exec(Some(&txn), "DELETE FROM t WHERE id = 1")
+            .unwrap();
         // Durability barrier: the in-flight delete's records (heap xmax
         // stamp + index delete) must survive the kill; the checkpoint's
         // ATT snapshot also records the loser as active.
@@ -216,7 +248,9 @@ fn crash_mid_update_compensates_index_entry() {
             .exec(None, "CREATE TABLE t (id INT, name TEXT)")
             .unwrap();
         engine.exec(None, "CREATE INDEX ON t (name)").unwrap();
-        engine.exec(None, "INSERT INTO t VALUES (1, 'old')").unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, 'old')")
+            .unwrap();
 
         let txn = engine.begin_txn().unwrap();
         engine
@@ -288,7 +322,9 @@ fn crash_loser_delete_before_redo_start_compensated() {
         // The loser: an in-flight DELETE. Its records (heap xmax stamp +
         // index delete) sit AFTER begin_A.
         let txn = engine.begin_txn().unwrap();
-        engine.exec(Some(&txn), "DELETE FROM t WHERE id = 1").unwrap();
+        engine
+            .exec(Some(&txn), "DELETE FROM t WHERE id = 1")
+            .unwrap();
 
         // Churn the pool with read-only scans of pad: t's dirty pages get
         // evicted and flushed BEFORE checkpoint B's DPT sample, so they

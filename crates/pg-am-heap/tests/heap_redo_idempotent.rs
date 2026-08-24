@@ -12,8 +12,8 @@ use pg_storage::engine::StorageEngine;
 use pg_storage::page::{page_pd_lsn, set_page_pd_lsn};
 use pg_storage::positioned_file::PositionedFile;
 use pg_storage::recovery::{
-    ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, IncompleteSplitTracker,
-    RedoContext, RedoHandler,
+    ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, IncompleteSplitTracker, RedoContext,
+    RedoHandler,
 };
 use pg_storage::types::{Lsn, PageId, Tid, TxnId, PAGE_SIZE};
 use pg_storage::wal::record::WalRecord;
@@ -335,8 +335,7 @@ fn heap_hot_update_redo_is_idempotent() {
     let infomask2 = u16::from_le_bytes([updated[54], updated[55]]);
     updated[54..56].copy_from_slice(&(infomask2 | HEAP_ONLY_TUPLE).to_le_bytes());
     let mut hot =
-        WalRecord::heap_hot_update(page_id, 0, 1, updated.clone(), TxnId(100), TxnId(100))
-            .unwrap();
+        WalRecord::heap_hot_update(page_id, 0, 1, updated.clone(), TxnId(100), TxnId(100)).unwrap();
     hot.lsn = Lsn(2_000);
 
     let clog = NoOpClogAccessor;

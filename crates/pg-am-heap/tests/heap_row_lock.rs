@@ -167,9 +167,7 @@ fn lock_only_stamp_visible_blocks_then_overwritable() {
     let handle = thread::spawn(move || {
         let xid_w = mgr2.begin_txn();
         let clog_ref: &dyn ClogAccessor = clog2.as_ref();
-        heap2
-            .lock_tuple(tid, &snap_for(xid_w), clog_ref)
-            .unwrap();
+        heap2.lock_tuple(tid, &snap_for(xid_w), clog_ref).unwrap();
         done2.store(true, Ordering::SeqCst);
         xid_w
     });

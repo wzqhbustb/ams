@@ -78,10 +78,7 @@ fn recover(dir: &Path, config: &StorageConfig, meta_page: PageId) -> (StorageEng
         dir,
         config,
         btree_redo_handlers(),
-        vec![
-            Box::new(HeapUndoHandler),
-            Box::new(BTreeUndoHandler),
-        ],
+        vec![Box::new(HeapUndoHandler), Box::new(BTreeUndoHandler)],
     )
     .unwrap();
     let am = BTreeAM::new(
@@ -582,9 +579,7 @@ fn test_root_split_on_recycled_page_crash_recovers() {
 #[test]
 fn test_btree_split_commit_fpi_precedes_commit_record() {
     use pg_storage::wal::reader::WalReader;
-    use pg_storage::wal::record::{
-        BTreeSplitCommitRecord, FullPageImageRecord, WalRecordType,
-    };
+    use pg_storage::wal::record::{BTreeSplitCommitRecord, FullPageImageRecord, WalRecordType};
 
     let tmp = TempDir::new().unwrap();
     let config = StorageConfig::new(tmp.path());
@@ -625,8 +620,7 @@ fn test_btree_split_commit_fpi_precedes_commit_record() {
         // modifies precedes the Commit record, and no FPI of those pages
         // follows it. (Pre-fix, the FPIs landed right AFTER their Commit.)
         engine.wal_writer().flush().unwrap();
-        let mut reader =
-            WalReader::open(tmp.path().join("wal"), config.wal_segment_size).unwrap();
+        let mut reader = WalReader::open(tmp.path().join("wal"), config.wal_segment_size).unwrap();
         let mut commits: Vec<(u64, BTreeSplitCommitRecord)> = Vec::new();
         let mut fpis: Vec<(u64, PageId)> = Vec::new();
         loop {
@@ -634,7 +628,8 @@ fn test_btree_split_commit_fpi_precedes_commit_record() {
             match reader.next_record() {
                 Ok(Some(rec)) => match rec.record_type {
                     WalRecordType::BTreeSplitCommit => {
-                        commits.push((lsn.0, BTreeSplitCommitRecord::decode(&rec.payload).unwrap()));
+                        commits
+                            .push((lsn.0, BTreeSplitCommitRecord::decode(&rec.payload).unwrap()));
                     }
                     WalRecordType::FullPageImage => {
                         let fpi: FullPageImageRecord = bincode::serde::decode_from_slice(
@@ -661,8 +656,7 @@ fn test_btree_split_commit_fpi_precedes_commit_record() {
             // `lo` inclusive: `ckpt` is the next unallocated LSN, so the
             // first post-publish append lands exactly at `lo`. `hi`
             // exclusive: the Commit itself is not an FPI.
-            fpis.iter()
-                .any(|(l, p)| *p == page && *l >= lo && *l < hi)
+            fpis.iter().any(|(l, p)| *p == page && *l >= lo && *l < hi)
         };
         // Note: split #1's Commit also names l0 as its left page (l0 was the
         // root leaf then) — match the LAST commit for each left page.
@@ -966,8 +960,7 @@ fn test_btree_split_commit_guarded_fpi_precedes_commit_record() {
     assert!(ckpt.0 < c, "the commit must follow the checkpoint publish");
     let fpis = wal_fpis(tmp.path(), &config);
     assert!(
-        fpis.iter()
-            .any(|(l, p)| *p == l0 && *l >= ckpt.0 && *l < c),
+        fpis.iter().any(|(l, p)| *p == l0 && *l >= ckpt.0 && *l < c),
         "guarded Commit: left page's cycle FPI must precede the Commit record"
     );
     assert!(
@@ -1020,7 +1013,11 @@ fn test_btree_split_commit_guarded_root_branch_new_root_fpi_order() {
     // as the checkpoint LSN — the exact (create_new_root, append) window.
     pg_am_btree::index::SPLIT_COMMIT_ROOT_CKPT_HOOK.with(|c| c.set(true));
     index.insert(&key(n), tid(n as u64)).unwrap(); // triggers the root split
-    assert_eq!(index.tree_level(), 1, "the insert must have promoted the root");
+    assert_eq!(
+        index.tree_level(),
+        1,
+        "the insert must have promoted the root"
+    );
     let new_root = index.root_page();
     assert_ne!(new_root, old_root);
     let n = n + 1;
@@ -1037,8 +1034,7 @@ fn test_btree_split_commit_guarded_root_branch_new_root_fpi_order() {
         .0;
     let fpis = wal_fpis(tmp.path(), &config);
     assert!(
-        fpis.iter()
-            .any(|(l, p)| *p == new_root && *l < c),
+        fpis.iter().any(|(l, p)| *p == new_root && *l < c),
         "the new root's cycle FPI must precede the Commit record"
     );
     assert!(

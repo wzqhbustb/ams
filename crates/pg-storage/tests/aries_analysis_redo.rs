@@ -724,7 +724,10 @@ fn test_corrupted_snapshot_degrades_to_wal_scan() {
         let att_path = tmp
             .path()
             .join(format!("meta/att-{:016}.snapshot", checkpoint_lsn.0));
-        assert!(att_path.exists(), "ATT snapshot must exist before corruption");
+        assert!(
+            att_path.exists(),
+            "ATT snapshot must exist before corruption"
+        );
         let mut bytes = std::fs::read(&att_path).unwrap();
         assert!(bytes.len() > 4);
         bytes[4] ^= 0xFF; // flip a body byte → CRC mismatch

@@ -572,10 +572,10 @@ mod tests {
     fn copy_redo_both_pages_past_copy_skips() {
         let mut h = Harness::new();
         let left = build_leaf(h.pool(), COPY_START, L2); // truncated, final
-        // Add post-copy inserts to the left page: entries at slots >=
-        // COPY_START inserted after the copy was applied. They must
-        // survive the idempotent skip untouched — rebuilding the left page
-        // would silently drop them.
+                                                         // Add post-copy inserts to the left page: entries at slots >=
+                                                         // COPY_START inserted after the copy was applied. They must
+                                                         // survive the idempotent skip untouched — rebuilding the left page
+                                                         // would silently drop them.
         {
             let mut guard = h.pool().pin_mut(left).unwrap();
             let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
@@ -602,9 +602,7 @@ mod tests {
         let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
         assert_eq!(
             slot_keys(page),
-            (0..COPY_START as i32)
-                .chain([50, 51])
-                .collect::<Vec<_>>()
+            (0..COPY_START as i32).chain([50, 51]).collect::<Vec<_>>()
         );
         assert_eq!(page_pd_lsn(page), L2, "left page pd_lsn must be untouched");
         drop(guard);

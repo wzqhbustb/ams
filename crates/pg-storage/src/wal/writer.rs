@@ -263,14 +263,11 @@ impl WalWriter {
 
         let buf = record.encode()?;
         let cond = Arc::clone(&self.cond);
-        write_record_to_segment(&mut state.segment_manager, &buf, lsn)
-            .inspect_err(|e| {
-                state.last_error = Some(format!(
-                    "append: segment write failed at {lsn}: {e}"
-                ));
-                state.shutdown = true;
-                cond.notify_all();
-            })?;
+        write_record_to_segment(&mut state.segment_manager, &buf, lsn).inspect_err(|e| {
+            state.last_error = Some(format!("append: segment write failed at {lsn}: {e}"));
+            state.shutdown = true;
+            cond.notify_all();
+        })?;
 
         state.pending += 1;
         let timeout = Duration::from_millis(self.config.wal_group_commit_timeout_ms);
@@ -349,14 +346,11 @@ impl WalWriter {
         }
 
         let cond = Arc::clone(&self.cond);
-        write_record_to_segment(&mut state.segment_manager, &buf, lsn)
-            .inspect_err(|e| {
-                state.last_error = Some(format!(
-                    "append_at: segment write failed at {lsn}: {e}"
-                ));
-                state.shutdown = true;
-                cond.notify_all();
-            })?;
+        write_record_to_segment(&mut state.segment_manager, &buf, lsn).inspect_err(|e| {
+            state.last_error = Some(format!("append_at: segment write failed at {lsn}: {e}"));
+            state.shutdown = true;
+            cond.notify_all();
+        })?;
 
         state.pending += 1;
         let timeout = Duration::from_millis(self.config.wal_group_commit_timeout_ms);
@@ -517,14 +511,13 @@ impl WalWriter {
         record.lsn = lsn;
         let buf = record.encode()?;
         let cond = Arc::clone(&self.cond);
-        write_record_to_segment(&mut state.segment_manager, &buf, lsn)
-            .inspect_err(|e| {
-                state.last_error = Some(format!(
-                    "reserve_and_append: segment write failed at {lsn}: {e}"
-                ));
-                state.shutdown = true;
-                cond.notify_all();
-            })?;
+        write_record_to_segment(&mut state.segment_manager, &buf, lsn).inspect_err(|e| {
+            state.last_error = Some(format!(
+                "reserve_and_append: segment write failed at {lsn}: {e}"
+            ));
+            state.shutdown = true;
+            cond.notify_all();
+        })?;
         state.pending += 1;
         let timeout = Duration::from_millis(self.config.wal_group_commit_timeout_ms);
         let should_wake = state.pending >= self.config.wal_group_commit_batch_size

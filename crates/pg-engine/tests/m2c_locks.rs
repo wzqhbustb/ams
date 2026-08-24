@@ -51,13 +51,18 @@ fn open_with_counter() -> (TempDir, Arc<Engine>) {
     engine
         .exec(None, "CREATE TABLE counter (id INT, v INT)")
         .unwrap();
-    engine.exec(None, "INSERT INTO counter VALUES (1, 0)").unwrap();
+    engine
+        .exec(None, "INSERT INTO counter VALUES (1, 0)")
+        .unwrap();
     (tmp, engine)
 }
 
 /// The current committed value of the counter row.
 fn counter_value(engine: &Engine) -> i32 {
-    match engine.exec(None, "SELECT v FROM counter WHERE id = 1").unwrap() {
+    match engine
+        .exec(None, "SELECT v FROM counter WHERE id = 1")
+        .unwrap()
+    {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1, "exactly one counter row must be visible");
             match &rows[0][0] {
@@ -71,10 +76,7 @@ fn counter_value(engine: &Engine) -> i32 {
 
 /// Is this the §9.1 step-3 "committed concurrent writer" error?
 fn is_concurrently_updated(e: &EngineError) -> bool {
-    matches!(
-        e,
-        EngineError::Heap(HeapError::TupleConcurrentlyUpdated(_))
-    )
+    matches!(e, EngineError::Heap(HeapError::TupleConcurrentlyUpdated(_)))
 }
 
 /// Poll `pred` until it holds, failing after a deadline (test-orchestration
@@ -145,10 +147,8 @@ fn concurrent_same_row_updates_no_lost_update() {
                     attempts += 1;
                     assert!(attempts <= MAX_ATTEMPTS, "increment retried too many times");
                     let txn = engine.begin_txn().unwrap();
-                    let locked = engine.exec(
-                        Some(&txn),
-                        "SELECT v FROM counter WHERE id = 1 FOR UPDATE",
-                    );
+                    let locked =
+                        engine.exec(Some(&txn), "SELECT v FROM counter WHERE id = 1 FOR UPDATE");
                     let v = match locked {
                         Ok(QueryResult::Rows { rows, .. }) => {
                             assert_eq!(
@@ -217,7 +217,10 @@ fn for_update_blocks_writer_until_commit() {
 
     let locker = engine.begin_txn().unwrap();
     let res = engine
-        .exec(Some(&locker), "SELECT v FROM counter WHERE id = 1 FOR UPDATE")
+        .exec(
+            Some(&locker),
+            "SELECT v FROM counter WHERE id = 1 FOR UPDATE",
+        )
         .unwrap();
     assert!(matches!(res, QueryResult::Rows { .. }));
 
@@ -266,7 +269,9 @@ fn for_share_locks_row_and_stays_visible() {
     let (_tmp, engine) = open_with_counter();
 
     // Auto-commit FOR SHARE: stamps shared lock, commits immediately.
-    let res = engine.exec(None, "SELECT * FROM counter FOR SHARE").unwrap();
+    let res = engine
+        .exec(None, "SELECT * FROM counter FOR SHARE")
+        .unwrap();
     let QueryResult::Rows { rows, .. } = res else {
         panic!("auto-commit FOR SHARE must return rows, got {res:?}");
     };
@@ -355,7 +360,9 @@ fn committed_concurrent_delete_surfaces_concurrently_updated() {
     assert!(matches!(res, QueryResult::Rows { .. }));
 
     // Concurrent delete + commit between the scan and the update.
-    engine.exec(None, "DELETE FROM counter WHERE id = 1").unwrap();
+    engine
+        .exec(None, "DELETE FROM counter WHERE id = 1")
+        .unwrap();
 
     let err = engine
         .exec(Some(&victim), "UPDATE counter SET v = 9 WHERE id = 1")
@@ -367,7 +374,10 @@ fn committed_concurrent_delete_surfaces_concurrently_updated() {
     victim.abort().unwrap();
 
     // The delete stands: the row is gone for fresh snapshots.
-    match engine.exec(None, "SELECT v FROM counter WHERE id = 1").unwrap() {
+    match engine
+        .exec(None, "SELECT v FROM counter WHERE id = 1")
+        .unwrap()
+    {
         QueryResult::Rows { rows, .. } => assert!(rows.is_empty()),
         other => panic!("expected Rows, got {other:?}"),
     }
@@ -424,9 +434,13 @@ fn create_index_exclusive_blocks_on_writer() {
 
     // The index exists and resolves BOTH the preloaded row and the row
     // committed by the writer the build blocked behind.
-    let tid = engine.index_lookup("counter", "id", &Datum::Int4(1)).unwrap();
+    let tid = engine
+        .index_lookup("counter", "id", &Datum::Int4(1))
+        .unwrap();
     assert!(tid.is_some());
-    let tid = engine.index_lookup("counter", "id", &Datum::Int4(2)).unwrap();
+    let tid = engine
+        .index_lookup("counter", "id", &Datum::Int4(2))
+        .unwrap();
     assert!(
         tid.is_some(),
         "row committed by the writer the build blocked behind must be indexed"
@@ -443,7 +457,10 @@ fn aborted_lock_only_stamp_is_reacquirable() {
 
     let locker = engine.begin_txn().unwrap();
     engine
-        .exec(Some(&locker), "SELECT v FROM counter WHERE id = 1 FOR UPDATE")
+        .exec(
+            Some(&locker),
+            "SELECT v FROM counter WHERE id = 1 FOR UPDATE",
+        )
         .unwrap();
 
     let engine2 = Arc::clone(&engine);
@@ -468,7 +485,9 @@ fn aborted_lock_only_stamp_is_reacquirable() {
 
     // The aborted lock changed nothing: the row is visible and updatable.
     assert_eq!(counter_value(&engine), 0);
-    engine.exec(None, "UPDATE counter SET v = 7 WHERE id = 1").unwrap();
+    engine
+        .exec(None, "UPDATE counter SET v = 7 WHERE id = 1")
+        .unwrap();
     assert_eq!(counter_value(&engine), 7);
     assert!(engine.txn_manager().wait_edges().is_empty());
     engine.shutdown();
@@ -489,7 +508,9 @@ fn auto_commit_for_update_releases_at_statement_end() {
     // The lock died with the auto-commit statement: an immediate writer
     // proceeds without waiting (no 300ms grace needed — any wait here is
     // a bug).
-    engine.exec(None, "UPDATE counter SET v = 3 WHERE id = 1").unwrap();
+    engine
+        .exec(None, "UPDATE counter SET v = 3 WHERE id = 1")
+        .unwrap();
     assert_eq!(counter_value(&engine), 3);
     engine.shutdown();
 }
@@ -564,11 +585,16 @@ fn lock_only_stamp_survives_crash_without_hiding_row() {
     engine
         .exec(None, "CREATE TABLE counter (id INT, v INT)")
         .unwrap();
-    engine.exec(None, "INSERT INTO counter VALUES (1, 0)").unwrap();
+    engine
+        .exec(None, "INSERT INTO counter VALUES (1, 0)")
+        .unwrap();
 
     let locker = engine.begin_txn().unwrap();
     engine
-        .exec(Some(&locker), "SELECT v FROM counter WHERE id = 1 FOR UPDATE")
+        .exec(
+            Some(&locker),
+            "SELECT v FROM counter WHERE id = 1 FOR UPDATE",
+        )
         .unwrap();
     // Push the lock-stamped page (and the CLOG) to disk.
     engine.checkpoint().unwrap();
@@ -582,7 +608,9 @@ fn lock_only_stamp_survives_crash_without_hiding_row() {
     // Visible (LOCK_ONLY masked), updatable (crashed stamp treated as
     // aborted), and re-lockable afterwards.
     assert_eq!(counter_value(&engine), 0);
-    engine.exec(None, "UPDATE counter SET v = 5 WHERE id = 1").unwrap();
+    engine
+        .exec(None, "UPDATE counter SET v = 5 WHERE id = 1")
+        .unwrap();
     assert_eq!(counter_value(&engine), 5);
     let txn = engine.begin_txn().unwrap();
     engine
@@ -649,7 +677,12 @@ fn cross_page_update_under_contention() {
                         // (and distinct), forcing the cross-page path.
                         let upd = engine.exec(
                             Some(&txn),
-                            &format!("UPDATE big SET v = {}, pad = '{}{}' WHERE id = 1", v + 1, pad, t),
+                            &format!(
+                                "UPDATE big SET v = {}, pad = '{}{}' WHERE id = 1",
+                                v + 1,
+                                pad,
+                                t
+                            ),
                         );
                         match upd {
                             Ok(QueryResult::Affected(1)) => {
@@ -681,7 +714,11 @@ fn cross_page_update_under_contention() {
         },
         other => panic!("expected Rows, got {other:?}"),
     };
-    assert_eq!(v, (THREADS * PER_THREAD) as i32, "lost update on cross-page path");
+    assert_eq!(
+        v,
+        (THREADS * PER_THREAD) as i32,
+        "lost update on cross-page path"
+    );
     engine.shutdown();
 }
 
@@ -725,7 +762,9 @@ fn for_share_coexists_with_for_share() {
     a.commit().unwrap();
     b.commit().unwrap();
     // Both locks died with their transactions: the row is freely writable.
-    engine.exec(None, "UPDATE counter SET v = 9 WHERE id = 1").unwrap();
+    engine
+        .exec(None, "UPDATE counter SET v = 9 WHERE id = 1")
+        .unwrap();
     assert_eq!(counter_value(&engine), 9);
     engine.shutdown();
 }
@@ -845,7 +884,9 @@ fn for_share_upgrades_within_same_txn() {
 #[test]
 fn for_share_upgrade_deadlock_detected() {
     let (_tmp, engine) = open_with_counter();
-    engine.exec(None, "INSERT INTO counter VALUES (2, 2)").unwrap();
+    engine
+        .exec(None, "INSERT INTO counter VALUES (2, 2)")
+        .unwrap();
 
     let a = engine.begin_txn().unwrap();
     let b = engine.begin_txn().unwrap();
@@ -902,7 +943,10 @@ fn for_share_upgrade_deadlock_detected() {
         "elder's UPDATE must succeed after the victim's abort, got {elder_result:?}"
     );
     assert_eq!(counter_value(&engine), 0); // row 1 untouched
-    match engine.exec(None, "SELECT v FROM counter WHERE id = 2").unwrap() {
+    match engine
+        .exec(None, "SELECT v FROM counter WHERE id = 2")
+        .unwrap()
+    {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows[0][0], Some(Datum::Int4(12)));
         }

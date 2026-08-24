@@ -96,9 +96,7 @@ impl WalReader {
         if header.iter().all(|&b| b == 0) {
             let probe_pos = start_lsn.0 + WAL_RECORD_HEADER_SIZE as u64;
             let mut probe = [0u8; WAL_RECORD_HEADER_SIZE];
-            if self.try_read_exact_at(probe_pos, &mut probe)?
-                && probe.iter().any(|&b| b != 0)
-            {
+            if self.try_read_exact_at(probe_pos, &mut probe)? && probe.iter().any(|&b| b != 0) {
                 return Err(StorageError::MetadataCorrupted(format!(
                     "WAL hole detected: zero-filled header at {:?} followed by non-zero data at {:?}; \
                      an unflushed reserved slot truncated the log",
@@ -582,13 +580,9 @@ mod tests {
 
         // Zero everything from mid-FPI-payload onward: the torn tail shape.
         let path = tmp.path().join("wal").join("wal-00000001.log");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let torn_from = fpi_lsn.segment_offset(cfg.wal_segment_size)
-            + WAL_RECORD_HEADER_SIZE as u64
-            + 16;
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let torn_from =
+            fpi_lsn.segment_offset(cfg.wal_segment_size) + WAL_RECORD_HEADER_SIZE as u64 + 16;
         let file_len = file.metadata().unwrap().len();
         assert!(torn_from < file_len);
         file.seek(SeekFrom::Start(torn_from)).unwrap();

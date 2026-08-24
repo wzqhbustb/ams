@@ -186,7 +186,10 @@ fn run_child(data_dir: &Path, seed: u64) {
             .unwrap();
     }
     engine
-        .exec(None, &format!("CREATE TABLE {IX_TABLE} (id INT, name TEXT)"))
+        .exec(
+            None,
+            &format!("CREATE TABLE {IX_TABLE} (id INT, name TEXT)"),
+        )
         .unwrap();
     engine
         .exec(None, &format!("CREATE INDEX ON {IX_TABLE} (name)"))
@@ -231,7 +234,10 @@ fn insert_base_row(engine: &Engine, rng: &mut Rng, model: &mut ChildModel) {
     let id = model.row_seq;
     model.row_seq += 1;
     engine
-        .exec(None, &format!("INSERT INTO {table} VALUES ({id}, 'row-{id}')"))
+        .exec(
+            None,
+            &format!("INSERT INTO {table} VALUES ({id}, 'row-{id}')"),
+        )
         .unwrap();
     model.tables.get_mut(&table).unwrap().push(id);
 }
@@ -450,7 +456,12 @@ fn parse_expectation(text: &str) -> Expectation {
     }
 }
 
-fn spawn_child_at(data_dir: &Path, seed: u64, env_var: &str, test_name: &str) -> std::process::Child {
+fn spawn_child_at(
+    data_dir: &Path,
+    seed: u64,
+    env_var: &str,
+    test_name: &str,
+) -> std::process::Child {
     let mut cmd = Command::new(std::env::current_exe().expect("test binary path"));
     cmd.arg("--test-threads=1")
         .arg(test_name)
@@ -812,20 +823,17 @@ fn run_conc_worker(engine: &Engine, data_dir: &Path, seed: u64, t: usize, ops: u
 
 /// Every arm changes at most one row of one table, so a mid-write kill
 /// leaves the recovered state at most one op ahead of the expectation.
-fn do_conc_op(
-    engine: &Engine,
-    rng: &mut Rng,
-    model: &mut ChildModel,
-    heap_t: &str,
-    index_t: &str,
-) {
+fn do_conc_op(engine: &Engine, rng: &mut Rng, model: &mut ChildModel, heap_t: &str, index_t: &str) {
     match rng.below(20) {
         // Heap INSERT (30%).
         0..=5 => {
             let id = model.row_seq;
             model.row_seq += 1;
             engine
-                .exec(None, &format!("INSERT INTO {heap_t} VALUES ({id}, 'row-{id}')"))
+                .exec(
+                    None,
+                    &format!("INSERT INTO {heap_t} VALUES ({id}, 'row-{id}')"),
+                )
                 .unwrap();
             model.tables.get_mut(heap_t).unwrap().push(id);
         }
@@ -835,7 +843,10 @@ fn do_conc_op(
             model.row_seq += 1;
             let key = ix_key(id);
             engine
-                .exec(None, &format!("INSERT INTO {index_t} VALUES ({id}, '{key}')"))
+                .exec(
+                    None,
+                    &format!("INSERT INTO {index_t} VALUES ({id}, '{key}')"),
+                )
                 .unwrap();
             model.tables.get_mut(index_t).unwrap().push(id);
         }
@@ -1058,7 +1069,13 @@ fn preserve_repro_dir(round: u64, data_dir: &Path) {
 /// the expectation and the recovered scan, and the one "extra" recovered
 /// row gets its own reachability spot-check; `validate` (which catches a
 /// split left unfinished by undo) always runs.
-fn verify_conc_index(round: u64, t: usize, engine: &Engine, expectation: &Expectation, data_dir: &Path) {
+fn verify_conc_index(
+    round: u64,
+    t: usize,
+    engine: &Engine,
+    expectation: &Expectation,
+    data_dir: &Path,
+) {
     let table = conc_index_table(t);
     let index = engine
         .btree_index(&table, "name")
@@ -1119,4 +1136,3 @@ fn verify_conc_index(round: u64, t: usize, engine: &Engine, expectation: &Expect
         }
     }
 }
-

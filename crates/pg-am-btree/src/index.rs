@@ -640,7 +640,8 @@ impl BTreeIndex {
             page_id: PageId::INVALID,
             slot_id: 0,
         };
-        let (mut guard, _, _) = self.descend_to_leaf_guard(start.unwrap_or(&[]), &probe_tid, false)?;
+        let (mut guard, _, _) =
+            self.descend_to_leaf_guard(start.unwrap_or(&[]), &probe_tid, false)?;
         let mut slot = match start {
             Some(s) => leaf_lower_bound(as_page(&guard), s, &probe_tid)? as u16,
             None => 0,
@@ -799,8 +800,14 @@ impl BTreeIndex {
             // can span siblings), so the exact page is found by walking the
             // sibling chain both ways. Right hops are the Blink mechanism
             // (§13.2); left hops cover stale separators.
-            guard =
-                self.walk_to_position_guard(guard, key, tid, level, &mut hopped, position_for_insert)?;
+            guard = self.walk_to_position_guard(
+                guard,
+                key,
+                tid,
+                level,
+                &mut hopped,
+                position_for_insert,
+            )?;
             if level == 0 {
                 return Ok((guard, path, hopped));
             }
@@ -908,9 +915,10 @@ impl BTreeIndex {
                                     let pguard = self.buffer_pool.pin(walk)?;
                                     let page = as_page(&pguard);
                                     let pcount = SlottedPage::slot_count(page);
-                                    let (lk, lt) = page::decode_leaf_entry(
-                                        entry_bytes(page, pcount as u16 - 1)?,
-                                    )?;
+                                    let (lk, lt) = page::decode_leaf_entry(entry_bytes(
+                                        page,
+                                        pcount as u16 - 1,
+                                    )?)?;
                                     (lk, lt) > (key, *tid)
                                 };
                                 hops += 1;
@@ -1681,8 +1689,8 @@ impl BTreeIndex {
         // the placement protocol. Without this, a boundary insert could land
         // left of a larger same-key entry — a silent chain-order inversion
         // inside a duplicate run (`pin_leaf_for_insert`'s doc).
-        let left_edge_with_left_sibling = pos == 0
-            && BtreePage::prev(as_page_mut(&mut leaf_guard))? != PageId::INVALID;
+        let left_edge_with_left_sibling =
+            pos == 0 && BtreePage::prev(as_page_mut(&mut leaf_guard))? != PageId::INVALID;
         if fits {
             if left_edge_with_left_sibling {
                 return Ok(Pessimistic::Retry);
@@ -2081,8 +2089,8 @@ impl BTreeIndex {
 
         if SlottedPage::free_space(as_page_mut(&mut parent_guard)) >= downlink.len() + 4 {
             let parent = parent_guard.page_id();
-            let slot = internal_lower_bound(as_page_mut(&mut parent_guard), &separator, st.right)?
-                as u16;
+            let slot =
+                internal_lower_bound(as_page_mut(&mut parent_guard), &separator, st.right)? as u16;
             // FPI-before-commit pre-touch (module doc): emit `st.left`'s
             // cycle FPI, if due, BEFORE the Commit record's WAL position is
             // fixed; the apply below re-pins with the FPI suppressed. A
@@ -2112,7 +2120,8 @@ impl BTreeIndex {
         // steps are redo-correct, and the tree stays readable via the chain.
         let parent = parent_guard.page_id();
         let mut p2_guard = self.buffer_pool.new_page()?;
-        let pst = self.split_prepare_on_guards(&mut parent_guard, &mut p2_guard, Some(&downlink))?;
+        let pst =
+            self.split_prepare_on_guards(&mut parent_guard, &mut p2_guard, Some(&downlink))?;
         let p2_first = entry_bytes(as_page_mut(&mut parent_guard), pst.copy_start_slot)?.to_vec();
         let p2_first_key = entry_key(&p2_first, pst.level)?.to_vec();
         self.split_copy_on_guards(&mut parent_guard, p2_guard, &pst)?;
@@ -3153,9 +3162,8 @@ fn root_from_meta(pool: &BufferPool, meta_page: PageId) -> Result<(PageId, u8)> 
              or a bulk load crashed before publishing the root)"
         )));
     }
-    let bytes = SlottedPage::tuple(page, (slot_count - 1) as u16)?.ok_or_else(|| {
-        BTreeError::Corrupted(format!("meta page {meta_page} slot unreadable"))
-    })?;
+    let bytes = SlottedPage::tuple(page, (slot_count - 1) as u16)?
+        .ok_or_else(|| BTreeError::Corrupted(format!("meta page {meta_page} slot unreadable")))?;
     let (root_page, tree_level) = page::decode_meta_record(bytes)?;
     if tree_level > 0x0F {
         return Err(BTreeError::Corrupted(format!(
@@ -3328,12 +3336,7 @@ pub(crate) fn finish_incomplete_split(
     };
 
     let (parent_page, new_root_page, meta_page, parent_insert_slot) = match plan {
-        SplitFinishPlan::Unlink => (
-            PageId::INVALID,
-            PageId::INVALID,
-            PageId::INVALID,
-            0,
-        ),
+        SplitFinishPlan::Unlink => (PageId::INVALID, PageId::INVALID, PageId::INVALID, 0),
         _ if is_root_split => {
             // 4-bit level bound before allocating the new root (post-Stage-S
             // C2 deep review; see ensure_root_promotion_fits).
@@ -3745,7 +3748,8 @@ pub(crate) fn apply_split_clr(
             // non-empty or previously-written right page is legitimate: the
             // NoMove and unlink plans never MOVE entries, though they do
             // stamp the right page's pd_lsn — H4, see above.)
-            let right: &[u8; PAGE_SIZE] = right_guard.page().try_into().expect("frame is PAGE_SIZE");
+            let right: &[u8; PAGE_SIZE] =
+                right_guard.page().try_into().expect("frame is PAGE_SIZE");
             if !clr_is_unlink(rec)
                 && SlottedPage::slot_count(right) == 0
                 && page_never_had_entries(right)
@@ -3753,10 +3757,7 @@ pub(crate) fn apply_split_clr(
                 return Err(BTreeError::Corrupted(format!(
                     "split CLR: left page {} is past the CLR (pd_lsn {:?} >= {:?}) but right \
                      page {} never received the moved entries",
-                    rec.left_page,
-                    left_lsn,
-                    lsn,
-                    rec.right_page
+                    rec.left_page, left_lsn, lsn, rec.right_page
                 )));
             }
         }
@@ -3907,7 +3908,6 @@ pub(crate) fn choose_split_slot_readonly(
     let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
     choose_split_slot(page, level, None)
 }
-
 
 #[cfg(test)]
 mod tests {

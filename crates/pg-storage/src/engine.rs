@@ -24,7 +24,7 @@ use crate::positioned_file::PositionedFile;
 use crate::recovery::{
     ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, IncompleteSplitTracker,
     NoOpRedoHandler, PageAllocRedoHandler, PageFreeRedoHandler, RedoContext, RedoHandler,
-    RedoRegistry, UndoHandler, UndoContext,
+    RedoRegistry, UndoContext, UndoHandler,
 };
 use crate::superblock::Superblock;
 use crate::txn_id::TxnIdClock;

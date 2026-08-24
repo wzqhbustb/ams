@@ -49,8 +49,8 @@
 //! `auto_commit`'s existing panic cost model.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
@@ -61,8 +61,8 @@ use pg_storage::clog::{ClogAccessor, TxnState};
 // coordinator, so it must be the aliased type: identical to
 // `parking_lot::RwLock` in production builds, loom-instrumented under
 // `--cfg loom` (Stage Q; see pg_storage::sync).
-use pg_storage::sync::RwLock;
 use pg_storage::error::Result;
+use pg_storage::sync::RwLock;
 use pg_storage::txn_id::TxnIdClock;
 use pg_storage::types::{Lsn, TxnId};
 use pg_storage::wal::record::WalRecord;
@@ -136,8 +136,7 @@ pub trait RowWaiter: std::fmt::Debug + Send + Sync {
     /// Block until `blocking_xid` commits or aborts (§9.1 step 5c). The
     /// caller must hold NO page latch while blocked. Clears the wait edge
     /// on success.
-    fn wait_for(&self, self_xid: TxnId, blocking_xid: TxnId)
-        -> std::result::Result<(), TxnError>;
+    fn wait_for(&self, self_xid: TxnId, blocking_xid: TxnId) -> std::result::Result<(), TxnError>;
 
     /// Is `xid` a live, in-flight transaction?
     ///
@@ -550,7 +549,11 @@ impl TxnManager {
     ///   state.
     /// - [`TxnError::DeadlockVictim`] if the detector chose this
     ///   transaction to break a wait-for cycle.
-    pub fn wait_for(&self, self_xid: TxnId, blocking_xid: TxnId) -> std::result::Result<(), TxnError> {
+    pub fn wait_for(
+        &self,
+        self_xid: TxnId,
+        blocking_xid: TxnId,
+    ) -> std::result::Result<(), TxnError> {
         if self_xid == blocking_xid {
             return Err(TxnError::SelfWait(self_xid));
         }

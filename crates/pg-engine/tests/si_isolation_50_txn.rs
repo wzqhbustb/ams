@@ -32,8 +32,12 @@ fn si_50_concurrent_transactions() {
     let engine = Arc::new(open(tmp.path()));
 
     // Pre-existing committed row.
-    engine.exec(None, "CREATE TABLE counter (id INT, val INT)").unwrap();
-    engine.exec(None, "INSERT INTO counter VALUES (0, 100)").unwrap();
+    engine
+        .exec(None, "CREATE TABLE counter (id INT, val INT)")
+        .unwrap();
+    engine
+        .exec(None, "INSERT INTO counter VALUES (0, 100)")
+        .unwrap();
 
     // Barrier ensures all threads take their snapshot before any thread
     // inserts — so every thread's first SELECT sees exactly 1 row.
@@ -66,7 +70,10 @@ fn si_50_concurrent_transactions() {
 
             // INSERT one row as this transaction.
             engine
-                .exec(Some(&txn), &format!("INSERT INTO counter VALUES ({i}, {i})"))
+                .exec(
+                    Some(&txn),
+                    &format!("INSERT INTO counter VALUES ({i}, {i})"),
+                )
                 .unwrap();
 
             // SELECT 2: should see exactly 2 rows (1 pre-existing + 1 own).
@@ -92,10 +99,17 @@ fn si_50_concurrent_transactions() {
     }
 
     // After all 50 threads commit, a fresh snapshot sees all 51 rows.
-    let res = engine.exec(None, "SELECT * FROM counter ORDER BY id").unwrap();
+    let res = engine
+        .exec(None, "SELECT * FROM counter ORDER BY id")
+        .unwrap();
     match res {
         QueryResult::Rows { rows, .. } => {
-            assert_eq!(rows.len(), N_THREADS + 1, "expected {} total rows", N_THREADS + 1);
+            assert_eq!(
+                rows.len(),
+                N_THREADS + 1,
+                "expected {} total rows",
+                N_THREADS + 1
+            );
         }
         other => panic!("expected Rows, got {other:?}"),
     }

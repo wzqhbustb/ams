@@ -185,7 +185,10 @@ fn bench_stage_q_indexed_insert(c: &mut Criterion) {
     for &t in &[1usize, threads] {
         group.throughput(Throughput::Elements((t * ops) as u64));
         group.bench_with_input(
-            BenchmarkId::new("engine_insert_indexed_autocommit", format!("{t}T_x_{ops}ops")),
+            BenchmarkId::new(
+                "engine_insert_indexed_autocommit",
+                format!("{t}T_x_{ops}ops"),
+            ),
             &t,
             |b, &t| {
                 b.iter_with_setup(setup, |fixture| {
@@ -195,7 +198,10 @@ fn bench_stage_q_indexed_insert(c: &mut Criterion) {
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("engine_insert_indexed_singletxn", format!("{t}T_x_{ops}ops")),
+            BenchmarkId::new(
+                "engine_insert_indexed_singletxn",
+                format!("{t}T_x_{ops}ops"),
+            ),
             &t,
             |b, &t| {
                 b.iter_with_setup(setup, |fixture| {

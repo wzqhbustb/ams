@@ -126,13 +126,17 @@ use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 
-use pg_am_btree::{btree_redo_handlers, encode_key, is_supported_key_type, BTreeAM, BTreeUndoHandler};
+use pg_am_btree::{
+    btree_redo_handlers, encode_key, is_supported_key_type, BTreeAM, BTreeUndoHandler,
+};
 use pg_am_heap::access_method::{
     DeleteContext, InsertContext, RelationDesc, ScanContext, UpdateContext,
 };
 use pg_am_heap::line_pointer::LINE_POINTER_SIZE;
 use pg_am_heap::tuple::{decode_tuple, encode_tuple, ColumnType, Datum, TupleHeader};
-use pg_am_heap::{heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM};
+use pg_am_heap::{
+    heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM,
+};
 use pg_catalog::builtin_types::{builtin_type, BUILTIN_TYPES};
 use pg_catalog::system_tables::{
     SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, PG_ATTRIBUTE, PG_CLASS, PG_INDEX, PG_RELPAGES,
@@ -325,7 +329,9 @@ impl Predicate {
 
     /// Whether `val` satisfies this predicate.
     pub fn matches(&self, val: &Value) -> bool {
-        let Some(d) = val else { return false; };
+        let Some(d) = val else {
+            return false;
+        };
         match self {
             Predicate::Eq { value, .. } => d == value,
             Predicate::Lt { value, .. } => d < value,
@@ -717,8 +723,7 @@ impl Engine {
         // 8. Lock manager (sharing the victim registry) and the deadlock
         //    detector thread (M2c Stage R, §9.3). Started LAST, once both
         //    managers exist; one detector per engine instance.
-        let lock_manager =
-            Arc::new(LockManager::new().with_deadlock_victims(Arc::clone(&victims)));
+        let lock_manager = Arc::new(LockManager::new().with_deadlock_victims(Arc::clone(&victims)));
         let deadlock_detector = DeadlockDetector::start(
             Arc::clone(&txn),
             Arc::clone(&lock_manager),
@@ -1445,13 +1450,7 @@ impl Engine {
         } else {
             header.t_xmax
         };
-        if is_visible(
-            header.t_xmin,
-            xmax,
-            header.t_cid,
-            snap,
-            self.clog.as_ref(),
-        ) {
+        if is_visible(header.t_xmin, xmax, header.t_cid, snap, self.clog.as_ref()) {
             return Ok(Some(tid));
         }
         // HOT chain: old version is invisible but t_ctid may point to a
@@ -1462,9 +1461,7 @@ impl Engine {
         // shared `follow_hot_chain` helper (post-Stage-S review H1; the
         // pre-H1 8-hop cap made >8-hop chains silently vanish from
         // index_lookup).
-        if header.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0
-            && header.t_ctid != tid
-        {
+        if header.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0 && header.t_ctid != tid {
             return Ok(pg_am_heap::follow_hot_chain(
                 page,
                 tid.page_id,
@@ -1555,7 +1552,13 @@ impl Engine {
             if let Some(datum) = &values[*col_index] {
                 let key = encode_key(datum)?;
                 self.open_btree(idx)?.insert(&key, out_tid)?;
-                self.record_index_undo(snap.current_xid(), idx, key, out_tid, IndexUndoOp::Inserted);
+                self.record_index_undo(
+                    snap.current_xid(),
+                    idx,
+                    key,
+                    out_tid,
+                    IndexUndoOp::Inserted,
+                );
             }
         }
         Ok(out_tid)
@@ -1678,7 +1681,13 @@ impl Engine {
                 if let Some(new_datum) = &values[*col_index] {
                     let key = encode_key(new_datum)?;
                     index.insert(&key, out_tid)?;
-                    self.record_index_undo(snap.current_xid(), idx, key, out_tid, IndexUndoOp::Inserted);
+                    self.record_index_undo(
+                        snap.current_xid(),
+                        idx,
+                        key,
+                        out_tid,
+                        IndexUndoOp::Inserted,
+                    );
                 }
             }
         }
@@ -1778,12 +1787,16 @@ impl Engine {
         tid: Tid,
         op: IndexUndoOp,
     ) {
-        self.index_undo.lock().entry(xid).or_default().push(IndexUndo {
-            index: idx.clone(),
-            key,
-            tid,
-            op,
-        });
+        self.index_undo
+            .lock()
+            .entry(xid)
+            .or_default()
+            .push(IndexUndo {
+                index: idx.clone(),
+                key,
+                tid,
+                op,
+            });
     }
 
     /// Read back the decoded values of the row at `tid` directly from its
@@ -1806,61 +1819,61 @@ impl Engine {
         Ok(values)
     }
 
-/// Find the first WAL record whose start lies inside segment `segment_id`
-/// by probing 8-byte-aligned offsets from the segment start with a
-/// CRC-checked decode (WAL records may straddle segment boundaries, so a
-/// segment start is NOT itself a record boundary). Used by the loser index
-/// compensation to extend its scan to the front of the retained segment.
-/// Returns `None` when nothing decodes within one maximum record length of
-/// the segment start, or when the first record starts at/after
-/// `upper_bound` (nothing to gain by rewinding).
-fn first_record_lsn_in_segment(
-    wal_dir: &Path,
-    segment_size: u64,
-    segment_id: u64,
-    upper_bound: Lsn,
-) -> Option<Lsn> {
-    use std::io::{Read, Seek, SeekFrom};
-    // pg-storage wal/segment.rs filename layout: wal-{segment_id + 1:08}.log.
-    let path = wal_dir.join(format!("wal-{:08}.log", segment_id + 1));
-    let mut file = std::fs::File::open(path).ok()?;
-    const HEADER: u64 = 32; // wal/record.rs fixed record header
-    const MAX_RECORD: u64 = HEADER + u16::MAX as u64 + 8; // length prefix is u16
-    // The segment FILE holds the segment's bytes at file offset 0 (file
-    // offset = global LSN - segment start).
-    let seg_start = segment_id * segment_size;
-    file.seek(SeekFrom::Start(0)).ok()?;
-    // Probe window: one max record for a straddling record's tail, plus one
-    // max record so the candidate itself can be decoded fully.
-    let window_len = (2 * MAX_RECORD).min(segment_size);
-    let mut window = Vec::new();
-    file.by_ref()
-        .take(window_len)
-        .read_to_end(&mut window)
-        .ok()?;
-    // WAL records are 8-byte aligned (pg-storage LSN_ALIGNMENT); the
-    // resync probe steps by it.
-    const PROBE_STEP: usize = 8;
-    let mut off = 0usize;
-    while off as u64 <= MAX_RECORD && off + HEADER as usize <= window.len() {
-        let payload_len =
-            u16::from_le_bytes(window[off + 26..off + 28].try_into().unwrap()) as u64;
-        let total = (HEADER + payload_len).next_multiple_of(8);
-        let end = off + total as usize;
-        if end <= window.len() {
-            if let Ok((rec, _)) = WalRecord::decode(&window[off..end]) {
-                // CRC passed; the position check pins the candidate to its
-                // header LSN, ruling out a coincidental decode of tail bytes.
-                if rec.lsn.0 == seg_start + off as u64 {
-                    let found = Lsn(seg_start + off as u64);
-                    return (found < upper_bound).then_some(found);
+    /// Find the first WAL record whose start lies inside segment `segment_id`
+    /// by probing 8-byte-aligned offsets from the segment start with a
+    /// CRC-checked decode (WAL records may straddle segment boundaries, so a
+    /// segment start is NOT itself a record boundary). Used by the loser index
+    /// compensation to extend its scan to the front of the retained segment.
+    /// Returns `None` when nothing decodes within one maximum record length of
+    /// the segment start, or when the first record starts at/after
+    /// `upper_bound` (nothing to gain by rewinding).
+    fn first_record_lsn_in_segment(
+        wal_dir: &Path,
+        segment_size: u64,
+        segment_id: u64,
+        upper_bound: Lsn,
+    ) -> Option<Lsn> {
+        use std::io::{Read, Seek, SeekFrom};
+        // pg-storage wal/segment.rs filename layout: wal-{segment_id + 1:08}.log.
+        let path = wal_dir.join(format!("wal-{:08}.log", segment_id + 1));
+        let mut file = std::fs::File::open(path).ok()?;
+        const HEADER: u64 = 32; // wal/record.rs fixed record header
+        const MAX_RECORD: u64 = HEADER + u16::MAX as u64 + 8; // length prefix is u16
+                                                              // The segment FILE holds the segment's bytes at file offset 0 (file
+                                                              // offset = global LSN - segment start).
+        let seg_start = segment_id * segment_size;
+        file.seek(SeekFrom::Start(0)).ok()?;
+        // Probe window: one max record for a straddling record's tail, plus one
+        // max record so the candidate itself can be decoded fully.
+        let window_len = (2 * MAX_RECORD).min(segment_size);
+        let mut window = Vec::new();
+        file.by_ref()
+            .take(window_len)
+            .read_to_end(&mut window)
+            .ok()?;
+        // WAL records are 8-byte aligned (pg-storage LSN_ALIGNMENT); the
+        // resync probe steps by it.
+        const PROBE_STEP: usize = 8;
+        let mut off = 0usize;
+        while off as u64 <= MAX_RECORD && off + HEADER as usize <= window.len() {
+            let payload_len =
+                u16::from_le_bytes(window[off + 26..off + 28].try_into().unwrap()) as u64;
+            let total = (HEADER + payload_len).next_multiple_of(8);
+            let end = off + total as usize;
+            if end <= window.len() {
+                if let Ok((rec, _)) = WalRecord::decode(&window[off..end]) {
+                    // CRC passed; the position check pins the candidate to its
+                    // header LSN, ruling out a coincidental decode of tail bytes.
+                    if rec.lsn.0 == seg_start + off as u64 {
+                        let found = Lsn(seg_start + off as u64);
+                        return (found < upper_bound).then_some(found);
+                    }
                 }
             }
+            off += PROBE_STEP;
         }
-        off += PROBE_STEP;
+        None
     }
-    None
-}
 
     /// Recovery-time index compensation for loser transactions (see the
     /// `Engine::open` step 7c note). Scans the post-redo-point WAL for
@@ -1974,8 +1987,9 @@ fn first_record_lsn_in_segment(
 
         let mut compensated = 0usize;
         for tid in victim_tids {
-            let Some((entry, col_types, _)) =
-                tables.iter().find(|(_, _, pages)| pages.contains(&tid.page_id))
+            let Some((entry, col_types, _)) = tables
+                .iter()
+                .find(|(_, _, pages)| pages.contains(&tid.page_id))
             else {
                 // The page belongs to no live table (dropped-table remnant
                 // or freelist reuse) — nothing live can reference the row.
@@ -2018,7 +2032,6 @@ fn first_record_lsn_in_segment(
         }
         Ok(())
     }
-
 
     /// Begin an explicit transaction, returning a [`TxnHandle`] for
     /// commit/abort control (§21 M2b API). The snapshot is taken at this
@@ -2144,7 +2157,9 @@ fn first_record_lsn_in_segment(
                         // registry closes).
                         let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
                         snap.advance_curcid();
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false, false)
+                        self.exec_select(
+                            &snap, &columns, &table, &filter, &order_by, &limit, false, false,
+                        )
                     }
                     // FOR UPDATE (M2c Stage P) needs a real transaction:
                     // the row locks are stamped with its XID and the table
@@ -2154,14 +2169,18 @@ fn first_record_lsn_in_segment(
                     // statement).
                     Some(LockClause::ForUpdate) => self.auto_commit(|snap| {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
-                        self.exec_select(snap, &columns, &table, &filter, &order_by, &limit, true, false)
+                        self.exec_select(
+                            snap, &columns, &table, &filter, &order_by, &limit, true, false,
+                        )
                     }),
                     // FOR SHARE (Stage S multixact lite): stamps a shared
                     // row lock (HEAP_XMAX_LOCK_ONLY + HEAP_XMAX_IS_SHARE).
                     // The row stays visible to all snapshots.
                     Some(LockClause::ForShare) => self.auto_commit(|snap| {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
-                        self.exec_select(snap, &columns, &table, &filter, &order_by, &limit, true, true)
+                        self.exec_select(
+                            snap, &columns, &table, &filter, &order_by, &limit, true, true,
+                        )
                     }),
                 }
             }
@@ -2173,7 +2192,10 @@ fn first_record_lsn_in_segment(
                 let count = self.auto_commit(|snap| {
                     let entry =
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
-                    let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                    let pred = filter
+                        .as_ref()
+                        .map(|f| filter_to_predicate(&entry, f))
+                        .transpose()?;
                     let rows = self.scan_inner(snap, &table, pred.as_ref())?;
                     let mut count = 0;
                     for (tid, old_values) in rows {
@@ -2189,7 +2211,10 @@ fn first_record_lsn_in_segment(
                 let count = self.auto_commit(|snap| {
                     let entry =
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
-                    let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                    let pred = filter
+                        .as_ref()
+                        .map(|f| filter_to_predicate(&entry, f))
+                        .transpose()?;
                     let rows = self.scan_inner(snap, &table, pred.as_ref())?;
                     let mut count = 0;
                     for (tid, _) in rows {
@@ -2251,29 +2276,36 @@ fn first_record_lsn_in_segment(
                 order_by,
                 limit,
                 lock,
-            } => {
-                match lock {
-                    None => {
-                        self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false, false)
-                    }
-                    Some(LockClause::ForUpdate) => {
-                        self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, true, false)
-                    }
-                    Some(LockClause::ForShare) => {
-                        self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, true, true)
-                    }
+            } => match lock {
+                None => {
+                    self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
+                    self.exec_select(
+                        &snap, &columns, &table, &filter, &order_by, &limit, false, false,
+                    )
                 }
-            }
+                Some(LockClause::ForUpdate) => {
+                    self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
+                    self.exec_select(
+                        &snap, &columns, &table, &filter, &order_by, &limit, true, false,
+                    )
+                }
+                Some(LockClause::ForShare) => {
+                    self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
+                    self.exec_select(
+                        &snap, &columns, &table, &filter, &order_by, &limit, true, true,
+                    )
+                }
+            },
             Statement::Update {
                 table,
                 sets,
                 filter,
             } => {
                 let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
-                let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                let pred = filter
+                    .as_ref()
+                    .map(|f| filter_to_predicate(&entry, f))
+                    .transpose()?;
                 let rows = self.scan_inner(&snap, &table, pred.as_ref())?;
                 let mut count = 0;
                 for (tid, old_values) in rows {
@@ -2285,7 +2317,10 @@ fn first_record_lsn_in_segment(
             }
             Statement::Delete { table, filter } => {
                 let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
-                let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                let pred = filter
+                    .as_ref()
+                    .map(|f| filter_to_predicate(&entry, f))
+                    .transpose()?;
                 let rows = self.scan_inner(&snap, &table, pred.as_ref())?;
                 let mut count = 0;
                 for (tid, _) in rows {
@@ -2328,7 +2363,10 @@ fn first_record_lsn_in_segment(
         shared: bool,
     ) -> Result<QueryResult> {
         let entry = self.table_entry(table)?;
-        let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+        let pred = filter
+            .as_ref()
+            .map(|f| filter_to_predicate(&entry, f))
+            .transpose()?;
         let mut rows = self.scan_inner(snap, table, pred.as_ref())?;
         if let Some(ob) = order_by {
             let idx = entry
@@ -2715,7 +2753,11 @@ fn encode_row(
 }
 
 /// Check that a predicate's column index is in range for the table.
-fn validate_predicate(table: &str, entry: &TableEntry, predicate: Option<&Predicate>) -> Result<()> {
+fn validate_predicate(
+    table: &str,
+    entry: &TableEntry,
+    predicate: Option<&Predicate>,
+) -> Result<()> {
     if let Some(p) = predicate {
         if p.col_index() >= entry.columns.len() {
             return Err(EngineError::InvalidPredicate(format!(
@@ -2732,9 +2774,7 @@ fn validate_predicate(table: &str, entry: &TableEntry, predicate: Option<&Predic
 fn apply_predicate(rows: &mut Vec<(Tid, Vec<Value>)>, predicate: Option<&Predicate>) {
     if let Some(p) = predicate {
         let col_index = p.col_index();
-        rows.retain(|(_, vals)| {
-            vals.get(col_index).is_some_and(|v| p.matches(v))
-        });
+        rows.retain(|(_, vals)| vals.get(col_index).is_some_and(|v| p.matches(v)));
     }
 }
 
@@ -2752,9 +2792,11 @@ fn type_oid_of(col_type: ColumnType) -> Result<(TypeOid, i32)> {
 /// target column type.
 fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
     match (lit, col_type) {
-        (Literal::Int(n), ColumnType::Int4) => Ok(Some(Datum::Int4(i32::try_from(*n).map_err(
-            |_| EngineError::InvalidArgument("integer literal out of range for INT4".to_string()),
-        )?))),
+        (Literal::Int(n), ColumnType::Int4) => {
+            Ok(Some(Datum::Int4(i32::try_from(*n).map_err(|_| {
+                EngineError::InvalidArgument("integer literal out of range for INT4".to_string())
+            })?)))
+        }
         (Literal::Int(n), ColumnType::Int8) => Ok(Some(Datum::Int8(*n))),
         (Literal::Int(n), ColumnType::Timestamptz) => Ok(Some(Datum::Timestamptz(*n))),
         (Literal::Str(s), ColumnType::Text) => Ok(Some(Datum::Text(s.clone()))),
@@ -2789,9 +2831,7 @@ fn build_insert_values(
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| {
-                        EngineError::InvalidArgument(format!(
-                            "no column {col_name:?} in table"
-                        ))
+                        EngineError::InvalidArgument(format!("no column {col_name:?} in table"))
                     })?;
                 v[idx] = literal_to_value(lit, entry.columns[idx].col_type)?;
             }

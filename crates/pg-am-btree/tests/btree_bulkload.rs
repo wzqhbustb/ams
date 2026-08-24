@@ -134,8 +134,13 @@ fn bulk_load_survives_crash() {
         engine.wal_writer().flush().unwrap();
         std::mem::forget(engine); // kill -9: no checkpoint, no shutdown
     }
-    let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, btree_redo_handlers(), Vec::new()).unwrap();
+    let engine = StorageEngine::open_with_redo_handlers(
+        tmp.path(),
+        &config,
+        btree_redo_handlers(),
+        Vec::new(),
+    )
+    .unwrap();
     let index = am(&engine)
         .open_index(REL_OID, meta_page, ColumnType::Int4)
         .unwrap();
