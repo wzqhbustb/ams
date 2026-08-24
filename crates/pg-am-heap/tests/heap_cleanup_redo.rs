@@ -2,12 +2,12 @@
 //! idempotency, and slot reuse after compaction across all four online
 //! write paths.
 //!
-//! The "online compact" here is exactly what Stage C's vacuum will do:
-//! append the `HeapCleanup` WAL record (ascending `dead_slots`), run the
-//! shared [`SlottedPage::compact`] primitive on the latched page, then stamp
-//! `pd_lsn`. Stage B has no vacuum driver yet, so the tests perform those
-//! three steps directly — the point under test is that crash recovery
-//! replays the SAME operation to the SAME bytes.
+//! The "online compact" here is exactly what Stage C's vacuum does:
+//! [`HeapAM::compact_page`] — the single home of the ordering pin_mut →
+//! append `HeapCleanup` (ascending `dead_slots`) → run the shared
+//! [`SlottedPage::compact`] primitive on the latched page → stamp `pd_lsn`.
+//! The tests drive that shared entry point directly — the point under test
+//! is that crash recovery replays the SAME operation to the SAME bytes.
 
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ use pg_am_heap::{
 use pg_storage::clog::NoOpClogAccessor;
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
-use pg_storage::page::{page_pd_lsn, set_page_pd_lsn};
+use pg_storage::page::page_pd_lsn;
 use pg_storage::recovery::{
     ActiveXactTable, DirtyPageTable, IncompleteSplitTracker, RedoContext, RedoHandler,
 };
@@ -108,26 +108,15 @@ fn recover_heap(tmp: &TempDir) -> (StorageEngine, HeapAM) {
 }
 
 /// The online half of vacuum compaction (Stage C will drive this from
-/// `Engine::vacuum`): pin for write FIRST — `pin_mut` may emit the
-/// per-checkpoint-cycle FPI of the PRE-compact image, and the `HeapCleanup`
-/// record must sort after it in the WAL, or recovery's unconditional FPI
-/// replay would roll the page back past the compact (F1: the reverse order
-/// silently undoes the compaction and the next slot-addressed redo hard-fails
-/// on an occupied slot) — then append the record, run the shared `compact()`
-/// primitive, and stamp `pd_lsn`, all while holding the page's write latch.
-fn online_compact(engine: &StorageEngine, page_id: PageId, dead_slots: &[u16]) {
-    let mut guard = engine.buffer_pool().pin_mut(page_id).unwrap();
-    let rec = WalRecord::heap_cleanup(
-        page_id,
-        dead_slots.to_vec(),
-        PageId::INVALID,
-        PageId::INVALID,
-    )
-    .unwrap();
-    let lsn = engine.wal_writer().append(rec).unwrap();
-    let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
-    SlottedPage::compact(page, dead_slots).unwrap();
-    set_page_pd_lsn(page, lsn);
+/// `Engine::vacuum`): delegates to [`HeapAM::compact_page`], the single home
+/// of the ordering pin_mut → append HeapCleanup → compact() → stamp pd_lsn
+/// (review F1: `pin_mut` may emit the per-checkpoint-cycle FPI of the
+/// PRE-compact image, and the `HeapCleanup` record must sort after it in the
+/// WAL, or recovery's unconditional FPI replay rolls the page back past the
+/// compact and the next slot-addressed redo hard-fails on an occupied slot).
+fn online_compact(heap: &HeapAM, page_id: PageId, dead_slots: &[u16]) {
+    heap.compact_page(page_id, dead_slots, PageId::INVALID, PageId::INVALID)
+        .unwrap();
 }
 
 /// Insert a row, returning its TID.
@@ -189,7 +178,7 @@ fn test_heap_cleanup_redo_converges() {
             insert_row(&heap, first_page, &snap, i, &format!("row-{i}"));
         }
         // Kill three middle slots, leaving holes and dead tuple bytes behind.
-        online_compact(&engine, first_page, &[1, 3, 4]);
+        online_compact(&heap, first_page, &[1, 3, 4]);
 
         let guard = engine.buffer_pool().pin(first_page).unwrap();
         let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
@@ -330,7 +319,7 @@ fn test_slot_reuse_after_compact_redo_insert() {
         for i in 0..4 {
             insert_row(&heap, first_page, &snap, i, &format!("v-{i}"));
         }
-        online_compact(&engine, first_page, &[1, 2]);
+        online_compact(&heap, first_page, &[1, 2]);
 
         // The insert must recycle slot 1 (lowest Unused), not append at 4.
         let tid = insert_row(&heap, first_page, &snap, 100, "recycled");
@@ -374,7 +363,7 @@ fn test_slot_reuse_after_compact_redo_hot_update() {
         for i in 0..3 {
             insert_row(&heap, first_page, &snap, 10 + i, &format!("filler-{i}"));
         }
-        online_compact(&engine, first_page, &[1, 2]);
+        online_compact(&heap, first_page, &[1, 2]);
 
         let new_tuple = encode_row(100, 1, "hot-updated");
         let mut new_tid = Tid {
@@ -446,7 +435,7 @@ fn test_slot_reuse_after_compact_redo_same_page_update() {
         for i in 0..3 {
             insert_row(&heap, first_page, &snap, 10 + i, &format!("filler-{i}"));
         }
-        online_compact(&engine, first_page, &[1, 2]);
+        online_compact(&heap, first_page, &[1, 2]);
 
         let new_tuple = encode_row(100, 1, "same-page-updated");
         let mut new_tid = Tid {
@@ -526,7 +515,7 @@ fn test_slot_reuse_after_compact_redo_cross_page_update() {
         // Compact the MIDDLE page: kill r2 (its slot 0), leaving one Unused
         // slot and room for exactly one more big tuple.
         let killed_slot = tids[2].slot_id;
-        online_compact(&engine, page_b, &[killed_slot]);
+        online_compact(&heap, page_b, &[killed_slot]);
 
         // Update r0 (page A is full): the reverse scan skips the full tail
         // page C and lands the new version on the compacted middle page B,
@@ -603,7 +592,7 @@ fn test_compact_after_checkpoint_replay_converges() {
         // and MUST emit the pre-compact FPI before the HeapCleanup record.
         engine.trigger_checkpoint().unwrap();
 
-        online_compact(&engine, first_page, &[1, 2]);
+        online_compact(&heap, first_page, &[1, 2]);
         let tid = insert_row(&heap, first_page, &snap, 100, "recycled");
         assert_eq!(tid.slot_id, 1, "insert recycles the first-fit Unused slot");
 

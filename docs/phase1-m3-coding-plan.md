@@ -1,6 +1,6 @@
 # Phase 1 M3 编码顺序
 
-> 基于 `docs/phase1-m3-tech-selection.md` v1.3（三轮 review / 13 条编号修订），按依赖
+> 基于 `docs/phase1-m3-tech-selection.md` v1.7（多轮 review / 编号修订见文末记录），按依赖
 > 关系排列的 M3 阶段编码执行计划。M3 交付五块内容（对应 ROADMAP.md:203-217）：
 > **基础 Vacuum（离线）+ 可观测性 + PG Wire 极简版 + SegmentedStorage 接口预留 +
 > Tier 2 接口预留**。每个阶段必须先通过单元 / 集成 / 崩溃测试与对抗性 review，再进入
@@ -179,8 +179,8 @@ cargo test --workspace
 
 | 任务 | 交付物 |
 |------|--------|
-| `Vacuumable` trait 扩展 | `pg-catalog` 按 §4.4 形状新增 `collect_index_keys`（只读）与 `reclaim`（纯物理）两个方法；`scan_dead_tuples` 不动。**拆两个方法不改回单一 `reclaim`**——返回列值的单一形状会强制压实先于索引清理，违反 §4.1 顺序不变量 |
-| 链分组 helper | heap AM 内部共享 helper：沿 `t_ctid` 走链、成员全落在 dead 集合才算全死链；`collect_index_keys` 是其唯一出口（§4.4）。普通死元组返回自身 (tid, 列值)；全死链返回链根 (tid, 链根列值)；**部分死链一律不返回**（§4.2，不 prune、不重定向） |
+| `Vacuumable` trait 扩展 | `pg-am-heap`（`access_method.rs`，trait 实体所在 crate；pg-catalog 仅 re-export）按 §4.4 形状新增 `collect_index_keys`（只读）与 `reclaim`（纯物理）两个方法；`scan_dead_tuples` 不动。**拆两个方法不改回单一 `reclaim`**——返回列值的单一形状会强制压实先于索引清理，违反 §4.1 顺序不变量 |
+| 链分组 helper | heap AM 内部共享 helper：沿 `t_ctid` 走链、成员全落在 dead 集合才算全死链；普通死元组返回自身 (tid, 列值)；全死链返回链根 (tid, 链根列值)；**部分死链一律不返回**（§4.2，不 prune、不重定向）。**出口为二**（Stage C 实施时修正，已记录于 stage_spec 交付内容第 8 条与选型 v1.7 注记）：`collect_index_keys`（只读出口）+ `reclaim` 内部重推导（结构保证"部分死链零回收"，不依赖调用方自律） |
 | `collect_index_keys` 实现 | 从元组字节解码索引列值 `Vec<Option<Datum>>`；key 提取路径与 `Engine::delete_inner` 一致（`read_row_by_tid` + `encode_key`，NULL 键跳过，engine.rs:1701/1717/1718）；必须先于一切物理改写（页压实后 key 读不出） |
 | `reclaim` 实现 | 按清单杀 slot：调 B 交付的 `compact()`（写 `HeapCleanup` WAL）；压实后全空页改写前驱 `next_page` 从页链摘除（unlink 信息进同条 HeapCleanup payload），调 `PageAllocator::free_page`（自带 `PageFree=41` WAL + freelist，page_allocator.rs:202；`drop_table` 同款先例 engine.rs:1113-1114）；heap AM 内存页列表缓存按单页粒度剔除（参照 `drop_relation` engine.rs:1119） |
 | 整链 HOT 回收 | 链上所有版本均死 → 整链全部 slot 进 reclaim 清单（§4.2）；索引条目删链根一条（归 D 的 engine 侧循环） |

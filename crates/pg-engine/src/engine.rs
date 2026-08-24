@@ -696,6 +696,10 @@ impl Engine {
         //     t_xmax, `TupleConcurrentlyUpdated` on a committed one) instead
         //     of the legacy "second-writer-errors" behavior.
         heap.set_row_waiter(Arc::clone(&txn) as Arc<dyn RowWaiter>);
+        // 5c. Page allocator (M3 Stage C): vacuum's `reclaim` returns fully
+        //     emptied heap pages to the allocator after unlinking them from
+        //     the chain.
+        heap.set_page_allocator(Arc::clone(storage.page_allocator()));
         // 6b. Checkpoint ATT snapshot source (Stage N, §11.4): every
         //     checkpoint persists the manager's in-flight XIDs as the ATT
         //     snapshot file referenced by the v2 CheckpointEnd record. The

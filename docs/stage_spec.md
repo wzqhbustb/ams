@@ -801,3 +801,43 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - ~~`AccessMethod::redo_handlers()` 只返回三个旧 handler~~ → **review F4 已修**：一行委托 `heap_redo_handlers()`，单一事实源（该 trait 方法仍无调用点，但不再是落后两份的地雷）
 
 ---
+
+## Stage C（M3）：Vacuum 核心（trait / 链分组 / 压实接线 / 页释放）
+
+**状态**：✅ 完成（debug 全量 669 绿 / 0 失败（= Stage B 出口 654 + 本 stage 新增 15，含 R1/R2 回归）；clippy `--workspace --all-targets -D warnings` 全绿；loom 不受影响——pg-am-heap/pg-storage 本无 loom feature，`cargo check -p pg-am-btree --features loom --tests` 验证通过；rustdoc 无新增警告（8 个 pre-existing 私项链接警告与 HEAD 持平）；未 commit——等用户确认）
+**工期**：预估 5–7 天
+**验收**：`vacuum_chain_grouping`（5：普通死元组自身映射含 NULL 列 / 全死 HOT 链只回链根且为链根列值 / 部分死链零输出 / 全死页逐条输出 / aborted 插入按规则 1 分组）；`vacuum_reclaim`（7：slot 置 Unused + 空洞回收 + first-fit 复用 / 空页 unlink→freelist→缓存剔除→复用无串扰 / 空链头只压实不摘除 / 部分死链零回收 / **相邻双空页连续摘除回归**（红绿验证：naive 左邻实现下链头 next 指向已释放页，测试红）/ **页 id 序 ≠ 链序的泛化回归**（LIFO freelist 复用拼出链序 [1,4,3,2,5]，链相邻双空页按页 id 序处理，前驱解析仍按链序取最近仍在链左邻，红绿对照成立）/ 读者-压实并发 watchdog 用例——每次读要么全旧要么全新，绝无半压实页）；`vacuum_crash_windows`（3：**崩溃窗口②**——HeapCleanup 落盘、PageFree 未写 → 恢复后被摘页脱链且不在 freelist（既定单页泄漏，`free_page` 补 free 成功证明其不在 freelist）+ 链遍历与堆扫描一致 + `scan_dead_tuples` 为空；**多页压实中途崩溃收敛**——在线 reclaim（两页压实 + 一页 unlink+free）崩溃后重放，两存活页 8192B 逐字节一致、链重链 A→C 复现、被释放页回 freelist；**R2 回归**——checkpoint → reclaim 含 unlink → flush → 崩溃 → 重放收敛，前驱页 unlink 前镜像 FPI 必须先于 HeapCleanup，旧顺序下必红）
+
+### 交付内容
+
+1. **compact 模板提升（Task 0，单一事实源）**：`HeapAM::compact_page(page_id, dead_slots, unlink_prev, unlink_next)`（`crates/pg-am-heap/src/heap_am.rs`）——**pin_mut（本周期的压实前 FPI 必须先于 HeapCleanup 落 WAL，review F1）→ append HeapCleanup → 同一 `SlottedPage::compact()` → stamp pd_lsn**；unlink 时**前驱页的 pin_mut 提到 append 之前**（其 unlink 前镜像 FPI 同样必须先于记录，见 R2），随后在前驱页自有 latch 下 `set_next_page` + 同 LSN stamp（两页落盘时机可不同，redo 侧各自 pd_lsn 幂等守卫，同跨页 HeapUpdate 策略）。Stage B 测试 helper `online_compact` 已迁移为薄委托（`heap_cleanup_redo.rs`），FPI 顺序只存在于这一个地方
+2. **`Vacuumable` trait 扩展**（`access_method.rs`，§4.4 形状）：`collect_index_keys`（只读）+ `reclaim`（纯物理）**两个方法，拒不合并**——融合形态会把索引清理挤到压实之后，违反 §4.1 顺序不变量；`scan_dead_tuples` 不动；`notify_indexes` 不进 trait（索引知识在 engine 层）
+3. **链分组 helper**（`HeapAM::classify_dead_tuples`，单页单 pin）：按页分组输入 → 每 slot 读一次 header → `HEAP_ONLY_TUPLE` 成员经 `hot_chain_root` 反走定位链根 → 链根沿 `t_ctid` 前走收全链（slot_count 有界、越界/脱页即终止、耗尽即 Corrupted，与 `follow_hot_chain` 同契约）。**死性判定不重做**——`dead` 集合成员身份即逐成员裁决（`scan_dead_tuples` 已套用过 horizon 规则）；helper 只做结构判定：全链成员 ∈ dead set 才算全死链。产出 `DeadClassification { index_keys, kills }`，`collect_index_keys` 与 `reclaim` 消费**同一份**结果，只读侧与物理侧结构上不可能分歧
+4. **`collect_index_keys` 实现**：普通死元组 → (自身 tid, 自身列值)；全死链 → (链根 tid, 链根列值)；部分死链一律不返回。列值经 `decode_tuple(bytes, rel.columns)` 全列解码（`Engine::delete_inner` 同路径的 AM 侧形态）；NULL 列保持 `None`，跳过发生在 engine 编码 key 处（既有约定）。全程只读 pin，必须先于 reclaim（压实后 key 读不出）
+5. **`reclaim` 实现**：kills 按页（BTreeMap 稳定序）逐页 `compact_page`；压实后全空页（kill 数 == 非 Unused slot 数）且非链头 → 前驱取链序缓存左邻 → **unlink（进同条 HeapCleanup）→ 缓存剔除 → `free_page`（PageFree + freelist），顺序不可逆**：先 free 后 unlink 的崩溃窗口会留下"页同时在链上与 freelist"，页被复用后链上出现活元组 = 结构性损坏；现顺序最坏只是单页泄漏（窗口②口径）。**链头永不摘除/释放**（`RelationDesc::first_page` 是目录与 `seed_from_chain` 的锚），空链头只压实。所有页修改记录 `txn_id = INVALID`（vacuum 非事务，`WalRecord::heap_cleanup` / `page_free` 既有语义，重放不依赖任何事务结局、analysis 不进 ATT）
+6. **缓存剔除（Stage B 前向提醒的落实）**：`HeapAM::evict_page` 按单页粒度从 `pages` 缓存移除已摘页（先于 `free_page`）；测试直接验证——摘除后的小插入经反向扫描**绝不**落进已摘页（若缓存残留，尾部空页必被选中）
+7. **页分配器接线**：`HeapAM` 新增 `page_allocator: Option<Arc<pg_storage::sync::Mutex<PageAllocator>>>` + `set_page_allocator`（`set_row_waiter` 同款 install-once-before-sharing 形态；锁类型走 `pg_storage::sync` 别名层，crate 边界规则）；`Engine::open` 装配（engine.rs 5c）
+8. **设计偏移（对 §4.4"reclaim 不需要链知识"的一处有意收紧）**：`reclaim` 内部用**同一个**分组 helper 重新推导 kill 集，而非盲信输入清单——engine（Stage D）会把 `scan_dead_tuples` 的原始输出直接传给 `reclaim`，其中含部分死链的死亡成员；不过滤则违反 `compact()` kill-list 契约（杀仍被 `t_ctid` 引用的成员 = 悬挂链）。过滤使"部分死链零回收"成为结构保证而非调用方自律；`vacuum_reclaim.rs::reclaim_never_touches_partially_dead_chains` 钉死
+9. **对抗性 review 修复（R1，中）相邻空页连续摘除的前驱选择**：初版取链序快照的直接左邻为前驱——A→B→C 三页中 B、C 同轮皆空时，C 的 unlink 记录把**已摘除的 B** 的 next 改写为 None，而活链 A.next 仍指向随后被 free 的 C（allocator 复用后链上出现他人活元组 = 结构性损坏）。修为：摘除前驱 = 最近的**仍在链上**的左邻（`removed` 集合跳过本轮已摘页；链头永不摘除，扫描必终止）；回归测试 `consecutive_empty_pages_unlink_to_live_predecessor` 红绿验证成立（naive 实现下 A.next 残留指向已释放页，测试红）
+10. **对抗性 review 修复（R2，高）unlink 前驱页的 FPI 顺序**：初版 `pin_mut(unlink_prev_page)` 排在 append HeapCleanup **之后**——前驱页是本 checkpoint 周期首次触碰的冷页时（vacuum 回收冷页是典型工况），其 unlink 前镜像 FPI 获得比 HeapCleanup 更大的 LSN；崩溃重放时 FPI 无条件覆盖、把前驱页回滚到"仍指向被摘页"，而 PageFree 照常重放把被摘页放上 freelist → 复用后链指向他人活页 = 结构性损坏。修为：unlink 时前驱页 pin_mut **先于** append（两 latch 同持无 AB/BA——vacuum 持表级 AccessExclusive 无并发写者、redo 单线程，已文档化）；确定性回归 `unlink_prev_fpi_precedes_heap_cleanup_across_checkpoint`（checkpoint → reclaim 含 unlink → flush → 崩溃 → 重放收敛）红绿验证成立（旧顺序下恢复后页 A 回滚到 unlink 前镜像、与在线字节不符，测试红）
+11. **文档修正（review 低优先级两条）**：`Vacuumable::reclaim` trait doc 补**互斥前提**——`scan_dead_tuples`/`collect_index_keys`/`reclaim` 之间不得有并发写（Stage D 的 AccessExclusive 保证；无锁使用是调用方责任，并发插入会在流水线中途回收的 Unused slot 上复用，使 kill 清单与已解码 key 失配）；`reclaim` 内 allocator 前置检查的注释改写为真实理由（缺 allocator 是可前置判定的配置错误，保持错误原子性——压实+摘除后半 applied 的释放无法被重试干净恢复：killed slot 已 Unused，重分类找不到 kill 对象、永不再进 unlink/free 分支）
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| HOT 死链回收 | 部分死链 LP_REDIRECT 重定向 + 整链回收 | 只做整链回收；部分死链原样保留 | LP 重定向是 on-disk 格式变更（页格式已冻结，变更须带 migration），归 Phase 7；代价是部分死链空间滞留到整链死亡（§4.2 已论证有界） |
+| 空页释放 | `lazy_vacuum` 摘页还空间给 relation 内复用 | unlink → 缓存剔除 → `free_page` 还 allocator（可跨 relation 复用） | 两笔 WAL 间有崩溃窗口②（单页泄漏，既定取舍）；消除窗口需把 unlink 并进 PageFree payload = on-disk 变更，判定不值 |
+| vacuum 事务性 | vacuum 在非事务的专用机制下运行，页修改 WAL 同样非事务 | 记录 `txn_id = INVALID`，redo 无条件重放 | 语义一致；analysis 不进 ATT，无 undo 负担 |
+| 死元组清单 | `LVDeadTuples` 物化 + 内存上限触发多轮 | `Vec<Tid>` 全量物化（离线模式） | 在线化时改迭代器（access_method.rs TODO 维持，归 Phase 5b） |
+
+### 已知残留与后续归队
+
+- **崩溃窗口② 单页泄漏**（既定取舍）：unlink 与 free 两笔 WAL 之间崩溃 → 页脱链且不在 freelist，永久泄漏直至手工干预；`vacuum_crash_windows.rs` 钉死精确口径。备选已记录：空页留链零窗口；消窗需改 PageFree payload（on-disk 变更，不值）。**注**：review F1（记为 R2）曾在此窗口之外另发现"前驱页 FPI 排在 HeapCleanup 之后"的重放回滚通道（链指向已释放页 = 结构性损坏），已修复并有确定性回归（交付内容第 10 条）；现窗口② 的残留口径仅为单页泄漏，无一致性问题
+- **部分死链空间滞留**（§4.2 代价）：死版本滞留到整链死亡才回收，`follow_hot_chain` 遍历成本同滞留 → 归 LP 重定向 + 格式演进（Phase 7）
+- **reclaim 缺 allocator 即报错**：未 `set_page_allocator` 的 `HeapAM`（纯 AM 测试构造）遇空页释放时 `InvalidArgument` 硬错——压实部分不受影响；engine 装配路径已接线
+- **索引清理 / `Engine::vacuum` 五阶段流水线**归 Stage D：`collect_index_keys` 产出的 (tid, 列值) 需 engine 侧逐索引 `delete`（EntryNotFound→Ok），本 stage 只交付 AM 能力
+- **WAL 流量观测**：vacuum 产生与死行数成正比的 WAL（§4.5 代价）+ FPI 放大 → 量化归 Stage G benchmark（N5）
+
+---
+

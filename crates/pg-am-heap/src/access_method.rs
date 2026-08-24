@@ -151,9 +151,17 @@ pub trait UpdatableAM: AccessMethod {
 
 /// AMs that support vacuum / garbage collection.
 ///
-/// M2 only defines the interface; `scan_dead_tuples` is implemented by heap in
-/// Stage I for MVCC correctness testing. `reclaim` and `notify_indexes` are
-/// deferred to M3.
+/// `scan_dead_tuples` is implemented by heap since Stage I; M3 Stage C adds
+/// `collect_index_keys` (read-only) and `reclaim` (purely physical)
+/// (tech-selection §4.4). The two are deliberately SEPARATE methods — never
+/// merge them: the §4.1 ordering invariant requires index cleanup (driven by
+/// the caller between the two calls) to be WAL-durable BEFORE any TID-
+/// invalidating heap record (`HeapCleanup` / `PageFree`) is appended. A
+/// single fused method would force compaction ahead of index cleanup and
+/// reopen the dangling-TID window.
+///
+/// Index cleanup itself is NOT part of this trait (`notify_indexes` stays
+/// out, §4.4): index knowledge lives at the engine layer.
 ///
 /// TODO(M3): When autovacuum is introduced, consider changing the return type
 /// from `Vec<Tid>` to an iterator or callback pattern to avoid materializing
@@ -172,4 +180,57 @@ pub trait Vacuumable {
         oldest_xmin: TxnId,
         clog: &dyn ClogAccessor,
     ) -> Result<Vec<Tid>>;
+
+    /// M3 Stage C (READ-ONLY): derive the `(tid, column values)` pairs whose
+    /// index entries need cleanup, from the dead-tuple list produced by
+    /// [`Vacuumable::scan_dead_tuples`]. A standalone dead tuple maps to
+    /// itself; a FULLY-dead HOT chain (every member in `dead`) maps to its
+    /// chain ROOT (root tid + the root's decoded column values — the root
+    /// owns the chain's index entries, Stage S); a PARTIALLY-dead chain
+    /// contributes NOTHING (§4.2: no prune, no redirect — LP redirection is
+    /// an on-disk format change, out of scope).
+    ///
+    /// The returned values are the tuple's full decoded row
+    /// (`Vec<Option<Datum>>`, `rel.columns` order); the caller picks out its
+    /// indexed columns and skips NULL keys (the `Engine::delete_inner`
+    /// convention).
+    ///
+    /// MUST run before [`Vacuumable::reclaim`]: once a page is compacted the
+    /// tuple bytes are gone and the keys are unreadable (§4.1 stage 2). This
+    /// method never modifies any page.
+    fn collect_index_keys(
+        &self,
+        rel: RelationDesc<'_>,
+        dead: &[Tid],
+    ) -> Result<Vec<(Tid, Vec<Option<Datum>>)>>;
+
+    /// M3 Stage C (PURELY PHYSICAL): kill the listed dead slots via
+    /// [`crate::slotted_page::SlottedPage::compact`] under `HeapCleanup` WAL
+    /// records, unlink pages that become fully empty from the relation's page
+    /// chain (the unlink rides in the same `HeapCleanup` payload), and return
+    /// them to the allocator via `PageAllocator::free_page` (`PageFree` WAL).
+    ///
+    /// Kill-list contract (inherited from `compact()`): only standalone dead
+    /// tuples and FULLY-dead HOT chains may be killed — never a chain member
+    /// still referenced by a predecessor's `t_ctid`, never a chain root while
+    /// any member lives. The implementation re-derives that classification
+    /// from `dead` itself (same grouping helper as `collect_index_keys`), so
+    /// passing the raw `scan_dead_tuples` output is safe: partially-dead
+    /// chain members in the input are left untouched (§4.2).
+    ///
+    /// Call preconditions (§4.1 ordering invariant):
+    ///
+    /// 1. ORDERING: the index cleanup for every entry `collect_index_keys`
+    ///    returned must already be WAL-durable — vacuum is not transactional,
+    ///    and every record written here carries `txn_id = INVALID`, so replay
+    ///    is unconditional.
+    /// 2. MUTUAL EXCLUSION: no concurrent writer may touch the relation
+    ///    between `scan_dead_tuples`, `collect_index_keys`, and `reclaim` —
+    ///    the kill list `reclaim` re-derives must still match the tuples
+    ///    `collect_index_keys` decoded, and a concurrent insert/update would
+    ///    invalidate that correspondence (a fresh row could even recycle a
+    ///    compacted `Unused` slot mid-pipeline). Stage D's `Engine::vacuum`
+    ///    guarantees this with the table's `AccessExclusive` lock; driving
+    ///    the trait without that lock is the caller's own responsibility.
+    fn reclaim(&self, rel: RelationDesc<'_>, dead: &[Tid]) -> Result<()>;
 }
