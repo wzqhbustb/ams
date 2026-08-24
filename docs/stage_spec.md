@@ -757,3 +757,47 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - vacuum 本体（取 horizon 一次、全程使用）归 Stage C/D
 
 ---
+
+## Stage B（M3）：HeapCleanup WAL + redo + §4.6 槽位寻址重构
+
+**状态**：✅ 完成（debug 全量 651 绿 / 1 已知 flaky（首次全量）；修复轮后复跑 654 绿 / 0 失败，含 F1–F5 新增用例；clippy 全绿；loom 用例不受影响——pg-am-heap/pg-storage 本无 loom feature，仅 pg-am-btree 的 loom 用例经 `cargo check --features loom` 验证不受影响；未 commit——等用户确认）
+**工期**：预估 5–6 天
+**验收**：payload roundtrip / `first_fit_slot`·`add_tuple_at` 单测 / `add_tuple` 组合行为等价（双页逐字节对比）/ `test_heap_cleanup_redo_converges`（在线 vs 重放整页 8192B 逐字节一致）/ `test_heap_cleanup_redo_idempotent`（同记录重放 10× 幂等，含链 unlink 变体）/ `test_slot_reuse_after_compact_redo_*` 四路径（insert / HOT / 同页非 HOT / 跨页落中部压实页）全部崩溃重放按 WAL 承载 slot 复现、无 diverged / analysis DPT 分类（压实页 + unlink 前驱页，不含重链目标页）全部落地。**回归**：m2b crash rounds 4/4 绿（R4 门槛在 §4.6 重构后、compact 落地前先行验证过一次，收口时复验）；首次全量 651 passed / 1 failed（失败项为已登记 flaky，详见下），**修复轮后终审复跑 654 passed / 0 failed**——失败项为 stage_spec 已登记的 `btree_concurrent` 预存 flaky（`concurrent_hundred_thread_smoke` 丢 key 0，与登记的 root-split 丢失更新疑似同源；本 stage 未触碰 pg-am-btree，pg-storage 改动纯增量；该测试单独重跑 5 次 4 过 1 挂，flaky 特征吻合）。**性能**：criterion 基对比不可用（`target/criterion` 基线来自更早 stage、机器又在并发跑全量回归：e2e -78% / no_fsync +26% 均为噪声，不可解释）；结构性论证——重构为纯重排，WAL 字节量与 I/O 不变，`first_fit_slot` 的 LP 扫描与被拆掉的 `add_tuple` 内部 first-fit 扫描同构，insert 路径净工作量不变
+
+### 交付内容
+
+1. **§4.6 槽位寻址重构（R4 前置，行为中性）**
+   - `SlottedPage::first_fit_slot(page) -> Option<u16>`（纯读，corrupt header 下钳制 `pd_lower` 防越界）+ `add_tuple_at(page, slot, bytes)`（`slot == slot_count` 追加新 LP；`slot < slot_count` 仅允许回收 `Unused`；其余 `InvalidSlot` 硬错）（`crates/pg-am-heap/src/slotted_page.rs`）；`add_tuple` 退化为二者组合，对外行为不变（`slot_addressing.rs` 双页逐字节等价测试钉死）
+   - 四处在线路径全部改为"先 `first_fit_slot`（或 `slot_count`）选 slot → 写 WAL（slot 随记录承载）→ `add_tuple_at` 落位"：insert、HOT update、同页非 HOT update、跨页 update（`heap_am.rs`；跨页路径 slot 选择保持在最终双 latch 落定之后，反向扫描使压实后中部页成为 update 落点）
+   - 三个 redo handler 全部改调 `add_tuple_at(page, rec.slot, ..)`：HeapInsert、HeapUpdate（同页 + 跨页两分支）、HeapHotUpdate（`redo.rs`）；"预测—断言"耦合删除，slot 不可用即 `MetadataCorrupted` 硬失败（语义与旧 diverged 检查一致）
+   - **WAL 布局核查结论**：`HeapInsertRecord.slot_id`、`HeapUpdateRecord.new_tid`、`HeapHotUpdateRecord.new_slot` 本就已承载 slot——**无磁盘格式变更**
+2. **`HeapCleanup = 8` payload**（`pg-storage/src/wal/record.rs`）：`(page_id, unlink_prev_page, unlink_next_page, dead_slots[])`；判别式 8 即 Stage-0 预留值，未新增占号。字段顺序不变量沿用 CLR B5 先例：三个定长 page id 在前、`dead_slots` 定 LAST——analysis 只前缀解码定长字段，不信任变长 Vec 的长度前缀；`MAX_HEAP_CLEANUP_SLOTS = (PAGE_SIZE-32-16)/4` 防御性上界随 decode 强制。unlink 两字段取 `PageId::INVALID` 哨兵（Stage B 在线侧只产压实形态，unlink 字段为 Stage C 页回收预留）
+3. **`SlottedPage::compact()`**（`slotted_page.rs`）：kill list 先校验后落笔（严格升序 / 越界 / 非 Normal·Dead 即硬错）；存活元组字节拷出→数据区清零→按 slot 升序向 `pd_special` 重排→LP 原位改指（flags/len 保留）；dead slot LP 置 `Unused`（`delete_tuple` 语义）；`pd_lower` 不动、`pd_upper` 吸收全部空洞。**LP 条目不移动不重排**（§4.1 阶段 4，slot 号是 TID 组成部分）
+4. **`HeapCleanupRedoHandler`**（`pg-am-heap/src/redo.rs`）：压实页与前驱页各自独立 `pd_lsn` 幂等守卫（两页落盘时机可不同，同跨页 HeapUpdate 策略）→ 调**同一个** `compact()`（同参数、升序 dead_slots，§4.5 重放收敛="重放=重执行同一物理操作"）；unlink 分支 `set_next_page(prev, unlink_next_page)`。注册进 `heap_redo_handlers()`（Stage 0 硬失败约定：记录与 handler 同 stage 交付）；`Engine::open` 经该函数自动获得
+5. **analysis DPT 分类**（`pg-storage/src/analysis.rs`）：`for_each_touched_page` 新增 `HeapCleanup` 臂——压实页 + unlink 前驱页（`INVALID` 过滤），重链目标页本身不被修改故不入 DPT；`every_record_type_is_classified_for_the_dpt` 护栏同步迁移
+6. **测试**：`pg-am-heap/tests/slot_addressing.rs`（7）；`pg-storage/tests/heap_cleanup_wal.rs`（3：roundtrip / 构造器+decode 双层拒绝 / DPT 分类端到端走 `run_analysis`）；`pg-am-heap/tests/heap_cleanup_redo.rs`（8：converges / idempotent×10 / 四路径 slot 复用 / checkpoint-介于-之间 FPI 顺序收敛 / 非升序 kill list 恢复硬失败）
+7. **对抗性 review 修复（F1–F5）**
+   - **F1（中）在线 compact 模板 FPI 顺序倒置**：测试 helper 原为 append HeapCleanup → pin_mut；当压实是 checkpoint 周期内对该页首次触碰时，`pin_mut` 发的压实前 FPI 会获得比 HeapCleanup 更大的 LSN，恢复端 FPI 无条件回滚把压实静默撤销、后续按 slot 落位的 redo 撞 Normal 槽 `MetadataCorrupted` 硬失败（目录变砖）。修为 **pin_mut → append → compact → stamp pd_lsn**；补 `test_compact_after_checkpoint_replay_converges`（checkpoint 介于 seed 与 compact 之间），红绿验证成立：旧顺序下恢复以 `MetadataCorrupted("heap redo: invalid slot 1")` 硬失败
+   - **F2（低-中）`set_next_page` 改返回 `Result`**（`slotted_page.rs`，与 `next_page` 对称，`checked_header` + `pd_special` 几何校验硬错）：redo 的 unlink 分支作用于磁盘恢复页（不受信来源），原 debug_assert 在 release 下可被损坏页触发越界 panic 或写进元组区；在线调用点（`heap_am.rs::extend_chain`）与测试一并迁移
+   - **F3（低）`WalRecord::heap_cleanup` 构造器硬校验**：非升序 / 超 `MAX_HEAP_CLEANUP_SLOTS` 直接 `Err`（原仅 debug_assert；WAL-first 协议下毒记录先落盘、之后每次恢复硬失败变砖）；decode 上界保留为第二层防御
+   - **F4（低）`AccessMethod::redo_handlers()` 死代码地雷**：一行委托 `heap_redo_handlers()`（原返回 3 个旧 handler，缺 HotUpdate/Cleanup）
+   - **F5 测试补强**：F1 配套 checkpoint 用例 + 负面向（字节手术构造非升序 dead_slots 的 CRC 合法记录 → 恢复硬失败、非 panic、非静默，错误信息点名 ascending 契约）；`compact()` 文档新增 kill-list 契约——调用方（Stage C vacuum）保证不杀仍被 `t_ctid` 引用的 HOT 链成员，否则留下指向 `Unused`（会被回收复用）槽位的悬挂链；**第三轮审查扩写（N1）**：契约还须覆盖链根——"链上仍有存活成员时不得杀链根"（链根无 `t_ctid` 指向它、指向它的是索引条目；杀根 = 存活成员从 seqscan 与索引扫描双双不可达 + 槽回收后索引返回错行）。链活性判定归 `scan_dead_tuples` horizon + 链分组（tech-selection §4.4），当前无在线生产者触发路径，Stage C 照抄前已修订
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| slot 分配 | `PageAddItem` 返回 offset number，调用方立即持锁写 WAL | 在线先选 slot 再写 WAL，slot 由记录显式承载 | redo 不依赖在线 writer 行为巧合；compact 产生 Unused 后必然分歧的旧"预测—断言"形态被 §4.6 禁掉 |
+| 页内压实 | `compactify_tuples` 重排 LP 数组（itemid 按 offset 排序，靠 redirect 保 TID） | LP 数组一律不动，只移 tuple 字节 | 无需 LP_REDIRECT 机制，索引条目与 HOT t_ctid 天然稳定；代价是压实不回收 LP 本身（与 PG 一致） |
+| 压实 WAL | PG 不单独记 vacuum WAL（HEAP2_CLEAN 记录含 redirect/死亡信息） | 单条 `HeapCleanup` 物理记录 + 同一 `compact()` 重放 | 重放收敛靠"同函数同参数"，无平行重放逻辑可漂移 |
+
+### 已知残留与后续归队
+
+- `HeapCleanup` 在线侧尚无生产者：Stage B 的"在线 compact"由测试直接驱动（模板为 **pin_mut（可能发该页本周期的 FPI，必须先于 HeapCleanup 落 WAL，否则恢复端 FPI 无条件回滚会把压实静默撤销、后续按 slot 落位的 redo 撞占用槽硬失败——review F1 修复）→ append HeapCleanup → compact() → stamp pd_lsn**，Stage C 必须照抄此顺序）；vacuum 本体（horizon → scan_dead → 索引清理 → reclaim 调 compact + unlink）归 Stage C/D
+- 空页识别与 unlink 记录的在线产生（含 `unlink_prev/next` 填充）归 Stage C 页释放阶段；redo 侧本 stage 已支持并有幂等测试
+- **Stage C 前向提醒（第三轮审查）**：在线 unlink 摘除页必须与 heap AM 的 `pages` 内存缓存剔除**同步**——否则 `acquire_page_with_room` 可能把新行插入已摘除页（物理 redo 仍收敛，但行逻辑不可达）；另：redo 的 unlink 分支不清被摘除页自身的 next 指针（"前驱旧镜像"状态下链读作 prev→P→X，P 为空页，walk 正常终止，无断言触发——此形态合法）
+- criterion INSERT 基线对比本次不可用（基线陈旧 + 并发负载）→ 如需 S2 式正式验收，在干净机器上重存 Stage A 基线后复测
+- `btree_concurrent` 预存 flaky 依旧（本次全量撞上 `concurrent_hundred_thread_smoke` 一例，单测重跑 4/5 过）→ 沿用 Stage A 残留条目，单开修复会话处理
+- ~~`AccessMethod::redo_handlers()` 只返回三个旧 handler~~ → **review F4 已修**：一行委托 `heap_redo_handlers()`，单一事实源（该 trait 方法仍无调用点，但不再是落后两份的地雷）
+
+---

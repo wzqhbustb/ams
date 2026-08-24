@@ -30,8 +30,8 @@ pub use error::{HeapError, Result};
 pub use heap_am::{follow_hot_chain, hot_chain_root, HeapAM};
 pub use line_pointer::{LinePointer, LpFlags};
 pub use redo::{
-    heap_redo_handlers, HeapDeleteHandler, HeapHotUpdateHandler, HeapInsertHandler,
-    HeapUpdateHandler,
+    heap_redo_handlers, HeapCleanupRedoHandler, HeapDeleteHandler, HeapHotUpdateHandler,
+    HeapInsertHandler, HeapUpdateHandler,
 };
 pub use slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
 pub use toast::ToastPointer;

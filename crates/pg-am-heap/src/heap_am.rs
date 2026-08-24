@@ -58,10 +58,14 @@
 //! Delete is *logical*: it stamps `t_xmax` on the tuple header and leaves the
 //! line pointer `Normal`. It never calls [`SlottedPage::delete_tuple`] (which
 //! recycles the slot as `Unused`), because MVCC still needs the physical row
-//! and recycling would break TID stability. A consequence is that
-//! [`SlottedPage::add_tuple`] always *appends* on a heap page (no `Unused` slot
-//! to recycle), so the slot it returns is deterministically `slot_count`. Redo
-//! relies on this to reproduce identical slots without a slot-addressed writer.
+//! and recycling would break TID stability. `Unused` slots appear only when
+//! vacuum's [`SlottedPage::compact`] (M3 Stage B) kills dead tuples, so
+//! first-fit recycling IS reachable on the online paths. Slot assignment is
+//! therefore explicit (M3 tech-selection §4.6): every online writer picks the
+//! slot with [`SlottedPage::first_fit_slot`] (falling back to `slot_count`),
+//! carries it in the WAL record, and places the tuple with
+//! [`SlottedPage::add_tuple_at`]; redo places at the recorded slot directly.
+//! Slot allocation is a WAL-carried fact, not an online-vs-redo coincidence.
 //!
 //! # Row-lock `t_xmax` protocol (M2c Stage P, tech-selection §9.1)
 //!
@@ -139,11 +143,11 @@ use crate::access_method::{
 };
 use crate::error::{HeapError, Result};
 use crate::line_pointer::{LpFlags, LINE_POINTER_SIZE};
-use crate::redo::{HeapDeleteHandler, HeapInsertHandler, HeapUpdateHandler};
+use crate::redo::heap_redo_handlers;
 use crate::slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
 use crate::tuple::{
-    decode_tuple, TupleHeader, HEAP_HOT_UPDATED, HEAP_ONLY_TUPLE, HEAP_UPDATED,
-    HEAP_XMAX_IS_SHARE, HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE,
+    decode_tuple, TupleHeader, HEAP_HOT_UPDATED, HEAP_ONLY_TUPLE, HEAP_UPDATED, HEAP_XMAX_IS_SHARE,
+    HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE,
 };
 
 /// Largest tuple that can ever fit on a heap page (page minus special space,
@@ -467,7 +471,7 @@ impl HeapAM {
             let mut tail_guard = self.buffer_pool.pin_mut(tail)?;
             let page = as_page_mut(&mut tail_guard);
             SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
-            SlottedPage::set_next_page(page, Some(new_page_id));
+            SlottedPage::set_next_page(page, Some(new_page_id))?;
             let image = page.to_vec();
             let lsn = self
                 .wal_writer
@@ -841,7 +845,10 @@ impl HeapAM {
                 },
             }
         }
-        let mut map = self.share_locks.lock().expect("share lock registry poisoned");
+        let mut map = self
+            .share_locks
+            .lock()
+            .expect("share lock registry poisoned");
         if live.is_empty() {
             map.remove(&key);
         } else {
@@ -857,7 +864,10 @@ impl HeapAM {
     /// authoritative again).
     fn note_stamp_overwrite(&self, tid: Tid, self_xid: TxnId, request: LockRequest) {
         let key = (tid.page_id, tid.slot_id);
-        let mut map = self.share_locks.lock().expect("share lock registry poisoned");
+        let mut map = self
+            .share_locks
+            .lock()
+            .expect("share lock registry poisoned");
         match request {
             LockRequest::Shared => {
                 map.insert(key, std::collections::BTreeSet::from([self_xid]));
@@ -904,22 +914,18 @@ impl HeapAM {
             .row_waiter
             .as_ref()
             .expect("row_lock_gate only returns Wait with a waiter installed");
-        waiter
-            .wait_for(self_xid, blocking_xid)
-            .map_err(|e| {
-                // Unreachable through the gate (it never returns
-                // `Wait(self_xid)`), but a failed wait must not leak the
-                // registered edge — Stage R's deadlock detector reads the
-                // registry as the wait-for graph. (Idempotent: `wait_for`
-                // already cleared the edge on its own error paths.)
-                waiter.unregister_row_wait(self_xid);
-                match e {
-                    pg_txn::TxnError::DeadlockVictim(_) => HeapError::DeadlockVictim,
-                    other => {
-                        HeapError::InvalidArgument(format!("row-lock wait failed: {other}"))
-                    }
-                }
-            })
+        waiter.wait_for(self_xid, blocking_xid).map_err(|e| {
+            // Unreachable through the gate (it never returns
+            // `Wait(self_xid)`), but a failed wait must not leak the
+            // registered edge — Stage R's deadlock detector reads the
+            // registry as the wait-for graph. (Idempotent: `wait_for`
+            // already cleared the edge on its own error paths.)
+            waiter.unregister_row_wait(self_xid);
+            match e {
+                pg_txn::TxnError::DeadlockVictim(_) => HeapError::DeadlockVictim,
+                other => HeapError::InvalidArgument(format!("row-lock wait failed: {other}")),
+            }
+        })
     }
 
     /// Acquire the §9.1 row lock on the tuple at `tid` WITHOUT deleting it
@@ -943,12 +949,7 @@ impl HeapAM {
     /// deleted or updated by a transaction that has since committed; in
     /// legacy no-waiter mode that condition (and any in-progress holder) is
     /// [`HeapError::TupleNotFound`] instead — see [`Self::row_lock_gate`].
-    pub fn lock_tuple(
-        &self,
-        tid: Tid,
-        snapshot: &Snapshot,
-        clog: &dyn ClogAccessor,
-    ) -> Result<()> {
+    pub fn lock_tuple(&self, tid: Tid, snapshot: &Snapshot, clog: &dyn ClogAccessor) -> Result<()> {
         let self_xid = snapshot.current_xid();
         debug_assert!(
             self_xid != TxnId::INVALID,
@@ -1277,13 +1278,16 @@ impl AccessMethod for HeapAM {
         let page_id = guard.page_id();
         let page = as_page_mut(&mut guard);
 
-        // add_tuple always appends on a heap page (no Unused slots to recycle),
-        // so the slot is known before the mutation — build the WAL record first.
-        let slot = SlottedPage::slot_count(page) as u16;
+        // §4.6 explicit slot addressing: choose the slot FIRST (first-fit
+        // recycling of an Unused slot, else append at slot_count), carry it
+        // in the WAL record, then place the tuple at exactly that slot. Redo
+        // replays `add_tuple_at(rec.slot_id)` and no longer depends on
+        // `add_tuple` reproducing the online writer's choice.
+        let slot =
+            SlottedPage::first_fit_slot(page).unwrap_or(SlottedPage::slot_count(page) as u16);
         let rec = WalRecord::heap_insert(page_id, slot, tuple.clone(), snapshot.current_xid())?;
         let lsn = self.wal_writer.append(rec)?;
-        let actual = SlottedPage::add_tuple(page, &tuple)?;
-        debug_assert_eq!(actual, slot, "heap slot prediction diverged from add_tuple");
+        SlottedPage::add_tuple_at(page, slot, &tuple)?;
         stamp_pd_lsn(page, lsn);
 
         if let Some(out) = out_tid {
@@ -1329,9 +1333,7 @@ impl AccessMethod for HeapAM {
                     clog,
                 ) {
                     out.push((self_tid, values));
-                } else if header.t_infomask2 & HEAP_HOT_UPDATED != 0
-                    && header.t_ctid != self_tid
-                {
+                } else if header.t_infomask2 & HEAP_HOT_UPDATED != 0 && header.t_ctid != self_tid {
                     // HOT chain: old version is invisible but t_ctid may
                     // point to a newer version visible to this snapshot.
                     // The walk reads the page pinned above (HOT chains never
@@ -1401,11 +1403,11 @@ impl AccessMethod for HeapAM {
     }
 
     fn redo_handlers(&self) -> Vec<Box<dyn RedoHandler>> {
-        vec![
-            Box::new(HeapInsertHandler),
-            Box::new(HeapUpdateHandler),
-            Box::new(HeapDeleteHandler),
-        ]
+        // Single source of truth (F4): the trait method delegates to the
+        // canonical constructor so the two can never drift apart again (this
+        // body previously lagged by two handlers — HeapHotUpdate and
+        // HeapCleanup).
+        heap_redo_handlers()
     }
 }
 
@@ -1442,8 +1444,9 @@ impl UpdatableAM for HeapAM {
             );
             // Fast path: pin the old page, run the gate, and check whether
             // the new version fits alongside it (single latch, single page).
-            // Stamping the old tuple does not change slot_count, so the new
-            // slot is `slot_count` and add_tuple appends there.
+            // Slot selection is explicit (§4.6): stamping the old tuple is a
+            // logical delete (LP stays Normal), so first-fit is unaffected by
+            // the stamp and the chosen slot stays valid through placement.
             let mut old_guard = self.buffer_pool.pin_mut(old_tid.page_id)?;
             let gate = {
                 let old_page = as_page_mut(&mut old_guard);
@@ -1466,7 +1469,10 @@ impl UpdatableAM for HeapAM {
             if old_has_room {
                 let page_id = old_guard.page_id();
                 let old_page = as_page_mut(&mut old_guard);
-                let new_slot = SlottedPage::slot_count(old_page) as u16;
+                // §4.6: pick the slot BEFORE writing WAL — first-fit recycles
+                // an Unused slot left by compact(), else append at slot_count.
+                let new_slot = SlottedPage::first_fit_slot(old_page)
+                    .unwrap_or(SlottedPage::slot_count(old_page) as u16);
                 let new_tid = Tid {
                     page_id,
                     slot_id: new_slot,
@@ -1482,23 +1488,15 @@ impl UpdatableAM for HeapAM {
                         xmax,
                     )?;
                     let lsn = self.wal_writer.append(rec)?;
-                    Self::stamp_hot_update(
-                        old_page,
-                        old_tid,
-                        xmax,
-                        snapshot.curcid(),
-                        new_tid,
-                    )?;
-                    let actual = SlottedPage::add_tuple(old_page, &hot_tuple)?;
-                    debug_assert_eq!(actual, new_slot);
+                    Self::stamp_hot_update(old_page, old_tid, xmax, snapshot.curcid(), new_tid)?;
+                    SlottedPage::add_tuple_at(old_page, new_slot, &hot_tuple)?;
                     stamp_pd_lsn(old_page, lsn);
                 } else {
                     let rec =
                         WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.clone(), xmax)?;
                     let lsn = self.wal_writer.append(rec)?;
                     Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid(), true)?;
-                    let actual = SlottedPage::add_tuple(old_page, &new_tuple)?;
-                    debug_assert_eq!(actual, new_slot);
+                    SlottedPage::add_tuple_at(old_page, new_slot, &new_tuple)?;
                     stamp_pd_lsn(old_page, lsn);
                 }
                 if let Some(out) = out_tid {
@@ -1573,12 +1571,16 @@ impl UpdatableAM for HeapAM {
                 "writer gates never coalesce with share holders"
             );
 
-            // The new slot is computed only now, under the final latching:
-            // in the re-ordered acquisition above the new page may have been
-            // dropped and re-pinned, so any earlier slot prediction is stale.
+            // The new slot is chosen only now, under the final latching
+            // (§4.6 explicit addressing): in the re-ordered acquisition above
+            // the new page may have been dropped and re-pinned, so any
+            // earlier slot choice is stale. First-fit recycles an Unused slot
+            // left by compact() — acquire_page_with_room reverse-scans from
+            // the tail, so a compacted middle page is a valid update target.
             let new_slot = {
                 let new_page = as_page_mut(&mut new_guard);
-                SlottedPage::slot_count(new_page) as u16
+                SlottedPage::first_fit_slot(new_page)
+                    .unwrap_or(SlottedPage::slot_count(new_page) as u16)
             };
             let new_tid = Tid {
                 page_id: new_page_id,
@@ -1595,8 +1597,7 @@ impl UpdatableAM for HeapAM {
             }
             {
                 let new_page = as_page_mut(&mut new_guard);
-                let actual = SlottedPage::add_tuple(new_page, &new_tuple)?;
-                debug_assert_eq!(actual, new_slot);
+                SlottedPage::add_tuple_at(new_page, new_slot, &new_tuple)?;
                 stamp_pd_lsn(new_page, lsn);
             }
 

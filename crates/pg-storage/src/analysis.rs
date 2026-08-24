@@ -258,9 +258,12 @@ pub fn run_analysis(
 /// Stage N performance sanity check ("analysis far faster than redo")
 /// relies on.
 ///
-/// Record types without a fixed payload layout (`HeapCleanup` — reserved,
-/// with no producer yet) and non-page records (`Txn*`, `Checkpoint*`)
-/// touch no pages here.
+/// Record types without a page-modifying producer (`Txn*`, `Checkpoint*`,
+/// and the Phase-2+ logical/segment records) touch no pages here.
+/// `HeapCleanup` — since M3 Stage B — carries a fixed page-id prefix
+/// (`page_id`, `unlink_prev_page`, `unlink_next_page`) and IS tracked; its
+/// variable-length `dead_slots` tail is never decoded (same prefix-decode
+/// discipline as `BTreeSplitCLR`).
 fn for_each_touched_page(record: &WalRecord, f: &mut impl FnMut(PageId)) -> Result<()> {
     use WalRecordType::*;
     let payload = record.payload.as_slice();
@@ -287,6 +290,22 @@ fn for_each_touched_page(record: &WalRecord, f: &mut impl FnMut(PageId)) -> Resu
             // Page-local HOT update: touches only the one page.
             let mut off = 0;
             f(decode_prefix::<PageId>(payload, &mut off)?);
+        }
+        HeapCleanup => {
+            // Vacuum compaction (M3 Stage B): the compacted page, plus the
+            // predecessor page when the record also unlinks the compacted
+            // page from the chain (its `next_page` is rewritten). Only the
+            // fixed-size page-id prefix is decoded — `dead_slots` is the
+            // payload's LAST field by layout contract (see
+            // `HeapCleanupRecord`) and is never read here. The unlink target
+            // itself is not modified, so it is not tracked.
+            let mut off = 0;
+            let page = decode_prefix::<PageId>(payload, &mut off)?;
+            let prev = decode_prefix::<PageId>(payload, &mut off)?;
+            f(page);
+            if prev != PageId::INVALID {
+                f(prev);
+            }
         }
         BTreeSplitPrepare => {
             // left_page, new_right_page. `left_old_next` is only *read* by
@@ -733,6 +752,24 @@ mod tests {
                     .unwrap(),
                 vec![PageId(14), PageId(15), PageId(16)],
             ),
+            (
+                WalRecord::heap_hot_update(PageId(17), 0, 1, vec![1, 2], TxnId(1), TxnId(1))
+                    .unwrap(),
+                vec![PageId(17)],
+            ),
+            (
+                // Compaction-only: just the page itself.
+                WalRecord::heap_cleanup(PageId(18), vec![1, 3], PageId::INVALID, PageId::INVALID)
+                    .unwrap(),
+                vec![PageId(18)],
+            ),
+            (
+                // Compaction + unlink: the compacted page AND the predecessor
+                // whose next_page is relinked. The relink target (19) is not
+                // itself modified, so it is not tracked.
+                WalRecord::heap_cleanup(PageId(20), vec![0], PageId(19), PageId(21)).unwrap(),
+                vec![PageId(20), PageId(19)],
+            ),
             // Non-page records touch nothing.
             (WalRecord::checkpoint_begin(), vec![]),
             (WalRecord::txn_commit(TxnId(1)).unwrap(), vec![]),
@@ -766,6 +803,7 @@ mod tests {
             HeapInsert,
             HeapUpdate,
             HeapDelete,
+            HeapCleanup,
             BTreeInsert,
             BTreeDelete,
             BTreeSplitPrepare,
@@ -774,14 +812,11 @@ mod tests {
             HeapHotUpdate,
             BTreeSplitCLR,
         ];
-        // Reserved type with no payload layout and no producers yet
-        // (HeapCleanup), transaction and checkpoint markers, and the
-        // Phase-2+ logical/segment records: no pages are tracked for them.
-        // If any of these gains a producer that modifies pages, move it to
-        // PAGE_MODIFYING and extend `for_each_touched_page` — this test
-        // fails until you do.
+        // Transaction and checkpoint markers, and the Phase-2+ logical/
+        // segment records: no pages are tracked for them. If any of these
+        // gains a producer that modifies pages, move it to PAGE_MODIFYING and
+        // extend `for_each_touched_page` — this test fails until you do.
         const NON_PAGE: &[WalRecordType] = &[
-            HeapCleanup,
             TxnBegin,
             TxnCommit,
             TxnAbort,
@@ -842,8 +877,9 @@ mod tests {
         // `separator_key` is the LAST field (layout contract on the struct),
         // so the fixed-size prefix is the payload minus the separator's own
         // encoding (length varint + bytes).
-        let sep_len =
-            bincode::serde::encode_to_vec(&rec.separator_key, bincode_config()).unwrap().len();
+        let sep_len = bincode::serde::encode_to_vec(&rec.separator_key, bincode_config())
+            .unwrap()
+            .len();
         let prefix = record.payload[..record.payload.len() - sep_len].to_vec();
         assert!(BTreeSplitCLRRecord::decode(&prefix).is_err());
         record.payload = prefix;
@@ -852,13 +888,7 @@ mod tests {
         for_each_touched_page(&record, &mut |p| pages.push(p)).unwrap();
         assert_eq!(
             pages,
-            vec![
-                PageId(10),
-                PageId(11),
-                PageId(12),
-                PageId(13),
-                PageId(14)
-            ]
+            vec![PageId(10), PageId(11), PageId(12), PageId(13), PageId(14)]
         );
 
         // INVALID sentinels are filtered, same as before the fix.
