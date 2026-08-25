@@ -439,6 +439,70 @@ impl BufferPool {
         Ok(())
     }
 
+    /// Force the pooled image of `page_id` back to its on-disk contents and
+    /// return the reloaded page's `pd_lsn` (redo-repair only).
+    ///
+    /// Mid-replay, a page's POOLED image can legitimately lag its on-disk
+    /// image: unconditional full-page-image replay restores an old image
+    /// (e.g. one from the page's PREVIOUS identity before freelist
+    /// recycling — M3 vacuum is the first freelist producer) and forward
+    /// replay has only rebuilt the page up to the record currently being
+    /// replayed. A redo handler whose record cannot be reconstructed from
+    /// the pooled state (the B+Tree split `Copy` recomputes the moved
+    /// entries from the LEFT page's pre-copy image, which is gone once the
+    /// pooled left page is past the copy) uses this to adopt the durable
+    /// on-disk state instead of declaring corruption — safe exactly when
+    /// the online protocol guarantees the on-disk image is new enough
+    /// (for `Copy`: the right page's post-copy image is flushed before the
+    /// left page's latch is released, so `left durable post-copy` implies
+    /// `right durable post-copy`).
+    ///
+    /// A page with no full on-disk image (beyond / partially at the data
+    /// file's tail) yields `Ok(Lsn::INVALID)` and leaves the frame
+    /// untouched: "no image" is a legitimate answer — the caller's guard
+    /// then decides what that means (for `Copy`: genuine corruption).
+    ///
+    /// The caller must hold no latch on the page. Single-threaded redo
+    /// only: no coordination with concurrent accessors beyond the frame's
+    /// own locks is provided.
+    pub fn force_reload_from_disk(&self, page_id: PageId) -> Result<Lsn> {
+        debug_assert!(
+            page_id != PageId::INVALID,
+            "INVALID has no on-disk image (same contract as read_page_from_disk)"
+        );
+        let offset = (page_id.0 - 1) * self.config.page_size() as u64;
+        if offset + self.config.page_size() as u64 > self.data_file.len()? {
+            return Ok(Lsn::INVALID);
+        }
+        let frame_id = {
+            let shard_idx = self.shard_index(page_id);
+            let shard = self.page_table[shard_idx].lock();
+            *shard
+                .get(&page_id)
+                .ok_or(StorageError::PageNotFound(page_id))?
+        };
+        self.read_page_from_disk(page_id, frame_id)?;
+        let pd = {
+            let content = self.frames[frame_id.0].content.read();
+            page_pd_lsn(&content[..])
+        };
+        {
+            let mut meta = self.frames[frame_id.0].meta.lock();
+            // Memory now equals the durable disk image — adopt the same
+            // per-field state `alloc_frame`'s load-from-disk path
+            // establishes: not dirty (a stale regressed image must never
+            // be flushed over the newer disk state), no dirty-era anchor,
+            // the cached pd_lsn mirror refreshed, and `needs_fpi = true`
+            // so the next modification in a later checkpoint cycle owes
+            // an FPI.
+            meta.dirty = false;
+            meta.first_dirty_lsn = Lsn::INVALID;
+            meta.cached_lsn = pd;
+            meta.needs_fpi = true;
+        }
+        Ok(pd)
+    }
+
     /// Return the number of frames in the pool.
     pub fn frame_count(&self) -> usize {
         self.frames.len()

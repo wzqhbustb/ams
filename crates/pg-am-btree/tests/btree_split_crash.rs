@@ -1057,3 +1057,121 @@ fn test_btree_split_commit_guarded_root_branch_new_root_fpi_order() {
     assert_eq!(root_slots, 2, "the new root must hold both downlinks");
     drop(engine);
 }
+
+/// M3 Stage D churn finding (red-green): a RECYCLED split right page +
+/// an in-window FPI from its previous identity used to brick recovery.
+///
+/// Shape: vacuum (M3) is the first freelist producer, so a split's right
+/// page can be a recycled page with an on-disk history — and, crucially,
+/// an old full-page image inside the replay window. At replay, that stale
+/// FPI restores the previous identity's image unconditionally, regressing
+/// the right page's pooled state behind its on-disk state; forward replay
+/// rebuilds it only up to the Copy record. Meanwhile the left page —
+/// never FPI'd in the window — loads its newest disk image, already past
+/// the copy. The Copy redo's asymmetry guard then saw "left past copy,
+/// right lacks it" and hard-failed with "the moved entries are lost",
+/// even though the right page's post-copy image was durable on disk
+/// (guaranteed by split_copy's flush-before-release discipline). The fix
+/// adopts that durable image (`BufferPool::force_reload_from_disk`)
+/// instead of declaring corruption.
+///
+/// Construction notes: the last checkpoint (C1) precedes everything below,
+/// so the whole test is one replay window. The future LEFT leaf is born
+/// after C1 (its pd_lsn is always >= C1, so it never owes a cycle FPI),
+/// while P's previous identity gets an explicit in-window FPI.
+#[test]
+fn split_copy_redo_right_page_regressed_by_stale_fpi() {
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+
+    let meta_page;
+    let n;
+    let (r0, r1, p);
+    {
+        let (engine, mut index, n_fill) = create_and_fill(tmp.path(), &config);
+        let r0_local = index.root_page();
+
+        // C1: the last completed checkpoint; the replay window starts here.
+        engine.trigger_checkpoint().unwrap();
+
+        // R0 splits on the next insert: left = R0 (FPI-covered in-window —
+        // replays through the anchor path), right = R1 (born after C1).
+        let mut n_local = n_fill;
+        index.insert(&key(n_local), tid(n_local as u64)).unwrap();
+        n_local += 1;
+        let r1_local = {
+            let chain = chain_from(&engine, r0_local);
+            assert_eq!(chain.len(), 2, "after the split: {chain:?}");
+            chain[1]
+        };
+
+        // Fill R1 to the brim (ascending keys route to the rightmost leaf).
+        const ENTRY_BYTES: usize = 4 + 10 + 4;
+        while index.page_free_space(r1_local).unwrap() >= ENTRY_BYTES {
+            index.insert(&key(n_local), tid(n_local as u64)).unwrap();
+            n_local += 1;
+        }
+
+        // P's previous identity: an on-disk image plus an IN-WINDOW FPI,
+        // then back to the freelist. `new_page` owes no FPI (needs_fpi is
+        // false for a fresh allocation), so: flush once (needs_fpi = true),
+        // then a second write hold emits the FPI at the cycle gate.
+        let p_local = {
+            let guard = engine.buffer_pool().new_page().unwrap();
+            guard.page_id()
+        };
+        engine.buffer_pool().flush(p_local).unwrap();
+        {
+            // The FPI fires at pin time, before any modification.
+            let _guard = engine.buffer_pool().pin_mut(p_local).unwrap();
+        }
+        engine.page_allocator().lock().free_page(p_local).unwrap();
+
+        // The next insert splits R1; the freelist pop makes P the split's
+        // right page. split_copy flushes P's post-copy image online (the
+        // discipline), so P's disk image is post-copy from here on.
+        index.insert(&key(n_local), tid(n_local as u64)).unwrap();
+        n_local += 1;
+        assert_eq!(
+            chain_from(&engine, r0_local),
+            vec![r0_local, r1_local, p_local],
+            "P must be the right page of R1's split"
+        );
+
+        // Flush EVERYTHING dirty: the left page's post-copy image is now
+        // durable with no in-window FPI covering it (flushes emit none).
+        for page in engine.buffer_pool().dirty_page_ids() {
+            engine.buffer_pool().flush(page).unwrap();
+        }
+
+        meta_page = index.meta_page();
+        n = n_local;
+        r0 = r0_local;
+        r1 = r1_local;
+        p = p_local;
+        std::mem::forget(engine); // kill -9: no checkpoint after the split
+    }
+
+    // Recovery 1: P's stale FPI replays (regressing P's pooled image behind
+    // its post-copy disk image), Prepare rebuilds P as the fresh right page,
+    // and Copy finds R1 already past the copy. Pre-fix this hard-failed
+    // recovery ("the moved entries are lost"); the fix adopts P's durable
+    // on-disk image.
+    let (engine, index) = recover(tmp.path(), &config, meta_page);
+    assert_all_keys(&index, n);
+    index
+        .validate()
+        .unwrap_or_else(|e| panic!("recovered tree must validate: {e}"));
+    assert_eq!(chain_from(&engine, r0), vec![r0, r1, p]);
+
+    // Crash again after recovery and replay the same stream a second time:
+    // the reload branch is idempotent (P's disk image is still post-copy).
+    std::mem::forget(engine);
+    let (engine, index) = recover(tmp.path(), &config, meta_page);
+    assert_all_keys(&index, n);
+    index
+        .validate()
+        .unwrap_or_else(|e| panic!("second recovery must validate: {e}"));
+    assert_eq!(chain_from(&engine, r0), vec![r0, r1, p]);
+    drop(engine);
+}

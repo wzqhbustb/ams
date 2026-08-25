@@ -234,20 +234,37 @@ impl RedoHandler for BTreeSplitCopyHandler {
                     // durable before the crash).
                     return Ok(());
                 }
-                // Left past the copy, right still missing it: the left
-                // page has already been truncated (pd_lsn ≥ copy LSN), so
-                // the moved entries are gone from it. With correct flush
-                // ordering (right page flushed before the left guard is
-                // released, both online and in this redo handler), this
-                // state is unreachable — the right page's post-copy image
-                // is always durable before the left page's. Reaching this
-                // branch means on-disk corruption: the moved entries exist
-                // nowhere.
+                // Left past the copy, right's POOLED image still lacking
+                // it. As a DISK state this is impossible — the online
+                // flush discipline (split_copy flushes the right page
+                // before the left page's latch is released; the left page
+                // is eviction-proof until then) makes the right page's
+                // post-copy image durable before the left's can be. But
+                // mid-replay the right page's pooled image can lag its
+                // on-disk image: an old full-page image from the page's
+                // PREVIOUS identity (freelist recycling — M3 vacuum is the
+                // first freelist producer) replays unconditionally and
+                // regresses the page, and forward replay has rebuilt it
+                // only up to this record. The moved entries are gone from
+                // the pooled left page (truncated), so adopt the right
+                // page's durable on-disk image — post-copy by the
+                // discipline — instead of rebuilding anything.
+                // (M3 Stage D churn finding; regression test:
+                // `split_copy_redo_right_page_regressed_by_stale_fpi`.)
+                drop(right_guard);
+                let disk_lsn = pool.force_reload_from_disk(rec.right_page)?;
+                if disk_lsn >= record.lsn {
+                    return Ok(());
+                }
+                // The right page's DISK image also lacks the copy: the
+                // flush discipline itself was violated — the moved entries
+                // exist nowhere durable. Genuine corruption; hard-fail
+                // loudly, never a silent skip (§11.6, v2.3-24).
                 return Err(StorageError::MetadataCorrupted(format!(
                     "split copy redo: left page {} is past the copy (pd_lsn {:?} >= {:?}) \
-                     but right page {} still lacks it (pd_lsn {:?}); \
+                     and right page {} lacks it even on disk (pd_lsn {:?}); \
                      the moved entries are lost",
-                    rec.left_page, left_lsn, record.lsn, rec.right_page, right_lsn
+                    rec.left_page, left_lsn, record.lsn, rec.right_page, disk_lsn
                 )));
             }
             if right_lsn >= record.lsn {

@@ -31,7 +31,7 @@ pub mod sql;
 
 pub use engine::{
     ColumnDef, Engine, EngineConfig, IndexEntry, Predicate, QueryResult, TableEntry, TxnHandle,
-    Value, DEFAULT_CLOG_BUFFER_FRAMES,
+    VacuumStats, Value, DEFAULT_CLOG_BUFFER_FRAMES,
 };
 pub use error::{EngineError, Result};
 

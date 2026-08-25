@@ -236,7 +236,7 @@ ROADMAP.md:216 的核心验收。
 | 锁的 XID 载体（S3） | 表锁以 XID 为键、事务结束由 `release_all(xid)` 释放，而 vacuum 不是用户事务——本项明确：vacuum 以 **auto-commit 风格维护 XID** 包裹全程（`create_table`/`drop_table` 同款模式：分配 XID → 进 active set → 结束走既有 `release_all(xid)` 释放路径），`AccessExclusive` 的持有与释放都挂在该 XID 上，锁生命周期 = 维护事务生命周期。**不死锁论证（一句话）**：vacuum 在**等待期间不持有任何锁**（`AccessExclusive` 与一切模式冲突，等待时对每个冲突持有者各有一条出边，但**入度恒为 0**——没有任何节点在等它持有的锁，因为它还没持有）；获准后不再申请第二把锁。等待图中入度为 0 的节点不可能出现在环上，环不可能经过 vacuum，死锁检测器只会看到普通等待 |
 | 推模式索引清理 | 遍历 `Engine::indexes`（engine.rs:409），对每条 (key, tid) 逐索引调 `BTreeIndex::delete(key, tid)`（index.rs:2563，自带 WAL）；**`EntryNotFound` 视为 Ok**（§4.3：eager 维护下绝大多数条目早已不在树上；真正有活的删除对象基本只有崩溃 loser INSERT 的悬挂条目） |
 | 顺序不变量测试化 | **崩溃窗口①**（§12.1）：索引清理 WAL 已落盘、HeapCleanup 未落盘时注入崩溃 → 恢复后索引扫描与堆扫描一致、无悬空 TID 读到错误行 |
-| churn 验收 | 固定行数表上 N 轮 "UPDATE/DELETE 一批 + INSERT 一批"，每 K 轮跑一次 vacuum：断言数据文件页数有界（不随轮数线性增长）、vacuum 后 `scan_dead_tuples(horizon=最新)` 返回空（§12.1；崩溃注入轮并入窗口①②，O2 已由 Stage S 清偿，无单独口径） |
+| churn 验收 | 固定行数表上 N 轮 "UPDATE/DELETE 一批 + INSERT 一批"，每 K 轮跑一次 vacuum：断言数据文件页数有界（按已声明的 btree 无合并漂移率 ~0.25 页/轮标定 + 绝对余量，而非不增长）、vacuum 后**无可回收垃圾**（精确口径：`collect_index_keys(scan_dead_tuples)` 为空 + 滞留量有界——HOT 负载下部分死链的死前缀合法滞留（§4.2 不 prune），"scan_dead_tuples 返回空"字面口径不可达；tech-selection §12.1 已按 v1.8 注记修正）（§12.1；崩溃注入轮并入窗口①②，O2 已由 Stage S 清偿，无单独口径） |
 | 空间复用验证 | churn 后 freelist 非空 / 新插入复用已释放页与压实空间，页数稳态收敛（ROADMAP.md:216） |
 | 并发共存正确性 | vacuum 进行中：纯 auto-commit SELECT（无锁）与新 BEGIN 不被锁挡住，但 horizon 防线保证其快照看不到被回收版本（§3.3 论证的端到端测试化）；显式事务 SELECT/DML 阻塞至 vacuum 结束（锁矩阵既有行为，断言超时有序而非死锁，watchdog 保护） |
 

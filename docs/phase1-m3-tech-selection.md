@@ -767,7 +767,7 @@ trait，避免现有 AM（heap/btree）任何改动。
 1. **Vacuum 空间复用**：churn 压测 —— 固定行数表上 N 轮
    "UPDATE/DELETE 一批 + INSERT 一批"，每 K 轮跑一次 `vacuum`；
    断言数据文件页数有界（不随轮数线性增长），且 vacuum 后
-   `scan_dead_tuples(horizon=最新)` 返回空（含崩溃注入轮：O2 已由
+   `scan_dead_tuples(horizon=最新)` 无**可回收垃圾**（精确口径：`collect_index_keys(scan_dead_tuples)` 为空 + 滞留量有界——HOT 负载下部分死链的死前缀合法滞留（§4.2 不 prune），"scan_dead_tuples 返回空"的字面口径不可达，v1.8 注记）（含崩溃注入轮：O2 已由
    Stage S 清偿，无需单独口径）。**崩溃窗口回归**（覆盖 §4.1 顺序
    不变量与 §4.6 重构）：在"索引清理 WAL 已落盘、HeapCleanup 未落盘"
    与"压实已落盘、PageFree 未落盘"两个窗口各注入一次崩溃，恢复后
@@ -801,3 +801,4 @@ trait，避免现有 AM（heap/btree）任何改动。
 | v1.5 | 2026-08 | panic 语义事实更正（§3 代价节与 §11 O1）：默认 unwind 策略下 panic **会**执行 guard 的 `Drop`（正常注销，horizon 不受影响），仅 `panic=abort`（本项目未启用）或 `mem::forget` 泄漏；"不加护栏"结论不变且更稳。与 Stage A 代码注释（review F1 修正）对齐。 |
 | v1.6 | 2026-08 | Stage A review P2 修正：horizon 空 registry 回落由"直接取 clock"改为"先取 active set 最小 XID、皆空才取 clock"——begin→snapshot 窗口内（已入 active set、尚未注册快照）取 clock 可使 horizon 高于该事务即将注册的 xmin；PG OldestXmin 同构（backend xid 与快照 xmin 均参与水位）。测试 `horizon_empty_registry_uses_clock` 更名并重写为 `horizon_empty_registry_falls_back_to_min_active_then_clock`。 |
 | v1.7 | 2026-08 | Stage C 设计终审注记：§4.4 原文"reclaim 不需要链知识，只按清单杀 slot"与实现存在有意偏差——`reclaim` 内部用同一个链分组 helper 重推导 kill 集，使"部分死链零回收"成为结构保证而非调用方自律（engine 会把 `scan_dead_tuples` 的原始输出直接传给 `reclaim`，其中含部分死链的死亡成员，盲杀即违反 `compact()` kill-list 契约）。判定为正确选择，coding-plan 的"唯一出口"措辞已同步修正。 |
+| v1.8 | 2026-08 | Stage D 设计终审注记：§12.1 的 churn 验收字面口径"vacuum 后 `scan_dead_tuples(horizon=最新)` 返回空"在 HOT 负载下不可达（部分死链的死前缀合法滞留，§4.2 不 prune）——精确化为"无可回收垃圾"（`collect_index_keys(scan_dead_tuples)` 为空 + 滞留量有界 ≤ 活行数），已写入 churn 测试注释与 stage_spec；coding-plan Stage D 行同步修正。 |

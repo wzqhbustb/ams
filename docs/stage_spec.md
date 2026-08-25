@@ -841,3 +841,43 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 
 ---
 
+
+## Stage D（M3）：索引清理 + `Engine::vacuum` 端到端
+
+**状态**：✅ 完成（debug 全量 74 目标 684 绿 / 0 失败（= Stage C 出口 669 + 本 stage 新增 15，含 1 个 btree 回归用例）；clippy `--workspace --all-targets -D warnings` 全绿；loom 两模型红为**预存**（M2 出口提交 31fe4b8 同红，二分证据见残留条），与本 stage 改动无关；未 commit——等用户确认）
+**工期**：预估 4–6 天
+**性能（S2 协议，`M2C_STRESS_SECS=300 M2C_STRESS_CONNS=100 M2C_STRESS_TPS=100` release × 2）**：89 / 87 txn/s，均值 88.0 vs M2c 基线 86.8（+1.4%，噪声界 ±3% 内，无统计显著回归）——vacuum 叠加 Stage A 注册开销后度量通过
+**验收**：`m3_vacuum_e2e`（11：空表 / 无死行表 / 纯死行表（页数 4→1、freelist +3、再插入零新页分配）/ HOT 链（全死链整链回收 + 部分死链零回收）/ 多索引表精确清理量（10 死行 × k 索引 + 6 非 NULL × v 索引 = 16 次 EntryNotFound 容忍，NULL 跳过）/ TableNotFound / **失败路径锁释放**（drop 先排队、vacuum 拿到已死 OID 的锁后 re-check 失败，无锁残留）/ **pin 住 horizon 的端到端防线**（显式事务注册快照钉住 horizon → vacuum 零回收；unpin 后再 vacuum 才回收）/ **阻塞顺序**（holder AS → vacuum AE → inserter RE 的 FIFO 队列，纯 SELECT 与新 BEGIN 期间照跑，无死锁，watchdog）/ **并发纯 SELECT 一致性**（4 读者 × 3 次 back-to-back vacuum，每次扫描恰好 600 行活行，绝无半压实页或复活行）/ **阶段④中途失败注入**（双索引表 + 各一条悬挂 loser 条目；腐蚀第二索引 meta 页使 open 失败——第一索引的删除已持久化、堆未动、维护 XID 出 active set、零锁残留；修复后下一轮 vacuum 以 EntryNotFound 容忍收尾并实际删除第二索引的悬挂条目，窗口①语义的非崩溃版））；`m3_vacuum_crash_windows`（2：**崩溃窗口①**——阶段④索引清理 WAL 落盘、HeapCleanup 未写 → 恢复后索引扫描与堆扫描一致、悬挂 TID 不解析到错误行、下一轮 vacuum 以 EntryNotFound 容忍收尾并 reclaim；**崩溃 loser INSERT 悬挂条目**——恢复后裸 `lookup_all` 见条目、`index_lookup` 被可见性屏蔽、vacuum 实际删除（`index_entries_removed == 1`）后裸探测为空）；`m3_vacuum_churn`（1：固定行数表 30 轮 UPDATE/DELETE/INSERT 批 + 每 5 轮 vacuum + 2 个崩溃注入轮（窗口①手驱 + 在飞 INSERT 批 loser 条目由恢复后 vacuum 实际清除），堆页数收敛（后半程 ≤ 前半程峰值 +3 且 ≤30 页）、每次 vacuum 后无可回收垃圾、freelist/压实复用（稳态高水位增长按**率**判定：≤0.25 页/轮 + 8 页绝对余量，随 soak 长度缩放——review 修复，原 ≤8 页绝对阈值按 30 轮标定、200 轮 soak 必败；实测漂移源为已声明的 btree 无页合并 ~0.18 页/轮）、终态扫描与簿记逐行相等；watchdog 保护；**200 轮 release soak 实测通过**（`M3_CHURN_ROUNDS=200`，8.4s；界 = 8 + 100/4 = 33 页，review 实测漂移 18 页 ≈ 0.18 页/轮在界内））。**churn 抓出并修复 1 个 M2 潜伏 bug**（见交付内容第 3 条，红→绿验证成立）
+
+### 交付内容
+
+1. **`Engine::vacuum(table) -> Result<VacuumStats>`**（`crates/pg-engine/src/engine.rs:1832`）：§4.1 五阶段流水线——① `auto_commit` 风格维护 XID 下取 `AccessExclusive` 表锁（`lock_table_entry` 含 post-lock registry re-check；`create_table`/`drop_table` 同款：分配 XID → 进 active set → 成功与失败两条路径都走 `release_all(xid)`），随后经 `oldest_snapshot_xmin()` **取一次 horizon 全程使用**（锁等待结束后取，锁持有者已全部退出；在飞无锁读者由快照注册表覆盖；XID 单调性保证未来快照 xmin ≥ horizon）→ ② `scan_dead_tuples(horizon)` → ③ `collect_index_keys`（只读）→ ④ 推模式索引清理：每 (tid, 列值) × 每注册索引 → 取索引列（NULL 跳过）→ `encode_key` → `BTreeIndex::delete(key, tid)`，**`EntryNotFound` 视为 Ok 且仅在此调用点**（§4.3：eager 维护早已删除常规死行条目，真实删除对象基本只有崩溃 loser 悬挂条目；btree delete 本身契约未动）；vacuum **不记 index undo**（物理维护操作，幂等，绝不被 reverse-apply）→ ⑤ `reclaim`（压实 + unlink + free，kill 集内部重推导，调用方不过滤）。**不死锁论证落地**：等待期间入度恒 0（零持有），获准后不再申请第二把表锁（阶段 2–5 只持短暂页 latch）。`VacuumStats`（engine.rs:377）：`dead_tuples / index_keys / index_entries_removed / index_entries_already_gone` 四计数，`lib.rs` 导出
+2. **并发共存正确性**：vacuum 进行中纯 auto-commit SELECT / `Engine::scan` / 新 BEGIN 不被锁挡（它们本就不取表锁）；horizon 防线（Stage A 注册）保证其快照看不到被回收版本——pin/unpin 用例端到端钉死；显式事务 SELECT/DML 按 FIFO 有序阻塞至 vacuum 结束（死锁检测器对 vacuum 等待零误报——入度 0 不可能成环）；`table_lock_state` 断言 vacuum 后零锁残留
+3. **churn 抓出的 M2 潜伏 bug（高，红→绿验证）——split-copy redo 的回收页 FPI 回归误报腐败**：churn 第二轮崩溃注入的恢复硬失败 `split copy redo: left page is past the copy ... but right page still lacks it; the moved entries are lost`。根因链：vacuum 是**首个 freelist 生产者** → split 右页可以是带前任身份磁盘历史的回收页，且其前任身份在重放窗口内留有**旧 FPI**；重放时旧 FPI 无条件整页恢复，把右页池内镜像**回退到其磁盘镜像之后**（前滚只重建到 Copy 记录处），而左页（窗口内无 FPI）直接载入了"已过 copy"的最新磁盘镜像——Copy redo 的不对称守卫把"左已过、右池内缺"误判为腐败。该守卫的"不可达"论证只覆盖**磁盘**状态（在线 flush 纪律：右页 post-copy 先于左页 post-copy 落盘），不覆盖被 FPI 回归的**池内**状态。修复：`BTreeSplitCopyHandler` 该分支改为 `BufferPool::force_reload_from_disk(right)`（pg-storage 新增，重做专用：池内镜像回退为盘上镜像、清 dirty 防回归镜像被回刷、逐字段对齐 `alloc_frame` 的 load-from-disk 约定）采纳耐久的 post-copy 盘上镜像并校验 `pd_lsn ≥ copy LSN`；盘上镜像也缺才维持硬失败（真腐败）。**为何 1000 轮 m2b crash rounds 没抓到**：无 vacuum 时新页全部来自高水位线、无前任身份 FPI；且 m2b 轮次持续 checkpoint，重放窗口短。确定性回归 `btree_split_crash.rs::split_copy_redo_right_page_regressed_by_stale_fpi`（构造：C1 checkpoint → 左叶生于 C1 后（窗口内无 FPI）→ P 的前任身份 FPI + free → split 复用 P 为右页 → 全量 flush → 崩溃 → 恢复；含二次崩溃幂等重放），红绿验证成立（回退修复后恢复硬失败、恢复修复后全绿）
+4. **过时注释清理**：`heap_tuple_visible` 的"HeapAM never reclaims slots"假设改写为 vacuum 时代的不变式（slot 复用只经 reclaim，且 §4.1 顺序保证指向它的索引条目先删后放；窗口① 崩溃后由下一轮 vacuum 在复用前补删）
+5. **Stage D review 修复清单**（终审后）：
+   - churn 稳态高水位断言从固定 ≤8 页改为率式（≤0.25 页/轮 + 8 页余量，随轮数缩放；200 轮 soak 实测后半程涨 18 页 = 0.18 页/轮，为已声明的 btree 漂移，非堆泄漏）
+   - watchdog 的 worker panic 消息改为先 downcast `&str`/`String` 再携带（原 `Any { .. }` 丢断言信息；`m3_vacuum_churn.rs` 与 `m3_vacuum_e2e.rs` 两处）
+   - 新增阶段④中途失败注入用例（见验收行）
+   - `BufferPool::force_reload_from_disk` 的注释出处从 `flush_frame` 更正为 `alloc_frame` 的 load-from-disk 路径（逐字段对齐对象）
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| vacuum 锁 | `ShareUpdateExclusive`（在线，不挡 DML） | `AccessExclusive`（离线停写窗口） | §2 既定代价；在线/渐进 vacuum 归 Phase 5b |
+| 锁载体 | 专用 VACUUM 伪事务 | auto-commit 风格维护 XID + `release_all` | 复用既有 DDL 先例，零新机制 |
+| 索引清理 | `lazy_vacuum_index` 批量回调 | 推模式逐条 `BTreeIndex::delete`，EntryNotFound→Ok | §4.3：eager 维护下绝大多数条目早已不在树上；批量接口归 Phase 5b |
+| 无锁读者与页回收 | PG 读者也取 AccessShare，被 AccessExclusive 挡住 | 纯 SELECT 无锁放行，靠快照注册表 horizon 防线 | tech-selection §2 既定：水位线问题由 Stage A 解决，非锁问题 |
+| horizon | GetSnapshotData 时算 OldestXmin | 锁授予后取一次全程使用 | §3.3 单调性论证；vacuum 自身快照注册使 horizon 略保守（等待期 xmin 被钉住），安全方向 |
+
+### 已知残留与后续归队
+
+- **loom 模型测试预存红（非本 stage 回归，二分定位 + 已实证复核）**：`btree_loom` 两模型在当前工具链下失败（`loom_two_writers_one_reader_linearizable` 报 "page 2 entries out of order at slot 1"、`loom_split_with_concurrent_writers` 报 "key 0 lost across the split"）。二分证据：在 M2 出口提交 31fe4b8（Stage Q 记录"loom 2 模型 2 万+ 交错全绿"的同一提交）上**同样失败** → 失败前移至 M2 之后的环境/工具链漂移（Stage A–C 只 `cargo check` 未实际运行 loom），与本 stage 改动无关（本 stage 未触碰 latch/split 编排）。**实证复核（2026-08-24)**：当前树与 31fe4b8 的隔离 worktree 各跑 CI 命令（`LOOM_MAX_PREEMPTIONS=2`），两侧同红且耗时一致（~22s/侧，非状态空间爆炸，是快速硬失败）。根因定位与修复单开会话处理，不阻塞 Stage D
+- **split-CLR redo 的同构不对称窗口**（本次未触发，理论残留）：`apply_split_clr` 的"左页已过 CLR 而右页没有"分支同样假设池内状态即磁盘状态；触发需"回收右页 + 窗口内旧 FPI + split 中途崩溃 + 恢复后再崩溃"四连，比 Copy 路径窄得多。修复模式相同（`force_reload_from_disk`），归后续 stage 按需处理
+- **回收页的撕页暴露**：`new_page` 对复用页仍设 `needs_fpi=false`（"新页无旧镜像"假设对复用页不成立——其前任镜像在盘上）；Stage Q 只给 `create_new_root` 补了 `log_page_init`。kill -9 测试模型撕不了页缓存 pwrite，纯断电模型才暴露 → **不在本阶段处理，列入后续 checkpoint/FPI 加固专项的处理清单**（新建该 stage 时作为其输入项；候选修复：split_prepare 对复用右页补 log_page_init）
+- **无锁读者撞上跨 relation 页复用的理论窗口**：纯 SELECT 走链时若读到"unlink 前旧 next 指针 → 页已释放并被他表复用"，MVCC 过滤（新元组 xmin 晚于读者快照）使其读不到错行，最坏是一次可重试的解码错误；本 stage 测试未构造出该交错 → 观察项，根治（读者侧 chain 代际校验）归 Phase 5b 在线 vacuum
+- **churn 验收口径偏差**（对 coding-plan 任务表）：计划写"vacuum 后 `scan_dead_tuples(最新 horizon)` 返回空"——HOT 更新负载下部分死链的死前缀**合法滞留**（§4.2 不 prune），该字面口径不可达；精确化为"无可回收垃圾"（`collect_index_keys(scan_dead_tuples)` 为空）+ 滞留量有界（≤ 活行数），已写入 churn 测试注释
+- **窗口① churn 轮次的阶段④ WAL 为空**：churn 的已提交删/改条目都被 eager 维护先行删除，手驱阶段④全部 EntryNotFound；"索引清理 WAL 有实质内容"的窗口① 变体由 `m3_vacuum_crash_windows.rs`（loser 条目）覆盖
+- **性能口径**：vacuum 叠加 A 注册开销后的 churn TPS 对比见 `docs/phase1-m2-benchmarks.md` 基线条目与本 stage 验收行（S2 协议）
+- **WAL 流量观测**（压实 FPI 放大，N5）归 Stage G benchmark

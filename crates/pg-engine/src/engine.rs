@@ -127,10 +127,10 @@ use std::time::Duration;
 use parking_lot::{Mutex, RwLock};
 
 use pg_am_btree::{
-    btree_redo_handlers, encode_key, is_supported_key_type, BTreeAM, BTreeUndoHandler,
+    btree_redo_handlers, encode_key, is_supported_key_type, BTreeAM, BTreeError, BTreeUndoHandler,
 };
 use pg_am_heap::access_method::{
-    DeleteContext, InsertContext, RelationDesc, ScanContext, UpdateContext,
+    DeleteContext, InsertContext, RelationDesc, ScanContext, UpdateContext, Vacuumable,
 };
 use pg_am_heap::line_pointer::LINE_POINTER_SIZE;
 use pg_am_heap::tuple::{decode_tuple, encode_tuple, ColumnType, Datum, TupleHeader};
@@ -370,6 +370,26 @@ pub struct IndexEntry {
     pub key_type: ColumnType,
     /// The index's meta page (`pg_rust_relpages.first_page` of the index).
     pub meta_page: PageId,
+}
+
+/// The outcome of one [`Engine::vacuum`] pass (M3 Stage D).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VacuumStats {
+    /// Dead TIDs `scan_dead_tuples` reported at the pass's horizon
+    /// (includes partially-dead HOT chain members, which phases 3–5 then
+    /// leave untouched — §4.2).
+    pub dead_tuples: usize,
+    /// `(tid, values)` work items `collect_index_keys` produced: standalone
+    /// dead tuples plus the roots of fully-dead HOT chains.
+    pub index_keys: usize,
+    /// Index entries physically removed by this pass (`BTreeDelete` WAL).
+    /// Under eager online index maintenance this is essentially only
+    /// crash-loser dangling entries (§4.3).
+    pub index_entries_removed: usize,
+    /// Phase-4 delete attempts that found the entry already gone
+    /// (`EntryNotFound` → Ok at the vacuum call site): eager online index
+    /// maintenance had removed them.
+    pub index_entries_already_gone: usize,
 }
 
 /// The assembled engine: storage + catalog + heap AM + txn manager + disk
@@ -1437,9 +1457,15 @@ impl Engine {
     /// A slot that no longer holds a tuple reads as invisible.
     ///
     /// This checks visibility only, not that the tuple's key matches the
-    /// queried key. That is safe because heap slots are append-only
-    /// (HeapAM never reclaims slots), so a TID can never come to hold an
-    /// unrelated row; revisit if vacuum/slot reuse ever lands.
+    /// queried key. That stays sound under vacuum's slot reuse (M3 Stage
+    /// D): a dead slot becomes reusable ONLY through `reclaim`, and the
+    /// §4.1 phase order guarantees every index entry pointing at it was
+    /// removed (WAL-durable) earlier in the same vacuum pass — or, after a
+    /// crash in window ①, by the next pass before any reuse, since the
+    /// still-present dead tuple is re-collected and its delete tolerated
+    /// as `EntryNotFound`. A stale entry resolving to an unrelated row in
+    /// a recycled slot therefore requires a phase-ordering violation, not
+    /// just bad luck.
     fn heap_tuple_visible(&self, snap: &Snapshot, tid: Tid) -> Result<Option<Tid>> {
         let guard = self.storage.buffer_pool().pin(tid.page_id)?;
         let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
@@ -1750,6 +1776,111 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Vacuum `table`: reclaim dead-tuple space end to end (M3 Stage D,
+    /// tech-selection §4.1). Returns per-pass [`VacuumStats`].
+    ///
+    /// Five phases, in the §4.1 invariant order — never reorder them
+    /// (a TID-invalidating heap record must become WAL-durable only AFTER
+    /// that TID's last `BTreeDelete`):
+    ///
+    /// 1. Take the table's `AccessExclusive` lock under a short-lived
+    ///    **maintenance XID**, auto-commit style — the `create_table` /
+    ///    `drop_table` precedent: [`Self::auto_commit`] allocates the XID,
+    ///    enters the active set, and routes both the success and the
+    ///    failure path through `release_all(xid)`, so the lock's lifetime
+    ///    is the maintenance transaction's. Then take the vacuum horizon
+    ///    ONCE via [`Self::oldest_snapshot_xmin`] and use it for the whole
+    ///    pass (§3.3: taken after the lock wait, so every lock-holding
+    ///    transaction has ended; lock-free readers in flight are covered
+    ///    through the snapshot registry, and XID monotonicity keeps every
+    ///    FUTURE snapshot's xmin ≥ this horizon, so nothing taken later
+    ///    can observe a version reclaimed below it).
+    /// 2. `scan_dead_tuples(horizon)` — the dead-TID list.
+    /// 3. `collect_index_keys` — READ-ONLY key extraction. Must precede
+    ///    phase 5: once a page is compacted the keys are unreadable.
+    /// 4. Push-mode index cleanup: per `(tid, values)` × per registered
+    ///    index on the table, encode the indexed column (NULL skipped, the
+    ///    `delete_inner` convention) and `BTreeIndex::delete(key, tid)`
+    ///    (the Stage Q online path, `BTreeDelete` WAL included).
+    ///    **`EntryNotFound` is Ok here and only here** (§4.3): eager
+    ///    online maintenance already removed the entries of ordinary
+    ///    committed deletes/updates, so the entries this phase actually
+    ///    removes are essentially crash-loser dangling ones. The btree's
+    ///    own delete contract is NOT weakened. Vacuum records no index
+    ///    undo: its btree deletes are physical, idempotent
+    ///    (EntryNotFound-tolerant) maintenance, never to be reverse-applied
+    ///    even when a later phase fails.
+    /// 5. `reclaim` — page compaction (`HeapCleanup` WAL) + empty-page
+    ///    unlink + `free_page` (`PageFree` WAL). `reclaim` re-derives the
+    ///    kill set from `dead` internally (Stage C), so partially-dead HOT
+    ///    chains are structurally untouched.
+    ///
+    /// # Deadlock freedom (S3)
+    ///
+    /// While WAITING for `AccessExclusive` vacuum holds no lock at all —
+    /// the waiting node has in-degree 0 in the wait-for graph (nobody waits
+    /// on a lock vacuum has not yet been granted), so no cycle can pass
+    /// through it; the detector sees an ordinary wait. Once granted, vacuum
+    /// acquires no second table lock (phases 2–5 take only short-lived page
+    /// latches).
+    ///
+    /// Fails with [`EngineError::TableNotFound`] if `table` does not exist
+    /// (including when it was dropped while vacuum queued on the lock —
+    /// the `lock_table_entry` post-lock re-check).
+    pub fn vacuum(&self, table: &str) -> Result<VacuumStats> {
+        self.auto_commit(|snap| {
+            // Phase 1: AccessExclusive under the maintenance XID, then the
+            // single horizon for the whole pass.
+            let entry =
+                self.lock_table_entry(snap.current_xid(), table, LockMode::AccessExclusive)?;
+            let horizon = self.oldest_snapshot_xmin();
+            let col_types = column_types(&entry);
+            let rel = relation_desc(&entry, &col_types);
+
+            // Phase 2: collect the dead-TID list at the pass's horizon.
+            let dead = self
+                .heap
+                .scan_dead_tuples(rel, horizon, self.clog.as_ref())?;
+            let mut stats = VacuumStats {
+                dead_tuples: dead.len(),
+                ..VacuumStats::default()
+            };
+            if dead.is_empty() {
+                return Ok(stats);
+            }
+
+            // Phase 3: read-only key extraction, BEFORE any physical rewrite.
+            let keys = self.heap.collect_index_keys(rel, &dead)?;
+            stats.index_keys = keys.len();
+
+            // Phase 4: push-mode index cleanup, one descent per (key, tid)
+            // per index (batch interfaces are Phase 5b, §4.3).
+            for (idx, col_index) in &self.indexes_of(&entry) {
+                let mut index = self.open_btree(idx)?;
+                for (tid, values) in &keys {
+                    // NULL keys carry no entry (the online convention).
+                    let Some(datum) = &values[*col_index] else {
+                        continue;
+                    };
+                    let key = encode_key(datum)?;
+                    match index.delete(&key, *tid) {
+                        Ok(()) => stats.index_entries_removed += 1,
+                        // §4.3: eager maintenance removed it long ago.
+                        Err(BTreeError::EntryNotFound) => {
+                            stats.index_entries_already_gone += 1;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+
+            // Phase 5: compaction + unlink + free (kill set re-derived
+            // from `dead` inside reclaim — do not pre-filter it here).
+            self.heap.reclaim(rel, &dead)?;
+            Ok(stats)
+        })
     }
 
     /// Every index registered on `entry`'s table, joined with the position
