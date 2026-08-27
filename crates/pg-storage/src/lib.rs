@@ -29,6 +29,7 @@ pub mod buffer_pool;
 pub mod checkpoint;
 pub mod clog;
 pub mod config;
+mod data_dir_lock;
 pub mod engine;
 pub mod error;
 pub mod freelist_meta;

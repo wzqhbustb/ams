@@ -1139,7 +1139,9 @@ impl WalRecord {
 }
 
 /// Return the shared bincode configuration used across the storage crate.
-pub(crate) fn bincode_config() -> bincode::config::Configuration {
+/// `pub` (not `pub(crate)`) so binary targets under `src/bin/` (separate
+/// crates linking this lib, e.g. pg-waldump) share the exact same config.
+pub fn bincode_config() -> bincode::config::Configuration {
     bincode::config::standard()
 }
 

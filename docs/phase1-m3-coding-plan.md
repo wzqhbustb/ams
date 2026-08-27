@@ -371,7 +371,7 @@ cargo test -p pg-wire --test wire_clients          # rust-postgres（CI 硬门�
 | Tier 2 预留 | `WalTailReader` trait（`tail_from(start: Lsn)`，背压与断点续传语义入 doc）、`WatermarkRegistry` trait（`index_oid -> applied_lsn` 存取）落 `pg-storage`；`AccessMethod` 加 `fn freshness(&self) -> Option<Lsn> { None }` 默认方法（§9：默认实现 = 现有 AM 零改动）——三者只定 trait 不交付实现 |
 | O2 验证清偿 | tech-selection 标 O2 "已由 Stage S 解决"（`HeapUndoHandler` recovery undo 阶段标 ATT 残余成员 ABORTED 于 CLOG，undo.rs:5-37 接线 engine.rs:631）：本 stage 补一条**显式**回归——崩溃孤儿插入（xmin 属崩溃事务）在恢复后被 `scan_dead_tuples` 规则 1 正常收集并被 vacuum 回收；已有覆盖则归档引用并关闭 O2 |
 | O4 清理 | 移除 `pg-storage/Cargo.toml:12` 的 tokio 死依赖声明（全仓库 `.rs` 零使用，死依赖误导选型）；`cargo tree` 验证依赖图收缩、`cargo test --workspace` 全绿 |
-| stage_spec 归档 | `docs/stage_spec.md` 追加 M3 Stage A–G 各节（交付内容 / PG trade-off / 已知残留），格式对齐 Stage L–T |
+| stage_spec 归档 | `docs/stage_spec.md` 追加 M3 Stage A–G 各节（交付内容 / PG trade-off / 已知残留），格式对齐 Stage L–T；**收口清单同时登记**（Stage E 终审建议）：① E 的性能抽查数字（S2 协议对比实测）；② README 补一句 QueryStats 口径（tech-selection §6.3 另注要求） |
 | benchmark 落盘 | `docs/phase1-m3-benchmarks.md`：churn 页数有界曲线、注册开销（A，S2 协议数字）、vacuum 叠加后 TPS（D）、waldump 吞吐、**WAL 字节量观测（N5：压实批量改页的 FPI 放大，§11 R1——无既有压测，本 stage 首次量化）**；每项 target + 实测 + 未达标归因（对齐 m2 benchmark 文档格式） |
 | 手动矩阵归档（N6） | psql / psycopg2 / node-postgres 三家手动矩阵结果（版本、通过项、探针报错清单）落盘进 benchmark 文档与 stage_spec Stage F 节 |
 | 全量回归 + release | debug + release 全量（含 loom、m2b crash rounds、M1 crash_recovery）；§12.5：100 并发 CRUD TPS 按 S2 协议对比 M2c 基线无统计显著回归（<5% 上限） |

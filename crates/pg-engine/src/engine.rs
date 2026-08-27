@@ -122,7 +122,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::{Mutex, RwLock};
 
@@ -154,10 +154,12 @@ use pg_storage::wal::record::{HeapDeleteRecord, HeapUpdateRecord, WalRecord, Wal
 use pg_storage::wal::WalWriter;
 use pg_txn::{
     is_visible, txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, DeadlockDetector,
-    DeadlockVictims, LockManager, LockMode, RowWaiter, Snapshot, SnapshotGuard, TxnManager,
+    DeadlockVictims, LockManager, LockMode, RowWaiter, Snapshot, SnapshotGuard, TableLockState,
+    TxnManager,
 };
 
 use crate::error::{EngineError, Result};
+use crate::query_stats::{ExecutionPath, QueryStatEntry, QueryStats, DEFAULT_QUERY_STATS_CAPACITY};
 use crate::sql::{self, CmpOp, Filter, Literal, LockClause, OrderBy, SelectCols, Statement};
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
@@ -236,6 +238,11 @@ pub struct EngineConfig {
     /// to a 1ms floor by `DeadlockDetector::start` — a free-running scan
     /// buys no observable latency and would busy-loop a core.
     pub deadlock_detector_interval: Duration,
+    /// Query-statistics ring buffer capacity (M3 Stage E, tech-selection
+    /// §6.3): how many recent `exec` statements the engine retains for
+    /// diagnostics. Default 1000 ([`DEFAULT_QUERY_STATS_CAPACITY`]);
+    /// 0 disables recording. Overflow drops the oldest entry (§6.3 既定语义).
+    pub query_stats_capacity: usize,
 }
 
 impl EngineConfig {
@@ -245,6 +252,7 @@ impl EngineConfig {
             storage: StorageConfig::new(data_dir),
             clog_buffer_frames: DEFAULT_CLOG_BUFFER_FRAMES,
             deadlock_detector_interval: pg_txn::DEFAULT_DEADLOCK_INTERVAL,
+            query_stats_capacity: DEFAULT_QUERY_STATS_CAPACITY,
         }
     }
 }
@@ -447,6 +455,10 @@ pub struct Engine {
     /// lost the entry of a still-live row. Entries are always removed on
     /// commit AND abort, so the map never leaks committed transactions.
     index_undo: Arc<Mutex<HashMap<TxnId, Vec<IndexUndo>>>>,
+    /// Query statistics ring buffer (M3 Stage E, tech-selection §6.3):
+    /// [`Self::exec`] records one entry per statement — see
+    /// [`Self::query_stats`].
+    query_stats: QueryStats,
 }
 
 /// A handle to an explicit transaction (§21 M2b API).
@@ -768,6 +780,7 @@ impl Engine {
             ddl_lock: Mutex::new(()),
             instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             index_undo: Arc::new(Mutex::new(HashMap::new())),
+            query_stats: QueryStats::new(config.query_stats_capacity),
         };
 
         // 7c. Recovery-time index compensation for loser transactions
@@ -2220,12 +2233,42 @@ impl Engine {
     /// commits — allowed, but only meaningful inside an explicit
     /// transaction (same as PG). `FOR SHARE` parses but returns
     /// [`EngineError::Unsupported`] (multixact is a later stage).
+    ///
+    /// # Query statistics (M3 Stage E, tech-selection §6.3)
+    ///
+    /// Every successfully parsed statement records one
+    /// [`QueryStatEntry`] into
+    /// [`Self::query_stats`] — auto-commit and explicit-transaction paths
+    /// alike, success or failure — making this the single instrumentation
+    /// point for the SQL surface. Parse failures return before the probe
+    /// and are not recorded. The typed API (`scan` / `insert` / `update` /
+    /// `delete` / `index_lookup`) never passes through here and produces
+    /// NO entries (§6.3 另注).
     pub fn exec(&self, txn: Option<&TxnHandle>, sql: &str) -> Result<QueryResult> {
+        let started = Instant::now();
         let stmt = sql::parse(sql)?;
-        match txn {
+        let path = ExecutionPath::of(&stmt);
+        let result = match txn {
             None => self.exec_auto(stmt),
             Some(h) => self.exec_txn(h, stmt),
+        };
+        // F2 (Stage E review): capacity 0 means "stats off" — skip the
+        // per-statement String allocation entirely.
+        if self.query_stats.capacity() > 0 {
+            let rows = match &result {
+                Ok(QueryResult::Rows { rows, .. }) => rows.len(),
+                Ok(QueryResult::Affected(n)) => *n,
+                _ => 0,
+            };
+            self.query_stats.record(QueryStatEntry {
+                query: sql.to_string(),
+                latency: started.elapsed(),
+                rows,
+                path,
+                timestamp: SystemTime::now(),
+            });
         }
+        result
     }
 
     fn exec_auto(&self, stmt: Statement) -> Result<QueryResult> {
@@ -2823,6 +2866,45 @@ impl Engine {
         self.txn.oldest_snapshot_xmin()
     }
 
+    /// Snapshot of the currently active XIDs, sorted (M3 Stage E
+    /// introspection, tech-selection §6.2). Pure passthrough to
+    /// [`TxnManager::active_xids`].
+    pub fn active_xids(&self) -> Vec<TxnId> {
+        self.txn.active_xids()
+    }
+
+    /// The complete wait-for graph `(waiter, holder)` (M3 Stage E
+    /// introspection, tech-selection §6.2): row-lock edges from
+    /// [`TxnManager::wait_edges`] merged with table-lock edges derived from
+    /// [`LockManager::table_lock_states`]. This is exactly the graph the
+    /// deadlock detector consumes — both sides call the same
+    /// [`pg_txn::wait_for_edges`], so the diagnostic view can never drift
+    /// from detection.
+    pub fn wait_edges(&self) -> Vec<(TxnId, TxnId)> {
+        pg_txn::wait_for_edges(&self.txn, &self.lock_manager)
+    }
+
+    /// Snapshot of one table's granted set and wait queue (M3 Stage E
+    /// introspection, tech-selection §6.2); `None` when the table has no
+    /// lock state at all. Passthrough to [`LockManager::table_lock_state`].
+    pub fn table_lock_state(&self, table: Oid) -> Option<TableLockState> {
+        self.lock_manager.table_lock_state(table)
+    }
+
+    /// Disk-CLOG SLRU hit rate since open (M3 Stage E introspection,
+    /// tech-selection §6.2): `hits / (hits + misses)`, `0.0` before any
+    /// lookup. Passthrough to [`ClogBuffer::hit_rate`].
+    pub fn clog_hit_rate(&self) -> f64 {
+        self.clog.hit_rate()
+    }
+
+    /// Buffer-pool hit rate since open (M3 Stage E introspection,
+    /// tech-selection §6.2): `hits / (hits + misses)`, `0.0` before any pin.
+    /// Passthrough to [`BufferPool::hit_rate`].
+    pub fn buffer_pool_hit_rate(&self) -> f64 {
+        self.storage.buffer_pool().hit_rate()
+    }
+
     /// The table lock manager (testing / observability, M2c Stage P):
     /// `is_granted` / `held_by` / `table_lock_state` let tests observe
     /// grants and wait queues; `release_all` pairs with back-door
@@ -2834,6 +2916,15 @@ impl Engine {
     /// The engine's disk CLOG (testing / advanced use).
     pub fn clog(&self) -> &Arc<ClogBuffer> {
         &self.clog
+    }
+
+    /// The query statistics ring buffer (M3 Stage E, tech-selection §6.3):
+    /// one entry per [`Self::exec`] call, oldest dropped on overflow. The
+    /// typed API (`scan` / `insert` / `update` / `delete` /
+    /// `index_lookup`) does NOT produce entries — it never passes through
+    /// `exec`.
+    pub fn query_stats(&self) -> &QueryStats {
+        &self.query_stats
     }
 }
 

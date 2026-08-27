@@ -76,7 +76,7 @@ pub mod visibility;
 
 pub use clog_buffer::ClogBuffer;
 pub use clog_mem::InMemoryClogAccessor;
-pub use deadlock::{DeadlockDetector, DeadlockVictims, DEFAULT_DEADLOCK_INTERVAL};
+pub use deadlock::{wait_for_edges, DeadlockDetector, DeadlockVictims, DEFAULT_DEADLOCK_INTERVAL};
 pub use lock_manager::{LockError, LockManager, LockMode, TableLockState};
 pub use manager::{CommitWal, RowWaiter, SnapshotGuard, TxnError, TxnManager};
 pub use pg_storage::clog::{ClogAccessor, TxnState};

@@ -25,8 +25,10 @@
 #![warn(rust_2018_idioms)]
 
 pub mod clog_snapshot_migrate;
+pub mod diag;
 pub mod engine;
 pub mod error;
+pub mod query_stats;
 pub mod sql;
 
 pub use engine::{
@@ -34,6 +36,9 @@ pub use engine::{
     VacuumStats, Value, DEFAULT_CLOG_BUFFER_FRAMES,
 };
 pub use error::{EngineError, Result};
+pub use query_stats::{
+    ExecutionPath, QueryStatEntry, QueryStats, DEFAULT_QUERY_STATS_CAPACITY, MAX_QUERY_TEXT_BYTES,
+};
 
 // API surface re-exports: callers of the programmatic API (tech-selection
 // §21) should not need to name the lower crates for the basic types.

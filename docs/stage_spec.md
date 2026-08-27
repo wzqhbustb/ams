@@ -881,3 +881,51 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **窗口① churn 轮次的阶段④ WAL 为空**：churn 的已提交删/改条目都被 eager 维护先行删除，手驱阶段④全部 EntryNotFound；"索引清理 WAL 有实质内容"的窗口① 变体由 `m3_vacuum_crash_windows.rs`（loser 条目）覆盖
 - **性能口径**：vacuum 叠加 A 注册开销后的 churn TPS 对比见 `docs/phase1-m2-benchmarks.md` 基线条目与本 stage 验收行（S2 协议）
 - **WAL 流量观测**（压实 FPI 放大，N5）归 Stage G benchmark
+
+---
+
+## Stage E（M3）：可观测性（pg-waldump / Engine 自省 API / QueryStats / pg-diag）
+
+**状态**：✅ 完成（debug 全量 709 绿 / 0 失败（= Stage D 出口 684 + 本 stage 新增 25：交付物测试 18 + 终审修复 F1–F4 测试 7；含 m2a/m2b crash rounds 与 crash_recovery 三个子进程崩溃 harness 回归）；clippy `--workspace --all-targets -D warnings` 全绿；fmt 全绿；loom 未实际运行（沿用 Stage D 登记的预存红条目）；未 commit——等用户确认）
+**工期**：预估 3–4 天
+**验收**：`pg-storage/tests/waldump.rs`（3：全记录族可解析（heap/btree/txn/checkpoint/HeapCleanup/reserved 逐条一行、关键字段解码、reserved 打印原始 payload 不报错）/ LSN 过滤边界精确包含 / 跨段读取 + 数据目录与段目录两种入参形态）；`pg-engine/tests/m3_introspection.rs`（4：表锁等待 + 行锁边 fixture → `wait_edges` 精确合成 / CLOG 与 BufferPool 已知命中序列计数精确、Engine 命中率与组件计数一致 / 并发快照钉住 `oldest_snapshot_xmin`、提交后水位按注册存活快照推进）；`pg-engine/tests/m3_query_stats.rs`（5：容量溢出丢最老 / exec 单点覆盖 auto-commit 与显式事务两路径（含失败语句 rows=0、parse 失败不入列）/ typed API 不产生条目 / capacity=0 关闭统计）；`pg-engine/tests/m3_diag_cli.rs`（2：活跃事务 + 锁等待 fixture 下 `txn`/`locks` 报告文本逐项断言 / 编译产物二进制双子命令冒烟（空引擎实例 = M3 单进程边界语义））
+
+### 交付内容
+
+1. **`pg-waldump`**（`crates/pg-storage/src/bin/pg-waldump.rs`，§6.1 选型 (a)：与 WAL 格式同 crate、零新依赖边）：人类可读 dump，每条记录一行 `lsn= prev= xid= type=Name(N) len= <关键字段>`；`--start-lsn/--end-lsn` 闭区间过滤（十进制或 `0x` 十六进制）；位置参数同时接受数据目录（自动取 `wal/` 子目录）与段目录；`--segment-size` 须与写入端 `wal_segment_size` 一致（默认 16 MiB）。遍历复用恢复同款 `WalReader`（段间跳转、撕裂尾部=干净 EOF 全部继承）；**错误策略与 recovery 相反**（§6.1"尽量多展示"）：reserved 类型（`SegmentSeal`=110/`SegmentMerge`=111 及 Phase-2+ 逻辑索引类型 100–103、`TxnBegin`=20）打印原始 payload 十六进制不报错；payload 解码失败仍打印头部字段 + 原始字节；只有"无法越过"的记录（未知判别式 = 更新版本二进制所写、中段 CRC 失败）才停在该 LSN 并报告——之前记录已全部输出
+2. **Engine 自省 API**（`engine.rs`，§6.2 全部只读拼装、零新增机制）：`active_xids()` → `TxnManager::active_xids`；`wait_edges()` → **`pg_txn::deadlock::wait_for_edges` 提为 pub 并导出**（row 边 `TxnManager::wait_edges` + 表边 `LockManager::table_lock_states` 的合成为单一事实源——诊断面与死锁检测器消费同一份图，结构上不可能漂移）；`table_lock_state(oid)` → `LockManager::table_lock_state`；`oldest_snapshot_xmin()`（Stage A 透传已存在，本 stage 进自省面）；`clog_hit_rate()` → `ClogBuffer::hit_rate`；`buffer_pool_hit_rate()` → 下方新增计数器
+3. **Buffer Pool 计数器**（§6.2 唯一实现缺口）：`BufferPool` 补 `hits/misses: AtomicU64` + `hits()/misses()/hit_rate()`（`buffer_pool.rs`），与 `clog_buffer.rs:156-175` 逐行同构（Relaxed 序、`0.0`-before-any-pin 语义）。计数点：命中 = `try_pin_resident` 成功（`locate_or_load` 快路径与 `alloc_frame` 双检路径共用此单点，每次成功 pin 恰计一次——双检成功即"并发 loader 抢先载入"，无读盘、是真命中）；未命中 = `alloc_frame` 的 load-from-disk 分支（读盘前自增，读失败也计——未命中度量的是"无驻留镜像"）。`new_page` 分配不计（无查找无读盘），redo 专用 `force_reload_from_disk` 不计（页本已驻留）
+4. **`QueryStats` ring buffer**（`crates/pg-engine/src/query_stats.rs`，§6.3 选型 (b)）：容量默认 1000（`EngineConfig::query_stats_capacity` 可配，0 = 关闭统计），每条 `{query 文本, latency(Duration), rows(影响/返回行数), path(ExecutionPath), timestamp(SystemTime)}`；单把 `parking_lot::Mutex` 护 `VecDeque`，溢出 `pop_front` 丢最老；读 API `entries()/len()/is_empty()/capacity()`。**`Engine::exec` 单点埋点**（latency 覆盖整个 exec 调用（parse + 执行）；auto-commit 与显式事务两路径天然同覆盖；失败语句记 rows=0；parse 失败在埋点之前返回、不入列）。`ExecutionPath` 七变体（`SeqScan/IndexLookup/Insert/Update/Delete/Ddl/TxnControl`）；`IndexLookup` 为预留——M3 SQL 执行器只有 seq scan（`exec_select`→`scan_inner`），typed `Engine::index_lookup` 按 §6.3 约定**不**入统计
+5. **`pg-diag`**（`crates/pg-engine/src/bin/pg-diag.rs` + 渲染逻辑在 lib 侧 `crates/pg-engine/src/diag.rs`，S1）：`txn` 子命令（active_xids + `oldest_snapshot_xmin` + clog/buffer-pool 命中率）、`locks` 子命令（完整 wait-for 图 + 竞争表的 granted/FIFO 等待队列）。渲染函数落 lib 使 CLI 精确输出可进程内 fixture 断言；二进制只是薄壳。**M3 边界文档化**：独立进程打开数据目录看到的是自己刚恢复的空闲引擎实例（单进程诊断）；跨进程 live 诊断归 Phase 4a 经 pg-wire 暴露同一 §6.2 面。指向 live server 数据目录的误用由 F1 的排他锁硬拒绝（见下）
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| 数据目录排他 | `postmaster.pid` + kill(pid,0) 活性检测 | `{data_dir}/lock`（`create_new`/O_EXCL + holder pid，F1） | 零新依赖约束排除 libc/fs2（std 无 flock，MSRV 1.86）；崩溃残留需手动删，活性检测归后续 |
+| WAL dump | `pg_waldump` 独立工具，rmgr 注册解码 | `pg-waldump` 挂在格式所属 crate（§6.1 (a)），未知/保留类型打印原始字节 | M3 只有一个 CLI，单建 tools crate 是过度组织；未来工具增多再迁 (b) |
+| 查询统计 | `pg_stat_statements` 系统表（持久、跨进程） | exec 层内存 ring buffer（1000 条、溢出丢最老、重启即失） | 系统表化要走 heap/WAL/MVCC 全家桶且自引用（统计表的查询也产统计），归 Phase 6（§6.3）；ring 语义对"诊断最近慢查询"够用 |
+| 统计覆盖 | 所有 utility/PL 路径 | 只覆盖 SQL 文本路径（`exec` 单点）；typed API 不入统计 | §6.3 既定口径；typed API 无 SQL 文本可记 |
+| 锁/事务自省 | `pg_locks` / `pg_stat_activity` 视图（共享内存跨进程） | 进程内只读 API + CLI 薄壳；独立进程只见空引擎 | 单进程口径 S1 既定；跨进程 live 诊断归 Phase 4a（pg-wire 管理通道） |
+| BP/CLOG 命中率 | `pg_stat_bgwriter` / `pg_statio` 计数器表 | 组件内 AtomicU64 + `hit_rate()` 只读方法 | 零新机制；计数不进目录表（同上行） |
+
+### 终审修复（F1–F4）
+
+- **F1（高）数据目录排他锁**：`pg-storage` 新增 `data_dir_lock` 模块——`StorageEngine` 打开时以 `create_new`（O_EXCL）创建 `{data_dir}/lock`（内容 `pid=<n>`，仅供错误消息与同 pid 判定），引擎值 Drop 时删除（声明为结构体最后字段，子系统全部释放后才放锁）。第二个**进程**打开同一目录干净报 `InvalidOperation`（"already in use … remove the stale lock file"）。**选型论证**：flock 语义（fd 生命周期=进程生命周期、崩溃自动释放）需要 libc/fs2，被 §10 零新依赖约束排除（std 的 `File::lock` 1.89 才稳定，MSRV 1.86）；且**任何同进程排除都会打破测试套件的崩溃惯用法**——约 100 个崩溃恢复测试以 `mem::forget(engine)` + 同进程重开模拟 kill -9，被遗忘引擎的 Drop 不执行，锁文件与 flock fd 都不会释放。因此同 pid 冲突（只能是该惯用法）视为残留锁**回收**（warn 级日志），异 pid 一律拒绝。真实跨进程崩溃残留（m2a/m2b crash rounds 与 crash_recovery 的子进程 SIGKILL 后立即重开）由 harness 在回收子进程后删除残留锁文件——恰好扮演文档化的运维清理动作。代价（文档化）：① 真崩溃残留需手动删文件（错误消息明示；kill(pid,0) 活性检测——PG postmaster.pid 的形态——需 libc，归后续）；② 同进程双开活引擎不拦截（F1 的实际危害面是第二进程，如 pg-diag 打向运行中 server）。接线点：`open_with_redo_and_clog`（ensure_data_dir 之后、superblock 探测之前）与 `recover_with_redo_handlers`（先取锁再读任何文件）；`recover` 系列拆出私有 `recover_inner` 承接已持有的锁。测试：`pg-storage/tests/data_dir_lock.rs`（3：异 pid 锁拒绝+手动清理后放行 / 干净关闭放锁可重开 / forget 重开同 pid 回收）+ 模块单测（2）+ `m3_diag_cli.rs::pg_diag_against_live_engine_dir_is_rejected`（pg-diag 子进程打向活引擎目录 → 非零退出 + "already in use"；holder 关闭后放行——真跨进程端到端）
+- **F2（低）capacity=0 跳过 entry 构造**：`Engine::exec` 埋点在 `query_stats.capacity() == 0` 时不再构造 `QueryStatEntry`（避免每语句一次 String clone；`engine.rs`）
+- **F3（低）查询文本无上限 → 截断 1 KiB**：`QueryStats::record` 单点截断至 `MAX_QUERY_TEXT_BYTES = 1024`（UTF-8 字符边界回退；ring 内存上界 ≈ capacity × 1 KiB）；lib 导出该常量；单测 `query_text_is_truncated_to_cap`（含多字节字符跨界）
+- **F4（低）locks_report 非原子快照**：`diag.rs` 补 doc——边列表与表状态来自先后两次独立快照（与 `wait_for_edges` 内部分源加锁同构），并发下可瞬时错位，诊断用途可接受，死锁检测器同此性质
+
+### 已知残留与后续归队
+
+- **F1 残留①：崩溃残留锁需手动删**（既定第一版）：kill -9 后 `lock` 文件残留，下次打开报可操作错误（点名持有者 pid 与删除指引）；自动活性检测（kill(pid,0)）受零新依赖约束归后续——若未来允许 libc 边或 MSRV 升至 1.89（`File::lock`），改 flock/postmaster.pid 全语义
+- **F1 残留②：同进程双开活引擎不拦截**（同 pid 回收是崩溃测试惯用法的前置）；进程内误开属编程错误，靠 review 把关
+- **跨进程 live 诊断不可达**：`pg-diag` 独立进程看到的是自己的空引擎实例（M3 口径 = "诊断面以 CLI 形式可用"，测试/单进程场景）；live server 诊断归 **Phase 4a**（经 pg-wire 暴露 §6.2 自省面，coding-plan"遗留与归队"S1 注记）
+- **waldump 撕裂/中段损坏覆盖注记**：撕裂尾部=干净 EOF、中段 CRC 失败=停止并报 LSN 的行为**继承自 `WalReader`**，由 `wal/reader.rs` 既有单测覆盖（`read_torn_tail_record_with_zero_remainder_returns_none` / `read_crc_failure_with_records_after_still_errors` 等）；`waldump.rs` 集成测试覆盖全记录族、LSN 过滤边界与 reserved 类型，未单独构造 bin 层撕裂 fixture（底层语义已有确定性测试，bin 只是透传）
+- **真正未知判别式（更新版本二进制所写的 WAL）在 dump 中报错停止**（记录边界不可读，无法越过），与 §6.1 要求的 reserved 类型（判别式已知、仅无 handler）不报错不同——前者会打印已走到的全部记录后报 LSN
+- **`ExecutionPath::IndexLookup` 预留无生产者**：SQL 执行器无索引访问路径（`exec_select` 恒 seq scan）；planner 索引选择归后续 stage
+- **QueryStats 重启即失 + 溢出丢最老**（§6.3 既定代价）；系统表化归 Phase 6
+- **waldump 需要显式 `--segment-size`** 匹配非默认段长的数据目录（段长不在段文件内自描述；superblock 化段长元数据归后续）
+- **统计埋点性能口径**：验收为"对 exec 路径开销不可测"（churn 对比抽查）——埋点 = 一次 Mutex push + 两次时钟读，相对 WAL append/页 I/O 不可测；正式 S2 数字归 Stage G 收口 benchmark
+- **loom 两模型预存红**沿用 Stage D 登记条目（本 stage 未触碰 latch/WAL 编排；BufferPool 计数器走 `crate::sync` 别名层，loom 构建不受影响）
+- **19 个 pre-existing rustdoc 警告（跨 6 crate：pg-storage 5 / pg-txn 2 / pg-catalog 1 / pg-am-heap 7 / pg-am-btree 3 / pg-engine 1）**：本 stage 零新增；CI doc job（`RUSTDOCFLAGS=-D warnings`）对其必红——**按用户节奏逐步消解，不阻塞本 stage 收口**；消解时顺带注意 pg-engine 的一处来自 Stage D 的 `Self::auto_commit` 私项链接

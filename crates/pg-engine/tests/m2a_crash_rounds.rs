@@ -588,6 +588,11 @@ fn m2a_crash_rounds() {
         child.kill().expect("failed to kill crash child");
         child.wait().expect("failed to reap crash child");
 
+        // M3 Stage E F1: the SIGKILLed child left its `{data_dir}/lock`
+        // file behind; the harness plays the documented operator action
+        // for crash residue (remove the stale lock) before reopening.
+        let _ = std::fs::remove_file(data_dir.join("lock"));
+
         verify_round(round, &data_dir);
     }
 }
