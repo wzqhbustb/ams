@@ -528,15 +528,30 @@ impl TxnHandle {
     pub fn commit(mut self) -> Result<()> {
         let xid = self.xid.take().expect("commit called twice");
         let result = self.txn.commit_txn(xid);
+        if result.is_err() {
+            // Commit failed (WAL/CLOG failure): without intervention the
+            // XID would leak into the active set forever — `self.xid` was
+            // taken, so `Drop` will NOT auto-abort — pinning the vacuum
+            // horizon and every future snapshot's xmin. Best-effort abort
+            // with the same discipline as `Drop`: replay the index undo
+            // FIRST (so no snapshot sees a heap row whose index entry is
+            // gone), then flip the CLOG bit. If the WAL is broken badly
+            // enough that even the abort record cannot append, the process
+            // is tearing down anyway; the failure must still be loud.
+            apply_index_undo(&self.index_undo, &self.buffer_pool, &self.wal_writer, xid);
+            if let Err(e) = self.txn.abort_txn(xid) {
+                tracing::warn!(error = %e, xid = xid.0, "commit failure fallback abort failed");
+            }
+        }
         // 2PL release point (M2c Stage P): table locks go AFTER the CLOG
         // bit flips, so a woken row-lock waiter that then needs this
         // transaction's table locks never observes the reverse order.
         self.lock_manager.release_all(xid);
-        // Discard the undo log either way: on success the entries are
-        // durable; on failure the txn stays in-progress (its heap writes
-        // invisible) and the `index_lookup` visibility mask covers the
-        // leftover index entries.
-        self.index_undo.lock().remove(&xid);
+        // Discard the undo log on success only: on failure it was replayed
+        // above. On success the entries are durable with the commit.
+        if result.is_ok() {
+            self.index_undo.lock().remove(&xid);
+        }
         result?;
         Ok(())
     }
@@ -2644,9 +2659,30 @@ impl Engine {
         match op(&snap) {
             Ok(v) => {
                 let result = self.txn.commit_txn(xid);
+                if result.is_err() {
+                    // Same fallback as TxnHandle::commit (F7): a failed
+                    // commit would otherwise leak the XID into the active
+                    // set forever, pinning the vacuum horizon. Replay the
+                    // index undo FIRST (same discipline as abort), then
+                    // flip the CLOG bit; both best-effort — a WAL broken
+                    // badly enough to fail the abort record means the
+                    // process is tearing down anyway, but it must be loud.
+                    apply_index_undo(
+                        &self.index_undo,
+                        self.storage.buffer_pool(),
+                        self.storage.wal_writer(),
+                        xid,
+                    );
+                    if let Err(abort_err) = self.txn.abort_txn(xid) {
+                        tracing::warn!(error = %abort_err, xid = xid.0, "auto-commit commit-failure fallback abort failed");
+                    }
+                }
                 self.lock_manager.release_all(xid);
-                // Discard the undo log either way (see TxnHandle::commit).
-                self.index_undo.lock().remove(&xid);
+                // Discard the undo log on success only — on failure it was
+                // replayed above (see TxnHandle::commit).
+                if result.is_ok() {
+                    self.index_undo.lock().remove(&xid);
+                }
                 result?;
                 Ok(v)
             }

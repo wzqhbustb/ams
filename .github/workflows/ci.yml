@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,6 +61,8 @@ jobs:
       # instrumented ones, which PANIC outside `loom::model` — so the two
       # loom-aware crates must be tested with default features. Running their
       # test suites with --all-features makes every non-model test panic.
+      # (M3 Stage F: pg-wire declares NO features, so it rides the
+      # all-features branch below unchanged.)
       - name: Test (default features — loom-gated crates)
         if: matrix.crate == 'pg-storage' || matrix.crate == 'pg-am-btree'
         run: cargo test -p ${{ matrix.crate }}
@@ -125,7 +127,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

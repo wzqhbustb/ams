@@ -357,3 +357,69 @@ fn crash_loser_delete_before_redo_start_compensated() {
          (scan starts at the oldest retained checkpoint begin)"
     );
 }
+
+/// F7 regression: a WAL-fatal commit must NOT leak the XID into the active
+/// set — `TxnHandle::commit` falls back to a best-effort abort (index undo
+/// replayed first, then the CLOG abort), so the vacuum horizon and every
+/// future snapshot's xmin are never pinned by a dead commit.
+#[test]
+fn commit_failure_falls_back_to_abort_and_reclaims_xid() {
+    use pg_am_btree::key::encode_key;
+    let (_tmp, engine) = setup();
+    let txn = engine.begin_txn().unwrap();
+    engine.exec(Some(&txn), "INSERT INTO t VALUES (7)").unwrap();
+    let xid = txn.xid();
+
+    // Arm the hook: commit_txn fails at entry, before any WAL work.
+    pg_txn::manager::test_hooks::set_commit_txn_force_fail(true);
+    let res = txn.commit();
+    pg_txn::manager::test_hooks::set_commit_txn_force_fail(false);
+    assert!(res.is_err(), "the injected commit failure must surface");
+
+    // The fallback abort removed the XID from the active set (pre-fix: it
+    // leaked forever — `self.xid` was taken, so Drop never aborted).
+    assert!(
+        !engine.active_xids().contains(&xid),
+        "commit failure leaked the XID into the active set (F7)"
+    );
+    // It replayed the index undo: the entry is gone even at the raw level.
+    let raw = engine
+        .btree_index("t", "id")
+        .unwrap()
+        .lookup_all(&encode_key(&Datum::Int4(7)).unwrap())
+        .unwrap();
+    assert!(
+        raw.is_empty(),
+        "fallback abort did not replay the index undo"
+    );
+    // The row is invisible, and subsequent commits work normally.
+    assert_eq!(scan_count(&engine), 0);
+    engine.exec(None, "INSERT INTO t VALUES (8)").unwrap();
+    assert!(lookup(&engine, 8));
+}
+
+/// F7/P2-1 regression, auto-commit path: a WAL-fatal commit inside
+/// `auto_commit` must not leak the XID either — the Ok branch mirrors
+/// `TxnHandle::commit`'s fallback (undo replay, then abort).
+#[test]
+fn auto_commit_commit_failure_reclaims_xid() {
+    use pg_am_btree::key::encode_key;
+    let (_tmp, engine) = setup();
+    pg_txn::manager::test_hooks::set_commit_txn_force_fail(true);
+    let res = engine.exec(None, "INSERT INTO t VALUES (11)");
+    pg_txn::manager::test_hooks::set_commit_txn_force_fail(false);
+    assert!(res.is_err(), "the injected commit failure must surface");
+    assert!(
+        engine.active_xids().is_empty(),
+        "auto-commit commit failure leaked the XID (F7/P2-1)"
+    );
+    let raw = engine
+        .btree_index("t", "id")
+        .unwrap()
+        .lookup_all(&encode_key(&Datum::Int4(11)).unwrap())
+        .unwrap();
+    assert!(raw.is_empty(), "fallback did not replay the index undo");
+    assert_eq!(scan_count(&engine), 0);
+    engine.exec(None, "INSERT INTO t VALUES (12)").unwrap();
+    assert!(lookup(&engine, 12));
+}

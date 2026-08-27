@@ -873,7 +873,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 
 ### 已知残留与后续归队
 
-- **loom 模型测试预存红（非本 stage 回归，二分定位 + 已实证复核）**：`btree_loom` 两模型在当前工具链下失败（`loom_two_writers_one_reader_linearizable` 报 "page 2 entries out of order at slot 1"、`loom_split_with_concurrent_writers` 报 "key 0 lost across the split"）。二分证据：在 M2 出口提交 31fe4b8（Stage Q 记录"loom 2 模型 2 万+ 交错全绿"的同一提交）上**同样失败** → 失败前移至 M2 之后的环境/工具链漂移（Stage A–C 只 `cargo check` 未实际运行 loom），与本 stage 改动无关（本 stage 未触碰 latch/split 编排）。**实证复核（2026-08-24)**：当前树与 31fe4b8 的隔离 worktree 各跑 CI 命令（`LOOM_MAX_PREEMPTIONS=2`），两侧同红且耗时一致（~22s/侧，非状态空间爆炸，是快速硬失败）。根因定位与修复单开会话处理，不阻塞 Stage D
+- **loom 模型测试预存红（非本 stage 回归，二分定位 + 已实证复核）**：`btree_loom` 两模型在当前工具链下失败（`loom_two_writers_one_reader_linearizable` 报 "page 2 entries out of order at slot 1"、`loom_split_with_concurrent_writers` 报 "key 0 lost across the split"）。二分证据：在 M2 出口提交 31fe4b8（Stage Q 记录"loom 2 模型 2 万+ 交错全绿"的同一提交）上**同样失败** → 失败前移至 M2 之后的环境/工具链漂移（Stage A–C 只 `cargo check` 未实际运行 loom），与本 stage 改动无关（本 stage 未触碰 latch/split 编排）。**实证复核（2026-08-24)**：当前树与 31fe4b8 的隔离 worktree 各跑 CI 命令（`LOOM_MAX_PREEMPTIONS=2`），两侧同红且耗时一致（~22s/侧，非状态空间爆炸，是快速硬失败）。**并档（2026-08-25)**：`btree_concurrent::concurrent_small_pool_split_eviction_storm` 的 solo flaky（实测 23 跑 2 败，~9%）失败信息 "scanner missed committed key 0" 与 loom 的 "key 0 lost across the split" **同族**——疑同一底层 bug（并发 split 丢 key 0），两个条目合并为同一单开修复会话的排查对象，不再按"容忍的 flaky"处理。根因定位与修复单开会话处理，不阻塞 Stage D
 - **split-CLR redo 的同构不对称窗口**（本次未触发，理论残留）：`apply_split_clr` 的"左页已过 CLR 而右页没有"分支同样假设池内状态即磁盘状态；触发需"回收右页 + 窗口内旧 FPI + split 中途崩溃 + 恢复后再崩溃"四连，比 Copy 路径窄得多。修复模式相同（`force_reload_from_disk`），归后续 stage 按需处理
 - **回收页的撕页暴露**：`new_page` 对复用页仍设 `needs_fpi=false`（"新页无旧镜像"假设对复用页不成立——其前任镜像在盘上）；Stage Q 只给 `create_new_root` 补了 `log_page_init`。kill -9 测试模型撕不了页缓存 pwrite，纯断电模型才暴露 → **不在本阶段处理，列入后续 checkpoint/FPI 加固专项的处理清单**（新建该 stage 时作为其输入项；候选修复：split_prepare 对复用右页补 log_page_init）
 - **无锁读者撞上跨 relation 页复用的理论窗口**：纯 SELECT 走链时若读到"unlink 前旧 next 指针 → 页已释放并被他表复用"，MVCC 过滤（新元组 xmin 晚于读者快照）使其读不到错行，最坏是一次可重试的解码错误；本 stage 测试未构造出该交错 → 观察项，根治（读者侧 chain 代际校验）归 Phase 5b 在线 vacuum
@@ -929,3 +929,54 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **统计埋点性能口径**：验收为"对 exec 路径开销不可测"（churn 对比抽查）——埋点 = 一次 Mutex push + 两次时钟读，相对 WAL append/页 I/O 不可测；正式 S2 数字归 Stage G 收口 benchmark
 - **loom 两模型预存红**沿用 Stage D 登记条目（本 stage 未触碰 latch/WAL 编排；BufferPool 计数器走 `crate::sync` 别名层，loom 构建不受影响）
 - **19 个 pre-existing rustdoc 警告（跨 6 crate：pg-storage 5 / pg-txn 2 / pg-catalog 1 / pg-am-heap 7 / pg-am-btree 3 / pg-engine 1）**：本 stage 零新增；CI doc job（`RUSTDOCFLAGS=-D warnings`）对其必红——**按用户节奏逐步消解，不阻塞本 stage 收口**；消解时顺带注意 pg-engine 的一处来自 Stage D 的 `Self::auto_commit` 私项链接
+
+
+## Stage F（M3）：pg-wire（v3 最小协议 + 连接管理 + SQL 透传）
+
+**状态**：✅ 完成（本 crate 28 绿：wire_protocol 24 + wire_clients 4；clippy `-p pg-wire --all-targets --all-features -D warnings` 绿；fmt 绿；doc job（`RUSTDOCFLAGS=-D warnings`）对 pg-wire 绿、零新增警告；`cargo tree` 抽查零新运行时依赖；终审修复 F1/F4 落地、F8 补强测试 2 条；F7 修复合入本 stage（commit 失败回退 abort + 双路径红绿回归测试，`m2b_index_txn` 13 绿）；**最终全量回归 739/0**（权威计数 740 = 739 可运行 + 1 ignored；早期一轮 736/1 的唯一失败为 `btree_concurrent::concurrent_small_pool_split_eviction_storm`；**注意（P3-1 修正）**：该测试 solo 实测 23 跑 2 败（~9%），失败信息 "scanner missed committed key 0" 与 loom 预存红（"key 0 lost across the split"）**同族**——"仅全量并行下偶发"的措辞不准确，它意味着 CI 的 pg-am-btree test job 约每 11 次红 1 次；已与 loom 红条目并档，疑同一底层 bug，单开修复会话排查而非容忍；与本 stage 无关（未触碰 pg-am-btree）；未 commit——等用户确认）
+**工期**：预估 5–7 天（+1–2 兼容余量未动用）
+**验收**：`pg-wire/tests/wire_protocol.rs`（24：启动四码 framing + 常规帧 `Q`/`X`/未知 tag + 畸形帧拒绝 / 超大声明长度在上限处拒绝为 Protocol 错而非分配（F1 红绿对照：旧实现会放行后撞 EOF-Io 错）/ `Q` 串 NUL 后多余字节报 Protocol 错（F4）/ 全部后端编码器 golden bytes + RowDescription/DataRow 结构断言 / 六类型文本编码 + NULL 协议标记 / BEGIN→begin_txn、COMMIT→commit、ROLLBACK→abort 映射 + exec 零到达（QueryStats 无 BEGIN/COMMIT 条目佐证）/ 事务中 BEGIN 报 25001 且句柄存活 / 无事务 COMMIT/ROLLBACK 报 25P01 / **带活事务断开连接 → XID 自动回收（F8）** / **CancelRequest 会话级关连（F8，真 socket）** / 多语句按序 auto-commit + 首错截断余串 / 探针语句 42601 报错不断连 / 空查询 EmptyQueryResponse / 全类型 SELECT 端到端（schema 驱动 OID + 文本值 + 5 NULL 标记））；`pg-wire/tests/wire_clients.rs`（4，rust-postgres 真 TCP 硬门槛：全 CRUD + BEGIN/COMMIT/ROLLBACK + 多语句串 / 探针 SET、SELECT version() 报错不断连 / 六类型文本 roundtrip / 4 并发客户端各自表 CRUD + 交错显式事务——全部挂 120s watchdog）
+
+### 交付内容
+
+1. **新 crate `crates/pg-wire`**（workspace member，依赖 pg-engine；§7.1）：只做协议编解码 + 连接管理 + SQL 透传，零执行逻辑。运行时依赖仅 pg-engine/thiserror/tracing（全部已在 workspace 依赖图内，§10 零新运行时依赖成立）；dev-dependency 引 `postgres` 0.19（rust-postgres 同步封装，§10 允许的测试驱动客户端）+ tempfile + uuid（fixture 构造，已在图内经 pg-am-heap）
+2. **手写编解码**（`src/codec.rs`，§10 选型 (b)）：启动阶段无 tag 帧（v3.0=196608 / SSLRequest / GSSENCRequest / CancelRequest 四码分发）+ 常规阶段 1B tag + 4B 长度帧；长度字校验上限分档——启动包 10000（PG `MAX_STARTUP_PACKET_LENGTH` 同款）、常规消息 64 MiB，且**分配随读入 8 KiB 分块增长**（声明长度永不全额预分配，终审 F1 修复；声明超上限拒绝为 Protocol 错而非分配）；干净 EOF 区分于截断帧（前者=正常关连，后者=协议错误）。后端编码器全部追加进调用方 buffer，一个 ReadyForQuery 周期一次 `write_all` 落盘
+3. **启动协商**（`src/session.rs`）：SSLRequest→`'N'`、GSSENCRequest→`'N'`（§7.2"忽略"落地为"拒绝加密但必回字节"——无 GSS 的 PG 也回 `'N'`，真不回字节 libpq 会永久阻塞）、CancelRequest→直接关连（§7.2 非目标，PG 消费完 cancel 包同样关连）、StartupMessage→AuthenticationOk（trust）→ParameterStatus 最小集（server_version=16.0 / server_encoding / client_encoding / DateStyle / integer_datetimes / standard_conforming_strings / is_superuser / session_authorization，外加回显 application_name）→ReadyForQuery
+4. **事务拦截**（`src/session.rs`）：`BEGIN`/`COMMIT`/`ROLLBACK` 由 pg-wire 层解析（复用 engine 的 `sql::parse`——同一解析器保证拦截面与 exec 面零漂移）后映射到 `Engine::begin_txn`/`TxnHandle::commit`/`abort`，**不透传 exec**（engine.rs exec_auto/exec_txn 对三者硬报错）；每连接至多一个 `TxnHandle`；事务中 BEGIN 报 25001（PG 是 WARNING 续跑，此处硬错误——"报错不破坏现状"口径内且客户端更易观测）且句柄原样存活；无事务 COMMIT/ROLLBACK 报 25P01；连接断开/Terminate 时 `TxnHandle::drop` 自动 abort，XID 不泄漏
+5. **多语句串**：`split_statements`（pub，可单测）按顶层 `';'` 切分，单引号字面量与 `''` 转义正确跳过；语句按序执行（auto-commit 各自独立，显式事务内共享该连接句柄）；首条错误截断余串（PG simple-protocol 语义）发 ErrorResponse 后照常 ReadyForQuery；全空串回 EmptyQueryResponse
+6. **结果渲染**：RowDescription（schema 驱动类型——SELECT 的表名经 `Engine::describe_table` 解析出真实 table OID/attnum/列类型；解析不到时回退到首个非 NULL 值推断，再回退 TEXT）+ 文本 DataRow（NULL=长度 -1 协议标记）+ CommandComplete（`SELECT n`/`INSERT 0 n`/`UPDATE n`/`DELETE n`/`CREATE TABLE`/`CREATE INDEX`/`BEGIN`/`COMMIT`/`ROLLBACK`）。SQLSTATE 映射只保留客户端可行动的区分：42P01/42P07/0A000/42601，其余 XX000
+7. **类型文本编码**（`src/types.rs`，§7.2）：INT4/INT8 十进制、TEXT 原样、NULL 协议空值、Bytea `\x`+小写 hex（恰为 PG 文本格式，OID 17 如实上报）、**Timestamptz 报 INT8 OID 配 µs 整数编码、Uuid 报 TEXT OID 配标准串编码**（见 trade-off 表）；`Datum::External`（TOAST 指针）响亮报错——M3 读路径不解析 TOAST
+8. **线程模型**（`src/server.rs`，§7.3）：`std::net::TcpListener` + 每连接一个命名 std 线程 + `Arc<Engine>`，零 tokio；accept 后即 set_nodelay；会话失败（I/O 或协议违规）只关该连接并 warn 日志，accept 循环与其余连接不受影响；连接线程 detached（进程即生命周期属主，与全仓库一致）
+9. **O5 编译期断言**（`src/lib.rs`）：裸 fn `assert_engine_send_sync` 钉死 `Engine: Send + Sync`（无 static_assertions crate）；该性质一旦失效线程模型即不健全，编译期直接拒
+10. **CI 接线**（P2-5 修正）：`.github/workflows/ci.yml` 的 clippy/test/doc 三个 crate matrix 加入 pg-wire（fmt job 无 matrix，`cargo fmt --all` 天然覆盖；msrv job 为 `--workspace --all-features` 同样天然覆盖）；pg-wire 零 features，test job 走 all-features 分支（loom 豁免分支先例不涉及，已在 ci.yml 注释注明）
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| Timestamptz/Uuid 的 RowDescription OID | 真 OID（1184/2950）配各自文本格式 | **OID 与线上字节自洽**：µs 整数报 INT8(20)、标准 UUID 串报 TEXT(25) | §7.2 只钉值编码不钉 OID；报真 OID 则无任何 stock 客户端能把 µs 整数解成 timestamptz（psycopg2 的 1184 cast 直接炸），roundtrip 验收不可能成立。真 OID + PG 文本时间戳格式归 Phase 4a |
+| 协议面 | Extended Query / COPY / 认证 / CancelRequest / TLS 全家桶 | 仅 Simple Query 最小闭集（§7.2 既定非目标） | M3 目标是"驱动能连上跑 CRUD"；扩展面归 Phase 4a（独立 crate 的立意即协议演进不污染 engine） |
+| 事务中 BEGIN | WARNING 级别，事务继续 | ERROR 25001，事务继续（句柄不动） | "报错不破坏现状"验收口径内；硬错误对客户端更易断言 |
+| 语句失败后的显式事务 | 进入 aborted 态，只接受 ROLLBACK（ReadyForQuery 报 `'E'`） | 无 failed-txn 态：事务保持 `'T'`，后续语句照常执行（M2b 语义——失败语句已写行留在事务内，安全收口只有 abort） | engine 无子事务是既定 M2b 边界，wire 层不虚构 `'E'` 语义 |
+| GSSENCRequest | 不支持时回 `'N'` | 回 `'N'`（§7.2 字面为"忽略"，落地为"不加密但必应答"） | 真忽略（零响应）libpq 永久阻塞——解释性落地，已注 session.rs 文档 |
+| 连接数 | fork 进程/连接 | std 线程/连接 | §7.3 既定：千级连接线程爆炸归 Phase 4a 再评估 runtime；M3 不做连接数压测 |
+
+### 终审修复（F1–F8）
+
+- **F1（中）声明长度即分配 = 内存 DoS 面**：原实现长度校验（旧上限 1 GiB）通过后立即 `vec![0u8; len]`——5 字节头声明 1 GiB 即触发等额分配并阻塞持有。修复（`codec.rs` `read_body`）：① 上限收紧——启动包 10000（PG `MAX_STARTUP_PACKET_LENGTH` 同款，自 8.0 即此值）、常规消息 64 MiB（SQL 子集无大对象字面量，绰绰有余）；② 分配随读入 8 KiB 分块增长，声明长度永不全额预分配，任一时刻内存上界 = 对端实际已发字节 + 一块余量。测试 `oversized_declared_length_rejected_before_allocation`：1 GiB / 64 MiB+1 / 10001 声明均拒绝为 Protocol 错（红绿对照：旧实现会放行分配后撞 EOF-Io 错）；贴上限但 body 不到则 Io 错（上限放行、分块读取零大额预分配）
+- **F4（nit）`Q` 消息 NUL 后多余字节静默忽略 → Protocol 错**（PG "invalid string in message" 同款）：cstring 必须占满整帧，拖尾字节 = 对端 framing bug，不静默丢弃。测试 `query_trailing_bytes_after_nul_rejected`
+- **F8 测试补强**：`drop_session_mid_txn_reclaims_xid`（BEGIN 后 drop session，`TxnHandle::drop` 自动 abort → `active_xids` 归零，XID 不泄漏钉 horizon）；`cancel_request_closes_connection`（真 socket 发 CancelRequest → 服务器无应答关连，客户端读到干净 EOF，会话线程 Ok 返回）
+
+### 已知残留与后续归队
+
+- **三家手动矩阵未跑**（N6 既定）：CI 硬门槛只有 rust-postgres（`wire_clients.rs` 4 测试全绿）；psql/psycopg2/node-postgres 手动命令已写进 `wire_clients.rs` 头部文档，结果（客户端版本、通过项、探针报错清单）归 **Stage G** 收口落盘 benchmark 文档
+- **psql catalog 探针固有落差**（§11 R3）：`\d` 等元命令与 `pg_type` 族查询答不出，口径 = "报错不断连 + 基本 CRUD 可用"，M3 不承诺交互体验
+- **Extended Query 非目标**（§7.2）：rust-postgres 的 `query`/`execute`（走 Parse/Bind/Execute）不可用，测试一律走 `simple_query`/`batch_execute`；驱动侧参数化查询归 Phase 4a
+- **TOAST 值读路径不可达**：`Datum::External` 上报 Encode 错误（响亮失败非静默错值）；TOAST 解析归 Stage I 既定归属
+- **结果集整体缓冲（F2 点名）**：一个 `'Q'` 周期的全部响应进单个 Vec 再一次 `write_all`——大结果集峰值内存 ~2×（engine 物化的行 + 编码后的帧），且客户端中途断开要等全量算完才察觉。engine 本就物化全部行（`QueryResult::Rows`），无额外渐近开销；流式 DataRow 归 **Phase 4a**
+- **slow-loris / 连接上限 / 线程不 join / 优雅关闭（F3 点名，§7.3 既定代价的具体形态）**：连接无读超时也无总数上限——慢速对端（slow-loris）可永久占住一个连接线程（线程模型下每连接一线程，占满即拒新连接）；连接线程 detached 不 join；无优雅关闭路径，且 accept 循环失败后 `Engine`（含 DataDirLock）要存续到最后一个连接线程退出才释放。M3 目标是"驱动能连上跑 CRUD"非公网服务；读超时/连接上限/关闭握手归 Phase 4a 与 runtime 再评估一并处理
+- **只认 protocol 196608（F5 记录项）**：3.x 次版本请求硬错误而非回 `NegotiateProtocolVersion`——PG18 前 libpq 默认协商 3.0 不受影响；客户端显式 `max_protocol_version=latest` 会撞。归 Phase 4a 协议扩展面
+- **database 参数不校验（F6 记录项）**：trust 模式下任何 dbname 均可连（单数据目录即库的既定形态）；多数据库/校验归后续阶段
+- ~~`commit()` 失败路径泄漏 XID（F7 记录项，非本 stage 引入，登记）~~ **已修复（Stage F 收口期）**：`TxnHandle::commit` 在 `commit_txn` 失败时回退为 best-effort abort——先回放索引 undo（与 `abort()`/`Drop` 同纪律）再翻 CLOG 位，XID 不再泄漏、horizon 不再被钉死；注入钩子 `pg_txn::manager::test_hooks::set_commit_txn_force_fail`（doc-hidden thread-local）+ 回归测试 `m2b_index_txn::commit_failure_falls_back_to_abort_and_reclaims_xid`（红绿对照成立：修复前 XID 留在 active set 断言必红）
+- **BackendKeyData 不发**（无 CancelRequest 支撑，§7.2 非目标）；个别驱动若强依赖 key data 会在取消路径上失败，正常查询路径不受影响
+- **19 个 pre-existing rustdoc 警告**沿用 Stage E 登记条目（本 stage 零新增，pg-wire 的 doc job 单独验证为绿）

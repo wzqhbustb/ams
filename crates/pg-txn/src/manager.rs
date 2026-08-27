@@ -52,6 +52,39 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Test-only failure injection (F7 regression): when armed on the current
+/// thread, `commit_txn` fails at entry with a synthetic error, before any
+/// WAL work. Compiled in always (doc-hidden) so pg-engine integration tests
+/// can arm it without feature plumbing; production never sets it.
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    thread_local! {
+        static COMMIT_TXN_FORCE_FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    /// Arm/disarm the hook for the current thread, with a process-global
+    /// claim so two tests can't arm it concurrently.
+    pub fn set_commit_txn_force_fail(on: bool) {
+        if on {
+            assert!(
+                !ARMED.swap(true, Ordering::SeqCst),
+                "commit_txn failure hook already armed by another test"
+            );
+        } else {
+            ARMED.store(false, Ordering::SeqCst);
+        }
+        COMMIT_TXN_FORCE_FAIL.with(|c| c.set(on));
+    }
+
+    pub(crate) fn commit_txn_should_fail() -> bool {
+        COMMIT_TXN_FORCE_FAIL.with(Cell::get)
+    }
+}
+
 use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -396,6 +429,14 @@ impl TxnManager {
         // caller — engine auto-commit, explicit TxnHandle, or direct
         // `txn_manager()` access — is covered by construction.
         let _barrier = self.commit_barrier.read();
+        // Test-only failure injection (F7 regression): fail before any WAL
+        // work, simulating a WAL-fatal commit.
+        if test_hooks::commit_txn_should_fail() {
+            return Err(pg_storage::error::StorageError::WalWriteFailed(format!(
+                "injected commit failure for xid {}",
+                xid.0
+            )));
+        }
         // 1. Append the commit record.
         let lsn = self.wal.append(WalRecord::txn_commit(xid)?)?;
         // 2. fsync it — the commit becomes durable here.
