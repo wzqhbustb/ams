@@ -588,12 +588,20 @@ fn readers_during_compaction_see_no_half_compacted_page() {
     // slotted-page invariants. Its verdict comes back through the channel.
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
+    // Start gate: the reader signals after its FIRST completed read pass, and
+    // the main thread only reclaims after receiving it. Without this gate a
+    // release-build reclaim of a 4-tuple page can finish before the reader is
+    // ever scheduled, `stop` is already set when the loop first runs, and the
+    // `reads > 0` assertion flakes on a zero-iteration pass (observed: solo
+    // release 10 runs, 4 failures — test-design defect, not a product bug).
+    let (started_tx, started_rx) = mpsc::channel();
     let reader = {
         let pool = Arc::clone(fx.engine.buffer_pool());
         let stop = Arc::clone(&stop);
         let kill_slots = kill_slots.clone();
         thread::spawn(move || {
             let mut reads = 0u64;
+            let mut started_tx = Some(started_tx);
             while !stop.load(Ordering::Relaxed) {
                 let guard = pool.pin(page_id).unwrap();
                 let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
@@ -610,12 +618,19 @@ fn readers_during_compaction_see_no_half_compacted_page() {
                 pg_am_heap::slotted_page::debug_assert_invariants(page);
                 drop(guard);
                 reads += 1;
+                if let Some(started) = started_tx.take() {
+                    let _ = started.send(());
+                }
             }
             let _ = tx.send(Ok(reads));
         })
     };
 
-    // Reclaim on the main thread while the reader spins on the same page.
+    // Wait (watchdog-guarded) for the reader's first completed pass, THEN
+    // reclaim on the main thread while the reader spins on the same page.
+    started_rx
+        .recv_timeout(WATCHDOG)
+        .unwrap_or_else(|e| panic!("reader never completed a first read after {WATCHDOG:?}: {e}"));
     fx.heap.reclaim(fx.rel(), &fx.dead()).unwrap();
     stop.store(true, Ordering::Relaxed);
 
