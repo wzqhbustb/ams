@@ -342,7 +342,7 @@ fn drive_back_door_txns(engine: &Engine) -> Vec<(TxnId, TxnState)> {
     for (id, commit) in [(9_000_001, true), (9_000_002, false)] {
         let xid = engine.txn_manager().begin_txn();
         let mut snap = Snapshot::everything();
-        snap.current_xid = xid;
+        snap.set_current_xid(xid);
         let tuple = encode_tuple(
             TupleHeader::new(
                 TxnId::INVALID,
@@ -587,6 +587,11 @@ fn m2a_crash_rounds() {
         }
         child.kill().expect("failed to kill crash child");
         child.wait().expect("failed to reap crash child");
+
+        // M3 Stage E F1: the SIGKILLed child left its `{data_dir}/lock`
+        // file behind; the harness plays the documented operator action
+        // for crash residue (remove the stale lock) before reopening.
+        let _ = std::fs::remove_file(data_dir.join("lock"));
 
         verify_round(round, &data_dir);
     }

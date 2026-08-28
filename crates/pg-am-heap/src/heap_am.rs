@@ -45,7 +45,7 @@
 //! # `t_xmin` stamping (Stage K, coding-plan Stage K row 3)
 //!
 //! `insert` / `update` overwrite the tuple header's fixed `t_xmin` field
-//! (offset 0..8, §三) with `snapshot.current_xid` before the tuple bytes
+//! (offset 0..8, §三) with `snapshot.current_xid()` before the tuple bytes
 //! reach the WAL record or the page. This is the one sanctioned exception to
 //! "the AM treats tuples as opaque bytes" — it touches only the fixed header
 //! field, never column data — and it closes the Stage J P2 #2 hole where a
@@ -58,10 +58,14 @@
 //! Delete is *logical*: it stamps `t_xmax` on the tuple header and leaves the
 //! line pointer `Normal`. It never calls [`SlottedPage::delete_tuple`] (which
 //! recycles the slot as `Unused`), because MVCC still needs the physical row
-//! and recycling would break TID stability. A consequence is that
-//! [`SlottedPage::add_tuple`] always *appends* on a heap page (no `Unused` slot
-//! to recycle), so the slot it returns is deterministically `slot_count`. Redo
-//! relies on this to reproduce identical slots without a slot-addressed writer.
+//! and recycling would break TID stability. `Unused` slots appear only when
+//! vacuum's [`SlottedPage::compact`] (M3 Stage B) kills dead tuples, so
+//! first-fit recycling IS reachable on the online paths. Slot assignment is
+//! therefore explicit (M3 tech-selection §4.6): every online writer picks the
+//! slot with [`SlottedPage::first_fit_slot`] (falling back to `slot_count`),
+//! carries it in the WAL record, and places the tuple with
+//! [`SlottedPage::add_tuple_at`]; redo places at the recorded slot directly.
+//! Slot allocation is a WAL-carried fact, not an online-vs-redo coincidence.
 //!
 //! # Row-lock `t_xmax` protocol (M2c Stage P, tech-selection §9.1)
 //!
@@ -120,13 +124,15 @@
 //! The registry is as transient as the stamps themselves — consistent with
 //! locks being WAL-less.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use pg_storage::buffer_pool::{BufferPool, PageGuardMut};
 use pg_storage::clog::{ClogAccessor, TxnState};
 use pg_storage::page::{page_pd_lsn, set_page_pd_lsn, PAGE_HEADER_SIZE};
+use pg_storage::page_allocator::PageAllocator;
 use pg_storage::recovery::RedoHandler;
+use pg_storage::sync::Mutex as StorageMutex;
 use pg_storage::types::{Lsn, Oid, PageId, Tid, TxnId, PAGE_SIZE};
 use pg_storage::wal::record::WalRecord;
 use pg_storage::wal::WalWriter;
@@ -139,10 +145,10 @@ use crate::access_method::{
 };
 use crate::error::{HeapError, Result};
 use crate::line_pointer::{LpFlags, LINE_POINTER_SIZE};
-use crate::redo::{HeapDeleteHandler, HeapInsertHandler, HeapUpdateHandler};
+use crate::redo::heap_redo_handlers;
 use crate::slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
 use crate::tuple::{
-    decode_tuple, TupleHeader, HEAP_HOT_UPDATED, HEAP_ONLY_TUPLE, HEAP_UPDATED,
+    decode_tuple, Datum, TupleHeader, HEAP_HOT_UPDATED, HEAP_ONLY_TUPLE, HEAP_UPDATED,
     HEAP_XMAX_IS_SHARE, HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE,
 };
 
@@ -184,6 +190,14 @@ pub struct HeapAM {
     /// a holder's transaction end does not remove it, the next gate pass on
     /// that tuple does.
     share_locks: Mutex<HashMap<(PageId, u16), std::collections::BTreeSet<TxnId>>>,
+    /// Page allocator handle for vacuum's page release (M3 Stage C),
+    /// installed by the engine via [`Self::set_page_allocator`]. `reclaim`
+    /// needs it only when a compacted page turns fully empty and is returned
+    /// to the allocator (`free_page`); compaction alone does not touch it.
+    /// The lock type is pg-storage's aliased `Mutex` (the crate-boundary
+    /// rule in `pg_storage::sync`): the exact `Arc<Mutex<PageAllocator>>`
+    /// the engine hands out.
+    page_allocator: Option<Arc<StorageMutex<PageAllocator>>>,
 }
 
 impl HeapAM {
@@ -196,6 +210,7 @@ impl HeapAM {
             extend_lock: Mutex::new(()),
             row_waiter: None,
             share_locks: Mutex::new(HashMap::new()),
+            page_allocator: None,
         }
     }
 
@@ -205,6 +220,12 @@ impl HeapAM {
     /// concurrent use.
     pub fn set_row_waiter(&mut self, waiter: Arc<dyn RowWaiter>) {
         self.row_waiter = Some(waiter);
+    }
+
+    /// Install the page allocator used by vacuum page release (M3 Stage C).
+    /// Same install-once-before-sharing shape as [`Self::set_row_waiter`].
+    pub fn set_page_allocator(&mut self, allocator: Arc<StorageMutex<PageAllocator>>) {
+        self.page_allocator = Some(allocator);
     }
 
     /// Allocate and initialize a relation's first heap page, tracking it as a
@@ -327,6 +348,288 @@ impl HeapAM {
             .lock()
             .expect("heap page map poisoned")
             .remove(&rel_oid);
+    }
+
+    /// Remove `page_id` from the cached page list of `rel_oid` (single-page
+    /// granularity, M3 Stage C). After vacuum unlinks an empty page from the
+    /// on-disk chain, the in-memory cache must forget it in the same breath:
+    /// otherwise `acquire_page_with_room` can still pick the stale entry and
+    /// insert new rows into a page no longer reachable from the chain —
+    /// physically consistent rows that are logically unreachable.
+    fn evict_page(&self, rel_oid: Oid, page_id: PageId) {
+        if let Some(list) = self
+            .pages
+            .lock()
+            .expect("heap page map poisoned")
+            .get_mut(&rel_oid)
+        {
+            list.retain(|&p| p != page_id);
+        }
+    }
+
+    /// The ONE online compaction template (M3 Stage C, tech-selection
+    /// §4.5): kill `dead_slots` on `page_id` via the shared
+    /// [`SlottedPage::compact`] primitive under a `HeapCleanup` WAL record,
+    /// optionally splicing the page out of the chain (`unlink_prev_page` /
+    /// `unlink_next_page`, both `PageId::INVALID` for compaction only).
+    /// Returns the record's LSN. Vacuum's `reclaim` and the Stage B/C crash
+    /// tests both go through here — the ordering below must exist in exactly
+    /// this one place.
+    ///
+    /// ORDERING (load-bearing, review F1): pin for write FIRST — `pin_mut`
+    /// may emit the per-checkpoint-cycle FPI of the PRE-compact image, and
+    /// the `HeapCleanup` record must sort after it in the WAL, or recovery's
+    /// unconditional FPI replay rolls the page back past the compact and the
+    /// next slot-addressed redo hard-fails on an occupied slot. Then append
+    /// the record, run `compact()`, stamp `pd_lsn` — all under the page's
+    /// write latch (WAL-before-data: no flush can slip between mutation and
+    /// stamp).
+    ///
+    /// The chain unlink (relink the predecessor's `next_page` past the
+    /// spliced page) rides in the SAME record and is applied to the
+    /// predecessor under its own latch, guarded by the predecessor's own
+    /// `pd_lsn` on the redo side — the two pages may reach disk at different
+    /// times before a crash (same policy as a cross-page `HeapUpdate`).
+    ///
+    /// The predecessor is pinned BEFORE the record is appended (post-Stage-C
+    /// review R2): its `pin_mut` may emit the per-checkpoint-cycle FPI of the
+    /// PRE-unlink image (vacuum reclaiming cold, disk-resident pages is the
+    /// typical workload), and that FPI must also sort before the
+    /// `HeapCleanup` record. The reverse order lets the FPI take a larger
+    /// LSN; recovery replays FPIs unconditionally, so it would roll the
+    /// predecessor back past the relink while the `PageFree` for the spliced
+    /// page still replays — the chain then points at a page the allocator
+    /// can rehand to another relation: structural corruption. Holding both
+    /// write latches at once is deadlock-free here: vacuum runs under the
+    /// caller's `AccessExclusive` table lock (no concurrent writers; the
+    /// lock-free readers only block on the latch), and redo is
+    /// single-threaded — no AB/BA pairing exists.
+    ///
+    /// Vacuum is not transactional: the record carries `txn_id = INVALID`
+    /// (`WalRecord::heap_cleanup`), so replay never depends on a transaction
+    /// outcome and the analysis phase never puts the page in an ATT.
+    pub fn compact_page(
+        &self,
+        page_id: PageId,
+        dead_slots: &[u16],
+        unlink_prev_page: PageId,
+        unlink_next_page: PageId,
+    ) -> Result<Lsn> {
+        // Predecessor FIRST (R2, see the fn docs): its pre-unlink FPI must
+        // reach the WAL before the HeapCleanup record.
+        let mut prev_guard = if unlink_prev_page != PageId::INVALID {
+            debug_assert!(
+                unlink_prev_page != page_id,
+                "a page is never its own chain predecessor"
+            );
+            Some(self.buffer_pool.pin_mut(unlink_prev_page)?)
+        } else {
+            None
+        };
+        let mut guard = self.buffer_pool.pin_mut(page_id)?;
+        // The constructor hard-validates the ascending kill list BEFORE the
+        // record can reach the WAL (F3): a poison record would brick every
+        // subsequent recovery.
+        let rec = WalRecord::heap_cleanup(
+            page_id,
+            dead_slots.to_vec(),
+            unlink_prev_page,
+            unlink_next_page,
+        )?;
+        let lsn = self.wal_writer.append(rec)?;
+        {
+            let page = as_page_mut(&mut guard);
+            SlottedPage::compact(page, dead_slots)?;
+            stamp_pd_lsn(page, lsn);
+        }
+        drop(guard);
+
+        if let Some(prev_guard) = prev_guard.as_mut() {
+            let prev = as_page_mut(prev_guard);
+            let next = if unlink_next_page == PageId::INVALID {
+                None
+            } else {
+                Some(unlink_next_page)
+            };
+            SlottedPage::set_next_page(prev, next)?;
+            stamp_pd_lsn(prev, lsn);
+        }
+        Ok(lsn)
+    }
+
+    /// Group a dead-tuple list (from `scan_dead_tuples`) by HOT chain and
+    /// split it into reclaimable vs retained (M3 Stage C, §4.2/§4.4). This
+    /// is the SINGLE implementation of chain grouping: both
+    /// `collect_index_keys` (its `index_keys`) and `reclaim` (its `kills`)
+    /// consume this one's output, so the read-only and the physical half of
+    /// vacuum can never disagree about which slots die.
+    ///
+    /// Deadness itself is NOT re-judged here — membership in the caller's
+    /// `dead` set IS the per-member verdict (`scan_dead_tuples` already
+    /// applied the horizon rules: aborted `t_xmin` → dead; committed,
+    /// non-LOCK_ONLY `t_xmax < horizon` → dead). What this helper decides is
+    /// purely structural: a chain is FULLY dead only when every member
+    /// reachable from its root via `t_ctid` is in the dead set.
+    ///
+    /// - Standalone dead tuple (no chain): reclaimable; index key = itself.
+    /// - Fully-dead chain: EVERY member slot is killable; the index key is
+    ///   the chain ROOT's (tid, decoded column values) — the root owns the
+    ///   chain's index entries (Stage S; `HEAP_ONLY_TUPLE` members never got
+    ///   entries of their own).
+    /// - Partially-dead chain: contributes NOTHING — no prune, no redirect
+    ///   (§4.2: LP redirection is an on-disk format change, out of scope);
+    ///   its dead members stay in place.
+    fn classify_dead_tuples(
+        &self,
+        rel: &RelationDesc<'_>,
+        dead: &[Tid],
+    ) -> Result<DeadClassification> {
+        let dead_set: HashSet<Tid> = dead.iter().copied().collect();
+        // Group the input by page so each page is pinned exactly once.
+        let mut by_page: BTreeMap<PageId, Vec<u16>> = BTreeMap::new();
+        for tid in dead {
+            by_page.entry(tid.page_id).or_default().push(tid.slot_id);
+        }
+
+        let mut out = DeadClassification {
+            index_keys: Vec::new(),
+            kills: BTreeMap::new(),
+        };
+        for (page_id, mut dead_slots) in by_page {
+            dead_slots.sort_unstable();
+            let guard = self.buffer_pool.pin(page_id)?;
+            let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+            // A fresh (never-initialized) page holds no tuples at all.
+            if SlottedPage::header(page).pd_upper == 0 {
+                continue;
+            }
+            let slot_count = SlottedPage::slot_count(page) as u16;
+
+            // Read every slot's header once (headers only — the full decode
+            // happens for chain roots selected below).
+            let mut headers: Vec<Option<TupleHeader>> = Vec::with_capacity(slot_count as usize);
+            for slot in 0..slot_count {
+                let header = match SlottedPage::tuple(page, slot)? {
+                    Some(bytes) => match TupleHeader::read_from(bytes) {
+                        Ok(h) => Some(h),
+                        // Mirror scan_dead_tuples: an undecodable tuple must
+                        // not abort the pass. The slot is treated as
+                        // non-killable — the SAFE direction (leak, never
+                        // corrupt) — and any chain containing it can no
+                        // longer be confirmed fully dead.
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                %page_id,
+                                slot,
+                                "vacuum classify: skipping undecodable tuple"
+                            );
+                            None
+                        }
+                    },
+                    // Non-Normal LP (already Unused/Dead): dead space, not a
+                    // kill candidate — `compact()` hard-errors on killing an
+                    // Unused slot, so such input must never reach the list.
+                    None => None,
+                };
+                headers.push(header);
+            }
+
+            let mut visited: HashSet<u16> = HashSet::new();
+            for &slot in &dead_slots {
+                if slot >= slot_count || !visited.insert(slot) {
+                    continue;
+                }
+                if headers[slot as usize].is_none() {
+                    continue;
+                }
+                let tid = Tid {
+                    page_id,
+                    slot_id: slot,
+                };
+                // Chain root: a non-HEAP_ONLY tuple is its own root; a
+                // HEAP_ONLY member walks the page's t_ctid links backwards
+                // (chains never leave their page; the pin above is exactly
+                // the pin hot_chain_root requires).
+                let root = if headers[slot as usize].expect("checked above").t_infomask2
+                    & HEAP_ONLY_TUPLE
+                    != 0
+                {
+                    hot_chain_root(page, page_id, tid)?
+                } else {
+                    tid
+                };
+
+                // Walk FORWARD from the root, collecting the whole chain.
+                // Same termination contract as follow_hot_chain: a
+                // well-formed chain ends (self-t_ctid, no HOT_UPDATED bit,
+                // or an off-page/undecodable link) within slot_count hops;
+                // exhausting the bound means a cycle — corruption, loudly.
+                let mut chain: Vec<Tid> = Vec::new();
+                let mut cur = root;
+                let mut terminated = false;
+                for _ in 0..slot_count {
+                    chain.push(cur);
+                    if cur.slot_id >= slot_count {
+                        terminated = true;
+                        break;
+                    }
+                    match &headers[cur.slot_id as usize] {
+                        Some(h)
+                            if h.t_infomask2 & HEAP_HOT_UPDATED != 0
+                                && h.t_ctid != cur
+                                && h.t_ctid.page_id == page_id =>
+                        {
+                            cur = h.t_ctid;
+                        }
+                        _ => {
+                            terminated = true;
+                            break;
+                        }
+                    }
+                }
+                if !terminated {
+                    return Err(HeapError::Corrupted(format!(
+                        "HOT chain on page {page_id} exceeds {slot_count} hops (cycle?)"
+                    )));
+                }
+                for t in &chain {
+                    visited.insert(t.slot_id);
+                }
+
+                // FULLY dead iff every chain member is in the dead set and
+                // decodable. Partially-dead chains fall through untouched.
+                let fully_dead = chain
+                    .iter()
+                    .all(|t| t.slot_id < slot_count && headers[t.slot_id as usize].is_some())
+                    && chain.iter().all(|t| dead_set.contains(t));
+                if !fully_dead {
+                    continue;
+                }
+
+                // Index key: the chain ROOT's (for a standalone tuple the
+                // root IS the tuple). Decode from the tuple bytes via the
+                // same path Engine::delete_inner uses (read tuple +
+                // decode_tuple over the relation schema); NULL columns stay
+                // None in the vector — the engine skips them when building
+                // keys, its existing convention.
+                let root_bytes = SlottedPage::tuple(page, root.slot_id)?
+                    .expect("fully-dead chain root passed the decodable check");
+                let (_, values) = decode_tuple(root_bytes, rel.columns)?;
+                out.index_keys.push((root, values));
+
+                let kills = out.kills.entry(page_id).or_default();
+                for t in &chain {
+                    kills.push(t.slot_id);
+                }
+            }
+            // compact()'s WAL payload contract: strictly ascending kill list.
+            if let Some(kills) = out.kills.get_mut(&page_id) {
+                kills.sort_unstable();
+                kills.dedup();
+            }
+        }
+        Ok(out)
     }
 
     /// Reject tuples that are empty or can never fit on a page, matching
@@ -467,7 +770,7 @@ impl HeapAM {
             let mut tail_guard = self.buffer_pool.pin_mut(tail)?;
             let page = as_page_mut(&mut tail_guard);
             SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
-            SlottedPage::set_next_page(page, Some(new_page_id));
+            SlottedPage::set_next_page(page, Some(new_page_id))?;
             let image = page.to_vec();
             let lsn = self
                 .wal_writer
@@ -542,7 +845,7 @@ impl HeapAM {
     /// `tid`'s slot (under the page write latch the caller holds) and decide
     /// whether the caller may stamp the tuple.
     ///
-    /// `self_xid` is the writer's own XID (`snapshot.current_xid`) — the
+    /// `self_xid` is the writer's own XID (`snapshot.current_xid()`) — the
     /// row-lock identity. A `t_xmax` naming `self_xid` is a self-conflict:
     /// the caller already locked/deleted/updated this row version inside its
     /// own transaction and simply proceeds (never waits on itself).
@@ -697,13 +1000,15 @@ impl HeapAM {
                     //   set, so observing not-active orders us after the
                     //   terminal write — re-reading the CLOG now yields the
                     //   terminal state, which the match below handles.
-                    // - The stamper CRASHED (post-recovery; recovery-end
-                    //   ATT abort marking is still open, §11.3): the CLOG
-                    //   re-read still says InProgress. WAL replay rebuilt
-                    //   every durable commit's bit, so this means "never
-                    //   committed" — treat the stamp as aborted (Proceed).
-                    //   Waiting would spin forever on a transaction that
-                    //   can never end.
+                    // - The stamper CRASHED: recovery undo (Stage S
+                    //   `HeapUndoHandler`) stamps every ATT member
+                    //   Aborted in the CLOG, so post-recovery this branch
+                    //   is defensive only — the re-read normally yields
+                    //   Aborted. If an InProgress stamp survives anyway,
+                    //   WAL replay has rebuilt every durable commit's
+                    //   bit, so it means "never committed" — treat it as
+                    //   aborted (Proceed). Waiting would spin forever on
+                    //   a transaction that can never end.
                     state = clog.get_state(xmax);
                 }
                 None => return Err(HeapError::TupleNotFound(tid)), // legacy mode
@@ -839,7 +1144,10 @@ impl HeapAM {
                 },
             }
         }
-        let mut map = self.share_locks.lock().expect("share lock registry poisoned");
+        let mut map = self
+            .share_locks
+            .lock()
+            .expect("share lock registry poisoned");
         if live.is_empty() {
             map.remove(&key);
         } else {
@@ -855,7 +1163,10 @@ impl HeapAM {
     /// authoritative again).
     fn note_stamp_overwrite(&self, tid: Tid, self_xid: TxnId, request: LockRequest) {
         let key = (tid.page_id, tid.slot_id);
-        let mut map = self.share_locks.lock().expect("share lock registry poisoned");
+        let mut map = self
+            .share_locks
+            .lock()
+            .expect("share lock registry poisoned");
         match request {
             LockRequest::Shared => {
                 map.insert(key, std::collections::BTreeSet::from([self_xid]));
@@ -902,28 +1213,24 @@ impl HeapAM {
             .row_waiter
             .as_ref()
             .expect("row_lock_gate only returns Wait with a waiter installed");
-        waiter
-            .wait_for(self_xid, blocking_xid)
-            .map_err(|e| {
-                // Unreachable through the gate (it never returns
-                // `Wait(self_xid)`), but a failed wait must not leak the
-                // registered edge — Stage R's deadlock detector reads the
-                // registry as the wait-for graph. (Idempotent: `wait_for`
-                // already cleared the edge on its own error paths.)
-                waiter.unregister_row_wait(self_xid);
-                match e {
-                    pg_txn::TxnError::DeadlockVictim(_) => HeapError::DeadlockVictim,
-                    other => {
-                        HeapError::InvalidArgument(format!("row-lock wait failed: {other}"))
-                    }
-                }
-            })
+        waiter.wait_for(self_xid, blocking_xid).map_err(|e| {
+            // Unreachable through the gate (it never returns
+            // `Wait(self_xid)`), but a failed wait must not leak the
+            // registered edge — Stage R's deadlock detector reads the
+            // registry as the wait-for graph. (Idempotent: `wait_for`
+            // already cleared the edge on its own error paths.)
+            waiter.unregister_row_wait(self_xid);
+            match e {
+                pg_txn::TxnError::DeadlockVictim(_) => HeapError::DeadlockVictim,
+                other => HeapError::InvalidArgument(format!("row-lock wait failed: {other}")),
+            }
+        })
     }
 
     /// Acquire the §9.1 row lock on the tuple at `tid` WITHOUT deleting it
     /// (M2c Stage P: `SELECT ... FOR UPDATE`): stamps
-    /// `t_xmax = snapshot.current_xid` with [`HEAP_XMAX_LOCK_ONLY`] set and
-    /// `t_cid = snapshot.curcid`.
+    /// `t_xmax = snapshot.current_xid()` with [`HEAP_XMAX_LOCK_ONLY`] set and
+    /// `t_cid = snapshot.curcid()`.
     ///
     /// Same 5-step protocol as delete/update: an INVALID/self/terminal
     /// stamp is (re)acquired immediately under the page write latch; a
@@ -941,13 +1248,8 @@ impl HeapAM {
     /// deleted or updated by a transaction that has since committed; in
     /// legacy no-waiter mode that condition (and any in-progress holder) is
     /// [`HeapError::TupleNotFound`] instead — see [`Self::row_lock_gate`].
-    pub fn lock_tuple(
-        &self,
-        tid: Tid,
-        snapshot: &Snapshot,
-        clog: &dyn ClogAccessor,
-    ) -> Result<()> {
-        let self_xid = snapshot.current_xid;
+    pub fn lock_tuple(&self, tid: Tid, snapshot: &Snapshot, clog: &dyn ClogAccessor) -> Result<()> {
+        let self_xid = snapshot.current_xid();
         debug_assert!(
             self_xid != TxnId::INVALID,
             "lock_tuple with INVALID current_xid would stamp a no-op lock"
@@ -971,7 +1273,7 @@ impl HeapAM {
             match gate {
                 RowLockGate::Proceed => {
                     let page = as_page_mut(&mut guard);
-                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid, false)?;
+                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid(), false)?;
                     return Ok(());
                 }
                 RowLockGate::ProceedNoStamp => {
@@ -1004,7 +1306,7 @@ impl HeapAM {
         snapshot: &Snapshot,
         clog: &dyn ClogAccessor,
     ) -> Result<()> {
-        let self_xid = snapshot.current_xid;
+        let self_xid = snapshot.current_xid();
         debug_assert!(
             self_xid != TxnId::INVALID,
             "lock_tuple_shared with INVALID current_xid would stamp a no-op lock"
@@ -1027,7 +1329,7 @@ impl HeapAM {
                     // becomes mine and the gate reset the holder registry
                     // to just me.
                     let page = as_page_mut(&mut guard);
-                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid, true)?;
+                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid(), true)?;
                     return Ok(());
                 }
                 RowLockGate::ProceedNoStamp => {
@@ -1263,25 +1565,28 @@ impl AccessMethod for HeapAM {
         // every scan forever (`is_effectively_committed` rejects INVALID on
         // sight) — a silent dead row. That is always a caller bug; catch it.
         debug_assert!(
-            snapshot.current_xid != pg_storage::types::TxnId::INVALID,
+            snapshot.current_xid() != pg_storage::types::TxnId::INVALID,
             "heap insert with INVALID current_xid produces an unreadable tuple"
         );
         // Stamp t_xmin with the writer's own XID before the bytes reach the
         // WAL record or the page (see the module docs).
-        let tuple = Self::stamp_xmin(tuple, snapshot.current_xid)?;
+        let tuple = Self::stamp_xmin(tuple, snapshot.current_xid())?;
 
         let needed = tuple.len() + LINE_POINTER_SIZE;
         let mut guard = self.acquire_page_with_room(&rel, needed, PageId::INVALID)?;
         let page_id = guard.page_id();
         let page = as_page_mut(&mut guard);
 
-        // add_tuple always appends on a heap page (no Unused slots to recycle),
-        // so the slot is known before the mutation — build the WAL record first.
-        let slot = SlottedPage::slot_count(page) as u16;
-        let rec = WalRecord::heap_insert(page_id, slot, tuple.clone(), snapshot.current_xid)?;
+        // §4.6 explicit slot addressing: choose the slot FIRST (first-fit
+        // recycling of an Unused slot, else append at slot_count), carry it
+        // in the WAL record, then place the tuple at exactly that slot. Redo
+        // replays `add_tuple_at(rec.slot_id)` and no longer depends on
+        // `add_tuple` reproducing the online writer's choice.
+        let slot =
+            SlottedPage::first_fit_slot(page).unwrap_or(SlottedPage::slot_count(page) as u16);
+        let rec = WalRecord::heap_insert(page_id, slot, tuple.clone(), snapshot.current_xid())?;
         let lsn = self.wal_writer.append(rec)?;
-        let actual = SlottedPage::add_tuple(page, &tuple)?;
-        debug_assert_eq!(actual, slot, "heap slot prediction diverged from add_tuple");
+        SlottedPage::add_tuple_at(page, slot, &tuple)?;
         stamp_pd_lsn(page, lsn);
 
         if let Some(out) = out_tid {
@@ -1327,9 +1632,7 @@ impl AccessMethod for HeapAM {
                     clog,
                 ) {
                     out.push((self_tid, values));
-                } else if header.t_infomask2 & HEAP_HOT_UPDATED != 0
-                    && header.t_ctid != self_tid
-                {
+                } else if header.t_infomask2 & HEAP_HOT_UPDATED != 0 && header.t_ctid != self_tid {
                     // HOT chain: old version is invisible but t_ctid may
                     // point to a newer version visible to this snapshot.
                     // The walk reads the page pinned above (HOT chains never
@@ -1353,7 +1656,7 @@ impl AccessMethod for HeapAM {
 
     fn delete(&self, ctx: DeleteContext<'_>) -> Result<()> {
         let tid = ctx.tid;
-        let xmax = ctx.snapshot.current_xid;
+        let xmax = ctx.snapshot.current_xid();
 
         // §9.1 restart loop: each iteration re-pins the page and re-runs the
         // gate from step 1; only a `Proceed` verdict falls through to the
@@ -1392,18 +1695,18 @@ impl AccessMethod for HeapAM {
             // recovery to choke on.
             let rec = WalRecord::heap_delete(tid, xmax, xmax)?;
             let lsn = self.wal_writer.append(rec)?;
-            Self::stamp_deleted(page, tid, xmax, ctx.snapshot.curcid, false)?;
+            Self::stamp_deleted(page, tid, xmax, ctx.snapshot.curcid(), false)?;
             stamp_pd_lsn(page, lsn);
             return Ok(());
         }
     }
 
     fn redo_handlers(&self) -> Vec<Box<dyn RedoHandler>> {
-        vec![
-            Box::new(HeapInsertHandler),
-            Box::new(HeapUpdateHandler),
-            Box::new(HeapDeleteHandler),
-        ]
+        // Single source of truth (F4): the trait method delegates to the
+        // canonical constructor so the two can never drift apart again (this
+        // body previously lagged by two handlers — HeapHotUpdate and
+        // HeapCleanup).
+        heap_redo_handlers()
     }
 }
 
@@ -1419,7 +1722,7 @@ impl UpdatableAM for HeapAM {
             hot_eligible,
         } = ctx;
         Self::validate_tuple_len(new_tuple)?;
-        let xmax = snapshot.current_xid;
+        let xmax = snapshot.current_xid();
         // Stamp the new version's t_xmin with the writer's own XID (module
         // docs); t_xmax of the old version is stamped by `stamp_deleted`.
         let new_tuple = Self::stamp_xmin(new_tuple, xmax)?;
@@ -1440,8 +1743,9 @@ impl UpdatableAM for HeapAM {
             );
             // Fast path: pin the old page, run the gate, and check whether
             // the new version fits alongside it (single latch, single page).
-            // Stamping the old tuple does not change slot_count, so the new
-            // slot is `slot_count` and add_tuple appends there.
+            // Slot selection is explicit (§4.6): stamping the old tuple is a
+            // logical delete (LP stays Normal), so first-fit is unaffected by
+            // the stamp and the chosen slot stays valid through placement.
             let mut old_guard = self.buffer_pool.pin_mut(old_tid.page_id)?;
             let gate = {
                 let old_page = as_page_mut(&mut old_guard);
@@ -1464,7 +1768,10 @@ impl UpdatableAM for HeapAM {
             if old_has_room {
                 let page_id = old_guard.page_id();
                 let old_page = as_page_mut(&mut old_guard);
-                let new_slot = SlottedPage::slot_count(old_page) as u16;
+                // §4.6: pick the slot BEFORE writing WAL — first-fit recycles
+                // an Unused slot left by compact(), else append at slot_count.
+                let new_slot = SlottedPage::first_fit_slot(old_page)
+                    .unwrap_or(SlottedPage::slot_count(old_page) as u16);
                 let new_tid = Tid {
                     page_id,
                     slot_id: new_slot,
@@ -1480,23 +1787,15 @@ impl UpdatableAM for HeapAM {
                         xmax,
                     )?;
                     let lsn = self.wal_writer.append(rec)?;
-                    Self::stamp_hot_update(
-                        old_page,
-                        old_tid,
-                        xmax,
-                        snapshot.curcid,
-                        new_tid,
-                    )?;
-                    let actual = SlottedPage::add_tuple(old_page, &hot_tuple)?;
-                    debug_assert_eq!(actual, new_slot);
+                    Self::stamp_hot_update(old_page, old_tid, xmax, snapshot.curcid(), new_tid)?;
+                    SlottedPage::add_tuple_at(old_page, new_slot, &hot_tuple)?;
                     stamp_pd_lsn(old_page, lsn);
                 } else {
                     let rec =
                         WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.clone(), xmax)?;
                     let lsn = self.wal_writer.append(rec)?;
-                    Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
-                    let actual = SlottedPage::add_tuple(old_page, &new_tuple)?;
-                    debug_assert_eq!(actual, new_slot);
+                    Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid(), true)?;
+                    SlottedPage::add_tuple_at(old_page, new_slot, &new_tuple)?;
                     stamp_pd_lsn(old_page, lsn);
                 }
                 if let Some(out) = out_tid {
@@ -1571,12 +1870,16 @@ impl UpdatableAM for HeapAM {
                 "writer gates never coalesce with share holders"
             );
 
-            // The new slot is computed only now, under the final latching:
-            // in the re-ordered acquisition above the new page may have been
-            // dropped and re-pinned, so any earlier slot prediction is stale.
+            // The new slot is chosen only now, under the final latching
+            // (§4.6 explicit addressing): in the re-ordered acquisition above
+            // the new page may have been dropped and re-pinned, so any
+            // earlier slot choice is stale. First-fit recycles an Unused slot
+            // left by compact() — acquire_page_with_room reverse-scans from
+            // the tail, so a compacted middle page is a valid update target.
             let new_slot = {
                 let new_page = as_page_mut(&mut new_guard);
-                SlottedPage::slot_count(new_page) as u16
+                SlottedPage::first_fit_slot(new_page)
+                    .unwrap_or(SlottedPage::slot_count(new_page) as u16)
             };
             let new_tid = Tid {
                 page_id: new_page_id,
@@ -1588,13 +1891,12 @@ impl UpdatableAM for HeapAM {
 
             {
                 let old_page = as_page_mut(&mut old_guard);
-                Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
+                Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid(), true)?;
                 stamp_pd_lsn(old_page, lsn);
             }
             {
                 let new_page = as_page_mut(&mut new_guard);
-                let actual = SlottedPage::add_tuple(new_page, &new_tuple)?;
-                debug_assert_eq!(actual, new_slot);
+                SlottedPage::add_tuple_at(new_page, new_slot, &new_tuple)?;
                 stamp_pd_lsn(new_page, lsn);
             }
 
@@ -1606,6 +1908,20 @@ impl UpdatableAM for HeapAM {
     }
 }
 
+/// The output of [`HeapAM::classify_dead_tuples`] (M3 Stage C): the dead
+/// list grouped by HOT chain and split into the reclaimable part.
+struct DeadClassification {
+    /// Index-cleanup items `(tid, decoded column values)`: standalone dead
+    /// tuples as themselves; fully-dead HOT chains as their ROOT (the root
+    /// owns the chain's index entries). Consumed by `collect_index_keys`.
+    index_keys: Vec<(Tid, Vec<Option<Datum>>)>,
+    /// Physical kill list, page → ascending slot ids: standalone dead tuples
+    /// plus EVERY member slot of each fully-dead chain. Consumed by
+    /// `reclaim`. Deterministic page order (BTreeMap) so multi-page vacuums
+    /// append their `HeapCleanup` records in a stable order.
+    kills: BTreeMap<PageId, Vec<u16>>,
+}
+
 impl Vacuumable for HeapAM {
     /// Scan `rel` for dead tuples.
     ///
@@ -1615,11 +1931,12 @@ impl Vacuumable for HeapAM {
     /// relies on (pg-storage `analysis` module docs) holds ONLY for
     /// visibility, not for reclamation: a tuple inserted by a crashed
     /// transaction has `t_xmin` whose CLOG entry reads `InProgress` (no
-    /// terminal record exists), so case 1 below does NOT collect it. Such
-    /// orphan tuples are reclaimed only once the crashed XIDs are
-    /// explicitly stamped ABORTED — recovery-end ATT marking is M2c work
-    /// (and vacuum/autovacuum M3); until then they are dead weight but
-    /// never visible.
+    /// terminal record exists), so case 1 below would NOT collect it until
+    /// the crashed XID is explicitly stamped ABORTED. That stamping is
+    /// exactly what Stage S's `HeapUndoHandler` does during recovery undo
+    /// (crates/pg-am-heap/src/undo.rs: every ATT member is marked Aborted
+    /// in the CLOG), so by the time vacuum runs post-recovery, crashed
+    /// inserters read Aborted and case 1 collects their orphans.
     fn scan_dead_tuples(
         &self,
         rel: RelationDesc<'_>,
@@ -1693,6 +2010,133 @@ impl Vacuumable for HeapAM {
             }
         }
         Ok(dead)
+    }
+
+    /// M3 Stage C (READ-ONLY): the `(tid, column values)` pairs whose index
+    /// entries need cleanup — standalone dead tuples as themselves,
+    /// fully-dead HOT chains as their root, partially-dead chains not at
+    /// all. See the trait docs and `HeapAM::classify_dead_tuples`. Runs
+    /// entirely under read pins; MUST be called before `reclaim` (§4.1 stage
+    /// 2: after compaction the keys are unreadable).
+    fn collect_index_keys(
+        &self,
+        rel: RelationDesc<'_>,
+        dead: &[Tid],
+    ) -> Result<Vec<(Tid, Vec<Option<Datum>>)>> {
+        Ok(self.classify_dead_tuples(&rel, dead)?.index_keys)
+    }
+
+    /// M3 Stage C (PURELY PHYSICAL): kill the reclaimable slots of `dead`
+    /// via `compact()` under `HeapCleanup` WAL records; unlink pages that
+    /// become fully empty (the unlink rides in the same record) and return
+    /// them to the allocator (`free_page` / `PageFree`).
+    ///
+    /// The kill set is RE-DERIVED from `dead` by the same grouping helper
+    /// `collect_index_keys` uses, so passing the raw `scan_dead_tuples`
+    /// output is safe: members of partially-dead chains in the input are
+    /// left untouched (§4.2), keeping the `compact()` kill-list contract
+    /// (never kill a member still referenced by a predecessor's `t_ctid`,
+    /// never kill a chain root while any member lives) structural rather
+    /// than caller-discipline.
+    ///
+    /// ORDER IS IRREVERSIBLE for empty pages: unlink (inside the
+    /// `HeapCleanup` record) THEN `free_page` (PageFree). The reverse —
+    /// free-then-unlink — can leave the page on BOTH the chain and the
+    /// freelist after a crash in the window between the two records; once
+    /// the allocator rehands the page and a writer fills it, the chain
+    /// walks into live tuples of another owner: structural corruption. This
+    /// order's worst case is a single-page leak (unlinked but never freed,
+    /// crash window ② of §12.1), the accepted trade-off.
+    fn reclaim(&self, rel: RelationDesc<'_>, dead: &[Tid]) -> Result<()> {
+        let classification = self.classify_dead_tuples(&rel, dead)?;
+        if classification.kills.is_empty() {
+            return Ok(());
+        }
+        // Chain-order snapshot of the relation's pages: the predecessor of a
+        // spliced page is its left neighbor here.
+        let chain_pages = self.relation_pages(&rel)?;
+        // Pages already spliced out THIS pass. When several chain-adjacent
+        // pages all become empty, each unlink must relink the nearest
+        // STILL-CHAINED predecessor — never a page already removed (relinking
+        // a removed page would leave the live chain pointing at the page now
+        // being freed: structural corruption once the allocator rehands it).
+        let mut removed: HashSet<PageId> = HashSet::new();
+
+        for (page_id, kills) in &classification.kills {
+            // Under a read pin: does killing `kills` empty the page (every
+            // non-Unused slot is on the list), and who is the current
+            // successor (the relink target)?
+            let (becomes_empty, next_page) = {
+                let guard = self.buffer_pool.pin(*page_id)?;
+                let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+                let slot_count = SlottedPage::slot_count(page) as u16;
+                let mut live = 0usize;
+                for slot in 0..slot_count {
+                    if SlottedPage::line_pointer(page, slot)?.flags() != LpFlags::Unused {
+                        live += 1;
+                    }
+                }
+                (live == kills.len(), SlottedPage::next_page(page)?)
+            };
+
+            // The chain HEAD is never unlinked or freed, even when empty: it
+            // is the relation's anchor (`RelationDesc::first_page` is what
+            // the catalog and `seed_from_chain` start from). An empty head
+            // stays as the head of a one-page chain and is simply compacted.
+            if becomes_empty && *page_id != rel.first_page {
+                let pos = chain_pages
+                    .iter()
+                    .position(|p| p == page_id)
+                    .ok_or_else(|| {
+                        HeapError::Corrupted(format!(
+                            "page {page_id} of rel {} missing from the chain-order page cache",
+                            rel.rel_oid
+                        ))
+                    })?;
+                // Nearest still-chained left neighbor (see `removed` above).
+                // The head is never removed, so the scan always terminates.
+                let prev = chain_pages[..pos]
+                    .iter()
+                    .rev()
+                    .find(|p| !removed.contains(p))
+                    .copied()
+                    .ok_or_else(|| {
+                        HeapError::Corrupted(format!(
+                            "page {page_id} of rel {} has no live predecessor in the chain",
+                            rel.rel_oid
+                        ))
+                    })?;
+                let unlink_next = next_page.unwrap_or(PageId::INVALID);
+                // Resolve the allocator BEFORE any page modification: a
+                // missing allocator is a configuration error knowable without
+                // touching the page. Failing AFTER the compact instead would
+                // leave the release half-applied — the page compacted and
+                // unlinked but neither cache-evicted nor freed (a stale cache
+                // entry could still route inserts into it) — and a caller
+                // retry cannot cleanly resume from that state: the killed
+                // slots are already Unused, so re-classification finds
+                // nothing to kill and never re-enters the unlink/free branch.
+                // Checking upfront keeps the error atomic (nothing touched).
+                let allocator = self.page_allocator.as_ref().ok_or_else(|| {
+                    HeapError::InvalidArgument(
+                        "reclaim: page release requires a page allocator \
+                         (HeapAM::set_page_allocator)"
+                            .to_string(),
+                    )
+                })?;
+                self.compact_page(*page_id, kills, prev, unlink_next)?;
+                // Evict BEFORE freeing: while the stale cache entry lives,
+                // `acquire_page_with_room` could route a new insert into the
+                // unlinked page (logically unreachable row). And freeing
+                // must come AFTER the unlink record — see the fn docs.
+                removed.insert(*page_id);
+                self.evict_page(rel.rel_oid, *page_id);
+                allocator.lock().free_page(*page_id)?;
+            } else {
+                self.compact_page(*page_id, kills, PageId::INVALID, PageId::INVALID)?;
+            }
+        }
+        Ok(())
     }
 }
 

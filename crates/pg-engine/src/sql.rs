@@ -806,8 +806,8 @@ mod tests {
 
     #[test]
     fn parse_select_where_order_limit() {
-        let stmt = parse("SELECT id, name FROM users WHERE id > 10 ORDER BY name DESC LIMIT 5")
-            .unwrap();
+        let stmt =
+            parse("SELECT id, name FROM users WHERE id > 10 ORDER BY name DESC LIMIT 5").unwrap();
         match stmt {
             Statement::Select {
                 columns,
@@ -921,7 +921,9 @@ mod tests {
     fn parse_negative_int() {
         let stmt = parse("SELECT * FROM t WHERE v < -5").unwrap();
         match stmt {
-            Statement::Select { filter: Some(f), .. } => {
+            Statement::Select {
+                filter: Some(f), ..
+            } => {
                 assert_eq!(f.value, Literal::Int(-5));
             }
             _ => panic!("expected Select with filter"),

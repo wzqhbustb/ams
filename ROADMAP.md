@@ -22,7 +22,8 @@ Phase 1：存储基座 + 行存 + 事务 + B+Tree
          │    ├── M2a: 单语句 auto-commit
          │    ├── M2b: 多语句事务 + MVCC
          │    └── M2c: 完整锁管理 + 并发
-         └── M3: Vacuum + 可观测性 + PG Wire 极简版
+         └── M3: Vacuum（离线）+ 可观测性 + PG Wire 极简版
+              （Vacuum 在线化明确归 Phase 5b 多 AM GC 协调器，见 Phase 5b 节）
 
 Phase 2：HNSW 向量索引
          ├── 2a: In-memory HNSW
@@ -209,6 +210,7 @@ Phase 4b + Phase 5b + Phase 6 → Phase 7
 | PG Wire Protocol 极简版 | 仅支持 Simple Query + 文本结果格式，让 psql / 标准 PG 驱动能连上来跑 CREATE/INSERT/SELECT/UPDATE/DELETE |
 | SegmentedStorage 接口预留 | Phase 3 (Inverted) 和 Phase 5 (TimeSeries) 都是 segment-based 架构，预留接口：SegmentedStorage trait (create_segment/freeze/seal/merge)、segment lifecycle、WAL 协议扩展 (SEGMENT_SEAL/SEGMENT_MERGE 记录类型) |
 | Tier 2 接口预留 | WAL tail reader 接口、watermark registry 接口、planner 可感知索引新鲜度的 hook |
+| ~~在线/渐进式 Vacuum~~ | **不在 M3 范围**。明确归属 Phase 5b（多 AM GC 协调器）：M3 只交付离线 `Engine::vacuum(table)`（`AccessExclusive` 一次完成）及其全部可复用地基（快照注册水位线、页内压实原语、索引通知路径、WAL 记录族）。若 M3 验收后停写窗口成为实际问题，以"分段离线"（按页区间分批持锁）缓解，不做中间态独立在线化 |
 
 **验证标准：**
 - Vacuum 后空间可被复用，无无限膨胀
@@ -524,7 +526,7 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 | 时间范围查询 | WHERE created_at BETWEEN ... AND ... 自动路由到时序索引 | Phase 4a（planner 路由） |
 | Graph AM（轻量版） | 邻接表存储，支持有向/无向边，边属性（JSONB），3 跳以内 BFS/DFS | Phase 4a（SQL 层就绪） |
 | 图查询语法 | SQL 扩展（LATERAL 递归或类 Cypher 子句） | Phase 4a |
-| 多 AM 统一 GC 协调器 | 统一的 Vacuum 协调：基于 oldest_active_snapshot 推进，回收死元组时通知所有引用该 TID 的索引 | ≥2 个 AM 落地（与 4b 正交） |
+| 多 AM 统一 GC 协调器 | 统一的 Vacuum 协调：基于 oldest_active_snapshot 推进，回收死元组时通知所有引用该 TID 的索引。**含 Vacuum 在线化**：heap/B+Tree 的在线渐进式 vacuum 作为协调器的第一个消费者落地（页级 TOCTOU 判定重验证、节流/背压、增量进度追踪、后台调度生命周期）；M3 的离线 vacuum 交付物（水位线注册表、压实原语、索引通知路径、`HeapCleanup`/`PageFree` WAL 族）全部作为其底层能力直接复用 | ≥2 个 AM 落地（与 4b 正交） |
 | 图参与 Fusion | 图遍历结果可与向量/全文/结构化联合检索 | Phase 4b（MultiIndexScan 算子） |
 | 时序参与 Fusion | 时序索引加入 MultiIndexScan，支持"最近 7 天 + 语义相似 + 关键词匹配"组合 | Phase 4b |
 
@@ -602,6 +604,7 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 | 逻辑备份 | 导出/导入工具 |
 | PITR | 基于 WAL 的 Point-in-Time Recovery |
 | WAL Shipping | 用于热备（不做主从自动切换） |
+| Autovacuum 生产形态 | 后台自动 vacuum 调度（基于 Phase 5b 的在线 vacuum 能力：水位监控、节流参数、触发策略）+ VACUUM FULL/CLUSTER |
 
 **前置技术债（来自 Phase 1 Stage B）**：
 - **WAL LSN 空洞兼容性**：Phase 1 的 `LsnClock::reserve` 占位机制（用于 checkpoint

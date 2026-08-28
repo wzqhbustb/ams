@@ -307,6 +307,51 @@ thread_local! {
     /// One-shot (auto-clears). Never set outside tests.
     #[doc(hidden)]
     pub static SPLIT_COMMIT_ROOT_CKPT_HOOK: Cell<bool> = const { Cell::new(false) };
+
+    /// Test hook (slot-0 stale-verdict regression, `test-hooks` feature):
+    /// while true **in the current thread**, `pin_leaf_for_insert`'s
+    /// no-non-empty-left branch parks inside the drop-and-re-latch window
+    /// (cur's latch dropped, not yet re-acquired) until
+    /// [`SLOT0_WINDOW_RELEASE`] is set, so a paired thread can land an
+    /// insert in the exact window the slot-0 re-validation covers.
+    /// Thread-local so parallel tests cannot consume each other's arming.
+    /// Never set outside tests.
+    #[doc(hidden)]
+    pub static SLOT0_WINDOW_PARK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Cross-thread signals for [`SLOT0_WINDOW_PARK`] (see there): `ENTERED`
+/// counts parkings (the paired thread waits for the first one),
+/// `RELEASE` ends the park. Global (not thread-local) because the two
+/// parties are different threads; only the arming test touches them.
+/// Compiled only under `test-hooks`.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static SLOT0_WINDOW_ENTERED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static SLOT0_WINDOW_RELEASE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Park inside the slot-0 re-latch window while [`SLOT0_WINDOW_PARK`] is
+/// armed (see there). Bounded so a broken pairing cannot wedge the thread.
+/// Compiled only under `test-hooks`.
+#[cfg(feature = "test-hooks")]
+fn slot0_window_hook() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    if !SLOT0_WINDOW_PARK.with(|c| c.get()) {
+        return;
+    }
+    SLOT0_WINDOW_ENTERED.fetch_add(1, AtomicOrdering::SeqCst);
+    let mut spins = 0usize;
+    while !SLOT0_WINDOW_RELEASE.load(AtomicOrdering::SeqCst) {
+        std::thread::yield_now();
+        spins += 1;
+        if spins > (1usize << 28) {
+            break;
+        }
+    }
 }
 
 /// Consume one injected undo-cascade failure (see [`UNDO_CASCADE_FAILURES`]);
@@ -640,7 +685,8 @@ impl BTreeIndex {
             page_id: PageId::INVALID,
             slot_id: 0,
         };
-        let (mut guard, _, _) = self.descend_to_leaf_guard(start.unwrap_or(&[]), &probe_tid, false)?;
+        let (mut guard, _, _) =
+            self.descend_to_leaf_guard(start.unwrap_or(&[]), &probe_tid, false)?;
         let mut slot = match start {
             Some(s) => leaf_lower_bound(as_page(&guard), s, &probe_tid)? as u16,
             None => 0,
@@ -799,8 +845,14 @@ impl BTreeIndex {
             // can span siblings), so the exact page is found by walking the
             // sibling chain both ways. Right hops are the Blink mechanism
             // (§13.2); left hops cover stale separators.
-            guard =
-                self.walk_to_position_guard(guard, key, tid, level, &mut hopped, position_for_insert)?;
+            guard = self.walk_to_position_guard(
+                guard,
+                key,
+                tid,
+                level,
+                &mut hopped,
+                position_for_insert,
+            )?;
             if level == 0 {
                 return Ok((guard, path, hopped));
             }
@@ -908,9 +960,10 @@ impl BTreeIndex {
                                     let pguard = self.buffer_pool.pin(walk)?;
                                     let page = as_page(&pguard);
                                     let pcount = SlottedPage::slot_count(page);
-                                    let (lk, lt) = page::decode_leaf_entry(
-                                        entry_bytes(page, pcount as u16 - 1)?,
-                                    )?;
+                                    let (lk, lt) = page::decode_leaf_entry(entry_bytes(
+                                        page,
+                                        pcount as u16 - 1,
+                                    )?)?;
                                     (lk, lt) > (key, *tid)
                                 };
                                 hops += 1;
@@ -1398,7 +1451,12 @@ impl BTreeIndex {
     ///   our right boundary — so we hold the nearest non-empty RIGHT
     ///   sibling's write latch through the apply (coupled rightward, which
     ///   needs no drop). If its first entry sorts at or below the probe,
-    ///   the placement moves right instead.
+    ///   the placement moves right instead. cur itself was unlatched while
+    ///   the left neighborhood was probed, so its slot-0 position is
+    ///   RE-VALIDATED after the re-latch (a concurrent insert may have
+    ///   claimed cur's left edge in the window; inserting at the stale
+    ///   slot 0 would break the page's `(key, tid)` order and mask a
+    ///   `DuplicateKey`); a failed re-validation restarts the placement.
     /// - the chain holds no non-empty page at all: nothing exists to
     ///   invert with; no side latch is taken.
     ///
@@ -1597,7 +1655,31 @@ impl BTreeIndex {
             // No non-empty page left of cur: re-latch cur and hold the
             // nearest non-empty RIGHT sibling through the apply (see the fn
             // doc for the mirror race this closes).
+            #[cfg(feature = "test-hooks")]
+            slot0_window_hook();
             guard = self.buffer_pool.pin_mut_without_fpi(cur_id)?;
+            // Re-validate cur itself, exactly as the left-neighbor branch
+            // above does: cur was UNLATCHED between the slot computation
+            // and this re-latch, so a concurrent insert may have claimed
+            // its left edge in the window. Without this check the caller
+            // would insert at the STALE slot 0, ahead of an entry that
+            // sorts below the probe — breaking the page's (key, tid) order
+            // (and silently duplicating an exact re-insert instead of
+            // failing DuplicateKey). Restart the placement; the recomputed
+            // slot lands interior (pos > 0) and returns immediately.
+            let still_left_edge = {
+                let page = as_page_mut(&mut guard);
+                let count = SlottedPage::slot_count(page);
+                if count == 0 {
+                    true
+                } else {
+                    let (fk, ft) = page::decode_leaf_entry(entry_bytes(page, 0)?)?;
+                    (fk, ft) > (key, *tid)
+                }
+            };
+            if !still_left_edge {
+                continue;
+            }
             let mut rnext = BtreePage::next(as_page_mut(&mut guard))?;
             let mut right = None;
             while rnext != PageId::INVALID {
@@ -1681,8 +1763,8 @@ impl BTreeIndex {
         // the placement protocol. Without this, a boundary insert could land
         // left of a larger same-key entry — a silent chain-order inversion
         // inside a duplicate run (`pin_leaf_for_insert`'s doc).
-        let left_edge_with_left_sibling = pos == 0
-            && BtreePage::prev(as_page_mut(&mut leaf_guard))? != PageId::INVALID;
+        let left_edge_with_left_sibling =
+            pos == 0 && BtreePage::prev(as_page_mut(&mut leaf_guard))? != PageId::INVALID;
         if fits {
             if left_edge_with_left_sibling {
                 return Ok(Pessimistic::Retry);
@@ -2081,8 +2163,8 @@ impl BTreeIndex {
 
         if SlottedPage::free_space(as_page_mut(&mut parent_guard)) >= downlink.len() + 4 {
             let parent = parent_guard.page_id();
-            let slot = internal_lower_bound(as_page_mut(&mut parent_guard), &separator, st.right)?
-                as u16;
+            let slot =
+                internal_lower_bound(as_page_mut(&mut parent_guard), &separator, st.right)? as u16;
             // FPI-before-commit pre-touch (module doc): emit `st.left`'s
             // cycle FPI, if due, BEFORE the Commit record's WAL position is
             // fixed; the apply below re-pins with the FPI suppressed. A
@@ -2112,7 +2194,8 @@ impl BTreeIndex {
         // steps are redo-correct, and the tree stays readable via the chain.
         let parent = parent_guard.page_id();
         let mut p2_guard = self.buffer_pool.new_page()?;
-        let pst = self.split_prepare_on_guards(&mut parent_guard, &mut p2_guard, Some(&downlink))?;
+        let pst =
+            self.split_prepare_on_guards(&mut parent_guard, &mut p2_guard, Some(&downlink))?;
         let p2_first = entry_bytes(as_page_mut(&mut parent_guard), pst.copy_start_slot)?.to_vec();
         let p2_first_key = entry_key(&p2_first, pst.level)?.to_vec();
         self.split_copy_on_guards(&mut parent_guard, p2_guard, &pst)?;
@@ -3153,9 +3236,8 @@ fn root_from_meta(pool: &BufferPool, meta_page: PageId) -> Result<(PageId, u8)> 
              or a bulk load crashed before publishing the root)"
         )));
     }
-    let bytes = SlottedPage::tuple(page, (slot_count - 1) as u16)?.ok_or_else(|| {
-        BTreeError::Corrupted(format!("meta page {meta_page} slot unreadable"))
-    })?;
+    let bytes = SlottedPage::tuple(page, (slot_count - 1) as u16)?
+        .ok_or_else(|| BTreeError::Corrupted(format!("meta page {meta_page} slot unreadable")))?;
     let (root_page, tree_level) = page::decode_meta_record(bytes)?;
     if tree_level > 0x0F {
         return Err(BTreeError::Corrupted(format!(
@@ -3328,12 +3410,7 @@ pub(crate) fn finish_incomplete_split(
     };
 
     let (parent_page, new_root_page, meta_page, parent_insert_slot) = match plan {
-        SplitFinishPlan::Unlink => (
-            PageId::INVALID,
-            PageId::INVALID,
-            PageId::INVALID,
-            0,
-        ),
+        SplitFinishPlan::Unlink => (PageId::INVALID, PageId::INVALID, PageId::INVALID, 0),
         _ if is_root_split => {
             // 4-bit level bound before allocating the new root (post-Stage-S
             // C2 deep review; see ensure_root_promotion_fits).
@@ -3745,7 +3822,8 @@ pub(crate) fn apply_split_clr(
             // non-empty or previously-written right page is legitimate: the
             // NoMove and unlink plans never MOVE entries, though they do
             // stamp the right page's pd_lsn — H4, see above.)
-            let right: &[u8; PAGE_SIZE] = right_guard.page().try_into().expect("frame is PAGE_SIZE");
+            let right: &[u8; PAGE_SIZE] =
+                right_guard.page().try_into().expect("frame is PAGE_SIZE");
             if !clr_is_unlink(rec)
                 && SlottedPage::slot_count(right) == 0
                 && page_never_had_entries(right)
@@ -3753,10 +3831,7 @@ pub(crate) fn apply_split_clr(
                 return Err(BTreeError::Corrupted(format!(
                     "split CLR: left page {} is past the CLR (pd_lsn {:?} >= {:?}) but right \
                      page {} never received the moved entries",
-                    rec.left_page,
-                    left_lsn,
-                    lsn,
-                    rec.right_page
+                    rec.left_page, left_lsn, lsn, rec.right_page
                 )));
             }
         }
@@ -3907,7 +3982,6 @@ pub(crate) fn choose_split_slot_readonly(
     let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
     choose_split_slot(page, level, None)
 }
-
 
 #[cfg(test)]
 mod tests {

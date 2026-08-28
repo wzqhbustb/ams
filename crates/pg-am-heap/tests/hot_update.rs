@@ -59,7 +59,7 @@ fn rel(first_page: PageId) -> RelationDesc<'static> {
 
 fn writer_snapshot(xid: TxnId) -> Snapshot {
     let mut snap = Snapshot::everything();
-    snap.current_xid = xid;
+    snap.set_current_xid(xid);
     snap
 }
 
@@ -111,10 +111,7 @@ fn hot_update(
 }
 
 /// Read the header of the tuple at `tid` for flag assertions.
-fn read_header(
-    buffer_pool: &pg_storage::buffer_pool::BufferPool,
-    tid: Tid,
-) -> TupleHeader {
+fn read_header(buffer_pool: &pg_storage::buffer_pool::BufferPool, tid: Tid) -> TupleHeader {
     let guard = buffer_pool.pin(tid.page_id).unwrap();
     let page: &[u8] = guard.page();
     let page_arr: &[u8; pg_storage::types::PAGE_SIZE] =
@@ -293,8 +290,13 @@ fn test_hot_update_crash_recovery() {
     };
 
     // Reopen with heap redo handlers (includes HeapHotUpdateHandler).
-    let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
+    let engine = StorageEngine::open_with_redo_handlers(
+        tmp.path(),
+        &config,
+        heap_redo_handlers(),
+        Vec::new(),
+    )
+    .unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),

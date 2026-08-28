@@ -50,6 +50,16 @@
 //! `LockManager::acquire` — consume the mark and fail with
 //! [`TxnError::DeadlockVictim`] / [`LockError::DeadlockVictim`], which the
 //! caller's abort path turns into a full rollback.
+//!
+//! # M3 scope (Stage A)
+//!
+//! Stage A adds the snapshot registry + vacuum horizon (tech-selection
+//! §3.3): [`TxnManager::snapshot`] registers each snapshot's `xmin`
+//! atomically with its construction and returns a [`SnapshotGuard`] that
+//! unregisters on `Drop`; [`TxnManager::oldest_snapshot_xmin`] exposes the
+//! horizon. [`Snapshot`] fields are crate-private (anti-enumeration
+//! guardrail: `snapshot()` is the only registered construction point;
+//! [`Snapshot::everything`] is the explicit never-registered special case).
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
@@ -66,9 +76,9 @@ pub mod visibility;
 
 pub use clog_buffer::ClogBuffer;
 pub use clog_mem::InMemoryClogAccessor;
-pub use deadlock::{DeadlockDetector, DeadlockVictims, DEFAULT_DEADLOCK_INTERVAL};
+pub use deadlock::{wait_for_edges, DeadlockDetector, DeadlockVictims, DEFAULT_DEADLOCK_INTERVAL};
 pub use lock_manager::{LockError, LockManager, LockMode, TableLockState};
-pub use manager::{CommitWal, RowWaiter, TxnError, TxnManager};
+pub use manager::{CommitWal, RowWaiter, SnapshotGuard, TxnError, TxnManager};
 pub use pg_storage::clog::{ClogAccessor, TxnState};
 pub use redo::txn_redo_handlers;
 pub use snapshot::Snapshot;

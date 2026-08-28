@@ -116,7 +116,7 @@ fn bench_concurrent_commit(c: &mut Criterion) {
                                     for i in 0..OPS_PER_THREAD {
                                         let xid = mgr.begin_txn();
                                         let mut snap = Snapshot::everything();
-                                        snap.current_xid = xid;
+                                        snap.set_current_xid(xid);
                                         let tuple = encode_row(xid, i as i32);
                                         heap.insert(InsertContext {
                                             rel: rel(first_page),

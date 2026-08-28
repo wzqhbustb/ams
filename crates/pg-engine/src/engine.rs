@@ -122,17 +122,21 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::{Mutex, RwLock};
 
-use pg_am_btree::{btree_redo_handlers, encode_key, is_supported_key_type, BTreeAM, BTreeUndoHandler};
+use pg_am_btree::{
+    btree_redo_handlers, encode_key, is_supported_key_type, BTreeAM, BTreeError, BTreeUndoHandler,
+};
 use pg_am_heap::access_method::{
-    DeleteContext, InsertContext, RelationDesc, ScanContext, UpdateContext,
+    DeleteContext, InsertContext, RelationDesc, ScanContext, UpdateContext, Vacuumable,
 };
 use pg_am_heap::line_pointer::LINE_POINTER_SIZE;
 use pg_am_heap::tuple::{decode_tuple, encode_tuple, ColumnType, Datum, TupleHeader};
-use pg_am_heap::{heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM};
+use pg_am_heap::{
+    heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM,
+};
 use pg_catalog::builtin_types::{builtin_type, BUILTIN_TYPES};
 use pg_catalog::system_tables::{
     SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, PG_ATTRIBUTE, PG_CLASS, PG_INDEX, PG_RELPAGES,
@@ -150,10 +154,12 @@ use pg_storage::wal::record::{HeapDeleteRecord, HeapUpdateRecord, WalRecord, Wal
 use pg_storage::wal::WalWriter;
 use pg_txn::{
     is_visible, txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, DeadlockDetector,
-    DeadlockVictims, LockManager, LockMode, RowWaiter, Snapshot, TxnManager,
+    DeadlockVictims, LockManager, LockMode, RowWaiter, Snapshot, SnapshotGuard, TableLockState,
+    TxnManager,
 };
 
 use crate::error::{EngineError, Result};
+use crate::query_stats::{ExecutionPath, QueryStatEntry, QueryStats, DEFAULT_QUERY_STATS_CAPACITY};
 use crate::sql::{self, CmpOp, Filter, Literal, LockClause, OrderBy, SelectCols, Statement};
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
@@ -232,6 +238,11 @@ pub struct EngineConfig {
     /// to a 1ms floor by `DeadlockDetector::start` — a free-running scan
     /// buys no observable latency and would busy-loop a core.
     pub deadlock_detector_interval: Duration,
+    /// Query-statistics ring buffer capacity (M3 Stage E, tech-selection
+    /// §6.3): how many recent `exec` statements the engine retains for
+    /// diagnostics. Default 1000 ([`DEFAULT_QUERY_STATS_CAPACITY`]);
+    /// 0 disables recording. Overflow drops the oldest entry (§6.3 既定语义).
+    pub query_stats_capacity: usize,
 }
 
 impl EngineConfig {
@@ -241,6 +252,7 @@ impl EngineConfig {
             storage: StorageConfig::new(data_dir),
             clog_buffer_frames: DEFAULT_CLOG_BUFFER_FRAMES,
             deadlock_detector_interval: pg_txn::DEFAULT_DEADLOCK_INTERVAL,
+            query_stats_capacity: DEFAULT_QUERY_STATS_CAPACITY,
         }
     }
 }
@@ -325,7 +337,9 @@ impl Predicate {
 
     /// Whether `val` satisfies this predicate.
     pub fn matches(&self, val: &Value) -> bool {
-        let Some(d) = val else { return false; };
+        let Some(d) = val else {
+            return false;
+        };
         match self {
             Predicate::Eq { value, .. } => d == value,
             Predicate::Lt { value, .. } => d < value,
@@ -364,6 +378,26 @@ pub struct IndexEntry {
     pub key_type: ColumnType,
     /// The index's meta page (`pg_rust_relpages.first_page` of the index).
     pub meta_page: PageId,
+}
+
+/// The outcome of one [`Engine::vacuum`] pass (M3 Stage D).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VacuumStats {
+    /// Dead TIDs `scan_dead_tuples` reported at the pass's horizon
+    /// (includes partially-dead HOT chain members, which phases 3–5 then
+    /// leave untouched — §4.2).
+    pub dead_tuples: usize,
+    /// `(tid, values)` work items `collect_index_keys` produced: standalone
+    /// dead tuples plus the roots of fully-dead HOT chains.
+    pub index_keys: usize,
+    /// Index entries physically removed by this pass (`BTreeDelete` WAL).
+    /// Under eager online index maintenance this is essentially only
+    /// crash-loser dangling entries (§4.3).
+    pub index_entries_removed: usize,
+    /// Phase-4 delete attempts that found the entry already gone
+    /// (`EntryNotFound` → Ok at the vacuum call site): eager online index
+    /// maintenance had removed them.
+    pub index_entries_already_gone: usize,
 }
 
 /// The assembled engine: storage + catalog + heap AM + txn manager + disk
@@ -421,6 +455,10 @@ pub struct Engine {
     /// lost the entry of a still-live row. Entries are always removed on
     /// commit AND abort, so the map never leaks committed transactions.
     index_undo: Arc<Mutex<HashMap<TxnId, Vec<IndexUndo>>>>,
+    /// Query statistics ring buffer (M3 Stage E, tech-selection §6.3):
+    /// [`Self::exec`] records one entry per statement — see
+    /// [`Self::query_stats`].
+    query_stats: QueryStats,
 }
 
 /// A handle to an explicit transaction (§21 M2b API).
@@ -447,6 +485,13 @@ pub struct TxnHandle {
     txn: Arc<TxnManager>,
     xid: Option<TxnId>,
     snapshot: RefCell<Snapshot>,
+    /// Keeps the snapshot's `xmin` registered in the vacuum-horizon
+    /// registry for the handle's whole lifetime (M3 Stage A, §3.3): dropped
+    /// — and thus unregistered — when the handle is consumed by
+    /// `commit`/`abort` or auto-aborted by `Drop` (field drops run after
+    /// `Drop::drop`, so the best-effort abort still sees the registration;
+    /// either order would be correct). Never read — RAII only.
+    _snapshot_guard: SnapshotGuard,
     /// Identity of the creating engine (see `NEXT_ENGINE_INSTANCE_ID`).
     instance_id: u64,
     /// Shared with the engine: table locks are keyed by XID, so commit /
@@ -483,15 +528,30 @@ impl TxnHandle {
     pub fn commit(mut self) -> Result<()> {
         let xid = self.xid.take().expect("commit called twice");
         let result = self.txn.commit_txn(xid);
+        if result.is_err() {
+            // Commit failed (WAL/CLOG failure): without intervention the
+            // XID would leak into the active set forever — `self.xid` was
+            // taken, so `Drop` will NOT auto-abort — pinning the vacuum
+            // horizon and every future snapshot's xmin. Best-effort abort
+            // with the same discipline as `Drop`: replay the index undo
+            // FIRST (so no snapshot sees a heap row whose index entry is
+            // gone), then flip the CLOG bit. If the WAL is broken badly
+            // enough that even the abort record cannot append, the process
+            // is tearing down anyway; the failure must still be loud.
+            apply_index_undo(&self.index_undo, &self.buffer_pool, &self.wal_writer, xid);
+            if let Err(e) = self.txn.abort_txn(xid) {
+                tracing::warn!(error = %e, xid = xid.0, "commit failure fallback abort failed");
+            }
+        }
         // 2PL release point (M2c Stage P): table locks go AFTER the CLOG
         // bit flips, so a woken row-lock waiter that then needs this
         // transaction's table locks never observes the reverse order.
         self.lock_manager.release_all(xid);
-        // Discard the undo log either way: on success the entries are
-        // durable; on failure the txn stays in-progress (its heap writes
-        // invisible) and the `index_lookup` visibility mask covers the
-        // leftover index entries.
-        self.index_undo.lock().remove(&xid);
+        // Discard the undo log on success only: on failure it was replayed
+        // above. On success the entries are durable with the commit.
+        if result.is_ok() {
+            self.index_undo.lock().remove(&xid);
+        }
         result?;
         Ok(())
     }
@@ -683,6 +743,10 @@ impl Engine {
         //     t_xmax, `TupleConcurrentlyUpdated` on a committed one) instead
         //     of the legacy "second-writer-errors" behavior.
         heap.set_row_waiter(Arc::clone(&txn) as Arc<dyn RowWaiter>);
+        // 5c. Page allocator (M3 Stage C): vacuum's `reclaim` returns fully
+        //     emptied heap pages to the allocator after unlinking them from
+        //     the chain.
+        heap.set_page_allocator(Arc::clone(storage.page_allocator()));
         // 6b. Checkpoint ATT snapshot source (Stage N, §11.4): every
         //     checkpoint persists the manager's in-flight XIDs as the ATT
         //     snapshot file referenced by the v2 CheckpointEnd record. The
@@ -710,8 +774,7 @@ impl Engine {
         // 8. Lock manager (sharing the victim registry) and the deadlock
         //    detector thread (M2c Stage R, §9.3). Started LAST, once both
         //    managers exist; one detector per engine instance.
-        let lock_manager =
-            Arc::new(LockManager::new().with_deadlock_victims(Arc::clone(&victims)));
+        let lock_manager = Arc::new(LockManager::new().with_deadlock_victims(Arc::clone(&victims)));
         let deadlock_detector = DeadlockDetector::start(
             Arc::clone(&txn),
             Arc::clone(&lock_manager),
@@ -732,6 +795,7 @@ impl Engine {
             ddl_lock: Mutex::new(()),
             instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             index_undo: Arc::new(Mutex::new(HashMap::new())),
+            query_stats: QueryStats::new(config.query_stats_capacity),
         };
 
         // 7c. Recovery-time index compensation for loser transactions
@@ -950,7 +1014,7 @@ impl Engine {
         // it fixes the DDL lock mode by construction and covers the
         // catalog-row writes like any other DDL.
         let first_page = self.auto_commit(|snap| {
-            self.lock_oid(snap.current_xid, oid, LockMode::AccessExclusive)?;
+            self.lock_oid(snap.current_xid(), oid, LockMode::AccessExclusive)?;
             self.create_table_inner(snap, oid, name, schema)
         });
         match first_page {
@@ -1070,7 +1134,7 @@ impl Engine {
             // AccessExclusive (§9.2): blocks — and is blocked by — every
             // other lock mode on this table, so a DROP waits for in-flight
             // readers/writers and new ones queue behind it (M2c Stage P).
-            self.lock_table(snap.current_xid, &entry, LockMode::AccessExclusive)?;
+            self.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
             self.drop_table_inner(snap, name, &entry)?;
             // Remove BEFORE commit releases the lock (see the fn docs).
             self.registry.write().remove(name);
@@ -1092,7 +1156,7 @@ impl Engine {
             Some(Datum::Int8(0)),
             Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
         ];
-        let header = tuple_header(snap.curcid);
+        let header = tuple_header(snap.curcid());
         let new_tuple = encode_tuple(header, &columns, &class_row)?;
         self.ensure_catalog_room(&PG_CLASS, new_tuple.len())?;
         self.heap.update(UpdateContext {
@@ -1191,15 +1255,16 @@ impl Engine {
         // "leak, never corruption" policy.
         let col_types = column_types(&entry);
         let meta_page = self.auto_commit(|snap| {
-            let entry = self.lock_table_entry(snap.current_xid, table, LockMode::Exclusive)?;
+            let entry = self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
             // Re-take the snapshot AFTER the lock wait (M2c Stage P
             // review): `auto_commit`'s snapshot was taken before we queued
             // on Exclusive, so a writer we blocked behind would be stuck in
             // its `xip` and its rows would silently never enter the index.
             // The lock guarantees no writer can be in flight now, so a
             // fresh snapshot sees exactly the committed contents the index
-            // must cover.
-            let mut snap = self.txn.snapshot(snap.current_xid);
+            // must cover. `_re_guard` keeps the re-snapshot registered
+            // until this auto-commit closure ends (M3 Stage A, §3.3).
+            let (mut snap, _re_guard) = self.txn.snapshot(snap.current_xid());
             snap.advance_curcid();
 
             // Collect (key_bytes, tid) from a full heap scan (M2b: simple
@@ -1401,7 +1466,8 @@ impl Engine {
     /// Takes no table lock, for the same reason as [`Engine::scan`] (no
     /// owning transaction; M2c Stage P).
     pub fn index_lookup(&self, table: &str, column: &str, key: &Datum) -> Result<Option<Tid>> {
-        let mut snap = self.txn.snapshot(TxnId::INVALID);
+        // `_guard`: registered for this call frame (M3 Stage A, §3.3).
+        let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
         snap.advance_curcid();
         let index = self.btree_index(table, column)?;
         let key_bytes = encode_key(key)?;
@@ -1419,9 +1485,15 @@ impl Engine {
     /// A slot that no longer holds a tuple reads as invisible.
     ///
     /// This checks visibility only, not that the tuple's key matches the
-    /// queried key. That is safe because heap slots are append-only
-    /// (HeapAM never reclaims slots), so a TID can never come to hold an
-    /// unrelated row; revisit if vacuum/slot reuse ever lands.
+    /// queried key. That stays sound under vacuum's slot reuse (M3 Stage
+    /// D): a dead slot becomes reusable ONLY through `reclaim`, and the
+    /// §4.1 phase order guarantees every index entry pointing at it was
+    /// removed (WAL-durable) earlier in the same vacuum pass — or, after a
+    /// crash in window ①, by the next pass before any reuse, since the
+    /// still-present dead tuple is re-collected and its delete tolerated
+    /// as `EntryNotFound`. A stale entry resolving to an unrelated row in
+    /// a recycled slot therefore requires a phase-ordering violation, not
+    /// just bad luck.
     fn heap_tuple_visible(&self, snap: &Snapshot, tid: Tid) -> Result<Option<Tid>> {
         let guard = self.storage.buffer_pool().pin(tid.page_id)?;
         let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
@@ -1436,13 +1508,7 @@ impl Engine {
         } else {
             header.t_xmax
         };
-        if is_visible(
-            header.t_xmin,
-            xmax,
-            header.t_cid,
-            snap,
-            self.clog.as_ref(),
-        ) {
+        if is_visible(header.t_xmin, xmax, header.t_cid, snap, self.clog.as_ref()) {
             return Ok(Some(tid));
         }
         // HOT chain: old version is invisible but t_ctid may point to a
@@ -1453,9 +1519,7 @@ impl Engine {
         // shared `follow_hot_chain` helper (post-Stage-S review H1; the
         // pre-H1 8-hop cap made >8-hop chains silently vanish from
         // index_lookup).
-        if header.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0
-            && header.t_ctid != tid
-        {
+        if header.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0 && header.t_ctid != tid {
             return Ok(pg_am_heap::follow_hot_chain(
                 page,
                 tid.page_id,
@@ -1519,7 +1583,7 @@ impl Engine {
     /// (NULL keys are skipped, matching `create_index`).
     pub fn insert(&self, table: &str, values: &[Value]) -> Result<Tid> {
         self.auto_commit(|snap| {
-            let entry = self.lock_table_entry(snap.current_xid, table, LockMode::RowExclusive)?;
+            let entry = self.lock_table_entry(snap.current_xid(), table, LockMode::RowExclusive)?;
             self.insert_inner(snap, &entry, values)
         })
     }
@@ -1530,7 +1594,7 @@ impl Engine {
     /// redundant recursive `registry.read()` per row.
     fn insert_inner(&self, snap: &Snapshot, entry: &TableEntry, values: &[Value]) -> Result<Tid> {
         let col_types = column_types(entry);
-        let tuple = encode_row(entry, &col_types, values, snap.curcid)?;
+        let tuple = encode_row(entry, &col_types, values, snap.curcid())?;
         let indexes = self.indexes_of(entry);
         let mut out_tid = Tid {
             page_id: PageId::INVALID,
@@ -1546,7 +1610,13 @@ impl Engine {
             if let Some(datum) = &values[*col_index] {
                 let key = encode_key(datum)?;
                 self.open_btree(idx)?.insert(&key, out_tid)?;
-                self.record_index_undo(snap.current_xid, idx, key, out_tid, IndexUndoOp::Inserted);
+                self.record_index_undo(
+                    snap.current_xid(),
+                    idx,
+                    key,
+                    out_tid,
+                    IndexUndoOp::Inserted,
+                );
             }
         }
         Ok(out_tid)
@@ -1568,7 +1638,8 @@ impl Engine {
         table: &str,
         predicate: Option<Predicate>,
     ) -> Result<Vec<(Tid, Vec<Value>)>> {
-        let mut snap = self.txn.snapshot(TxnId::INVALID);
+        // `_guard`: registered for this call frame (M3 Stage A, §3.3).
+        let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
         snap.advance_curcid();
         self.scan_inner(&snap, table, predicate.as_ref())
     }
@@ -1601,7 +1672,7 @@ impl Engine {
     /// are skipped on both sides.
     pub fn update(&self, table: &str, tid: Tid, values: &[Value]) -> Result<Tid> {
         self.auto_commit(|snap| {
-            self.lock_table_entry(snap.current_xid, table, LockMode::RowExclusive)?;
+            self.lock_table_entry(snap.current_xid(), table, LockMode::RowExclusive)?;
             self.update_inner(snap, table, tid, values)
         })
     }
@@ -1615,7 +1686,7 @@ impl Engine {
     ) -> Result<Tid> {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
-        let tuple = encode_row(&entry, &col_types, values, snap.curcid)?;
+        let tuple = encode_row(&entry, &col_types, values, snap.curcid())?;
         let indexes = self.indexes_of(&entry);
         let old_values = if indexes.is_empty() {
             Vec::new()
@@ -1658,7 +1729,7 @@ impl Engine {
                     let key = encode_key(old_datum)?;
                     index.delete(&key, index_tid)?;
                     self.record_index_undo(
-                        snap.current_xid,
+                        snap.current_xid(),
                         idx,
                         key,
                         index_tid,
@@ -1668,7 +1739,13 @@ impl Engine {
                 if let Some(new_datum) = &values[*col_index] {
                     let key = encode_key(new_datum)?;
                     index.insert(&key, out_tid)?;
-                    self.record_index_undo(snap.current_xid, idx, key, out_tid, IndexUndoOp::Inserted);
+                    self.record_index_undo(
+                        snap.current_xid(),
+                        idx,
+                        key,
+                        out_tid,
+                        IndexUndoOp::Inserted,
+                    );
                 }
             }
         }
@@ -1686,7 +1763,7 @@ impl Engine {
     /// table already disagreed). NULL keys are skipped.
     pub fn delete(&self, table: &str, tid: Tid) -> Result<()> {
         self.auto_commit(|snap| {
-            self.lock_table_entry(snap.current_xid, table, LockMode::RowExclusive)?;
+            self.lock_table_entry(snap.current_xid(), table, LockMode::RowExclusive)?;
             self.delete_inner(snap, table, tid)
         })
     }
@@ -1718,7 +1795,7 @@ impl Engine {
                 let key = encode_key(old_datum)?;
                 self.open_btree(idx)?.delete(&key, index_tid)?;
                 self.record_index_undo(
-                    snap.current_xid,
+                    snap.current_xid(),
                     idx,
                     key,
                     index_tid,
@@ -1727,6 +1804,111 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Vacuum `table`: reclaim dead-tuple space end to end (M3 Stage D,
+    /// tech-selection §4.1). Returns per-pass [`VacuumStats`].
+    ///
+    /// Five phases, in the §4.1 invariant order — never reorder them
+    /// (a TID-invalidating heap record must become WAL-durable only AFTER
+    /// that TID's last `BTreeDelete`):
+    ///
+    /// 1. Take the table's `AccessExclusive` lock under a short-lived
+    ///    **maintenance XID**, auto-commit style — the `create_table` /
+    ///    `drop_table` precedent: [`Self::auto_commit`] allocates the XID,
+    ///    enters the active set, and routes both the success and the
+    ///    failure path through `release_all(xid)`, so the lock's lifetime
+    ///    is the maintenance transaction's. Then take the vacuum horizon
+    ///    ONCE via [`Self::oldest_snapshot_xmin`] and use it for the whole
+    ///    pass (§3.3: taken after the lock wait, so every lock-holding
+    ///    transaction has ended; lock-free readers in flight are covered
+    ///    through the snapshot registry, and XID monotonicity keeps every
+    ///    FUTURE snapshot's xmin ≥ this horizon, so nothing taken later
+    ///    can observe a version reclaimed below it).
+    /// 2. `scan_dead_tuples(horizon)` — the dead-TID list.
+    /// 3. `collect_index_keys` — READ-ONLY key extraction. Must precede
+    ///    phase 5: once a page is compacted the keys are unreadable.
+    /// 4. Push-mode index cleanup: per `(tid, values)` × per registered
+    ///    index on the table, encode the indexed column (NULL skipped, the
+    ///    `delete_inner` convention) and `BTreeIndex::delete(key, tid)`
+    ///    (the Stage Q online path, `BTreeDelete` WAL included).
+    ///    **`EntryNotFound` is Ok here and only here** (§4.3): eager
+    ///    online maintenance already removed the entries of ordinary
+    ///    committed deletes/updates, so the entries this phase actually
+    ///    removes are essentially crash-loser dangling ones. The btree's
+    ///    own delete contract is NOT weakened. Vacuum records no index
+    ///    undo: its btree deletes are physical, idempotent
+    ///    (EntryNotFound-tolerant) maintenance, never to be reverse-applied
+    ///    even when a later phase fails.
+    /// 5. `reclaim` — page compaction (`HeapCleanup` WAL) + empty-page
+    ///    unlink + `free_page` (`PageFree` WAL). `reclaim` re-derives the
+    ///    kill set from `dead` internally (Stage C), so partially-dead HOT
+    ///    chains are structurally untouched.
+    ///
+    /// # Deadlock freedom (S3)
+    ///
+    /// While WAITING for `AccessExclusive` vacuum holds no lock at all —
+    /// the waiting node has in-degree 0 in the wait-for graph (nobody waits
+    /// on a lock vacuum has not yet been granted), so no cycle can pass
+    /// through it; the detector sees an ordinary wait. Once granted, vacuum
+    /// acquires no second table lock (phases 2–5 take only short-lived page
+    /// latches).
+    ///
+    /// Fails with [`EngineError::TableNotFound`] if `table` does not exist
+    /// (including when it was dropped while vacuum queued on the lock —
+    /// the `lock_table_entry` post-lock re-check).
+    pub fn vacuum(&self, table: &str) -> Result<VacuumStats> {
+        self.auto_commit(|snap| {
+            // Phase 1: AccessExclusive under the maintenance XID, then the
+            // single horizon for the whole pass.
+            let entry =
+                self.lock_table_entry(snap.current_xid(), table, LockMode::AccessExclusive)?;
+            let horizon = self.oldest_snapshot_xmin();
+            let col_types = column_types(&entry);
+            let rel = relation_desc(&entry, &col_types);
+
+            // Phase 2: collect the dead-TID list at the pass's horizon.
+            let dead = self
+                .heap
+                .scan_dead_tuples(rel, horizon, self.clog.as_ref())?;
+            let mut stats = VacuumStats {
+                dead_tuples: dead.len(),
+                ..VacuumStats::default()
+            };
+            if dead.is_empty() {
+                return Ok(stats);
+            }
+
+            // Phase 3: read-only key extraction, BEFORE any physical rewrite.
+            let keys = self.heap.collect_index_keys(rel, &dead)?;
+            stats.index_keys = keys.len();
+
+            // Phase 4: push-mode index cleanup, one descent per (key, tid)
+            // per index (batch interfaces are Phase 5b, §4.3).
+            for (idx, col_index) in &self.indexes_of(&entry) {
+                let mut index = self.open_btree(idx)?;
+                for (tid, values) in &keys {
+                    // NULL keys carry no entry (the online convention).
+                    let Some(datum) = &values[*col_index] else {
+                        continue;
+                    };
+                    let key = encode_key(datum)?;
+                    match index.delete(&key, *tid) {
+                        Ok(()) => stats.index_entries_removed += 1,
+                        // §4.3: eager maintenance removed it long ago.
+                        Err(BTreeError::EntryNotFound) => {
+                            stats.index_entries_already_gone += 1;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+
+            // Phase 5: compaction + unlink + free (kill set re-derived
+            // from `dead` inside reclaim — do not pre-filter it here).
+            self.heap.reclaim(rel, &dead)?;
+            Ok(stats)
+        })
     }
 
     /// Every index registered on `entry`'s table, joined with the position
@@ -1768,12 +1950,16 @@ impl Engine {
         tid: Tid,
         op: IndexUndoOp,
     ) {
-        self.index_undo.lock().entry(xid).or_default().push(IndexUndo {
-            index: idx.clone(),
-            key,
-            tid,
-            op,
-        });
+        self.index_undo
+            .lock()
+            .entry(xid)
+            .or_default()
+            .push(IndexUndo {
+                index: idx.clone(),
+                key,
+                tid,
+                op,
+            });
     }
 
     /// Read back the decoded values of the row at `tid` directly from its
@@ -1796,61 +1982,61 @@ impl Engine {
         Ok(values)
     }
 
-/// Find the first WAL record whose start lies inside segment `segment_id`
-/// by probing 8-byte-aligned offsets from the segment start with a
-/// CRC-checked decode (WAL records may straddle segment boundaries, so a
-/// segment start is NOT itself a record boundary). Used by the loser index
-/// compensation to extend its scan to the front of the retained segment.
-/// Returns `None` when nothing decodes within one maximum record length of
-/// the segment start, or when the first record starts at/after
-/// `upper_bound` (nothing to gain by rewinding).
-fn first_record_lsn_in_segment(
-    wal_dir: &Path,
-    segment_size: u64,
-    segment_id: u64,
-    upper_bound: Lsn,
-) -> Option<Lsn> {
-    use std::io::{Read, Seek, SeekFrom};
-    // pg-storage wal/segment.rs filename layout: wal-{segment_id + 1:08}.log.
-    let path = wal_dir.join(format!("wal-{:08}.log", segment_id + 1));
-    let mut file = std::fs::File::open(path).ok()?;
-    const HEADER: u64 = 32; // wal/record.rs fixed record header
-    const MAX_RECORD: u64 = HEADER + u16::MAX as u64 + 8; // length prefix is u16
-    // The segment FILE holds the segment's bytes at file offset 0 (file
-    // offset = global LSN - segment start).
-    let seg_start = segment_id * segment_size;
-    file.seek(SeekFrom::Start(0)).ok()?;
-    // Probe window: one max record for a straddling record's tail, plus one
-    // max record so the candidate itself can be decoded fully.
-    let window_len = (2 * MAX_RECORD).min(segment_size);
-    let mut window = Vec::new();
-    file.by_ref()
-        .take(window_len)
-        .read_to_end(&mut window)
-        .ok()?;
-    // WAL records are 8-byte aligned (pg-storage LSN_ALIGNMENT); the
-    // resync probe steps by it.
-    const PROBE_STEP: usize = 8;
-    let mut off = 0usize;
-    while off as u64 <= MAX_RECORD && off + HEADER as usize <= window.len() {
-        let payload_len =
-            u16::from_le_bytes(window[off + 26..off + 28].try_into().unwrap()) as u64;
-        let total = (HEADER + payload_len).next_multiple_of(8);
-        let end = off + total as usize;
-        if end <= window.len() {
-            if let Ok((rec, _)) = WalRecord::decode(&window[off..end]) {
-                // CRC passed; the position check pins the candidate to its
-                // header LSN, ruling out a coincidental decode of tail bytes.
-                if rec.lsn.0 == seg_start + off as u64 {
-                    let found = Lsn(seg_start + off as u64);
-                    return (found < upper_bound).then_some(found);
+    /// Find the first WAL record whose start lies inside segment `segment_id`
+    /// by probing 8-byte-aligned offsets from the segment start with a
+    /// CRC-checked decode (WAL records may straddle segment boundaries, so a
+    /// segment start is NOT itself a record boundary). Used by the loser index
+    /// compensation to extend its scan to the front of the retained segment.
+    /// Returns `None` when nothing decodes within one maximum record length of
+    /// the segment start, or when the first record starts at/after
+    /// `upper_bound` (nothing to gain by rewinding).
+    fn first_record_lsn_in_segment(
+        wal_dir: &Path,
+        segment_size: u64,
+        segment_id: u64,
+        upper_bound: Lsn,
+    ) -> Option<Lsn> {
+        use std::io::{Read, Seek, SeekFrom};
+        // pg-storage wal/segment.rs filename layout: wal-{segment_id + 1:08}.log.
+        let path = wal_dir.join(format!("wal-{:08}.log", segment_id + 1));
+        let mut file = std::fs::File::open(path).ok()?;
+        const HEADER: u64 = 32; // wal/record.rs fixed record header
+        const MAX_RECORD: u64 = HEADER + u16::MAX as u64 + 8; // length prefix is u16
+                                                              // The segment FILE holds the segment's bytes at file offset 0 (file
+                                                              // offset = global LSN - segment start).
+        let seg_start = segment_id * segment_size;
+        file.seek(SeekFrom::Start(0)).ok()?;
+        // Probe window: one max record for a straddling record's tail, plus one
+        // max record so the candidate itself can be decoded fully.
+        let window_len = (2 * MAX_RECORD).min(segment_size);
+        let mut window = Vec::new();
+        file.by_ref()
+            .take(window_len)
+            .read_to_end(&mut window)
+            .ok()?;
+        // WAL records are 8-byte aligned (pg-storage LSN_ALIGNMENT); the
+        // resync probe steps by it.
+        const PROBE_STEP: usize = 8;
+        let mut off = 0usize;
+        while off as u64 <= MAX_RECORD && off + HEADER as usize <= window.len() {
+            let payload_len =
+                u16::from_le_bytes(window[off + 26..off + 28].try_into().unwrap()) as u64;
+            let total = (HEADER + payload_len).next_multiple_of(8);
+            let end = off + total as usize;
+            if end <= window.len() {
+                if let Ok((rec, _)) = WalRecord::decode(&window[off..end]) {
+                    // CRC passed; the position check pins the candidate to its
+                    // header LSN, ruling out a coincidental decode of tail bytes.
+                    if rec.lsn.0 == seg_start + off as u64 {
+                        let found = Lsn(seg_start + off as u64);
+                        return (found < upper_bound).then_some(found);
+                    }
                 }
             }
+            off += PROBE_STEP;
         }
-        off += PROBE_STEP;
+        None
     }
-    None
-}
 
     /// Recovery-time index compensation for loser transactions (see the
     /// `Engine::open` step 7c note). Scans the post-redo-point WAL for
@@ -1964,8 +2150,9 @@ fn first_record_lsn_in_segment(
 
         let mut compensated = 0usize;
         for tid in victim_tids {
-            let Some((entry, col_types, _)) =
-                tables.iter().find(|(_, _, pages)| pages.contains(&tid.page_id))
+            let Some((entry, col_types, _)) = tables
+                .iter()
+                .find(|(_, _, pages)| pages.contains(&tid.page_id))
             else {
                 // The page belongs to no live table (dropped-table remnant
                 // or freelist reuse) — nothing live can reference the row.
@@ -2009,7 +2196,6 @@ fn first_record_lsn_in_segment(
         Ok(())
     }
 
-
     /// Begin an explicit transaction, returning a [`TxnHandle`] for
     /// commit/abort control (§21 M2b API). The snapshot is taken at this
     /// point (SI isolation); `curcid` starts at 0 and is advanced by the
@@ -2024,11 +2210,12 @@ fn first_record_lsn_in_segment(
     /// release everything (`LockManager::release_all`).
     pub fn begin_txn(&self) -> Result<TxnHandle> {
         let xid = self.txn.begin_txn();
-        let snapshot = self.txn.snapshot(xid);
+        let (snapshot, snapshot_guard) = self.txn.snapshot(xid);
         Ok(TxnHandle {
             txn: Arc::clone(&self.txn),
             xid: Some(xid),
             snapshot: RefCell::new(snapshot),
+            _snapshot_guard: snapshot_guard,
             instance_id: self.instance_id,
             lock_manager: Arc::clone(&self.lock_manager),
             index_undo: Arc::clone(&self.index_undo),
@@ -2061,12 +2248,42 @@ fn first_record_lsn_in_segment(
     /// commits — allowed, but only meaningful inside an explicit
     /// transaction (same as PG). `FOR SHARE` parses but returns
     /// [`EngineError::Unsupported`] (multixact is a later stage).
+    ///
+    /// # Query statistics (M3 Stage E, tech-selection §6.3)
+    ///
+    /// Every successfully parsed statement records one
+    /// [`QueryStatEntry`] into
+    /// [`Self::query_stats`] — auto-commit and explicit-transaction paths
+    /// alike, success or failure — making this the single instrumentation
+    /// point for the SQL surface. Parse failures return before the probe
+    /// and are not recorded. The typed API (`scan` / `insert` / `update` /
+    /// `delete` / `index_lookup`) never passes through here and produces
+    /// NO entries (§6.3 另注).
     pub fn exec(&self, txn: Option<&TxnHandle>, sql: &str) -> Result<QueryResult> {
+        let started = Instant::now();
         let stmt = sql::parse(sql)?;
-        match txn {
+        let path = ExecutionPath::of(&stmt);
+        let result = match txn {
             None => self.exec_auto(stmt),
             Some(h) => self.exec_txn(h, stmt),
+        };
+        // F2 (Stage E review): capacity 0 means "stats off" — skip the
+        // per-statement String allocation entirely.
+        if self.query_stats.capacity() > 0 {
+            let rows = match &result {
+                Ok(QueryResult::Rows { rows, .. }) => rows.len(),
+                Ok(QueryResult::Affected(n)) => *n,
+                _ => 0,
+            };
+            self.query_stats.record(QueryStatEntry {
+                query: sql.to_string(),
+                latency: started.elapsed(),
+                rows,
+                path,
+                timestamp: SystemTime::now(),
+            });
         }
+        result
     }
 
     fn exec_auto(&self, stmt: Statement) -> Result<QueryResult> {
@@ -2102,7 +2319,7 @@ fn first_record_lsn_in_segment(
             } => {
                 let count = self.auto_commit(|snap| {
                     let entry =
-                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
+                        self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                     let mut count = 0;
                     for row in &rows {
                         let values = build_insert_values(&entry, &columns, row)?;
@@ -2127,9 +2344,15 @@ fn first_record_lsn_in_segment(
                     // (see its doc). MVCC makes the read consistent; a
                     // racing DROP TABLE is the documented DDL-vs-DML gap.
                     None => {
-                        let mut snap = self.txn.snapshot(TxnId::INVALID);
+                        // `_guard` registers this lock-free reader's
+                        // snapshot for the duration of the statement
+                        // (M3 Stage A, §3.1/§3.3 — the exact hole the
+                        // registry closes).
+                        let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
                         snap.advance_curcid();
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false, false)
+                        self.exec_select(
+                            &snap, &columns, &table, &filter, &order_by, &limit, false, false,
+                        )
                     }
                     // FOR UPDATE (M2c Stage P) needs a real transaction:
                     // the row locks are stamped with its XID and the table
@@ -2138,15 +2361,19 @@ fn first_record_lsn_in_segment(
                     // statement-level FOR UPDATE's locks die with the
                     // statement).
                     Some(LockClause::ForUpdate) => self.auto_commit(|snap| {
-                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
-                        self.exec_select(snap, &columns, &table, &filter, &order_by, &limit, true, false)
+                        self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
+                        self.exec_select(
+                            snap, &columns, &table, &filter, &order_by, &limit, true, false,
+                        )
                     }),
                     // FOR SHARE (Stage S multixact lite): stamps a shared
                     // row lock (HEAP_XMAX_LOCK_ONLY + HEAP_XMAX_IS_SHARE).
                     // The row stays visible to all snapshots.
                     Some(LockClause::ForShare) => self.auto_commit(|snap| {
-                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
-                        self.exec_select(snap, &columns, &table, &filter, &order_by, &limit, true, true)
+                        self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
+                        self.exec_select(
+                            snap, &columns, &table, &filter, &order_by, &limit, true, true,
+                        )
                     }),
                 }
             }
@@ -2157,8 +2384,11 @@ fn first_record_lsn_in_segment(
             } => {
                 let count = self.auto_commit(|snap| {
                     let entry =
-                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
-                    let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                        self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
+                    let pred = filter
+                        .as_ref()
+                        .map(|f| filter_to_predicate(&entry, f))
+                        .transpose()?;
                     let rows = self.scan_inner(snap, &table, pred.as_ref())?;
                     let mut count = 0;
                     for (tid, old_values) in rows {
@@ -2173,8 +2403,11 @@ fn first_record_lsn_in_segment(
             Statement::Delete { table, filter } => {
                 let count = self.auto_commit(|snap| {
                     let entry =
-                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
-                    let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                        self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
+                    let pred = filter
+                        .as_ref()
+                        .map(|f| filter_to_predicate(&entry, f))
+                        .transpose()?;
                     let rows = self.scan_inner(snap, &table, pred.as_ref())?;
                     let mut count = 0;
                     for (tid, _) in rows {
@@ -2236,29 +2469,36 @@ fn first_record_lsn_in_segment(
                 order_by,
                 limit,
                 lock,
-            } => {
-                match lock {
-                    None => {
-                        self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false, false)
-                    }
-                    Some(LockClause::ForUpdate) => {
-                        self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, true, false)
-                    }
-                    Some(LockClause::ForShare) => {
-                        self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, true, true)
-                    }
+            } => match lock {
+                None => {
+                    self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
+                    self.exec_select(
+                        &snap, &columns, &table, &filter, &order_by, &limit, false, false,
+                    )
                 }
-            }
+                Some(LockClause::ForUpdate) => {
+                    self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
+                    self.exec_select(
+                        &snap, &columns, &table, &filter, &order_by, &limit, true, false,
+                    )
+                }
+                Some(LockClause::ForShare) => {
+                    self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
+                    self.exec_select(
+                        &snap, &columns, &table, &filter, &order_by, &limit, true, true,
+                    )
+                }
+            },
             Statement::Update {
                 table,
                 sets,
                 filter,
             } => {
                 let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
-                let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                let pred = filter
+                    .as_ref()
+                    .map(|f| filter_to_predicate(&entry, f))
+                    .transpose()?;
                 let rows = self.scan_inner(&snap, &table, pred.as_ref())?;
                 let mut count = 0;
                 for (tid, old_values) in rows {
@@ -2270,7 +2510,10 @@ fn first_record_lsn_in_segment(
             }
             Statement::Delete { table, filter } => {
                 let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
-                let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                let pred = filter
+                    .as_ref()
+                    .map(|f| filter_to_predicate(&entry, f))
+                    .transpose()?;
                 let rows = self.scan_inner(&snap, &table, pred.as_ref())?;
                 let mut count = 0;
                 for (tid, _) in rows {
@@ -2287,7 +2530,7 @@ fn first_record_lsn_in_segment(
     /// stamped with a lock-only `t_xmax` via [`HeapAM::lock_tuple`] BEFORE
     /// projection — locking after LIMIT matches PG (only returned rows are
     /// locked). The caller must have already taken the statement's table
-    /// lock, and `snap.current_xid` must be a real transaction XID (auto-
+    /// lock, and `snap.current_xid()` must be a real transaction XID (auto-
     /// commit FOR UPDATE runs inside `auto_commit` for exactly this
     /// reason); the locks are released when that transaction ends.
     ///
@@ -2313,7 +2556,10 @@ fn first_record_lsn_in_segment(
         shared: bool,
     ) -> Result<QueryResult> {
         let entry = self.table_entry(table)?;
-        let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+        let pred = filter
+            .as_ref()
+            .map(|f| filter_to_predicate(&entry, f))
+            .transpose()?;
         let mut rows = self.scan_inner(snap, table, pred.as_ref())?;
         if let Some(ob) = order_by {
             let idx = entry
@@ -2401,14 +2647,42 @@ fn first_record_lsn_in_segment(
     /// applies rather than a best-effort cleanup that might make it worse.
     fn auto_commit<T>(&self, op: impl FnOnce(&Snapshot) -> Result<T>) -> Result<T> {
         let xid = self.txn.begin_txn();
-        let mut snap = self.txn.snapshot(xid);
+        // `_snap_guard` unregisters the snapshot at the end of this frame
+        // on BOTH the success and the failure path (M3 Stage A, §3.3). A
+        // panic in `op` still runs the guard's Drop during unwinding (the
+        // default panic policy), so the snapshot unregisters normally; only
+        // panic=abort or mem::forget would skip it — the documented O1
+        // semantics (horizon pinned low, vacuum degrades to no-reclaim,
+        // safe), matching this function's existing panic policy below.
+        let (mut snap, _snap_guard) = self.txn.snapshot(xid);
         snap.advance_curcid();
         match op(&snap) {
             Ok(v) => {
                 let result = self.txn.commit_txn(xid);
+                if result.is_err() {
+                    // Same fallback as TxnHandle::commit (F7): a failed
+                    // commit would otherwise leak the XID into the active
+                    // set forever, pinning the vacuum horizon. Replay the
+                    // index undo FIRST (same discipline as abort), then
+                    // flip the CLOG bit; both best-effort — a WAL broken
+                    // badly enough to fail the abort record means the
+                    // process is tearing down anyway, but it must be loud.
+                    apply_index_undo(
+                        &self.index_undo,
+                        self.storage.buffer_pool(),
+                        self.storage.wal_writer(),
+                        xid,
+                    );
+                    if let Err(abort_err) = self.txn.abort_txn(xid) {
+                        tracing::warn!(error = %abort_err, xid = xid.0, "auto-commit commit-failure fallback abort failed");
+                    }
+                }
                 self.lock_manager.release_all(xid);
-                // Discard the undo log either way (see TxnHandle::commit).
-                self.index_undo.lock().remove(&xid);
+                // Discard the undo log on success only — on failure it was
+                // replayed above (see TxnHandle::commit).
+                if result.is_ok() {
+                    self.index_undo.lock().remove(&xid);
+                }
                 result?;
                 Ok(v)
             }
@@ -2439,7 +2713,7 @@ fn first_record_lsn_in_segment(
         row: &[Value],
     ) -> Result<()> {
         let columns = def.column_types();
-        let tuple = encode_tuple(tuple_header(snap.curcid), &columns, row)?;
+        let tuple = encode_tuple(tuple_header(snap.curcid()), &columns, row)?;
         self.ensure_catalog_room(def, tuple.len())?;
         self.heap.insert(InsertContext {
             rel: RelationDesc {
@@ -2619,6 +2893,54 @@ fn first_record_lsn_in_segment(
         &self.txn
     }
 
+    /// The vacuum horizon: smallest `xmin` among all live registered
+    /// snapshots, or the XID clock's current value when no snapshot is
+    /// registered (M3 Stage A, tech-selection §3.3). Passthrough to
+    /// [`TxnManager::oldest_snapshot_xmin`] for §6.2 introspection and the
+    /// upcoming `Engine::vacuum`.
+    pub fn oldest_snapshot_xmin(&self) -> TxnId {
+        self.txn.oldest_snapshot_xmin()
+    }
+
+    /// Snapshot of the currently active XIDs, sorted (M3 Stage E
+    /// introspection, tech-selection §6.2). Pure passthrough to
+    /// [`TxnManager::active_xids`].
+    pub fn active_xids(&self) -> Vec<TxnId> {
+        self.txn.active_xids()
+    }
+
+    /// The complete wait-for graph `(waiter, holder)` (M3 Stage E
+    /// introspection, tech-selection §6.2): row-lock edges from
+    /// [`TxnManager::wait_edges`] merged with table-lock edges derived from
+    /// [`LockManager::table_lock_states`]. This is exactly the graph the
+    /// deadlock detector consumes — both sides call the same
+    /// [`pg_txn::wait_for_edges`], so the diagnostic view can never drift
+    /// from detection.
+    pub fn wait_edges(&self) -> Vec<(TxnId, TxnId)> {
+        pg_txn::wait_for_edges(&self.txn, &self.lock_manager)
+    }
+
+    /// Snapshot of one table's granted set and wait queue (M3 Stage E
+    /// introspection, tech-selection §6.2); `None` when the table has no
+    /// lock state at all. Passthrough to [`LockManager::table_lock_state`].
+    pub fn table_lock_state(&self, table: Oid) -> Option<TableLockState> {
+        self.lock_manager.table_lock_state(table)
+    }
+
+    /// Disk-CLOG SLRU hit rate since open (M3 Stage E introspection,
+    /// tech-selection §6.2): `hits / (hits + misses)`, `0.0` before any
+    /// lookup. Passthrough to [`ClogBuffer::hit_rate`].
+    pub fn clog_hit_rate(&self) -> f64 {
+        self.clog.hit_rate()
+    }
+
+    /// Buffer-pool hit rate since open (M3 Stage E introspection,
+    /// tech-selection §6.2): `hits / (hits + misses)`, `0.0` before any pin.
+    /// Passthrough to [`BufferPool::hit_rate`].
+    pub fn buffer_pool_hit_rate(&self) -> f64 {
+        self.storage.buffer_pool().hit_rate()
+    }
+
     /// The table lock manager (testing / observability, M2c Stage P):
     /// `is_granted` / `held_by` / `table_lock_state` let tests observe
     /// grants and wait queues; `release_all` pairs with back-door
@@ -2630,6 +2952,15 @@ fn first_record_lsn_in_segment(
     /// The engine's disk CLOG (testing / advanced use).
     pub fn clog(&self) -> &Arc<ClogBuffer> {
         &self.clog
+    }
+
+    /// The query statistics ring buffer (M3 Stage E, tech-selection §6.3):
+    /// one entry per [`Self::exec`] call, oldest dropped on overflow. The
+    /// typed API (`scan` / `insert` / `update` / `delete` /
+    /// `index_lookup`) does NOT produce entries — it never passes through
+    /// `exec`.
+    pub fn query_stats(&self) -> &QueryStats {
+        &self.query_stats
     }
 }
 
@@ -2684,7 +3015,11 @@ fn encode_row(
 }
 
 /// Check that a predicate's column index is in range for the table.
-fn validate_predicate(table: &str, entry: &TableEntry, predicate: Option<&Predicate>) -> Result<()> {
+fn validate_predicate(
+    table: &str,
+    entry: &TableEntry,
+    predicate: Option<&Predicate>,
+) -> Result<()> {
     if let Some(p) = predicate {
         if p.col_index() >= entry.columns.len() {
             return Err(EngineError::InvalidPredicate(format!(
@@ -2701,9 +3036,7 @@ fn validate_predicate(table: &str, entry: &TableEntry, predicate: Option<&Predic
 fn apply_predicate(rows: &mut Vec<(Tid, Vec<Value>)>, predicate: Option<&Predicate>) {
     if let Some(p) = predicate {
         let col_index = p.col_index();
-        rows.retain(|(_, vals)| {
-            vals.get(col_index).is_some_and(|v| p.matches(v))
-        });
+        rows.retain(|(_, vals)| vals.get(col_index).is_some_and(|v| p.matches(v)));
     }
 }
 
@@ -2721,9 +3054,11 @@ fn type_oid_of(col_type: ColumnType) -> Result<(TypeOid, i32)> {
 /// target column type.
 fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
     match (lit, col_type) {
-        (Literal::Int(n), ColumnType::Int4) => Ok(Some(Datum::Int4(i32::try_from(*n).map_err(
-            |_| EngineError::InvalidArgument("integer literal out of range for INT4".to_string()),
-        )?))),
+        (Literal::Int(n), ColumnType::Int4) => {
+            Ok(Some(Datum::Int4(i32::try_from(*n).map_err(|_| {
+                EngineError::InvalidArgument("integer literal out of range for INT4".to_string())
+            })?)))
+        }
         (Literal::Int(n), ColumnType::Int8) => Ok(Some(Datum::Int8(*n))),
         (Literal::Int(n), ColumnType::Timestamptz) => Ok(Some(Datum::Timestamptz(*n))),
         (Literal::Str(s), ColumnType::Text) => Ok(Some(Datum::Text(s.clone()))),
@@ -2758,9 +3093,7 @@ fn build_insert_values(
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| {
-                        EngineError::InvalidArgument(format!(
-                            "no column {col_name:?} in table"
-                        ))
+                        EngineError::InvalidArgument(format!("no column {col_name:?} in table"))
                     })?;
                 v[idx] = literal_to_value(lit, entry.columns[idx].col_type)?;
             }

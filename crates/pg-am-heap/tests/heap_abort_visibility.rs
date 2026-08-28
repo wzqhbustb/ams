@@ -55,7 +55,7 @@ fn rel(first_page: PageId) -> RelationDesc<'static> {
 /// Insert one row as `xid` (tuple `t_xmin = xid`, snapshot's own transaction).
 fn insert_as(heap: &HeapAM, first_page: PageId, xid: TxnId, id: i32, name: &str) -> Tid {
     let mut snap = Snapshot::everything();
-    snap.current_xid = xid;
+    snap.set_current_xid(xid);
     let tuple = encode_row(xid, id, name);
     let mut out_tid = Tid {
         page_id: PageId(0),
@@ -168,8 +168,8 @@ fn in_progress_insert_is_invisible_to_others_but_visible_to_self() {
     // stamped t_cid=0; the scan uses curcid=1, so t_cid < curcid → visible
     // as "written by an earlier command" — §7.2 / v2.3-Q4).
     let mut own_snap = Snapshot::everything();
-    own_snap.current_xid = xid;
-    own_snap.curcid = 1;
+    own_snap.set_current_xid(xid);
+    own_snap.set_curcid(1);
     let rows = heap
         .scan(ScanContext {
             rel: rel(first_page),
@@ -233,7 +233,7 @@ fn scan_dead_tuples_collects_aborted_inserts_and_committed_deletes() {
     // Delete B as xid_c and commit — B becomes dead by the xmax rule.
     let xid_c = mgr.begin_txn();
     let mut snap_c = Snapshot::everything();
-    snap_c.current_xid = xid_c;
+    snap_c.set_current_xid(xid_c);
     heap.delete(DeleteContext {
         clog: clog.as_ref(),
         rel: rel(first_page),
@@ -298,7 +298,7 @@ fn aborted_deleter_tuple_is_not_dead() {
     // Delete it as xid_c, then ABORT the delete.
     let xid_c = mgr.begin_txn();
     let mut snap_c = Snapshot::everything();
-    snap_c.current_xid = xid_c;
+    snap_c.set_current_xid(xid_c);
     heap.delete(DeleteContext {
         clog: clog.as_ref(),
         rel: rel(first_page),
@@ -368,7 +368,7 @@ fn delete_of_deleted_and_update_of_deleted_are_rejected() {
 
     let xid_d1 = mgr.begin_txn();
     let mut snap_d1 = Snapshot::everything();
-    snap_d1.current_xid = xid_d1;
+    snap_d1.set_current_xid(xid_d1);
     heap.delete(DeleteContext {
         clog: clog.as_ref(),
         rel: rel(first_page),
@@ -382,7 +382,7 @@ fn delete_of_deleted_and_update_of_deleted_are_rejected() {
     // overwrote t_xmax; if this deleter aborted, the row resurrected).
     let xid_d2 = mgr.begin_txn();
     let mut snap_d2 = Snapshot::everything();
-    snap_d2.current_xid = xid_d2;
+    snap_d2.set_current_xid(xid_d2);
     let err = heap
         .delete(DeleteContext {
             clog: clog.as_ref(),
@@ -400,7 +400,7 @@ fn delete_of_deleted_and_update_of_deleted_are_rejected() {
     // Update of the deleted row must also be rejected.
     let xid_u = mgr.begin_txn();
     let mut snap_u = Snapshot::everything();
-    snap_u.current_xid = xid_u;
+    snap_u.set_current_xid(xid_u);
     let err = heap
         .update(UpdateContext {
             clog: clog.as_ref(),
@@ -466,7 +466,7 @@ fn aborted_deleter_tuple_can_be_deleted_again() {
 
     let xid_c = mgr.begin_txn();
     let mut snap_c = Snapshot::everything();
-    snap_c.current_xid = xid_c;
+    snap_c.set_current_xid(xid_c);
     heap.delete(DeleteContext {
         rel: rel(first_page),
         snapshot: &snap_c,
@@ -480,7 +480,7 @@ fn aborted_deleter_tuple_can_be_deleted_again() {
     // does not block it.
     let xid_d = mgr.begin_txn();
     let mut snap_d = Snapshot::everything();
-    snap_d.current_xid = xid_d;
+    snap_d.set_current_xid(xid_d);
     heap.delete(DeleteContext {
         rel: rel(first_page),
         snapshot: &snap_d,
@@ -510,7 +510,7 @@ fn aborted_deleter_tuple_can_be_deleted_again() {
 
     let xid_c2 = mgr.begin_txn();
     let mut snap_c2 = Snapshot::everything();
-    snap_c2.current_xid = xid_c2;
+    snap_c2.set_current_xid(xid_c2);
     heap.delete(DeleteContext {
         rel: rel(first_page),
         snapshot: &snap_c2,
@@ -522,7 +522,7 @@ fn aborted_deleter_tuple_can_be_deleted_again() {
 
     let xid_u = mgr.begin_txn();
     let mut snap_u = Snapshot::everything();
-    snap_u.current_xid = xid_u;
+    snap_u.set_current_xid(xid_u);
     heap.update(UpdateContext {
         rel: rel(first_page),
         snapshot: &snap_u,

@@ -382,7 +382,11 @@ impl Drop for DeadlockDetector {
 /// never held across the other — so the hot path (`end_txn`, `release_all`,
 /// `wait_for`) is never blocked by the detector, and the detector can never
 /// invert the registry→active / entries→victims lock orders.
-fn wait_for_edges(txn: &TxnManager, lock_manager: &LockManager) -> Vec<(TxnId, TxnId)> {
+///
+/// Public since M3 Stage E (tech-selection §6.2): the engine's `wait_edges()`
+/// introspection API exposes exactly the graph the detector consumes, so the
+/// diagnostic surface can never drift from deadlock detection.
+pub fn wait_for_edges(txn: &TxnManager, lock_manager: &LockManager) -> Vec<(TxnId, TxnId)> {
     let mut edges = txn.wait_edges();
     for (_table, state) in lock_manager.table_lock_states() {
         for &(waiter, waiter_mode) in &state.waiters {

@@ -37,7 +37,7 @@ fn insert_1m(engine: &Engine) -> f64 {
     let col_types = [ColumnType::Int8, ColumnType::Int8];
     let xid = engine.txn_manager().begin_txn();
     let mut snap = Snapshot::everything();
-    snap.current_xid = xid;
+    snap.set_current_xid(xid);
     let start = Instant::now();
     for i in 0..ROWS {
         let tuple = encode_tuple(

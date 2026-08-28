@@ -31,7 +31,9 @@ fn assert_affected(res: QueryResult, expected: usize) {
 
 fn assert_row_count(res: &QueryResult, expected: usize) {
     match res {
-        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), expected, "expected {expected} rows"),
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), expected, "expected {expected} rows")
+        }
         other => panic!("expected Rows, got {other:?}"),
     }
 }
@@ -42,7 +44,9 @@ fn setup() -> (TempDir, Engine) {
     engine
         .exec(None, "CREATE TABLE users (id INT, name TEXT)")
         .unwrap();
-    engine.exec(None, "INSERT INTO users VALUES (1, 'Alice')").unwrap();
+    engine
+        .exec(None, "INSERT INTO users VALUES (1, 'Alice')")
+        .unwrap();
     (tmp, engine)
 }
 
@@ -51,9 +55,15 @@ fn setup() -> (TempDir, Engine) {
 fn case1_self_insert_delete_select_empty() {
     let (_tmp, engine) = setup();
     let txn = engine.begin_txn().unwrap();
-    engine.exec(Some(&txn), "INSERT INTO users VALUES (2, 'Bob')").unwrap();
-    engine.exec(Some(&txn), "DELETE FROM users WHERE id = 2").unwrap();
-    let res = engine.exec(Some(&txn), "SELECT * FROM users WHERE id = 2").unwrap();
+    engine
+        .exec(Some(&txn), "INSERT INTO users VALUES (2, 'Bob')")
+        .unwrap();
+    engine
+        .exec(Some(&txn), "DELETE FROM users WHERE id = 2")
+        .unwrap();
+    let res = engine
+        .exec(Some(&txn), "SELECT * FROM users WHERE id = 2")
+        .unwrap();
     assert_row_count(&res, 0);
     txn.commit().unwrap();
 }
@@ -63,8 +73,12 @@ fn case1_self_insert_delete_select_empty() {
 fn case2_self_insert_select_visible() {
     let (_tmp, engine) = setup();
     let txn = engine.begin_txn().unwrap();
-    engine.exec(Some(&txn), "INSERT INTO users VALUES (2, 'Bob')").unwrap();
-    let res = engine.exec(Some(&txn), "SELECT * FROM users WHERE id = 2").unwrap();
+    engine
+        .exec(Some(&txn), "INSERT INTO users VALUES (2, 'Bob')")
+        .unwrap();
+    let res = engine
+        .exec(Some(&txn), "SELECT * FROM users WHERE id = 2")
+        .unwrap();
     assert_row_count(&res, 1);
     txn.commit().unwrap();
 }
@@ -74,8 +88,12 @@ fn case2_self_insert_select_visible() {
 fn case3_self_insert_then_delete_then_select_empty() {
     let (_tmp, engine) = setup();
     let txn = engine.begin_txn().unwrap();
-    engine.exec(Some(&txn), "INSERT INTO users VALUES (3, 'Carol')").unwrap();
-    engine.exec(Some(&txn), "DELETE FROM users WHERE id = 3").unwrap();
+    engine
+        .exec(Some(&txn), "INSERT INTO users VALUES (3, 'Carol')")
+        .unwrap();
+    engine
+        .exec(Some(&txn), "DELETE FROM users WHERE id = 3")
+        .unwrap();
     let res = engine.exec(Some(&txn), "SELECT * FROM users").unwrap();
     // Only the pre-existing row (id=1, Alice) should be visible.
     assert_row_count(&res, 1);
@@ -88,13 +106,22 @@ fn case3_self_insert_then_delete_then_select_empty() {
 fn case4_halloween_update_does_not_rescan() {
     let (_tmp, engine) = setup();
     let txn = engine.begin_txn().unwrap();
-    engine.exec(Some(&txn), "INSERT INTO users VALUES (2, 'Bob')").unwrap();
-    engine.exec(Some(&txn), "UPDATE users SET name = 'Bobby' WHERE id = 2").unwrap();
-    let res = engine.exec(Some(&txn), "SELECT * FROM users WHERE id = 2").unwrap();
+    engine
+        .exec(Some(&txn), "INSERT INTO users VALUES (2, 'Bob')")
+        .unwrap();
+    engine
+        .exec(Some(&txn), "UPDATE users SET name = 'Bobby' WHERE id = 2")
+        .unwrap();
+    let res = engine
+        .exec(Some(&txn), "SELECT * FROM users WHERE id = 2")
+        .unwrap();
     match res {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0][1], Some(pg_engine::Datum::Text("Bobby".to_string())));
+            assert_eq!(
+                rows[0][1],
+                Some(pg_engine::Datum::Text("Bobby".to_string()))
+            );
         }
         other => panic!("expected Rows, got {other:?}"),
     }
@@ -106,10 +133,14 @@ fn case4_halloween_update_does_not_rescan() {
 fn case5_concurrent_uncommitted_delete_other_txn_sees_row() {
     let (_tmp, engine) = setup();
     let t1 = engine.begin_txn().unwrap();
-    engine.exec(Some(&t1), "DELETE FROM users WHERE id = 1").unwrap();
+    engine
+        .exec(Some(&t1), "DELETE FROM users WHERE id = 1")
+        .unwrap();
     // T2 begins AFTER T1's delete is uncommitted — T1 is in T2's xip.
     let t2 = engine.begin_txn().unwrap();
-    let res = engine.exec(Some(&t2), "SELECT * FROM users WHERE id = 1").unwrap();
+    let res = engine
+        .exec(Some(&t2), "SELECT * FROM users WHERE id = 1")
+        .unwrap();
     assert_row_count(&res, 1);
     t2.abort().unwrap();
     t1.abort().unwrap();
@@ -120,11 +151,15 @@ fn case5_concurrent_uncommitted_delete_other_txn_sees_row() {
 fn case6_committed_delete_other_txn_no_row() {
     let (_tmp, engine) = setup();
     let t1 = engine.begin_txn().unwrap();
-    engine.exec(Some(&t1), "DELETE FROM users WHERE id = 1").unwrap();
+    engine
+        .exec(Some(&t1), "DELETE FROM users WHERE id = 1")
+        .unwrap();
     t1.commit().unwrap();
     // T2 begins AFTER T1 commits — T1's delete is visible to T2.
     let t2 = engine.begin_txn().unwrap();
-    let res = engine.exec(Some(&t2), "SELECT * FROM users WHERE id = 1").unwrap();
+    let res = engine
+        .exec(Some(&t2), "SELECT * FROM users WHERE id = 1")
+        .unwrap();
     assert_row_count(&res, 0);
     t2.commit().unwrap();
 }
@@ -134,13 +169,28 @@ fn case6_committed_delete_other_txn_no_row() {
 fn exec_auto_commit_roundtrip() {
     let tmp = TempDir::new().unwrap();
     let engine = open(tmp.path());
-    engine.exec(None, "CREATE TABLE t (id INT, name TEXT)").unwrap();
-    assert_affected(engine.exec(None, "INSERT INTO t VALUES (1, 'a')").unwrap(), 1);
-    assert_affected(engine.exec(None, "INSERT INTO t VALUES (2, 'b'), (3, 'c')").unwrap(), 2);
+    engine
+        .exec(None, "CREATE TABLE t (id INT, name TEXT)")
+        .unwrap();
+    assert_affected(
+        engine.exec(None, "INSERT INTO t VALUES (1, 'a')").unwrap(),
+        1,
+    );
+    assert_affected(
+        engine
+            .exec(None, "INSERT INTO t VALUES (2, 'b'), (3, 'c')")
+            .unwrap(),
+        2,
+    );
     let res = engine.exec(None, "SELECT * FROM t ORDER BY id").unwrap();
     assert_row_count(&res, 3);
     // WHERE + ORDER BY DESC + LIMIT
-    let res = engine.exec(None, "SELECT * FROM t WHERE id > 1 ORDER BY id DESC LIMIT 1").unwrap();
+    let res = engine
+        .exec(
+            None,
+            "SELECT * FROM t WHERE id > 1 ORDER BY id DESC LIMIT 1",
+        )
+        .unwrap();
     assert_row_count(&res, 1);
     match res {
         QueryResult::Rows { rows, .. } => {
@@ -155,9 +205,18 @@ fn exec_auto_commit_roundtrip() {
 fn exec_update_delete() {
     let tmp = TempDir::new().unwrap();
     let engine = open(tmp.path());
-    engine.exec(None, "CREATE TABLE t (id INT, name TEXT)").unwrap();
-    engine.exec(None, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
-    assert_affected(engine.exec(None, "UPDATE t SET name = 'x' WHERE id > 1").unwrap(), 2);
+    engine
+        .exec(None, "CREATE TABLE t (id INT, name TEXT)")
+        .unwrap();
+    engine
+        .exec(None, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    assert_affected(
+        engine
+            .exec(None, "UPDATE t SET name = 'x' WHERE id > 1")
+            .unwrap(),
+        2,
+    );
     assert_affected(engine.exec(None, "DELETE FROM t WHERE id < 3").unwrap(), 2);
     let res = engine.exec(None, "SELECT * FROM t").unwrap();
     assert_row_count(&res, 1);
@@ -198,10 +257,16 @@ fn exec_clean_shutdown_reopen() {
     let tmp = TempDir::new().unwrap();
     {
         let engine = open(tmp.path());
-        engine.exec(None, "CREATE TABLE t (id INT, name TEXT)").unwrap();
-        engine.exec(None, "INSERT INTO t VALUES (1, 'hello')").unwrap();
+        engine
+            .exec(None, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, 'hello')")
+            .unwrap();
         engine.checkpoint().unwrap();
-        engine.exec(None, "INSERT INTO t VALUES (2, 'world')").unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (2, 'world')")
+            .unwrap();
         engine.shutdown();
     }
     let engine = open(tmp.path());
@@ -216,7 +281,10 @@ fn exec_txn_control_statements_error() {
     let tmp = TempDir::new().unwrap();
     let engine = open(tmp.path());
     let err = engine.exec(None, "BEGIN").unwrap_err().to_string();
-    assert!(err.contains("Engine::begin_txn()"), "unexpected BEGIN error: {err}");
+    assert!(
+        err.contains("Engine::begin_txn()"),
+        "unexpected BEGIN error: {err}"
+    );
     for sql in ["COMMIT", "ROLLBACK"] {
         let err = engine.exec(None, sql).unwrap_err().to_string();
         assert!(
@@ -231,14 +299,18 @@ fn exec_txn_control_statements_error() {
 fn exec_negative_paths_error() {
     let tmp = TempDir::new().unwrap();
     let engine = open(tmp.path());
-    engine.exec(None, "CREATE TABLE t (id INT, name TEXT)").unwrap();
+    engine
+        .exec(None, "CREATE TABLE t (id INT, name TEXT)")
+        .unwrap();
 
     // Malformed SQL.
     assert!(engine.exec(None, "SELEC * FROM t").is_err());
     assert!(engine.exec(None, "SELECT * WHERE id = 1").is_err());
     // Unknown table.
     assert!(engine.exec(None, "SELECT * FROM nope").is_err());
-    assert!(engine.exec(None, "INSERT INTO nope VALUES (1, 'a')").is_err());
+    assert!(engine
+        .exec(None, "INSERT INTO nope VALUES (1, 'a')")
+        .is_err());
     // Type mismatch on INSERT.
     assert!(engine.exec(None, "INSERT INTO t VALUES ('a', 1)").is_err());
     // DDL inside an explicit transaction (locks in engine.rs exec_txn).
@@ -301,10 +373,18 @@ fn exec_txn_handle_from_other_engine_errors() {
 fn exec_identifier_case_insensitive() {
     let tmp = TempDir::new().unwrap();
     let engine = open(tmp.path());
-    engine.exec(None, "CREATE TABLE Users (ID INT, Name TEXT)").unwrap();
-    engine.exec(None, "INSERT INTO users VALUES (1, 'Alice')").unwrap();
-    engine.exec(None, "INSERT INTO USERS (id, NAME) VALUES (2, 'Bob')").unwrap();
-    let res = engine.exec(None, "SELECT name FROM Users WHERE ID = 2").unwrap();
+    engine
+        .exec(None, "CREATE TABLE Users (ID INT, Name TEXT)")
+        .unwrap();
+    engine
+        .exec(None, "INSERT INTO users VALUES (1, 'Alice')")
+        .unwrap();
+    engine
+        .exec(None, "INSERT INTO USERS (id, NAME) VALUES (2, 'Bob')")
+        .unwrap();
+    let res = engine
+        .exec(None, "SELECT name FROM Users WHERE ID = 2")
+        .unwrap();
     match res {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -345,9 +425,15 @@ fn txn_handle_drop_auto_abort_visibility() {
 fn exec_order_by_desc() {
     let tmp = TempDir::new().unwrap();
     let engine = open(tmp.path());
-    engine.exec(None, "CREATE TABLE t (id INT, name TEXT)").unwrap();
-    engine.exec(None, "INSERT INTO t VALUES (2, 'b'), (1, 'a'), (3, 'c')").unwrap();
-    let res = engine.exec(None, "SELECT id FROM t ORDER BY id DESC").unwrap();
+    engine
+        .exec(None, "CREATE TABLE t (id INT, name TEXT)")
+        .unwrap();
+    engine
+        .exec(None, "INSERT INTO t VALUES (2, 'b'), (1, 'a'), (3, 'c')")
+        .unwrap();
+    let res = engine
+        .exec(None, "SELECT id FROM t ORDER BY id DESC")
+        .unwrap();
     match res {
         QueryResult::Rows { rows, .. } => {
             let ids: Vec<i32> = rows
@@ -369,11 +455,17 @@ fn exec_order_by_desc() {
 fn exec_update_delete_no_where_full_table() {
     let tmp = TempDir::new().unwrap();
     let engine = open(tmp.path());
-    engine.exec(None, "CREATE TABLE t (id INT, name TEXT)").unwrap();
-    engine.exec(None, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+    engine
+        .exec(None, "CREATE TABLE t (id INT, name TEXT)")
+        .unwrap();
+    engine
+        .exec(None, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
     // Full-table UPDATE.
     assert_affected(engine.exec(None, "UPDATE t SET name = 'x'").unwrap(), 3);
-    let res = engine.exec(None, "SELECT * FROM t WHERE name = 'x'").unwrap();
+    let res = engine
+        .exec(None, "SELECT * FROM t WHERE name = 'x'")
+        .unwrap();
     assert_row_count(&res, 3);
     // Full-table DELETE.
     assert_affected(engine.exec(None, "DELETE FROM t").unwrap(), 3);

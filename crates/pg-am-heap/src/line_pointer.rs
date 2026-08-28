@@ -24,7 +24,7 @@ const LP_LEN_SHIFT: u32 = 17;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum LpFlags {
-    /// Slot is empty and may be recycled by `add_tuple`.
+    /// Slot is empty and may be recycled by `add_tuple`/`add_tuple_at`.
     Unused = 0,
     /// Slot points to a live tuple.
     Normal = 1,

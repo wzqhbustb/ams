@@ -126,7 +126,12 @@ fn setup(threads: usize) -> Fixture {
 /// post-batch TIDs; the fixture's TID list is rewritten after the join so
 /// the next criterion iteration starts from live row versions (updating a
 /// stale TID is a committed-conflict error, §9.1 step 3).
-fn run_update_batch(engine: &Arc<Engine>, tids: &std::sync::Mutex<Vec<Tid>>, threads: usize, ops: usize) {
+fn run_update_batch(
+    engine: &Arc<Engine>,
+    tids: &std::sync::Mutex<Vec<Tid>>,
+    threads: usize,
+    ops: usize,
+) {
     let snapshot = tids.lock().unwrap().clone();
     let per_slice = snapshot.len() / threads;
     let mut new_slices: Vec<Vec<Tid>> = Vec::with_capacity(threads);

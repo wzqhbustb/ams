@@ -1,7 +1,9 @@
-//! Heap redo handlers (M2a Stage I).
+//! Heap redo handlers (M2a Stage I; HeapCleanup added in M3 Stage B).
 //!
-//! Three handlers replay the heap WAL records produced by [`crate::heap_am`]:
-//! [`HeapInsertHandler`], [`HeapUpdateHandler`], [`HeapDeleteHandler`]. They are
+//! Five handlers replay the heap WAL records produced by [`crate::heap_am`]
+//! and by vacuum's compaction (M3): [`HeapInsertHandler`],
+//! [`HeapUpdateHandler`], [`HeapDeleteHandler`], [`HeapHotUpdateHandler`],
+//! [`HeapCleanupRedoHandler`]. They are
 //! stateless — the buffer pool and page allocator arrive via [`RedoContext`] —
 //! so [`crate::heap_am::HeapAM::redo_handlers`] can hand fresh boxes to the
 //! recovery registry (which `pg-storage` cannot construct itself, as it must
@@ -13,10 +15,11 @@
 //! records after a crash *during* recovery. Each handler is therefore guarded by
 //! the authoritative page LSN: if `page_pd_lsn(page) >= record.lsn`, the change
 //! is already durable and the handler is a no-op. Otherwise it applies the
-//! change and stamps `pd_lsn = max(record.lsn, pd_lsn)`. Because heap delete is
-//! logical (slots are never recycled), [`SlottedPage::add_tuple`] appends
-//! deterministically, so re-applying `HeapInsert` after a fresh page is
-//! initialized reproduces the exact slot recorded in the WAL.
+//! change and stamps `pd_lsn = max(record.lsn, pd_lsn)`. Slot assignment is
+//! explicit (M3 §4.6): the WAL record carries the slot chosen online, and redo
+//! places the tuple with [`SlottedPage::add_tuple_at`] at exactly that slot —
+//! no dependence on the online writer's first-fit choice being reproducible
+//! against a page vacuum's `compact()` may have left with `Unused` slots.
 //!
 //! Freshly allocated heap pages may be materialized as all-zero bytes when the
 //! data file is extended during replay (the `PageAlloc` record, which has a
@@ -45,9 +48,10 @@ use pg_storage::buffer_pool::BufferPool;
 use pg_storage::error::{Result, StorageError};
 use pg_storage::page::{page_pd_lsn, set_page_pd_lsn};
 use pg_storage::recovery::{RedoContext, RedoHandler};
-use pg_storage::types::{Lsn, Tid, PAGE_SIZE};
+use pg_storage::types::{Lsn, PageId, Tid, PAGE_SIZE};
 use pg_storage::wal::record::{
-    HeapDeleteRecord, HeapHotUpdateRecord, HeapInsertRecord, HeapUpdateRecord, WalRecord,
+    HeapCleanupRecord, HeapDeleteRecord, HeapHotUpdateRecord, HeapInsertRecord, HeapUpdateRecord,
+    WalRecord,
 };
 use pg_storage::wal::WalRecordType;
 
@@ -56,12 +60,17 @@ use pg_storage::wal::WalRecordType;
 ///
 /// `pg-storage` owns the registry but cannot depend on this crate, so the
 /// caller opening the engine must pass these in.
+///
+/// Every heap record type with a producer MUST have a handler here (Stage 0
+/// hard-fail convention: recovery errors out on an unregistered type) —
+/// record and handler ship in the same stage (§4.5).
 pub fn heap_redo_handlers() -> Vec<Box<dyn RedoHandler>> {
     vec![
         Box::new(HeapInsertHandler),
         Box::new(HeapUpdateHandler),
         Box::new(HeapDeleteHandler),
         Box::new(HeapHotUpdateHandler),
+        Box::new(HeapCleanupRedoHandler),
     ]
 }
 
@@ -83,17 +92,12 @@ impl RedoHandler for HeapInsertHandler {
             return Ok(());
         }
         SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
-        let slot = SlottedPage::add_tuple(page, &rec.tuple_bytes).map_err(heap_to_storage)?;
-        // Slot divergence means the page on disk is inconsistent with the
-        // WAL stream (e.g. torn base page). Hard-fail rather than silently
-        // writing the tuple to the wrong slot (§11.6: redo never skips
-        // silently).
-        if slot != rec.slot_id {
-            return Err(StorageError::MetadataCorrupted(format!(
-                "HeapInsert redo slot diverged: record expects slot {}, page gives {slot}",
-                rec.slot_id
-            )));
-        }
+        // §4.6: place the tuple at the slot the record carries. A slot the
+        // page cannot honor (out of range, or still occupied) means the page
+        // on disk is inconsistent with the WAL stream (e.g. a torn base
+        // page) — hard-fail rather than silently writing the tuple elsewhere
+        // (§11.6: redo never skips silently).
+        SlottedPage::add_tuple_at(page, rec.slot_id, &rec.tuple_bytes).map_err(heap_to_storage)?;
         stamp_pd_lsn(page, record.lsn);
         Ok(())
     }
@@ -124,14 +128,9 @@ impl RedoHandler for HeapUpdateHandler {
             if page_pd_lsn(page) < record.lsn {
                 SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
                 stamp_deleted(page, rec.old_tid, rec.xmax_old, true).map_err(heap_to_storage)?;
-                let slot =
-                    SlottedPage::add_tuple(page, &rec.new_tuple_bytes).map_err(heap_to_storage)?;
-                if slot != rec.new_tid.slot_id {
-                    return Err(StorageError::MetadataCorrupted(format!(
-                        "HeapUpdate redo slot diverged: record expects slot {}, page gives {slot}",
-                        rec.new_tid.slot_id
-                    )));
-                }
+                // §4.6: the new version goes to the slot the record carries.
+                SlottedPage::add_tuple_at(page, rec.new_tid.slot_id, &rec.new_tuple_bytes)
+                    .map_err(heap_to_storage)?;
                 stamp_pd_lsn(page, record.lsn);
             }
             return Ok(());
@@ -153,21 +152,15 @@ impl RedoHandler for HeapUpdateHandler {
             }
         }
 
-        // New page: append the new version.
+        // New page: append the new version at the recorded slot (§4.6).
         {
             let mut guard = pool.pin_mut(rec.new_tid.page_id)?;
             let page: &mut [u8; PAGE_SIZE] =
                 guard.page_mut().try_into().expect("frame is PAGE_SIZE");
             if page_pd_lsn(page) < record.lsn {
                 SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
-                let slot =
-                    SlottedPage::add_tuple(page, &rec.new_tuple_bytes).map_err(heap_to_storage)?;
-                if slot != rec.new_tid.slot_id {
-                    return Err(StorageError::MetadataCorrupted(format!(
-                        "HeapUpdate redo slot diverged: record expects slot {}, page gives {slot}",
-                        rec.new_tid.slot_id
-                    )));
-                }
+                SlottedPage::add_tuple_at(page, rec.new_tid.slot_id, &rec.new_tuple_bytes)
+                    .map_err(heap_to_storage)?;
                 stamp_pd_lsn(page, record.lsn);
             }
         }
@@ -226,14 +219,69 @@ impl RedoHandler for HeapHotUpdateHandler {
             slot_id: rec.new_slot,
         };
         stamp_hot_update(page, old_tid, new_tid, rec.xmax).map_err(heap_to_storage)?;
-        let slot = SlottedPage::add_tuple(page, &rec.new_tuple_bytes).map_err(heap_to_storage)?;
-        if slot != rec.new_slot {
-            return Err(StorageError::MetadataCorrupted(format!(
-                "HeapHotUpdate redo slot diverged: record expects slot {}, page gives {slot}",
-                rec.new_slot
-            )));
-        }
+        // §4.6: the new HEAP_ONLY version goes to the recorded slot.
+        SlottedPage::add_tuple_at(page, rec.new_slot, &rec.new_tuple_bytes)
+            .map_err(heap_to_storage)?;
         stamp_pd_lsn(page, record.lsn);
+        Ok(())
+    }
+}
+
+/// Redo handler for `HeapCleanup` records (M3 Stage B, tech-selection §4.5):
+/// replay vacuum's page compaction — and, when the record carries one, the
+/// page-chain unlink — by re-executing the SAME physical operation the
+/// online path ran.
+pub struct HeapCleanupRedoHandler;
+
+impl RedoHandler for HeapCleanupRedoHandler {
+    fn kind(&self) -> WalRecordType {
+        WalRecordType::HeapCleanup
+    }
+
+    fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        let rec = HeapCleanupRecord::decode(&record.payload)?;
+        let pool = require_pool(ctx)?;
+
+        // Compacted page: pd_lsn idempotency guard, then the SAME
+        // `SlottedPage::compact` with the same (ascending) dead_slots the
+        // online path used — replay convergence is "replay = re-execute",
+        // never a parallel reimplementation (§4.5). A fresh (all-zero) page
+        // cannot hold the listed slots, so compact hard-fails on it — the
+        // correct response to a WAL stream whose page-content records were
+        // lost.
+        {
+            let mut guard = pool.pin_mut(rec.page_id)?;
+            let page: &mut [u8; PAGE_SIZE] =
+                guard.page_mut().try_into().expect("frame is PAGE_SIZE");
+            if page_pd_lsn(page) < record.lsn {
+                SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
+                SlottedPage::compact(page, &rec.dead_slots).map_err(heap_to_storage)?;
+                stamp_pd_lsn(page, record.lsn);
+            }
+        }
+
+        // Chain unlink: relink the predecessor's `next_page` past the
+        // spliced-out page. Guarded by the predecessor's OWN pd_lsn — the
+        // two pages may have reached disk at different times before the
+        // crash (same policy as a cross-page `HeapUpdate`).
+        if rec.unlink_prev_page != PageId::INVALID {
+            let mut guard = pool.pin_mut(rec.unlink_prev_page)?;
+            let page: &mut [u8; PAGE_SIZE] =
+                guard.page_mut().try_into().expect("frame is PAGE_SIZE");
+            if page_pd_lsn(page) < record.lsn {
+                SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
+                let next = if rec.unlink_next_page == PageId::INVALID {
+                    None
+                } else {
+                    Some(rec.unlink_next_page)
+                };
+                // The predecessor page comes from disk — an untrusted source
+                // — so the geometry check inside set_next_page is a hard
+                // Result here, not a debug assertion (F2).
+                SlottedPage::set_next_page(page, next).map_err(heap_to_storage)?;
+                stamp_pd_lsn(page, record.lsn);
+            }
+        }
         Ok(())
     }
 }

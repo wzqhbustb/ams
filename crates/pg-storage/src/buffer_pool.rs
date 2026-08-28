@@ -176,6 +176,11 @@ pub struct BufferPool {
     /// contract wait here for the in-flight flush to complete.
     #[cfg_attr(loom, allow(dead_code))] // only waited on by the real `flush_frame`
     flush_done: Condvar,
+    /// Cache hits (page already resident at pin time), for hit-rate
+    /// observability (M3 Stage E, tech-selection §6.2).
+    hits: AtomicU64,
+    /// Cache misses (page had to be read from the data file).
+    misses: AtomicU64,
 }
 
 impl BufferPool {
@@ -215,6 +220,8 @@ impl BufferPool {
             flush_gen: AtomicU64::new(0),
             synced_gen: AtomicU64::new(0),
             flush_done: Condvar::new(),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         })
     }
 
@@ -229,6 +236,33 @@ impl BufferPool {
     /// Return the current checkpoint LSN.
     pub fn checkpoint_lsn(&self) -> Lsn {
         Lsn(self.checkpoint_lsn.load(Ordering::Acquire))
+    }
+
+    /// Cumulative cache hits since open (M3 Stage E, tech-selection §6.2).
+    ///
+    /// A hit is a pin that found its page already resident — including the
+    /// `alloc_frame` double-check that wins the race against a concurrent
+    /// loader. `new_page` allocations are not counted (no lookup, no disk
+    /// read), and neither is the redo-only [`Self::force_reload_from_disk`].
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative cache misses since open (page had to be read from the
+    /// data file into a frame).
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    /// `hits / (hits + misses)`; `0.0` before any pin.
+    pub fn hit_rate(&self) -> f64 {
+        let hits = self.hits();
+        let total = hits + self.misses();
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
     }
 
     /// Pin a page for read access.
@@ -439,6 +473,70 @@ impl BufferPool {
         Ok(())
     }
 
+    /// Force the pooled image of `page_id` back to its on-disk contents and
+    /// return the reloaded page's `pd_lsn` (redo-repair only).
+    ///
+    /// Mid-replay, a page's POOLED image can legitimately lag its on-disk
+    /// image: unconditional full-page-image replay restores an old image
+    /// (e.g. one from the page's PREVIOUS identity before freelist
+    /// recycling — M3 vacuum is the first freelist producer) and forward
+    /// replay has only rebuilt the page up to the record currently being
+    /// replayed. A redo handler whose record cannot be reconstructed from
+    /// the pooled state (the B+Tree split `Copy` recomputes the moved
+    /// entries from the LEFT page's pre-copy image, which is gone once the
+    /// pooled left page is past the copy) uses this to adopt the durable
+    /// on-disk state instead of declaring corruption — safe exactly when
+    /// the online protocol guarantees the on-disk image is new enough
+    /// (for `Copy`: the right page's post-copy image is flushed before the
+    /// left page's latch is released, so `left durable post-copy` implies
+    /// `right durable post-copy`).
+    ///
+    /// A page with no full on-disk image (beyond / partially at the data
+    /// file's tail) yields `Ok(Lsn::INVALID)` and leaves the frame
+    /// untouched: "no image" is a legitimate answer — the caller's guard
+    /// then decides what that means (for `Copy`: genuine corruption).
+    ///
+    /// The caller must hold no latch on the page. Single-threaded redo
+    /// only: no coordination with concurrent accessors beyond the frame's
+    /// own locks is provided.
+    pub fn force_reload_from_disk(&self, page_id: PageId) -> Result<Lsn> {
+        debug_assert!(
+            page_id != PageId::INVALID,
+            "INVALID has no on-disk image (same contract as read_page_from_disk)"
+        );
+        let offset = (page_id.0 - 1) * self.config.page_size() as u64;
+        if offset + self.config.page_size() as u64 > self.data_file.len()? {
+            return Ok(Lsn::INVALID);
+        }
+        let frame_id = {
+            let shard_idx = self.shard_index(page_id);
+            let shard = self.page_table[shard_idx].lock();
+            *shard
+                .get(&page_id)
+                .ok_or(StorageError::PageNotFound(page_id))?
+        };
+        self.read_page_from_disk(page_id, frame_id)?;
+        let pd = {
+            let content = self.frames[frame_id.0].content.read();
+            page_pd_lsn(&content[..])
+        };
+        {
+            let mut meta = self.frames[frame_id.0].meta.lock();
+            // Memory now equals the durable disk image — adopt the same
+            // per-field state `alloc_frame`'s load-from-disk path
+            // establishes: not dirty (a stale regressed image must never
+            // be flushed over the newer disk state), no dirty-era anchor,
+            // the cached pd_lsn mirror refreshed, and `needs_fpi = true`
+            // so the next modification in a later checkpoint cycle owes
+            // an FPI.
+            meta.dirty = false;
+            meta.first_dirty_lsn = Lsn::INVALID;
+            meta.cached_lsn = pd;
+            meta.needs_fpi = true;
+        }
+        Ok(pd)
+    }
+
     /// Return the number of frames in the pool.
     pub fn frame_count(&self) -> usize {
         self.frames.len()
@@ -543,6 +641,12 @@ impl BufferPool {
 
         meta.pin_count += 1;
         meta.reference = true;
+        // Hit: the page was already resident (§6.2 counter). Both call sites
+        // — the `locate_or_load` fast path and the `alloc_frame` double-check
+        // — reach this line exactly once per successful pin, and the
+        // double-check success genuinely is a hit (a concurrent loader beat
+        // us to it; no disk read happens on this pin).
+        self.hits.fetch_add(1, Ordering::Relaxed);
         Some(frame_id)
     }
 
@@ -591,6 +695,10 @@ impl BufferPool {
         }
 
         if load_from_disk {
+            // Miss: the page was not resident and is read from the data file
+            // (§6.2 counter). Counted even if the read then fails — the miss
+            // (no resident image) is what the rate measures.
+            self.misses.fetch_add(1, Ordering::Relaxed);
             self.read_page_from_disk(page_id, frame_id)?;
         }
 
@@ -1107,6 +1215,52 @@ mod tests {
 
         let read_guard = pool.pin(page_id).unwrap();
         assert_eq!(read_guard.page()[PAGE_HEADER_SIZE], 0xAB);
+    }
+
+    /// M3 Stage E (tech-selection §6.2): the hit/miss counters track a known
+    /// pin sequence exactly — page allocation is not a lookup (uncounted), a
+    /// resident pin is a hit, a first pin on a fresh pool over the same data
+    /// file is a disk-read miss.
+    #[test]
+    fn hit_rate_counts_pin_hits_and_disk_misses() {
+        let tmp = TempDir::new().unwrap();
+        let (allocator, wal, pool) = setup(&tmp);
+        assert_eq!(pool.hits(), 0);
+        assert_eq!(pool.misses(), 0);
+        assert_eq!(pool.hit_rate(), 0.0);
+
+        let page_id = {
+            let mut guard = pool.new_page().unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xAB;
+            guard.page_id()
+        };
+        // Page allocation is not a lookup: no hit, no miss.
+        assert_eq!(pool.hits(), 0);
+        assert_eq!(pool.misses(), 0);
+
+        // The fresh page is still resident: pinning it is a hit.
+        drop(pool.pin(page_id).unwrap());
+        assert_eq!(pool.hits(), 1);
+        assert_eq!(pool.misses(), 0);
+        assert_eq!(pool.hit_rate(), 1.0);
+
+        pool.flush(page_id).unwrap();
+        drop(pool);
+
+        // A new pool over the same data file starts with an empty page
+        // table: the first pin is a disk-read miss, the second a hit.
+        let cfg = test_config(&tmp);
+        let pool2 = BufferPool::open(tmp.path(), &cfg, allocator, wal).unwrap();
+        drop(pool2.pin(page_id).unwrap());
+        assert_eq!(pool2.hits(), 0);
+        assert_eq!(pool2.misses(), 1);
+        assert_eq!(pool2.hit_rate(), 0.0);
+        let guard = pool2.pin(page_id).unwrap();
+        assert_eq!(guard.page()[PAGE_HEADER_SIZE], 0xAB);
+        drop(guard);
+        assert_eq!(pool2.hits(), 1);
+        assert_eq!(pool2.misses(), 1);
+        assert_eq!(pool2.hit_rate(), 0.5);
     }
 
     #[test]

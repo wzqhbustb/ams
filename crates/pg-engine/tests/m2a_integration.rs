@@ -169,7 +169,7 @@ fn abort_invisible() {
     // Transaction A: insert through the engine's heap AM, then ABORT.
     let xid_a = engine.txn_manager().begin_txn();
     let mut snap_a = Snapshot::everything();
-    snap_a.current_xid = xid_a;
+    snap_a.set_current_xid(xid_a);
     let tuple = encode_tuple(
         TupleHeader::new(
             TxnId::INVALID,
@@ -339,7 +339,7 @@ fn clog_survives_checkpoint_and_crash() {
         let col_types = [ColumnType::Int4, ColumnType::Text];
         let xid = engine.txn_manager().begin_txn();
         let mut snap = Snapshot::everything();
-        snap.current_xid = xid;
+        snap.set_current_xid(xid);
         let tuple = encode_tuple(
             TupleHeader::new(
                 TxnId::INVALID,
@@ -620,7 +620,7 @@ fn drive_explicit_txn(engine: &Engine, table: &str, id: i32, name: &str, commit:
     let col_types = [ColumnType::Int4, ColumnType::Text];
     let xid = engine.txn_manager().begin_txn();
     let mut snap = Snapshot::everything();
-    snap.current_xid = xid;
+    snap.set_current_xid(xid);
     let tuple = encode_tuple(
         TupleHeader::new(
             TxnId::INVALID,

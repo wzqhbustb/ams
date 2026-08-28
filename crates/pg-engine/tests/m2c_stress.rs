@@ -164,7 +164,10 @@ impl Worker {
             .exec(None, &format!("SELECT v FROM stress WHERE id = {id}"))
             .map_err(|e| format!("conn {}: SELECT id={id} failed: {e}", self.conn))?;
         let QueryResult::Rows { rows, .. } = res else {
-            return Err(format!("conn {}: SELECT id={id} returned {res:?}", self.conn));
+            return Err(format!(
+                "conn {}: SELECT id={id} returned {res:?}",
+                self.conn
+            ));
         };
         if rows.len() != 1 {
             return Err(format!(
@@ -411,7 +414,10 @@ fn m2c_mixed_stress() {
     let outcomes = rx
         .recv_timeout(Duration::from_secs(secs + WATCHDOG_MARGIN_SECS))
         .unwrap_or_else(|e| {
-            panic!("stress watchdog tripped after {}s (+{WATCHDOG_MARGIN_SECS}s margin): {e}", secs)
+            panic!(
+                "stress watchdog tripped after {}s (+{WATCHDOG_MARGIN_SECS}s margin): {e}",
+                secs
+            )
         });
     stop.store(true, Ordering::Relaxed);
     match ckpt.join() {
@@ -430,7 +436,10 @@ fn m2c_mixed_stress() {
         total_selects += outcome.selects_checked;
         deleted_per_conn.push(outcome.deleted);
         for (id, v) in outcome.model {
-            assert!(expected.insert(id, v).is_none(), "id ranges must be disjoint");
+            assert!(
+                expected.insert(id, v).is_none(),
+                "id ranges must be disjoint"
+            );
         }
     }
     let elapsed = started.elapsed();

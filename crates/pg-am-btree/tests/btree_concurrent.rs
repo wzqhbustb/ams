@@ -72,7 +72,9 @@ fn setup() -> (TempDir, Arc<StorageEngine>, PageId) {
 }
 
 /// Setup with a config tweak (e.g. a tiny buffer pool).
-fn setup_with_config(tweak: impl FnOnce(&mut StorageConfig)) -> (TempDir, Arc<StorageEngine>, PageId) {
+fn setup_with_config(
+    tweak: impl FnOnce(&mut StorageConfig),
+) -> (TempDir, Arc<StorageEngine>, PageId) {
     let tmp = TempDir::new().unwrap();
     let mut config = StorageConfig::new(tmp.path());
     tweak(&mut config);
@@ -202,8 +204,7 @@ fn concurrent_insert_and_range_scan_no_miss() {
                     // snapshotted key in its range. Keys inserted during the
                     // scan are legitimately absent from the snapshot and are
                     // not asserted on.
-                    let snapshot: Vec<i32> =
-                        committed.lock().unwrap().iter().copied().collect();
+                    let snapshot: Vec<i32> = committed.lock().unwrap().iter().copied().collect();
                     if snapshot.is_empty() {
                         thread::yield_now();
                         continue;
@@ -317,7 +318,11 @@ fn concurrent_duplicate_keys_lookup_all() {
         for (idx, t) in all.iter().enumerate() {
             // Thread t inserted this key with tid(t * keys + k); lookup_all
             // returns them in ascending (key, tid) order.
-            assert_eq!(*t, tid((idx * keys + k as usize) as u64), "key {k} out of order");
+            assert_eq!(
+                *t,
+                tid((idx * keys + k as usize) as u64),
+                "key {k} out of order"
+            );
         }
     }
     index.validate().unwrap();
@@ -400,8 +405,7 @@ fn concurrent_hundred_thread_smoke() {
                 let index = open_handle(&engine, meta_page);
                 let mut window = 0usize;
                 while writers_done.load(Ordering::SeqCst) < threads {
-                    let snapshot: Vec<i32> =
-                        committed.lock().unwrap().iter().copied().collect();
+                    let snapshot: Vec<i32> = committed.lock().unwrap().iter().copied().collect();
                     if snapshot.is_empty() {
                         thread::yield_now();
                         continue;
@@ -510,8 +514,7 @@ fn concurrent_small_pool_split_eviction_storm() {
                 let index = open_handle(&engine, meta_page);
                 let mut window = 0usize;
                 while writers_done.load(Ordering::SeqCst) < THREADS {
-                    let snapshot: Vec<i32> =
-                        committed.lock().unwrap().iter().copied().collect();
+                    let snapshot: Vec<i32> = committed.lock().unwrap().iter().copied().collect();
                     if snapshot.is_empty() {
                         thread::yield_now();
                         continue;
@@ -570,61 +573,65 @@ fn soak_mixed_insert_scan_no_miss() {
 
     let engine2 = Arc::clone(&engine);
     let committed2 = Arc::clone(&committed);
-    run_with_watchdog("1h soak", Duration::from_secs(secs as u64 + 300), move || {
-        let mut handles = Vec::new();
-        for t in 0..threads {
-            let engine = Arc::clone(&engine2);
-            let committed = Arc::clone(&committed2);
-            handles.push(thread::spawn(move || {
-                let mut index = open_handle(&engine, meta_page);
-                let base = (t as i32) * RANGE;
-                let mut i = 0i32;
-                while Instant::now() < deadline {
-                    let k = base + i;
-                    index.insert(&key(k), tid(k as u64)).unwrap();
-                    // Publish only after the insert fully returned.
-                    committed.lock().unwrap().insert(k);
-                    i += 1;
-                }
-            }));
-        }
-        for _ in 0..SCANNERS {
-            let engine = Arc::clone(&engine2);
-            let committed = Arc::clone(&committed2);
-            handles.push(thread::spawn(move || {
-                let index = open_handle(&engine, meta_page);
-                let mut window = 0usize;
-                while Instant::now() < deadline {
-                    // Snapshot first: the scan below must contain every
-                    // snapshotted key in its range.
-                    let snapshot: Vec<i32> =
-                        committed.lock().unwrap().iter().copied().collect();
-                    if snapshot.is_empty() {
-                        thread::yield_now();
-                        continue;
+    run_with_watchdog(
+        "1h soak",
+        Duration::from_secs(secs as u64 + 300),
+        move || {
+            let mut handles = Vec::new();
+            for t in 0..threads {
+                let engine = Arc::clone(&engine2);
+                let committed = Arc::clone(&committed2);
+                handles.push(thread::spawn(move || {
+                    let mut index = open_handle(&engine, meta_page);
+                    let base = (t as i32) * RANGE;
+                    let mut i = 0i32;
+                    while Instant::now() < deadline {
+                        let k = base + i;
+                        index.insert(&key(k), tid(k as u64)).unwrap();
+                        // Publish only after the insert fully returned.
+                        committed.lock().unwrap().insert(k);
+                        i += 1;
                     }
-                    let w = window % threads;
-                    window += 1;
-                    let lo = (w as i32) * RANGE;
-                    let hi = lo + RANGE;
-                    let rows = index.range_scan(Some(&key(lo)), Some(&key(hi))).unwrap();
-                    let got: BTreeSet<i32> = rows
-                        .iter()
-                        .map(|(k, _)| decode_i32(k.clone().try_into().unwrap()))
-                        .collect();
-                    for k in snapshot.into_iter().filter(|k| *k >= lo && *k < hi) {
-                        assert!(
-                            got.contains(&k),
-                            "scanner missed committed key {k} in range [{lo}, {hi})"
-                        );
+                }));
+            }
+            for _ in 0..SCANNERS {
+                let engine = Arc::clone(&engine2);
+                let committed = Arc::clone(&committed2);
+                handles.push(thread::spawn(move || {
+                    let index = open_handle(&engine, meta_page);
+                    let mut window = 0usize;
+                    while Instant::now() < deadline {
+                        // Snapshot first: the scan below must contain every
+                        // snapshotted key in its range.
+                        let snapshot: Vec<i32> =
+                            committed.lock().unwrap().iter().copied().collect();
+                        if snapshot.is_empty() {
+                            thread::yield_now();
+                            continue;
+                        }
+                        let w = window % threads;
+                        window += 1;
+                        let lo = (w as i32) * RANGE;
+                        let hi = lo + RANGE;
+                        let rows = index.range_scan(Some(&key(lo)), Some(&key(hi))).unwrap();
+                        let got: BTreeSet<i32> = rows
+                            .iter()
+                            .map(|(k, _)| decode_i32(k.clone().try_into().unwrap()))
+                            .collect();
+                        for k in snapshot.into_iter().filter(|k| *k >= lo && *k < hi) {
+                            assert!(
+                                got.contains(&k),
+                                "scanner missed committed key {k} in range [{lo}, {hi})"
+                            );
+                        }
                     }
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-    });
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        },
+    );
 
     let index = open_handle(&engine, meta_page);
     let rows = index.range_scan(None, None).unwrap();

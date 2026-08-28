@@ -70,9 +70,7 @@ struct Fixture {
 fn setup(threads: usize) -> Fixture {
     let tmp = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap());
-    engine
-        .exec(None, "CREATE TABLE t (id INT, v INT)")
-        .unwrap();
+    engine.exec(None, "CREATE TABLE t (id INT, v INT)").unwrap();
     // Preload in ONE explicit transaction: one fsync total, not one per row.
     let preload = engine.begin_txn().unwrap();
     for conn in 0..threads {

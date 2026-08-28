@@ -108,10 +108,16 @@ fn setup() -> Fixture {
 
 /// One mixed unit of work: insert + update + delete in ONE transaction
 /// (one commit fsync), all addressing the row through its tracked TID.
-fn mixed_unit(mgr: &TxnManager, clog: &dyn ClogAccessor, heap: &HeapAM, first_page: PageId, i: i32) {
+fn mixed_unit(
+    mgr: &TxnManager,
+    clog: &dyn ClogAccessor,
+    heap: &HeapAM,
+    first_page: PageId,
+    i: i32,
+) {
     let xid = mgr.begin_txn();
     let mut snap = Snapshot::everything();
-    snap.current_xid = xid;
+    snap.set_current_xid(xid);
 
     let mut tid = Tid {
         page_id: PageId::INVALID,

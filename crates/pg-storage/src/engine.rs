@@ -16,6 +16,7 @@ use crate::buffer_pool::BufferPool;
 use crate::checkpoint::CheckpointCoordinator;
 use crate::clog::{ClogAccessor, NoOpClogAccessor, TxnState};
 use crate::config::StorageConfig;
+use crate::data_dir_lock::DataDirLock;
 use crate::error::{Result, StorageError};
 use crate::freelist_meta::FreelistMeta;
 use crate::io::ensure_data_dir;
@@ -24,7 +25,7 @@ use crate::positioned_file::PositionedFile;
 use crate::recovery::{
     ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, IncompleteSplitTracker,
     NoOpRedoHandler, PageAllocRedoHandler, PageFreeRedoHandler, RedoContext, RedoHandler,
-    RedoRegistry, UndoHandler, UndoContext,
+    RedoRegistry, UndoContext, UndoHandler,
 };
 use crate::superblock::Superblock;
 use crate::txn_id::TxnIdClock;
@@ -63,6 +64,11 @@ pub struct StorageEngine {
     /// retained segment. [`Lsn::FIRST`] for a freshly created database.
     /// pg-engine's loser-transaction index compensation scans from here.
     recovered_redo_start: Lsn,
+    /// Exclusive data-directory lock (M3 Stage E review F1): created at
+    /// open, held until the engine value is dropped. Declared LAST so the
+    /// lock is released only after every subsystem that writes through the
+    /// directory (fields drop in declaration order).
+    _data_dir_lock: DataDirLock,
 }
 
 impl StorageEngine {
@@ -73,6 +79,17 @@ impl StorageEngine {
     ///
     /// Background checkpointing is not started automatically; call
     /// [`Self::start_background_checkpointing`] to enable it.
+    ///
+    /// # Exclusive directory lock (M3 Stage E review F1)
+    ///
+    /// Opening takes an exclusive lock on the data directory (a
+    /// `{data_dir}/lock` file, `create_new`) held until the engine value is
+    /// dropped; a second PROCESS opening the same directory fails with
+    /// [`StorageError::InvalidOperation`] ("already in use"). A stale lock
+    /// left by a crashed process must be removed by hand (the error says
+    /// so); a same-pid lock — the in-process `mem::forget` crash-test
+    /// idiom — is reclaimed automatically. See the `data_dir_lock` module
+    /// docs for the design and its limits.
     pub fn open(data_dir: impl AsRef<Path>, config: &StorageConfig) -> Result<Self> {
         Self::open_with_redo_handlers(data_dir, config, Vec::new(), Vec::new())
     }
@@ -120,18 +137,23 @@ impl StorageEngine {
         config.validate()?;
         let data_dir = data_dir.as_ref().to_path_buf();
         ensure_data_dir(&data_dir)?;
+        // F1: take the exclusive directory lock BEFORE any file is read or
+        // written (superblock probe included), so a second process can
+        // never interleave with this one's recovery/writes.
+        let data_dir_lock = DataDirLock::acquire(&data_dir)?;
 
         let sb_path = Superblock::path(&data_dir);
         if sb_path.exists() {
-            Self::recover_with_redo_handlers(
+            Self::recover_inner(
                 data_dir,
                 config,
                 extra_redo_handlers,
                 extra_undo_handlers,
                 clog,
+                data_dir_lock,
             )
         } else {
-            Self::create_new(data_dir, config, clog)
+            Self::create_new(data_dir, config, clog, data_dir_lock)
         }
     }
 
@@ -140,6 +162,7 @@ impl StorageEngine {
         data_dir: PathBuf,
         config: &StorageConfig,
         clog: Arc<dyn ClogAccessor>,
+        data_dir_lock: DataDirLock,
     ) -> Result<Self> {
         info!(data_dir = %data_dir.display(), "creating new storage engine");
 
@@ -190,6 +213,7 @@ impl StorageEngine {
             clog,
             recovered_att: Vec::new(),
             recovered_redo_start: Lsn::FIRST,
+            _data_dir_lock: data_dir_lock,
         })
     }
 
@@ -224,6 +248,30 @@ impl StorageEngine {
         extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
         extra_undo_handlers: Vec<Box<dyn UndoHandler>>,
         clog: Arc<dyn ClogAccessor>,
+    ) -> Result<Self> {
+        // F1: same exclusive directory lock as the open path, taken before
+        // any file is read (the superblock included).
+        let data_dir_lock = DataDirLock::acquire(&data_dir)?;
+        Self::recover_inner(
+            data_dir,
+            config,
+            extra_redo_handlers,
+            extra_undo_handlers,
+            clog,
+            data_dir_lock,
+        )
+    }
+
+    /// The recovery body, with the directory lock already held by the
+    /// caller (see [`Self::open_with_redo_and_clog`] /
+    /// [`Self::recover_with_redo_handlers`]).
+    fn recover_inner(
+        data_dir: PathBuf,
+        config: &StorageConfig,
+        extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
+        extra_undo_handlers: Vec<Box<dyn UndoHandler>>,
+        clog: Arc<dyn ClogAccessor>,
+        data_dir_lock: DataDirLock,
     ) -> Result<Self> {
         info!(data_dir = %data_dir.display(), "recovering storage engine");
 
@@ -460,6 +508,7 @@ impl StorageEngine {
             clog,
             recovered_att,
             recovered_redo_start: replay_start,
+            _data_dir_lock: data_dir_lock,
         })
     }
 

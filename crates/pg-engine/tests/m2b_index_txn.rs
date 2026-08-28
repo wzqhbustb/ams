@@ -44,7 +44,10 @@ fn insert_abort_removes_index_entry() {
     let txn = engine.begin_txn().unwrap();
     engine.exec(Some(&txn), "INSERT INTO t VALUES (1)").unwrap();
     txn.abort().unwrap();
-    assert!(!lookup(&engine, 1), "aborted insert left a dangling index entry");
+    assert!(
+        !lookup(&engine, 1),
+        "aborted insert left a dangling index entry"
+    );
     assert_eq!(scan_count(&engine), 0, "aborted insert visible to scan");
 }
 
@@ -55,10 +58,19 @@ fn delete_abort_restores_index_entry() {
     let (_tmp, engine) = setup();
     engine.exec(None, "INSERT INTO t VALUES (1)").unwrap();
     let txn = engine.begin_txn().unwrap();
-    engine.exec(Some(&txn), "DELETE FROM t WHERE id = 1").unwrap();
+    engine
+        .exec(Some(&txn), "DELETE FROM t WHERE id = 1")
+        .unwrap();
     txn.abort().unwrap();
-    assert!(lookup(&engine, 1), "aborted delete lost the live row's index entry");
-    assert_eq!(scan_count(&engine), 1, "aborted delete hid the row from scan");
+    assert!(
+        lookup(&engine, 1),
+        "aborted delete lost the live row's index entry"
+    );
+    assert_eq!(
+        scan_count(&engine),
+        1,
+        "aborted delete hid the row from scan"
+    );
 }
 
 /// UPDATE (key change) inside an explicit txn, then ABORT: the old key
@@ -69,10 +81,18 @@ fn update_abort_restores_old_key_entry() {
     let (_tmp, engine) = setup();
     engine.exec(None, "INSERT INTO t VALUES (1)").unwrap();
     let txn = engine.begin_txn().unwrap();
-    engine.exec(Some(&txn), "UPDATE t SET id = 2 WHERE id = 1").unwrap();
+    engine
+        .exec(Some(&txn), "UPDATE t SET id = 2 WHERE id = 1")
+        .unwrap();
     txn.abort().unwrap();
-    assert!(lookup(&engine, 1), "aborted update lost the old key's entry");
-    assert!(!lookup(&engine, 2), "aborted update left the new key's entry");
+    assert!(
+        lookup(&engine, 1),
+        "aborted update lost the old key's entry"
+    );
+    assert!(
+        !lookup(&engine, 2),
+        "aborted update left the new key's entry"
+    );
     assert_eq!(scan_count(&engine), 1);
 }
 
@@ -97,7 +117,10 @@ fn txn_handle_drop_auto_abort_undoes_index() {
         engine.exec(Some(&txn), "INSERT INTO t VALUES (3)").unwrap();
         // No commit/abort: drop triggers the best-effort auto-abort.
     }
-    assert!(!lookup(&engine, 3), "drop auto-abort left a dangling index entry");
+    assert!(
+        !lookup(&engine, 3),
+        "drop auto-abort left a dangling index entry"
+    );
     assert_eq!(scan_count(&engine), 0);
 }
 
@@ -108,8 +131,15 @@ fn auto_commit_failure_undoes_index() {
     let (_tmp, engine) = setup();
     let res = engine.exec(None, "INSERT INTO t VALUES (1), ('not-an-int')");
     assert!(res.is_err(), "type-mismatched row must fail the statement");
-    assert!(!lookup(&engine, 1), "failed statement left a dangling index entry");
-    assert_eq!(scan_count(&engine), 0, "failed statement left a visible row");
+    assert!(
+        !lookup(&engine, 1),
+        "failed statement left a dangling index entry"
+    );
+    assert_eq!(
+        scan_count(&engine),
+        0,
+        "failed statement left a visible row"
+    );
 }
 
 /// Duplicate keys (non-unique index): two rows share key 5; after one is
@@ -170,7 +200,9 @@ fn crash_mid_delete_compensates_index_entry() {
         engine.exec(None, "INSERT INTO t VALUES (1)").unwrap();
 
         let txn = engine.begin_txn().unwrap();
-        engine.exec(Some(&txn), "DELETE FROM t WHERE id = 1").unwrap();
+        engine
+            .exec(Some(&txn), "DELETE FROM t WHERE id = 1")
+            .unwrap();
         // Durability barrier: the in-flight delete's records (heap xmax
         // stamp + index delete) must survive the kill; the checkpoint's
         // ATT snapshot also records the loser as active.
@@ -216,7 +248,9 @@ fn crash_mid_update_compensates_index_entry() {
             .exec(None, "CREATE TABLE t (id INT, name TEXT)")
             .unwrap();
         engine.exec(None, "CREATE INDEX ON t (name)").unwrap();
-        engine.exec(None, "INSERT INTO t VALUES (1, 'old')").unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, 'old')")
+            .unwrap();
 
         let txn = engine.begin_txn().unwrap();
         engine
@@ -288,7 +322,9 @@ fn crash_loser_delete_before_redo_start_compensated() {
         // The loser: an in-flight DELETE. Its records (heap xmax stamp +
         // index delete) sit AFTER begin_A.
         let txn = engine.begin_txn().unwrap();
-        engine.exec(Some(&txn), "DELETE FROM t WHERE id = 1").unwrap();
+        engine
+            .exec(Some(&txn), "DELETE FROM t WHERE id = 1")
+            .unwrap();
 
         // Churn the pool with read-only scans of pad: t's dirty pages get
         // evicted and flushed BEFORE checkpoint B's DPT sample, so they
@@ -320,4 +356,70 @@ fn crash_loser_delete_before_redo_start_compensated() {
         "the loser's pre-redo-start index delete must be compensated \
          (scan starts at the oldest retained checkpoint begin)"
     );
+}
+
+/// F7 regression: a WAL-fatal commit must NOT leak the XID into the active
+/// set — `TxnHandle::commit` falls back to a best-effort abort (index undo
+/// replayed first, then the CLOG abort), so the vacuum horizon and every
+/// future snapshot's xmin are never pinned by a dead commit.
+#[test]
+fn commit_failure_falls_back_to_abort_and_reclaims_xid() {
+    use pg_am_btree::key::encode_key;
+    let (_tmp, engine) = setup();
+    let txn = engine.begin_txn().unwrap();
+    engine.exec(Some(&txn), "INSERT INTO t VALUES (7)").unwrap();
+    let xid = txn.xid();
+
+    // Arm the hook: commit_txn fails at entry, before any WAL work.
+    pg_txn::manager::test_hooks::set_commit_txn_force_fail(true);
+    let res = txn.commit();
+    pg_txn::manager::test_hooks::set_commit_txn_force_fail(false);
+    assert!(res.is_err(), "the injected commit failure must surface");
+
+    // The fallback abort removed the XID from the active set (pre-fix: it
+    // leaked forever — `self.xid` was taken, so Drop never aborted).
+    assert!(
+        !engine.active_xids().contains(&xid),
+        "commit failure leaked the XID into the active set (F7)"
+    );
+    // It replayed the index undo: the entry is gone even at the raw level.
+    let raw = engine
+        .btree_index("t", "id")
+        .unwrap()
+        .lookup_all(&encode_key(&Datum::Int4(7)).unwrap())
+        .unwrap();
+    assert!(
+        raw.is_empty(),
+        "fallback abort did not replay the index undo"
+    );
+    // The row is invisible, and subsequent commits work normally.
+    assert_eq!(scan_count(&engine), 0);
+    engine.exec(None, "INSERT INTO t VALUES (8)").unwrap();
+    assert!(lookup(&engine, 8));
+}
+
+/// F7/P2-1 regression, auto-commit path: a WAL-fatal commit inside
+/// `auto_commit` must not leak the XID either — the Ok branch mirrors
+/// `TxnHandle::commit`'s fallback (undo replay, then abort).
+#[test]
+fn auto_commit_commit_failure_reclaims_xid() {
+    use pg_am_btree::key::encode_key;
+    let (_tmp, engine) = setup();
+    pg_txn::manager::test_hooks::set_commit_txn_force_fail(true);
+    let res = engine.exec(None, "INSERT INTO t VALUES (11)");
+    pg_txn::manager::test_hooks::set_commit_txn_force_fail(false);
+    assert!(res.is_err(), "the injected commit failure must surface");
+    assert!(
+        engine.active_xids().is_empty(),
+        "auto-commit commit failure leaked the XID (F7/P2-1)"
+    );
+    let raw = engine
+        .btree_index("t", "id")
+        .unwrap()
+        .lookup_all(&encode_key(&Datum::Int4(11)).unwrap())
+        .unwrap();
+    assert!(raw.is_empty(), "fallback did not replay the index undo");
+    assert_eq!(scan_count(&engine), 0);
+    engine.exec(None, "INSERT INTO t VALUES (12)").unwrap();
+    assert!(lookup(&engine, 12));
 }

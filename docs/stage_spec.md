@@ -713,6 +713,307 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - torn-tail 的 header 无自 CRC（payload_len 被 bit-rot 放大的残余误截窗口）→ 结构性修复归后续（PG xl_crc 模式）
 - `btpo_prev` 陈旧链（prev 恒指最旧左页）已从"纯文档"升级为被 `nearest_nonempty_left` 实际依赖提示——残余窗口（左侧全空时的 TOCTOU）有 validate 全链检查兜底 → 后续 stage 评估 prev 维护
 - 叶页死空间不回收（churn 分裂放大器）→ 压实/合并归 M2c+/vacuum(M3)
+- **已知 flaky（M3 Stage A 期间发现，预存）**：`btree_concurrent` 套件在 release 下存在间歇性失败。观测记录：早期实测 15 跑出现 **5 个不同测试** flaky（`concurrent_disjoint_inserts_all_found` 丢 key 0 占 2/15，疑 root split 路径丢失更新）；边界落位修复（乱序治理）后复测 15 跑仅 `concurrent_duplicate_keys_lookup_all` 失败 1 次——说明多数 flaky 与该修复同源，但**仍有残余**。干净 HEAD worktree 复跑可复现，零依赖 pg-txn，非 Stage A 回归 → 单开修复会话处理（重点：剩余重复键并发路径），未阻塞 Stage A 收口
 - 所有性能 P 类未达标项的根治（batch commit、O_DIRECT、io_uring）→ Phase 7b
 
 ---
+
+## Stage A（M3）：快照注册表 + horizon
+
+**状态**：✅ 完成（debug 全量 636 绿 + clippy/loom-check 全绿；S2 性能验收通过）
+**工期**：预估 3–4 天
+**验收**：六路径注册覆盖 / 泄漏自由 / horizon 并发与原子性专项 / 100 线程 churn 全部带 watchdog 落地；**性能（S2 协议，5×300s 取均值）：87.2 txn/s vs M2c 基线 86.8（+0.5%，噪声界 ±3% 内，无统计显著回归）——注册开销不可测，R2 通过**
+
+### 交付内容
+
+1. **注册与构造原子化（B1，tech-selection §3.3 v1.3）**
+   - `TxnManager` 新增 `TxnShared { active, snapshot_xmins: BTreeMap<TxnId, usize> }`（xmin → 引用计数），active set 与 registry 合并进**同一把锁**（`crates/pg-txn/src/manager.rs`）；`snapshot()` 在读取 active set + XID clock 的**同一临界区**完成 xmin 注册，签名改为 `snapshot(current_xid) -> (Snapshot, SnapshotGuard)`，guard `Drop` 减计数、归零删键
+   - caller-wrapper（先构造后注册）形态按 B1 否决，反例（U xid=15 未注册 → vacuum 取空 registry horizon → 删除者提交 → U 必见行被回收）写入 `snapshot()` 的 doc
+2. **反枚举护栏（v1.4 口径）**
+   - `Snapshot` 五个字段收为 `pub(crate)`；外部读取走访问器（`xmin()/xmax()/xip()/current_xid()/curcid()`），engine.rs 约 21 处与 heap_am.rs 17 处字段访问随迁
+   - `Snapshot::everything()` 保持 pub，是明确的**不注册**特例（目录引导 `Engine::open` + 测试路径）；doc 明示 xmin=0 注册即 horizon 钉死
+   - pg-txn 集成测试的全字段构造走 `#[doc(hidden)] Snapshot::new_unregistered`（crate 内实现，CI grep 不拦）；测试/bench 的 writer 场景改造用 `set_current_xid`/`set_curcid`
+   - 计数断言：`TxnManager::live_registered_snapshots()`（AtomicUsize 镜像）== registry 引用计数和（静息点断言，`snapshot_registry.rs` / `m3_snapshot_coverage.rs`）
+   - CI grep（loom job）：`Snapshot[[:space:]]*\{` 字面构造（豁免"整行即 `-> Snapshot {` 签名"）与 `impl Snapshot` 块均禁止出现在 `crates/pg-txn` 之外；模式只用 POSIX 字符类（`\b`/`\s` 在 BSD grep 下静默失效——设计终审发现原护栏从未真正生效，已修复并做正反注入验证：现状绿、注入 crate 外字面构造被拦）
+3. **六调用点适配**：`begin_txn`（guard 随 `TxnHandle`，commit/abort/Drop 注销）、`auto_commit`（`_snap_guard` 绑到帧尾，成功与失败两路径都注销）、`create_index` re-snapshot（`_re_guard` 随外层闭包）、纯 SELECT / `Engine::scan` / `Engine::index_lookup`（guard 随调用帧）
+4. **horizon API**：`TxnManager::oldest_snapshot_xmin()`（registry 最小键；registry 空则取 **active set 最小 XID**——覆盖 begin→snapshot 窗口的结构性修正（review P2，PG OldestXmin 同构：backend xid 与快照 xmin 都参与水位）；二者皆空才取 `txn_id_clock.current()`）+ `Engine::oldest_snapshot_xmin()` 透传
+5. **panic 语义（O1 决定：不加护栏）**：默认 unwind 策略下 panic **会**执行 guard 的 `Drop`，快照正常注销、horizon 不受影响；仅 `panic=abort`/`mem::forget` 跳过 Drop → horizon 永久偏低（vacuum 退化为不回收，安全但失效），与 `auto_commit` 既有 panic 策略代价一致。写入 `SnapshotGuard` 与 `auto_commit` 的 doc（review F1 修正：初版误写为"panic 跳过 Drop"，与 unwind 实际行为相反）
+6. **测试**：`pg-txn/tests/snapshot_registry.rs`（注册/注销/引用计数、空 registry→clock horizon、horizon=min key、everything() 不注册、并发注册注销无漂移、**B1 原子性专项**——horizon 永不越过任一已返回未销毁快照的 xmin）；`pg-engine/tests/m3_snapshot_coverage.rs`（六路径注册覆盖、auto_commit 失败路径与 TxnHandle::Drop 泄漏自由、**auto-commit DML 快照先于锁等待注册**（v1.4 路径）、100 线程 churn 归零）；全部并发用例带 watchdog
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| 快照登记 | 每后端 ProcArray 自有槽位，无共享锁 | 全局单 mutex 的 `BTreeMap` registry | 临界区变长是新共享热点（§11 R2）；S2 判定无统计显著回归则维持，超标备选分片 registry（xmin 聚合仍取全局 min） |
+| horizon | OldestXmin 综合 backend xid / KnownAssignedXids 等多源 | registry 最小键；空取 XID clock 当前值 | 单源语义更简单；安全论证靠 XID 单调性（§3.3 v1.2 重写版），不允许改回"集合包含"式 |
+| panic 路径 | 后端退出即清理 proc 条目 | unwind 会执行 guard Drop 正常注销；仅 panic=abort/forget 使 horizon 永久偏低 | 决定（§11 O1）：与 auto_commit 既有 panic 泄漏 XID/锁的进程级失败策略代价一致，不加护栏（review F1 修正了初版的错误描述） |
+
+### 已知残留与后续归队
+
+- registry 全局单锁在高并发短查询下是共享热点（§11 R2）→ **S2 已判定通过**（87.2 vs 86.8，噪声界内；数字见 `docs/phase1-m2-benchmarks.md` 基线条目与本文"验收"行）；分片 registry 备选保留
+- panic 泄漏 horizon 无护栏（已决定的语义）→ 若未来改进程级 panic 策略需重估
+- `#[doc(hidden)] Snapshot::new_unregistered` / `set_current_xid` / `set_curcid` 是全字段构造/改写逃生口（供 pg-txn 集成测试与 AM 测试）；CI grep 只拦 crate 外的构造，crate 内新增关联构造函数靠 review 把关
+- horizon 自省目前仅 API（`oldest_snapshot_xmin()`）；§6.2 的指标暴露归 Stage E（可观测性）
+- vacuum 本体（取 horizon 一次、全程使用）归 Stage C/D
+
+---
+
+## Stage B（M3）：HeapCleanup WAL + redo + §4.6 槽位寻址重构
+
+**状态**：✅ 完成（debug 全量 651 绿 / 1 已知 flaky（首次全量）；修复轮后复跑 654 绿 / 0 失败，含 F1–F5 新增用例；clippy 全绿；loom 用例不受影响——pg-am-heap/pg-storage 本无 loom feature，仅 pg-am-btree 的 loom 用例经 `cargo check --features loom` 验证不受影响；未 commit——等用户确认）
+**工期**：预估 5–6 天
+**验收**：payload roundtrip / `first_fit_slot`·`add_tuple_at` 单测 / `add_tuple` 组合行为等价（双页逐字节对比）/ `test_heap_cleanup_redo_converges`（在线 vs 重放整页 8192B 逐字节一致）/ `test_heap_cleanup_redo_idempotent`（同记录重放 10× 幂等，含链 unlink 变体）/ `test_slot_reuse_after_compact_redo_*` 四路径（insert / HOT / 同页非 HOT / 跨页落中部压实页）全部崩溃重放按 WAL 承载 slot 复现、无 diverged / analysis DPT 分类（压实页 + unlink 前驱页，不含重链目标页）全部落地。**回归**：m2b crash rounds 4/4 绿（R4 门槛在 §4.6 重构后、compact 落地前先行验证过一次，收口时复验）；首次全量 651 passed / 1 failed（失败项为已登记 flaky，详见下），**修复轮后终审复跑 654 passed / 0 failed**——失败项为 stage_spec 已登记的 `btree_concurrent` 预存 flaky（`concurrent_hundred_thread_smoke` 丢 key 0，与登记的 root-split 丢失更新疑似同源；本 stage 未触碰 pg-am-btree，pg-storage 改动纯增量；该测试单独重跑 5 次 4 过 1 挂，flaky 特征吻合）。**性能**：criterion 基对比不可用（`target/criterion` 基线来自更早 stage、机器又在并发跑全量回归：e2e -78% / no_fsync +26% 均为噪声，不可解释）；结构性论证——重构为纯重排，WAL 字节量与 I/O 不变，`first_fit_slot` 的 LP 扫描与被拆掉的 `add_tuple` 内部 first-fit 扫描同构，insert 路径净工作量不变
+
+### 交付内容
+
+1. **§4.6 槽位寻址重构（R4 前置，行为中性）**
+   - `SlottedPage::first_fit_slot(page) -> Option<u16>`（纯读，corrupt header 下钳制 `pd_lower` 防越界）+ `add_tuple_at(page, slot, bytes)`（`slot == slot_count` 追加新 LP；`slot < slot_count` 仅允许回收 `Unused`；其余 `InvalidSlot` 硬错）（`crates/pg-am-heap/src/slotted_page.rs`）；`add_tuple` 退化为二者组合，对外行为不变（`slot_addressing.rs` 双页逐字节等价测试钉死）
+   - 四处在线路径全部改为"先 `first_fit_slot`（或 `slot_count`）选 slot → 写 WAL（slot 随记录承载）→ `add_tuple_at` 落位"：insert、HOT update、同页非 HOT update、跨页 update（`heap_am.rs`；跨页路径 slot 选择保持在最终双 latch 落定之后，反向扫描使压实后中部页成为 update 落点）
+   - 三个 redo handler 全部改调 `add_tuple_at(page, rec.slot, ..)`：HeapInsert、HeapUpdate（同页 + 跨页两分支）、HeapHotUpdate（`redo.rs`）；"预测—断言"耦合删除，slot 不可用即 `MetadataCorrupted` 硬失败（语义与旧 diverged 检查一致）
+   - **WAL 布局核查结论**：`HeapInsertRecord.slot_id`、`HeapUpdateRecord.new_tid`、`HeapHotUpdateRecord.new_slot` 本就已承载 slot——**无磁盘格式变更**
+2. **`HeapCleanup = 8` payload**（`pg-storage/src/wal/record.rs`）：`(page_id, unlink_prev_page, unlink_next_page, dead_slots[])`；判别式 8 即 Stage-0 预留值，未新增占号。字段顺序不变量沿用 CLR B5 先例：三个定长 page id 在前、`dead_slots` 定 LAST——analysis 只前缀解码定长字段，不信任变长 Vec 的长度前缀；`MAX_HEAP_CLEANUP_SLOTS = (PAGE_SIZE-32-16)/4` 防御性上界随 decode 强制。unlink 两字段取 `PageId::INVALID` 哨兵（Stage B 在线侧只产压实形态，unlink 字段为 Stage C 页回收预留）
+3. **`SlottedPage::compact()`**（`slotted_page.rs`）：kill list 先校验后落笔（严格升序 / 越界 / 非 Normal·Dead 即硬错）；存活元组字节拷出→数据区清零→按 slot 升序向 `pd_special` 重排→LP 原位改指（flags/len 保留）；dead slot LP 置 `Unused`（`delete_tuple` 语义）；`pd_lower` 不动、`pd_upper` 吸收全部空洞。**LP 条目不移动不重排**（§4.1 阶段 4，slot 号是 TID 组成部分）
+4. **`HeapCleanupRedoHandler`**（`pg-am-heap/src/redo.rs`）：压实页与前驱页各自独立 `pd_lsn` 幂等守卫（两页落盘时机可不同，同跨页 HeapUpdate 策略）→ 调**同一个** `compact()`（同参数、升序 dead_slots，§4.5 重放收敛="重放=重执行同一物理操作"）；unlink 分支 `set_next_page(prev, unlink_next_page)`。注册进 `heap_redo_handlers()`（Stage 0 硬失败约定：记录与 handler 同 stage 交付）；`Engine::open` 经该函数自动获得
+5. **analysis DPT 分类**（`pg-storage/src/analysis.rs`）：`for_each_touched_page` 新增 `HeapCleanup` 臂——压实页 + unlink 前驱页（`INVALID` 过滤），重链目标页本身不被修改故不入 DPT；`every_record_type_is_classified_for_the_dpt` 护栏同步迁移
+6. **测试**：`pg-am-heap/tests/slot_addressing.rs`（7）；`pg-storage/tests/heap_cleanup_wal.rs`（3：roundtrip / 构造器+decode 双层拒绝 / DPT 分类端到端走 `run_analysis`）；`pg-am-heap/tests/heap_cleanup_redo.rs`（8：converges / idempotent×10 / 四路径 slot 复用 / checkpoint-介于-之间 FPI 顺序收敛 / 非升序 kill list 恢复硬失败）
+7. **对抗性 review 修复（F1–F5）**
+   - **F1（中）在线 compact 模板 FPI 顺序倒置**：测试 helper 原为 append HeapCleanup → pin_mut；当压实是 checkpoint 周期内对该页首次触碰时，`pin_mut` 发的压实前 FPI 会获得比 HeapCleanup 更大的 LSN，恢复端 FPI 无条件回滚把压实静默撤销、后续按 slot 落位的 redo 撞 Normal 槽 `MetadataCorrupted` 硬失败（目录变砖）。修为 **pin_mut → append → compact → stamp pd_lsn**；补 `test_compact_after_checkpoint_replay_converges`（checkpoint 介于 seed 与 compact 之间），红绿验证成立：旧顺序下恢复以 `MetadataCorrupted("heap redo: invalid slot 1")` 硬失败
+   - **F2（低-中）`set_next_page` 改返回 `Result`**（`slotted_page.rs`，与 `next_page` 对称，`checked_header` + `pd_special` 几何校验硬错）：redo 的 unlink 分支作用于磁盘恢复页（不受信来源），原 debug_assert 在 release 下可被损坏页触发越界 panic 或写进元组区；在线调用点（`heap_am.rs::extend_chain`）与测试一并迁移
+   - **F3（低）`WalRecord::heap_cleanup` 构造器硬校验**：非升序 / 超 `MAX_HEAP_CLEANUP_SLOTS` 直接 `Err`（原仅 debug_assert；WAL-first 协议下毒记录先落盘、之后每次恢复硬失败变砖）；decode 上界保留为第二层防御
+   - **F4（低）`AccessMethod::redo_handlers()` 死代码地雷**：一行委托 `heap_redo_handlers()`（原返回 3 个旧 handler，缺 HotUpdate/Cleanup）
+   - **F5 测试补强**：F1 配套 checkpoint 用例 + 负面向（字节手术构造非升序 dead_slots 的 CRC 合法记录 → 恢复硬失败、非 panic、非静默，错误信息点名 ascending 契约）；`compact()` 文档新增 kill-list 契约——调用方（Stage C vacuum）保证不杀仍被 `t_ctid` 引用的 HOT 链成员，否则留下指向 `Unused`（会被回收复用）槽位的悬挂链；**第三轮审查扩写（N1）**：契约还须覆盖链根——"链上仍有存活成员时不得杀链根"（链根无 `t_ctid` 指向它、指向它的是索引条目；杀根 = 存活成员从 seqscan 与索引扫描双双不可达 + 槽回收后索引返回错行）。链活性判定归 `scan_dead_tuples` horizon + 链分组（tech-selection §4.4），当前无在线生产者触发路径，Stage C 照抄前已修订
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| slot 分配 | `PageAddItem` 返回 offset number，调用方立即持锁写 WAL | 在线先选 slot 再写 WAL，slot 由记录显式承载 | redo 不依赖在线 writer 行为巧合；compact 产生 Unused 后必然分歧的旧"预测—断言"形态被 §4.6 禁掉 |
+| 页内压实 | `compactify_tuples` 重排 LP 数组（itemid 按 offset 排序，靠 redirect 保 TID） | LP 数组一律不动，只移 tuple 字节 | 无需 LP_REDIRECT 机制，索引条目与 HOT t_ctid 天然稳定；代价是压实不回收 LP 本身（与 PG 一致） |
+| 压实 WAL | PG 不单独记 vacuum WAL（HEAP2_CLEAN 记录含 redirect/死亡信息） | 单条 `HeapCleanup` 物理记录 + 同一 `compact()` 重放 | 重放收敛靠"同函数同参数"，无平行重放逻辑可漂移 |
+
+### 已知残留与后续归队
+
+- `HeapCleanup` 在线侧尚无生产者：Stage B 的"在线 compact"由测试直接驱动（模板为 **pin_mut（可能发该页本周期的 FPI，必须先于 HeapCleanup 落 WAL，否则恢复端 FPI 无条件回滚会把压实静默撤销、后续按 slot 落位的 redo 撞占用槽硬失败——review F1 修复）→ append HeapCleanup → compact() → stamp pd_lsn**，Stage C 必须照抄此顺序）；vacuum 本体（horizon → scan_dead → 索引清理 → reclaim 调 compact + unlink）归 Stage C/D
+- 空页识别与 unlink 记录的在线产生（含 `unlink_prev/next` 填充）归 Stage C 页释放阶段；redo 侧本 stage 已支持并有幂等测试
+- **Stage C 前向提醒（第三轮审查）**：在线 unlink 摘除页必须与 heap AM 的 `pages` 内存缓存剔除**同步**——否则 `acquire_page_with_room` 可能把新行插入已摘除页（物理 redo 仍收敛，但行逻辑不可达）；另：redo 的 unlink 分支不清被摘除页自身的 next 指针（"前驱旧镜像"状态下链读作 prev→P→X，P 为空页，walk 正常终止，无断言触发——此形态合法）
+- criterion INSERT 基线对比本次不可用（基线陈旧 + 并发负载）→ 如需 S2 式正式验收，在干净机器上重存 Stage A 基线后复测
+- `btree_concurrent` 预存 flaky 依旧（本次全量撞上 `concurrent_hundred_thread_smoke` 一例，单测重跑 4/5 过）→ 沿用 Stage A 残留条目，单开修复会话处理
+- ~~`AccessMethod::redo_handlers()` 只返回三个旧 handler~~ → **review F4 已修**：一行委托 `heap_redo_handlers()`，单一事实源（该 trait 方法仍无调用点，但不再是落后两份的地雷）
+
+---
+
+## Stage C（M3）：Vacuum 核心（trait / 链分组 / 压实接线 / 页释放）
+
+**状态**：✅ 完成（debug 全量 669 绿 / 0 失败（= Stage B 出口 654 + 本 stage 新增 15，含 R1/R2 回归）；clippy `--workspace --all-targets -D warnings` 全绿；loom 不受影响——pg-am-heap/pg-storage 本无 loom feature，`cargo check -p pg-am-btree --features loom --tests` 验证通过；rustdoc 无新增警告（8 个 pre-existing 私项链接警告与 HEAD 持平）；未 commit——等用户确认）
+**工期**：预估 5–7 天
+**验收**：`vacuum_chain_grouping`（5：普通死元组自身映射含 NULL 列 / 全死 HOT 链只回链根且为链根列值 / 部分死链零输出 / 全死页逐条输出 / aborted 插入按规则 1 分组）；`vacuum_reclaim`（7：slot 置 Unused + 空洞回收 + first-fit 复用 / 空页 unlink→freelist→缓存剔除→复用无串扰 / 空链头只压实不摘除 / 部分死链零回收 / **相邻双空页连续摘除回归**（红绿验证：naive 左邻实现下链头 next 指向已释放页，测试红）/ **页 id 序 ≠ 链序的泛化回归**（LIFO freelist 复用拼出链序 [1,4,3,2,5]，链相邻双空页按页 id 序处理，前驱解析仍按链序取最近仍在链左邻，红绿对照成立）/ 读者-压实并发 watchdog 用例——每次读要么全旧要么全新，绝无半压实页）；`vacuum_crash_windows`（3：**崩溃窗口②**——HeapCleanup 落盘、PageFree 未写 → 恢复后被摘页脱链且不在 freelist（既定单页泄漏，`free_page` 补 free 成功证明其不在 freelist）+ 链遍历与堆扫描一致 + `scan_dead_tuples` 为空；**多页压实中途崩溃收敛**——在线 reclaim（两页压实 + 一页 unlink+free）崩溃后重放，两存活页 8192B 逐字节一致、链重链 A→C 复现、被释放页回 freelist；**R2 回归**——checkpoint → reclaim 含 unlink → flush → 崩溃 → 重放收敛，前驱页 unlink 前镜像 FPI 必须先于 HeapCleanup，旧顺序下必红）
+
+### 交付内容
+
+1. **compact 模板提升（Task 0，单一事实源）**：`HeapAM::compact_page(page_id, dead_slots, unlink_prev, unlink_next)`（`crates/pg-am-heap/src/heap_am.rs`）——**pin_mut（本周期的压实前 FPI 必须先于 HeapCleanup 落 WAL，review F1）→ append HeapCleanup → 同一 `SlottedPage::compact()` → stamp pd_lsn**；unlink 时**前驱页的 pin_mut 提到 append 之前**（其 unlink 前镜像 FPI 同样必须先于记录，见 R2），随后在前驱页自有 latch 下 `set_next_page` + 同 LSN stamp（两页落盘时机可不同，redo 侧各自 pd_lsn 幂等守卫，同跨页 HeapUpdate 策略）。Stage B 测试 helper `online_compact` 已迁移为薄委托（`heap_cleanup_redo.rs`），FPI 顺序只存在于这一个地方
+2. **`Vacuumable` trait 扩展**（`access_method.rs`，§4.4 形状）：`collect_index_keys`（只读）+ `reclaim`（纯物理）**两个方法，拒不合并**——融合形态会把索引清理挤到压实之后，违反 §4.1 顺序不变量；`scan_dead_tuples` 不动；`notify_indexes` 不进 trait（索引知识在 engine 层）
+3. **链分组 helper**（`HeapAM::classify_dead_tuples`，单页单 pin）：按页分组输入 → 每 slot 读一次 header → `HEAP_ONLY_TUPLE` 成员经 `hot_chain_root` 反走定位链根 → 链根沿 `t_ctid` 前走收全链（slot_count 有界、越界/脱页即终止、耗尽即 Corrupted，与 `follow_hot_chain` 同契约）。**死性判定不重做**——`dead` 集合成员身份即逐成员裁决（`scan_dead_tuples` 已套用过 horizon 规则）；helper 只做结构判定：全链成员 ∈ dead set 才算全死链。产出 `DeadClassification { index_keys, kills }`，`collect_index_keys` 与 `reclaim` 消费**同一份**结果，只读侧与物理侧结构上不可能分歧
+4. **`collect_index_keys` 实现**：普通死元组 → (自身 tid, 自身列值)；全死链 → (链根 tid, 链根列值)；部分死链一律不返回。列值经 `decode_tuple(bytes, rel.columns)` 全列解码（`Engine::delete_inner` 同路径的 AM 侧形态）；NULL 列保持 `None`，跳过发生在 engine 编码 key 处（既有约定）。全程只读 pin，必须先于 reclaim（压实后 key 读不出）
+5. **`reclaim` 实现**：kills 按页（BTreeMap 稳定序）逐页 `compact_page`；压实后全空页（kill 数 == 非 Unused slot 数）且非链头 → 前驱取链序缓存左邻 → **unlink（进同条 HeapCleanup）→ 缓存剔除 → `free_page`（PageFree + freelist），顺序不可逆**：先 free 后 unlink 的崩溃窗口会留下"页同时在链上与 freelist"，页被复用后链上出现活元组 = 结构性损坏；现顺序最坏只是单页泄漏（窗口②口径）。**链头永不摘除/释放**（`RelationDesc::first_page` 是目录与 `seed_from_chain` 的锚），空链头只压实。所有页修改记录 `txn_id = INVALID`（vacuum 非事务，`WalRecord::heap_cleanup` / `page_free` 既有语义，重放不依赖任何事务结局、analysis 不进 ATT）
+6. **缓存剔除（Stage B 前向提醒的落实）**：`HeapAM::evict_page` 按单页粒度从 `pages` 缓存移除已摘页（先于 `free_page`）；测试直接验证——摘除后的小插入经反向扫描**绝不**落进已摘页（若缓存残留，尾部空页必被选中）
+7. **页分配器接线**：`HeapAM` 新增 `page_allocator: Option<Arc<pg_storage::sync::Mutex<PageAllocator>>>` + `set_page_allocator`（`set_row_waiter` 同款 install-once-before-sharing 形态；锁类型走 `pg_storage::sync` 别名层，crate 边界规则）；`Engine::open` 装配（engine.rs 5c）
+8. **设计偏移（对 §4.4"reclaim 不需要链知识"的一处有意收紧）**：`reclaim` 内部用**同一个**分组 helper 重新推导 kill 集，而非盲信输入清单——engine（Stage D）会把 `scan_dead_tuples` 的原始输出直接传给 `reclaim`，其中含部分死链的死亡成员；不过滤则违反 `compact()` kill-list 契约（杀仍被 `t_ctid` 引用的成员 = 悬挂链）。过滤使"部分死链零回收"成为结构保证而非调用方自律；`vacuum_reclaim.rs::reclaim_never_touches_partially_dead_chains` 钉死
+9. **对抗性 review 修复（R1，中）相邻空页连续摘除的前驱选择**：初版取链序快照的直接左邻为前驱——A→B→C 三页中 B、C 同轮皆空时，C 的 unlink 记录把**已摘除的 B** 的 next 改写为 None，而活链 A.next 仍指向随后被 free 的 C（allocator 复用后链上出现他人活元组 = 结构性损坏）。修为：摘除前驱 = 最近的**仍在链上**的左邻（`removed` 集合跳过本轮已摘页；链头永不摘除，扫描必终止）；回归测试 `consecutive_empty_pages_unlink_to_live_predecessor` 红绿验证成立（naive 实现下 A.next 残留指向已释放页，测试红）
+10. **对抗性 review 修复（R2，高）unlink 前驱页的 FPI 顺序**：初版 `pin_mut(unlink_prev_page)` 排在 append HeapCleanup **之后**——前驱页是本 checkpoint 周期首次触碰的冷页时（vacuum 回收冷页是典型工况），其 unlink 前镜像 FPI 获得比 HeapCleanup 更大的 LSN；崩溃重放时 FPI 无条件覆盖、把前驱页回滚到"仍指向被摘页"，而 PageFree 照常重放把被摘页放上 freelist → 复用后链指向他人活页 = 结构性损坏。修为：unlink 时前驱页 pin_mut **先于** append（两 latch 同持无 AB/BA——vacuum 持表级 AccessExclusive 无并发写者、redo 单线程，已文档化）；确定性回归 `unlink_prev_fpi_precedes_heap_cleanup_across_checkpoint`（checkpoint → reclaim 含 unlink → flush → 崩溃 → 重放收敛）红绿验证成立（旧顺序下恢复后页 A 回滚到 unlink 前镜像、与在线字节不符，测试红）
+11. **文档修正（review 低优先级两条）**：`Vacuumable::reclaim` trait doc 补**互斥前提**——`scan_dead_tuples`/`collect_index_keys`/`reclaim` 之间不得有并发写（Stage D 的 AccessExclusive 保证；无锁使用是调用方责任，并发插入会在流水线中途回收的 Unused slot 上复用，使 kill 清单与已解码 key 失配）；`reclaim` 内 allocator 前置检查的注释改写为真实理由（缺 allocator 是可前置判定的配置错误，保持错误原子性——压实+摘除后半 applied 的释放无法被重试干净恢复：killed slot 已 Unused，重分类找不到 kill 对象、永不再进 unlink/free 分支）
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| HOT 死链回收 | 部分死链 LP_REDIRECT 重定向 + 整链回收 | 只做整链回收；部分死链原样保留 | LP 重定向是 on-disk 格式变更（页格式已冻结，变更须带 migration），归 Phase 7；代价是部分死链空间滞留到整链死亡（§4.2 已论证有界） |
+| 空页释放 | `lazy_vacuum` 摘页还空间给 relation 内复用 | unlink → 缓存剔除 → `free_page` 还 allocator（可跨 relation 复用） | 两笔 WAL 间有崩溃窗口②（单页泄漏，既定取舍）；消除窗口需把 unlink 并进 PageFree payload = on-disk 变更，判定不值 |
+| vacuum 事务性 | vacuum 在非事务的专用机制下运行，页修改 WAL 同样非事务 | 记录 `txn_id = INVALID`，redo 无条件重放 | 语义一致；analysis 不进 ATT，无 undo 负担 |
+| 死元组清单 | `LVDeadTuples` 物化 + 内存上限触发多轮 | `Vec<Tid>` 全量物化（离线模式） | 在线化时改迭代器（access_method.rs TODO 维持，归 Phase 5b） |
+
+### 已知残留与后续归队
+
+- **崩溃窗口② 单页泄漏**（既定取舍）：unlink 与 free 两笔 WAL 之间崩溃 → 页脱链且不在 freelist，永久泄漏直至手工干预；`vacuum_crash_windows.rs` 钉死精确口径。备选已记录：空页留链零窗口；消窗需改 PageFree payload（on-disk 变更，不值）。**注**：review F1（记为 R2）曾在此窗口之外另发现"前驱页 FPI 排在 HeapCleanup 之后"的重放回滚通道（链指向已释放页 = 结构性损坏），已修复并有确定性回归（交付内容第 10 条）；现窗口② 的残留口径仅为单页泄漏，无一致性问题
+- **部分死链空间滞留**（§4.2 代价）：死版本滞留到整链死亡才回收，`follow_hot_chain` 遍历成本同滞留 → 归 LP 重定向 + 格式演进（Phase 7）
+- **reclaim 缺 allocator 即报错**：未 `set_page_allocator` 的 `HeapAM`（纯 AM 测试构造）遇空页释放时 `InvalidArgument` 硬错——压实部分不受影响；engine 装配路径已接线
+- **索引清理 / `Engine::vacuum` 五阶段流水线**归 Stage D：`collect_index_keys` 产出的 (tid, 列值) 需 engine 侧逐索引 `delete`（EntryNotFound→Ok），本 stage 只交付 AM 能力
+- **WAL 流量观测**：vacuum 产生与死行数成正比的 WAL（§4.5 代价）+ FPI 放大 → ~~量化归 Stage G benchmark（N5）~~ **已在 Stage G 落盘**（`docs/phase1-m3-benchmarks.md` N5 节：最坏档 FPI 占 64.1%、总 WAL 2.05× 于对照档）
+
+---
+
+
+## Stage D（M3）：索引清理 + `Engine::vacuum` 端到端
+
+**状态**：✅ 完成（debug 全量 74 目标 684 绿 / 0 失败（= Stage C 出口 669 + 本 stage 新增 15，含 1 个 btree 回归用例）；clippy `--workspace --all-targets -D warnings` 全绿；loom 两模型红为**预存**（M2 出口提交 31fe4b8 同红，二分证据见残留条），与本 stage 改动无关；未 commit——等用户确认）
+**工期**：预估 4–6 天
+**性能（S2 协议，`M2C_STRESS_SECS=300 M2C_STRESS_CONNS=100 M2C_STRESS_TPS=100` release × 2）**：89 / 87 txn/s，均值 88.0 vs M2c 基线 86.8（+1.4%，噪声界 ±3% 内，无统计显著回归）——vacuum 叠加 Stage A 注册开销后度量通过
+**验收**：`m3_vacuum_e2e`（11：空表 / 无死行表 / 纯死行表（页数 4→1、freelist +3、再插入零新页分配）/ HOT 链（全死链整链回收 + 部分死链零回收）/ 多索引表精确清理量（10 死行 × k 索引 + 6 非 NULL × v 索引 = 16 次 EntryNotFound 容忍，NULL 跳过）/ TableNotFound / **失败路径锁释放**（drop 先排队、vacuum 拿到已死 OID 的锁后 re-check 失败，无锁残留）/ **pin 住 horizon 的端到端防线**（显式事务注册快照钉住 horizon → vacuum 零回收；unpin 后再 vacuum 才回收）/ **阻塞顺序**（holder AS → vacuum AE → inserter RE 的 FIFO 队列，纯 SELECT 与新 BEGIN 期间照跑，无死锁，watchdog）/ **并发纯 SELECT 一致性**（4 读者 × 3 次 back-to-back vacuum，每次扫描恰好 600 行活行，绝无半压实页或复活行）/ **阶段④中途失败注入**（双索引表 + 各一条悬挂 loser 条目；腐蚀第二索引 meta 页使 open 失败——第一索引的删除已持久化、堆未动、维护 XID 出 active set、零锁残留；修复后下一轮 vacuum 以 EntryNotFound 容忍收尾并实际删除第二索引的悬挂条目，窗口①语义的非崩溃版））；`m3_vacuum_crash_windows`（2：**崩溃窗口①**——阶段④索引清理 WAL 落盘、HeapCleanup 未写 → 恢复后索引扫描与堆扫描一致、悬挂 TID 不解析到错误行、下一轮 vacuum 以 EntryNotFound 容忍收尾并 reclaim；**崩溃 loser INSERT 悬挂条目**——恢复后裸 `lookup_all` 见条目、`index_lookup` 被可见性屏蔽、vacuum 实际删除（`index_entries_removed == 1`）后裸探测为空）；`m3_vacuum_churn`（1：固定行数表 30 轮 UPDATE/DELETE/INSERT 批 + 每 5 轮 vacuum + 2 个崩溃注入轮（窗口①手驱 + 在飞 INSERT 批 loser 条目由恢复后 vacuum 实际清除），堆页数收敛（后半程 ≤ 前半程峰值 +3 且 ≤30 页）、每次 vacuum 后无可回收垃圾、freelist/压实复用（稳态高水位增长按**率**判定：≤0.25 页/轮 + 8 页绝对余量，随 soak 长度缩放——review 修复，原 ≤8 页绝对阈值按 30 轮标定、200 轮 soak 必败；实测漂移源为已声明的 btree 无页合并 ~0.18 页/轮）、终态扫描与簿记逐行相等；watchdog 保护；**200 轮 release soak 实测通过**（`M3_CHURN_ROUNDS=200`，8.4s；界 = 8 + 100/4 = 33 页，review 实测漂移 18 页 ≈ 0.18 页/轮在界内））。**churn 抓出并修复 1 个 M2 潜伏 bug**（见交付内容第 3 条，红→绿验证成立）
+
+### 交付内容
+
+1. **`Engine::vacuum(table) -> Result<VacuumStats>`**（`crates/pg-engine/src/engine.rs:1832`）：§4.1 五阶段流水线——① `auto_commit` 风格维护 XID 下取 `AccessExclusive` 表锁（`lock_table_entry` 含 post-lock registry re-check；`create_table`/`drop_table` 同款：分配 XID → 进 active set → 成功与失败两条路径都走 `release_all(xid)`），随后经 `oldest_snapshot_xmin()` **取一次 horizon 全程使用**（锁等待结束后取，锁持有者已全部退出；在飞无锁读者由快照注册表覆盖；XID 单调性保证未来快照 xmin ≥ horizon）→ ② `scan_dead_tuples(horizon)` → ③ `collect_index_keys`（只读）→ ④ 推模式索引清理：每 (tid, 列值) × 每注册索引 → 取索引列（NULL 跳过）→ `encode_key` → `BTreeIndex::delete(key, tid)`，**`EntryNotFound` 视为 Ok 且仅在此调用点**（§4.3：eager 维护早已删除常规死行条目，真实删除对象基本只有崩溃 loser 悬挂条目；btree delete 本身契约未动）；vacuum **不记 index undo**（物理维护操作，幂等，绝不被 reverse-apply）→ ⑤ `reclaim`（压实 + unlink + free，kill 集内部重推导，调用方不过滤）。**不死锁论证落地**：等待期间入度恒 0（零持有），获准后不再申请第二把表锁（阶段 2–5 只持短暂页 latch）。`VacuumStats`（engine.rs:377）：`dead_tuples / index_keys / index_entries_removed / index_entries_already_gone` 四计数，`lib.rs` 导出
+2. **并发共存正确性**：vacuum 进行中纯 auto-commit SELECT / `Engine::scan` / 新 BEGIN 不被锁挡（它们本就不取表锁）；horizon 防线（Stage A 注册）保证其快照看不到被回收版本——pin/unpin 用例端到端钉死；显式事务 SELECT/DML 按 FIFO 有序阻塞至 vacuum 结束（死锁检测器对 vacuum 等待零误报——入度 0 不可能成环）；`table_lock_state` 断言 vacuum 后零锁残留
+3. **churn 抓出的 M2 潜伏 bug（高，红→绿验证）——split-copy redo 的回收页 FPI 回归误报腐败**：churn 第二轮崩溃注入的恢复硬失败 `split copy redo: left page is past the copy ... but right page still lacks it; the moved entries are lost`。根因链：vacuum 是**首个 freelist 生产者** → split 右页可以是带前任身份磁盘历史的回收页，且其前任身份在重放窗口内留有**旧 FPI**；重放时旧 FPI 无条件整页恢复，把右页池内镜像**回退到其磁盘镜像之后**（前滚只重建到 Copy 记录处），而左页（窗口内无 FPI）直接载入了"已过 copy"的最新磁盘镜像——Copy redo 的不对称守卫把"左已过、右池内缺"误判为腐败。该守卫的"不可达"论证只覆盖**磁盘**状态（在线 flush 纪律：右页 post-copy 先于左页 post-copy 落盘），不覆盖被 FPI 回归的**池内**状态。修复：`BTreeSplitCopyHandler` 该分支改为 `BufferPool::force_reload_from_disk(right)`（pg-storage 新增，重做专用：池内镜像回退为盘上镜像、清 dirty 防回归镜像被回刷、逐字段对齐 `alloc_frame` 的 load-from-disk 约定）采纳耐久的 post-copy 盘上镜像并校验 `pd_lsn ≥ copy LSN`；盘上镜像也缺才维持硬失败（真腐败）。**为何 1000 轮 m2b crash rounds 没抓到**：无 vacuum 时新页全部来自高水位线、无前任身份 FPI；且 m2b 轮次持续 checkpoint，重放窗口短。确定性回归 `btree_split_crash.rs::split_copy_redo_right_page_regressed_by_stale_fpi`（构造：C1 checkpoint → 左叶生于 C1 后（窗口内无 FPI）→ P 的前任身份 FPI + free → split 复用 P 为右页 → 全量 flush → 崩溃 → 恢复；含二次崩溃幂等重放），红绿验证成立（回退修复后恢复硬失败、恢复修复后全绿）
+4. **过时注释清理**：`heap_tuple_visible` 的"HeapAM never reclaims slots"假设改写为 vacuum 时代的不变式（slot 复用只经 reclaim，且 §4.1 顺序保证指向它的索引条目先删后放；窗口① 崩溃后由下一轮 vacuum 在复用前补删）
+5. **Stage D review 修复清单**（终审后）：
+   - churn 稳态高水位断言从固定 ≤8 页改为率式（≤0.25 页/轮 + 8 页余量，随轮数缩放；200 轮 soak 实测后半程涨 18 页 = 0.18 页/轮，为已声明的 btree 漂移，非堆泄漏）
+   - watchdog 的 worker panic 消息改为先 downcast `&str`/`String` 再携带（原 `Any { .. }` 丢断言信息；`m3_vacuum_churn.rs` 与 `m3_vacuum_e2e.rs` 两处）
+   - 新增阶段④中途失败注入用例（见验收行）
+   - `BufferPool::force_reload_from_disk` 的注释出处从 `flush_frame` 更正为 `alloc_frame` 的 load-from-disk 路径（逐字段对齐对象）
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| vacuum 锁 | `ShareUpdateExclusive`（在线，不挡 DML） | `AccessExclusive`（离线停写窗口） | §2 既定代价；在线/渐进 vacuum 归 Phase 5b |
+| 锁载体 | 专用 VACUUM 伪事务 | auto-commit 风格维护 XID + `release_all` | 复用既有 DDL 先例，零新机制 |
+| 索引清理 | `lazy_vacuum_index` 批量回调 | 推模式逐条 `BTreeIndex::delete`，EntryNotFound→Ok | §4.3：eager 维护下绝大多数条目早已不在树上；批量接口归 Phase 5b |
+| 无锁读者与页回收 | PG 读者也取 AccessShare，被 AccessExclusive 挡住 | 纯 SELECT 无锁放行，靠快照注册表 horizon 防线 | tech-selection §2 既定：水位线问题由 Stage A 解决，非锁问题 |
+| horizon | GetSnapshotData 时算 OldestXmin | 锁授予后取一次全程使用 | §3.3 单调性论证；vacuum 自身快照注册使 horizon 略保守（等待期 xmin 被钉住），安全方向 |
+
+### 已知残留与后续归队
+
+- **loom 模型测试预存红（非本 stage 回归，二分定位 + 已实证复核）**：`btree_loom` 两模型在当前工具链下失败（`loom_two_writers_one_reader_linearizable` 报 "page 2 entries out of order at slot 1"、`loom_split_with_concurrent_writers` 报 "key 0 lost across the split"）。二分证据：在 M2 出口提交 31fe4b8（Stage Q 记录"loom 2 模型 2 万+ 交错全绿"的同一提交）上**同样失败** → 失败前移至 M2 之后的环境/工具链漂移（Stage A–C 只 `cargo check` 未实际运行 loom），与本 stage 改动无关（本 stage 未触碰 latch/split 编排）。**实证复核（2026-08-24)**：当前树与 31fe4b8 的隔离 worktree 各跑 CI 命令（`LOOM_MAX_PREEMPTIONS=2`），两侧同红且耗时一致（~22s/侧，非状态空间爆炸，是快速硬失败）。**并档（2026-08-25)**：`btree_concurrent::concurrent_small_pool_split_eviction_storm` 的 solo flaky（实测 23 跑 2 败，~9%）失败信息 "scanner missed committed key 0" 与 loom 的 "key 0 lost across the split" **同族**——疑同一底层 bug（并发 split 丢 key 0），两个条目合并为同一单开修复会话的排查对象，不再按"容忍的 flaky"处理。根因定位与修复单开会话处理，不阻塞 Stage D
+- **split-CLR redo 的同构不对称窗口**（本次未触发，理论残留）：`apply_split_clr` 的"左页已过 CLR 而右页没有"分支同样假设池内状态即磁盘状态；触发需"回收右页 + 窗口内旧 FPI + split 中途崩溃 + 恢复后再崩溃"四连，比 Copy 路径窄得多。修复模式相同（`force_reload_from_disk`），归后续 stage 按需处理
+- **回收页的撕页暴露**：`new_page` 对复用页仍设 `needs_fpi=false`（"新页无旧镜像"假设对复用页不成立——其前任镜像在盘上）；Stage Q 只给 `create_new_root` 补了 `log_page_init`。kill -9 测试模型撕不了页缓存 pwrite，纯断电模型才暴露 → **不在本阶段处理，列入后续 checkpoint/FPI 加固专项的处理清单**（新建该 stage 时作为其输入项；候选修复：split_prepare 对复用右页补 log_page_init）
+- **无锁读者撞上跨 relation 页复用的理论窗口**：纯 SELECT 走链时若读到"unlink 前旧 next 指针 → 页已释放并被他表复用"，MVCC 过滤（新元组 xmin 晚于读者快照）使其读不到错行，最坏是一次可重试的解码错误；本 stage 测试未构造出该交错 → 观察项，根治（读者侧 chain 代际校验）归 Phase 5b 在线 vacuum
+- **churn 验收口径偏差**（对 coding-plan 任务表）：计划写"vacuum 后 `scan_dead_tuples(最新 horizon)` 返回空"——HOT 更新负载下部分死链的死前缀**合法滞留**（§4.2 不 prune），该字面口径不可达；精确化为"无可回收垃圾"（`collect_index_keys(scan_dead_tuples)` 为空）+ 滞留量有界（≤ 活行数），已写入 churn 测试注释
+- **窗口① churn 轮次的阶段④ WAL 为空**：churn 的已提交删/改条目都被 eager 维护先行删除，手驱阶段④全部 EntryNotFound；"索引清理 WAL 有实质内容"的窗口① 变体由 `m3_vacuum_crash_windows.rs`（loser 条目）覆盖
+- **性能口径**：vacuum 叠加 A 注册开销后的 churn TPS 对比见 `docs/phase1-m2-benchmarks.md` 基线条目与本 stage 验收行（S2 协议）
+- **WAL 流量观测**（压实 FPI 放大，N5）~~归 Stage G benchmark~~ **已在 Stage G 落盘**（`docs/phase1-m3-benchmarks.md` N5 节）
+
+---
+
+## Stage E（M3）：可观测性（pg-waldump / Engine 自省 API / QueryStats / pg-diag）
+
+**状态**：✅ 完成（debug 全量 709 绿 / 0 失败（= Stage D 出口 684 + 本 stage 新增 25：交付物测试 18 + 终审修复 F1–F4 测试 7；含 m2a/m2b crash rounds 与 crash_recovery 三个子进程崩溃 harness 回归）；clippy `--workspace --all-targets -D warnings` 全绿；fmt 全绿；loom 未实际运行（沿用 Stage D 登记的预存红条目）；未 commit——等用户确认）
+**工期**：预估 3–4 天
+**验收**：`pg-storage/tests/waldump.rs`（3：全记录族可解析（heap/btree/txn/checkpoint/HeapCleanup/reserved 逐条一行、关键字段解码、reserved 打印原始 payload 不报错）/ LSN 过滤边界精确包含 / 跨段读取 + 数据目录与段目录两种入参形态）；`pg-engine/tests/m3_introspection.rs`（4：表锁等待 + 行锁边 fixture → `wait_edges` 精确合成 / CLOG 与 BufferPool 已知命中序列计数精确、Engine 命中率与组件计数一致 / 并发快照钉住 `oldest_snapshot_xmin`、提交后水位按注册存活快照推进）；`pg-engine/tests/m3_query_stats.rs`（5：容量溢出丢最老 / exec 单点覆盖 auto-commit 与显式事务两路径（含失败语句 rows=0、parse 失败不入列）/ typed API 不产生条目 / capacity=0 关闭统计）；`pg-engine/tests/m3_diag_cli.rs`（2：活跃事务 + 锁等待 fixture 下 `txn`/`locks` 报告文本逐项断言 / 编译产物二进制双子命令冒烟（空引擎实例 = M3 单进程边界语义））
+
+### 交付内容
+
+1. **`pg-waldump`**（`crates/pg-storage/src/bin/pg-waldump.rs`，§6.1 选型 (a)：与 WAL 格式同 crate、零新依赖边）：人类可读 dump，每条记录一行 `lsn= prev= xid= type=Name(N) len= <关键字段>`；`--start-lsn/--end-lsn` 闭区间过滤（十进制或 `0x` 十六进制）；位置参数同时接受数据目录（自动取 `wal/` 子目录）与段目录；`--segment-size` 须与写入端 `wal_segment_size` 一致（默认 16 MiB）。遍历复用恢复同款 `WalReader`（段间跳转、撕裂尾部=干净 EOF 全部继承）；**错误策略与 recovery 相反**（§6.1"尽量多展示"）：reserved 类型（`SegmentSeal`=110/`SegmentMerge`=111 及 Phase-2+ 逻辑索引类型 100–103、`TxnBegin`=20）打印原始 payload 十六进制不报错；payload 解码失败仍打印头部字段 + 原始字节；只有"无法越过"的记录（未知判别式 = 更新版本二进制所写、中段 CRC 失败）才停在该 LSN 并报告——之前记录已全部输出
+2. **Engine 自省 API**（`engine.rs`，§6.2 全部只读拼装、零新增机制）：`active_xids()` → `TxnManager::active_xids`；`wait_edges()` → **`pg_txn::deadlock::wait_for_edges` 提为 pub 并导出**（row 边 `TxnManager::wait_edges` + 表边 `LockManager::table_lock_states` 的合成为单一事实源——诊断面与死锁检测器消费同一份图，结构上不可能漂移）；`table_lock_state(oid)` → `LockManager::table_lock_state`；`oldest_snapshot_xmin()`（Stage A 透传已存在，本 stage 进自省面）；`clog_hit_rate()` → `ClogBuffer::hit_rate`；`buffer_pool_hit_rate()` → 下方新增计数器
+3. **Buffer Pool 计数器**（§6.2 唯一实现缺口）：`BufferPool` 补 `hits/misses: AtomicU64` + `hits()/misses()/hit_rate()`（`buffer_pool.rs`），与 `clog_buffer.rs:156-175` 逐行同构（Relaxed 序、`0.0`-before-any-pin 语义）。计数点：命中 = `try_pin_resident` 成功（`locate_or_load` 快路径与 `alloc_frame` 双检路径共用此单点，每次成功 pin 恰计一次——双检成功即"并发 loader 抢先载入"，无读盘、是真命中）；未命中 = `alloc_frame` 的 load-from-disk 分支（读盘前自增，读失败也计——未命中度量的是"无驻留镜像"）。`new_page` 分配不计（无查找无读盘），redo 专用 `force_reload_from_disk` 不计（页本已驻留）
+4. **`QueryStats` ring buffer**（`crates/pg-engine/src/query_stats.rs`，§6.3 选型 (b)）：容量默认 1000（`EngineConfig::query_stats_capacity` 可配，0 = 关闭统计），每条 `{query 文本, latency(Duration), rows(影响/返回行数), path(ExecutionPath), timestamp(SystemTime)}`；单把 `parking_lot::Mutex` 护 `VecDeque`，溢出 `pop_front` 丢最老；读 API `entries()/len()/is_empty()/capacity()`。**`Engine::exec` 单点埋点**（latency 覆盖整个 exec 调用（parse + 执行）；auto-commit 与显式事务两路径天然同覆盖；失败语句记 rows=0；parse 失败在埋点之前返回、不入列）。`ExecutionPath` 七变体（`SeqScan/IndexLookup/Insert/Update/Delete/Ddl/TxnControl`）；`IndexLookup` 为预留——M3 SQL 执行器只有 seq scan（`exec_select`→`scan_inner`），typed `Engine::index_lookup` 按 §6.3 约定**不**入统计
+5. **`pg-diag`**（`crates/pg-engine/src/bin/pg-diag.rs` + 渲染逻辑在 lib 侧 `crates/pg-engine/src/diag.rs`，S1）：`txn` 子命令（active_xids + `oldest_snapshot_xmin` + clog/buffer-pool 命中率）、`locks` 子命令（完整 wait-for 图 + 竞争表的 granted/FIFO 等待队列）。渲染函数落 lib 使 CLI 精确输出可进程内 fixture 断言；二进制只是薄壳。**M3 边界文档化**：独立进程打开数据目录看到的是自己刚恢复的空闲引擎实例（单进程诊断）；跨进程 live 诊断归 Phase 4a 经 pg-wire 暴露同一 §6.2 面。指向 live server 数据目录的误用由 F1 的排他锁硬拒绝（见下）
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| 数据目录排他 | `postmaster.pid` + kill(pid,0) 活性检测 | `{data_dir}/lock`（`create_new`/O_EXCL + holder pid，F1） | 零新依赖约束排除 libc/fs2（std 无 flock，MSRV 1.86）；崩溃残留需手动删，活性检测归后续 |
+| WAL dump | `pg_waldump` 独立工具，rmgr 注册解码 | `pg-waldump` 挂在格式所属 crate（§6.1 (a)），未知/保留类型打印原始字节 | M3 只有一个 CLI，单建 tools crate 是过度组织；未来工具增多再迁 (b) |
+| 查询统计 | `pg_stat_statements` 系统表（持久、跨进程） | exec 层内存 ring buffer（1000 条、溢出丢最老、重启即失） | 系统表化要走 heap/WAL/MVCC 全家桶且自引用（统计表的查询也产统计），归 Phase 6（§6.3）；ring 语义对"诊断最近慢查询"够用 |
+| 统计覆盖 | 所有 utility/PL 路径 | 只覆盖 SQL 文本路径（`exec` 单点）；typed API 不入统计 | §6.3 既定口径；typed API 无 SQL 文本可记 |
+| 锁/事务自省 | `pg_locks` / `pg_stat_activity` 视图（共享内存跨进程） | 进程内只读 API + CLI 薄壳；独立进程只见空引擎 | 单进程口径 S1 既定；跨进程 live 诊断归 Phase 4a（pg-wire 管理通道） |
+| BP/CLOG 命中率 | `pg_stat_bgwriter` / `pg_statio` 计数器表 | 组件内 AtomicU64 + `hit_rate()` 只读方法 | 零新机制；计数不进目录表（同上行） |
+
+### 终审修复（F1–F4）
+
+- **F1（高）数据目录排他锁**：`pg-storage` 新增 `data_dir_lock` 模块——`StorageEngine` 打开时以 `create_new`（O_EXCL）创建 `{data_dir}/lock`（内容 `pid=<n>`，仅供错误消息与同 pid 判定），引擎值 Drop 时删除（声明为结构体最后字段，子系统全部释放后才放锁）。第二个**进程**打开同一目录干净报 `InvalidOperation`（"already in use … remove the stale lock file"）。**选型论证**：flock 语义（fd 生命周期=进程生命周期、崩溃自动释放）需要 libc/fs2，被 §10 零新依赖约束排除（std 的 `File::lock` 1.89 才稳定，MSRV 1.86）；且**任何同进程排除都会打破测试套件的崩溃惯用法**——约 100 个崩溃恢复测试以 `mem::forget(engine)` + 同进程重开模拟 kill -9，被遗忘引擎的 Drop 不执行，锁文件与 flock fd 都不会释放。因此同 pid 冲突（只能是该惯用法）视为残留锁**回收**（warn 级日志），异 pid 一律拒绝。真实跨进程崩溃残留（m2a/m2b crash rounds 与 crash_recovery 的子进程 SIGKILL 后立即重开）由 harness 在回收子进程后删除残留锁文件——恰好扮演文档化的运维清理动作。代价（文档化）：① 真崩溃残留需手动删文件（错误消息明示；kill(pid,0) 活性检测——PG postmaster.pid 的形态——需 libc，归后续）；② 同进程双开活引擎不拦截（F1 的实际危害面是第二进程，如 pg-diag 打向运行中 server）。接线点：`open_with_redo_and_clog`（ensure_data_dir 之后、superblock 探测之前）与 `recover_with_redo_handlers`（先取锁再读任何文件）；`recover` 系列拆出私有 `recover_inner` 承接已持有的锁。测试：`pg-storage/tests/data_dir_lock.rs`（3：异 pid 锁拒绝+手动清理后放行 / 干净关闭放锁可重开 / forget 重开同 pid 回收）+ 模块单测（2）+ `m3_diag_cli.rs::pg_diag_against_live_engine_dir_is_rejected`（pg-diag 子进程打向活引擎目录 → 非零退出 + "already in use"；holder 关闭后放行——真跨进程端到端）
+- **F2（低）capacity=0 跳过 entry 构造**：`Engine::exec` 埋点在 `query_stats.capacity() == 0` 时不再构造 `QueryStatEntry`（避免每语句一次 String clone；`engine.rs`）
+- **F3（低）查询文本无上限 → 截断 1 KiB**：`QueryStats::record` 单点截断至 `MAX_QUERY_TEXT_BYTES = 1024`（UTF-8 字符边界回退；ring 内存上界 ≈ capacity × 1 KiB）；lib 导出该常量；单测 `query_text_is_truncated_to_cap`（含多字节字符跨界）
+- **F4（低）locks_report 非原子快照**：`diag.rs` 补 doc——边列表与表状态来自先后两次独立快照（与 `wait_for_edges` 内部分源加锁同构），并发下可瞬时错位，诊断用途可接受，死锁检测器同此性质
+
+### 已知残留与后续归队
+
+- **F1 残留①：崩溃残留锁需手动删**（既定第一版）：kill -9 后 `lock` 文件残留，下次打开报可操作错误（点名持有者 pid 与删除指引）；自动活性检测（kill(pid,0)）受零新依赖约束归后续——若未来允许 libc 边或 MSRV 升至 1.89（`File::lock`），改 flock/postmaster.pid 全语义
+- **F1 残留②：同进程双开活引擎不拦截**（同 pid 回收是崩溃测试惯用法的前置）；进程内误开属编程错误，靠 review 把关
+- **跨进程 live 诊断不可达**：`pg-diag` 独立进程看到的是自己的空引擎实例（M3 口径 = "诊断面以 CLI 形式可用"，测试/单进程场景）；live server 诊断归 **Phase 4a**（经 pg-wire 暴露 §6.2 自省面，coding-plan"遗留与归队"S1 注记）
+- **waldump 撕裂/中段损坏覆盖注记**：撕裂尾部=干净 EOF、中段 CRC 失败=停止并报 LSN 的行为**继承自 `WalReader`**，由 `wal/reader.rs` 既有单测覆盖（`read_torn_tail_record_with_zero_remainder_returns_none` / `read_crc_failure_with_records_after_still_errors` 等）；`waldump.rs` 集成测试覆盖全记录族、LSN 过滤边界与 reserved 类型，未单独构造 bin 层撕裂 fixture（底层语义已有确定性测试，bin 只是透传）
+- **真正未知判别式（更新版本二进制所写的 WAL）在 dump 中报错停止**（记录边界不可读，无法越过），与 §6.1 要求的 reserved 类型（判别式已知、仅无 handler）不报错不同——前者会打印已走到的全部记录后报 LSN
+- **`ExecutionPath::IndexLookup` 预留无生产者**：SQL 执行器无索引访问路径（`exec_select` 恒 seq scan）；planner 索引选择归后续 stage
+- **QueryStats 重启即失 + 溢出丢最老**（§6.3 既定代价）；系统表化归 Phase 6
+- **waldump 需要显式 `--segment-size`** 匹配非默认段长的数据目录（段长不在段文件内自描述；superblock 化段长元数据归后续）
+- **统计埋点性能口径**：验收为"对 exec 路径开销不可测"（churn 对比抽查）——埋点 = 一次 Mutex push + 两次时钟读，相对 WAL append/页 I/O 不可测；~~正式 S2 数字归 Stage G 收口 benchmark~~ **已在 Stage G 落盘**：收口 S2 86.0 vs 基线 86.8（-0.9%，噪声界内，`docs/phase1-m3-benchmarks.md`）
+- **loom 两模型预存红**沿用 Stage D 登记条目（本 stage 未触碰 latch/WAL 编排；BufferPool 计数器走 `crate::sync` 别名层，loom 构建不受影响）
+- **19 个 pre-existing rustdoc 警告（跨 6 crate：pg-storage 5 / pg-txn 2 / pg-catalog 1 / pg-am-heap 7 / pg-am-btree 3 / pg-engine 1）**：本 stage 零新增；CI doc job（`RUSTDOCFLAGS=-D warnings`）对其必红——**按用户节奏逐步消解，不阻塞本 stage 收口**；消解时顺带注意 pg-engine 的一处来自 Stage D 的 `Self::auto_commit` 私项链接
+
+
+## Stage F（M3）：pg-wire（v3 最小协议 + 连接管理 + SQL 透传）
+
+**状态**：✅ 完成（本 crate 28 绿：wire_protocol 24 + wire_clients 4；clippy `-p pg-wire --all-targets --all-features -D warnings` 绿；fmt 绿；doc job（`RUSTDOCFLAGS=-D warnings`）对 pg-wire 绿、零新增警告；`cargo tree` 抽查零新运行时依赖；终审修复 F1/F4 落地、F8 补强测试 2 条；F7 修复合入本 stage（commit 失败回退 abort + 双路径红绿回归测试，`m2b_index_txn` 13 绿）；**最终全量回归 739/0**（权威计数 740 = 739 可运行 + 1 ignored；早期一轮 736/1 的唯一失败为 `btree_concurrent::concurrent_small_pool_split_eviction_storm`；**注意（P3-1 修正）**：该测试 solo 实测 23 跑 2 败（~9%），失败信息 "scanner missed committed key 0" 与 loom 预存红（"key 0 lost across the split"）**同族**——"仅全量并行下偶发"的措辞不准确，它意味着 CI 的 pg-am-btree test job 约每 11 次红 1 次；已与 loom 红条目并档，疑同一底层 bug，单开修复会话排查而非容忍；与本 stage 无关（未触碰 pg-am-btree）；未 commit——等用户确认）
+**工期**：预估 5–7 天（+1–2 兼容余量未动用）
+**验收**：`pg-wire/tests/wire_protocol.rs`（24：启动四码 framing + 常规帧 `Q`/`X`/未知 tag + 畸形帧拒绝 / 超大声明长度在上限处拒绝为 Protocol 错而非分配（F1 红绿对照：旧实现会放行后撞 EOF-Io 错）/ `Q` 串 NUL 后多余字节报 Protocol 错（F4）/ 全部后端编码器 golden bytes + RowDescription/DataRow 结构断言 / 六类型文本编码 + NULL 协议标记 / BEGIN→begin_txn、COMMIT→commit、ROLLBACK→abort 映射 + exec 零到达（QueryStats 无 BEGIN/COMMIT 条目佐证）/ 事务中 BEGIN 报 25001 且句柄存活 / 无事务 COMMIT/ROLLBACK 报 25P01 / **带活事务断开连接 → XID 自动回收（F8）** / **CancelRequest 会话级关连（F8，真 socket）** / 多语句按序 auto-commit + 首错截断余串 / 探针语句 42601 报错不断连 / 空查询 EmptyQueryResponse / 全类型 SELECT 端到端（schema 驱动 OID + 文本值 + 5 NULL 标记））；`pg-wire/tests/wire_clients.rs`（4，rust-postgres 真 TCP 硬门槛：全 CRUD + BEGIN/COMMIT/ROLLBACK + 多语句串 / 探针 SET、SELECT version() 报错不断连 / 六类型文本 roundtrip / 4 并发客户端各自表 CRUD + 交错显式事务——全部挂 120s watchdog）
+
+### 交付内容
+
+1. **新 crate `crates/pg-wire`**（workspace member，依赖 pg-engine；§7.1）：只做协议编解码 + 连接管理 + SQL 透传，零执行逻辑。运行时依赖仅 pg-engine/thiserror/tracing（全部已在 workspace 依赖图内，§10 零新运行时依赖成立）；dev-dependency 引 `postgres` 0.19（rust-postgres 同步封装，§10 允许的测试驱动客户端）+ tempfile + uuid（fixture 构造，已在图内经 pg-am-heap）
+2. **手写编解码**（`src/codec.rs`，§10 选型 (b)）：启动阶段无 tag 帧（v3.0=196608 / SSLRequest / GSSENCRequest / CancelRequest 四码分发）+ 常规阶段 1B tag + 4B 长度帧；长度字校验上限分档——启动包 10000（PG `MAX_STARTUP_PACKET_LENGTH` 同款）、常规消息 64 MiB，且**分配随读入 8 KiB 分块增长**（声明长度永不全额预分配，终审 F1 修复；声明超上限拒绝为 Protocol 错而非分配）；干净 EOF 区分于截断帧（前者=正常关连，后者=协议错误）。后端编码器全部追加进调用方 buffer，一个 ReadyForQuery 周期一次 `write_all` 落盘
+3. **启动协商**（`src/session.rs`）：SSLRequest→`'N'`、GSSENCRequest→`'N'`（§7.2"忽略"落地为"拒绝加密但必回字节"——无 GSS 的 PG 也回 `'N'`，真不回字节 libpq 会永久阻塞）、CancelRequest→直接关连（§7.2 非目标，PG 消费完 cancel 包同样关连）、StartupMessage→AuthenticationOk（trust）→ParameterStatus 最小集（server_version=16.0 / server_encoding / client_encoding / DateStyle / integer_datetimes / standard_conforming_strings / is_superuser / session_authorization，外加回显 application_name）→ReadyForQuery
+4. **事务拦截**（`src/session.rs`）：`BEGIN`/`COMMIT`/`ROLLBACK` 由 pg-wire 层解析（复用 engine 的 `sql::parse`——同一解析器保证拦截面与 exec 面零漂移）后映射到 `Engine::begin_txn`/`TxnHandle::commit`/`abort`，**不透传 exec**（engine.rs exec_auto/exec_txn 对三者硬报错）；每连接至多一个 `TxnHandle`；事务中 BEGIN 报 25001（PG 是 WARNING 续跑，此处硬错误——"报错不破坏现状"口径内且客户端更易观测）且句柄原样存活；无事务 COMMIT/ROLLBACK 报 25P01；连接断开/Terminate 时 `TxnHandle::drop` 自动 abort，XID 不泄漏
+5. **多语句串**：`split_statements`（pub，可单测）按顶层 `';'` 切分，单引号字面量与 `''` 转义正确跳过；语句按序执行（auto-commit 各自独立，显式事务内共享该连接句柄）；首条错误截断余串（PG simple-protocol 语义）发 ErrorResponse 后照常 ReadyForQuery；全空串回 EmptyQueryResponse
+6. **结果渲染**：RowDescription（schema 驱动类型——SELECT 的表名经 `Engine::describe_table` 解析出真实 table OID/attnum/列类型；解析不到时回退到首个非 NULL 值推断，再回退 TEXT）+ 文本 DataRow（NULL=长度 -1 协议标记）+ CommandComplete（`SELECT n`/`INSERT 0 n`/`UPDATE n`/`DELETE n`/`CREATE TABLE`/`CREATE INDEX`/`BEGIN`/`COMMIT`/`ROLLBACK`）。SQLSTATE 映射只保留客户端可行动的区分：42P01/42P07/0A000/42601，其余 XX000
+7. **类型文本编码**（`src/types.rs`，§7.2）：INT4/INT8 十进制、TEXT 原样、NULL 协议空值、Bytea `\x`+小写 hex（恰为 PG 文本格式，OID 17 如实上报）、**Timestamptz 报 INT8 OID 配 µs 整数编码、Uuid 报 TEXT OID 配标准串编码**（见 trade-off 表）；`Datum::External`（TOAST 指针）响亮报错——M3 读路径不解析 TOAST
+8. **线程模型**（`src/server.rs`，§7.3）：`std::net::TcpListener` + 每连接一个命名 std 线程 + `Arc<Engine>`，零 tokio；accept 后即 set_nodelay；会话失败（I/O 或协议违规）只关该连接并 warn 日志，accept 循环与其余连接不受影响；连接线程 detached（进程即生命周期属主，与全仓库一致）
+9. **O5 编译期断言**（`src/lib.rs`）：裸 fn `assert_engine_send_sync` 钉死 `Engine: Send + Sync`（无 static_assertions crate）；该性质一旦失效线程模型即不健全，编译期直接拒
+10. **CI 接线**（P2-5 修正）：`.github/workflows/ci.yml` 的 clippy/test/doc 三个 crate matrix 加入 pg-wire（fmt job 无 matrix，`cargo fmt --all` 天然覆盖；msrv job 为 `--workspace --all-features` 同样天然覆盖）；pg-wire 零 features，test job 走 all-features 分支（loom 豁免分支先例不涉及，已在 ci.yml 注释注明）
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| Timestamptz/Uuid 的 RowDescription OID | 真 OID（1184/2950）配各自文本格式 | **OID 与线上字节自洽**：µs 整数报 INT8(20)、标准 UUID 串报 TEXT(25) | §7.2 只钉值编码不钉 OID；报真 OID 则无任何 stock 客户端能把 µs 整数解成 timestamptz（psycopg2 的 1184 cast 直接炸），roundtrip 验收不可能成立。真 OID + PG 文本时间戳格式归 Phase 4a |
+| 协议面 | Extended Query / COPY / 认证 / CancelRequest / TLS 全家桶 | 仅 Simple Query 最小闭集（§7.2 既定非目标） | M3 目标是"驱动能连上跑 CRUD"；扩展面归 Phase 4a（独立 crate 的立意即协议演进不污染 engine） |
+| 事务中 BEGIN | WARNING 级别，事务继续 | ERROR 25001，事务继续（句柄不动） | "报错不破坏现状"验收口径内；硬错误对客户端更易断言 |
+| 语句失败后的显式事务 | 进入 aborted 态，只接受 ROLLBACK（ReadyForQuery 报 `'E'`） | 无 failed-txn 态：事务保持 `'T'`，后续语句照常执行（M2b 语义——失败语句已写行留在事务内，安全收口只有 abort） | engine 无子事务是既定 M2b 边界，wire 层不虚构 `'E'` 语义 |
+| GSSENCRequest | 不支持时回 `'N'` | 回 `'N'`（§7.2 字面为"忽略"，落地为"不加密但必应答"） | 真忽略（零响应）libpq 永久阻塞——解释性落地，已注 session.rs 文档 |
+| 连接数 | fork 进程/连接 | std 线程/连接 | §7.3 既定：千级连接线程爆炸归 Phase 4a 再评估 runtime；M3 不做连接数压测 |
+
+### 终审修复（F1–F8）
+
+- **F1（中）声明长度即分配 = 内存 DoS 面**：原实现长度校验（旧上限 1 GiB）通过后立即 `vec![0u8; len]`——5 字节头声明 1 GiB 即触发等额分配并阻塞持有。修复（`codec.rs` `read_body`）：① 上限收紧——启动包 10000（PG `MAX_STARTUP_PACKET_LENGTH` 同款，自 8.0 即此值）、常规消息 64 MiB（SQL 子集无大对象字面量，绰绰有余）；② 分配随读入 8 KiB 分块增长，声明长度永不全额预分配，任一时刻内存上界 = 对端实际已发字节 + 一块余量。测试 `oversized_declared_length_rejected_before_allocation`：1 GiB / 64 MiB+1 / 10001 声明均拒绝为 Protocol 错（红绿对照：旧实现会放行分配后撞 EOF-Io 错）；贴上限但 body 不到则 Io 错（上限放行、分块读取零大额预分配）
+- **F4（nit）`Q` 消息 NUL 后多余字节静默忽略 → Protocol 错**（PG "invalid string in message" 同款）：cstring 必须占满整帧，拖尾字节 = 对端 framing bug，不静默丢弃。测试 `query_trailing_bytes_after_nul_rejected`
+- **F8 测试补强**：`drop_session_mid_txn_reclaims_xid`（BEGIN 后 drop session，`TxnHandle::drop` 自动 abort → `active_xids` 归零，XID 不泄漏钉 horizon）；`cancel_request_closes_connection`（真 socket 发 CancelRequest → 服务器无应答关连，客户端读到干净 EOF，会话线程 Ok 返回）
+
+### 已知残留与后续归队
+
+- ~~三家手动矩阵未跑~~ **已归档（Stage G，2026-08-27）**：psql 19devel / psycopg2 2.9.12 / node-postgres pg 8.23.0 三家 CRUD + BEGIN/COMMIT/ROLLBACK 全部通过，探针报错清单与新发现（psycopg2 隐式事务包 DDL 撞 M2b 边界）落盘 `docs/phase1-m3-benchmarks.md` 手动矩阵节；CI 硬门槛维持只有 rust-postgres（`wire_clients.rs` 4 测试全绿）。手动 server 载体 = Stage G 新增的 `crates/pg-wire/src/bin/pg-server.rs`（`wire_clients.rs` 头部文档原建议的 "a tiny bin"）
+- **psql catalog 探针固有落差**（§11 R3）：`\d` 等元命令与 `pg_type` 族查询答不出，口径 = "报错不断连 + 基本 CRUD 可用"，M3 不承诺交互体验
+- **Extended Query 非目标**（§7.2）：rust-postgres 的 `query`/`execute`（走 Parse/Bind/Execute）不可用，测试一律走 `simple_query`/`batch_execute`；驱动侧参数化查询归 Phase 4a
+- **TOAST 值读路径不可达**：`Datum::External` 上报 Encode 错误（响亮失败非静默错值）；TOAST 解析归 Stage I 既定归属
+- **结果集整体缓冲（F2 点名）**：一个 `'Q'` 周期的全部响应进单个 Vec 再一次 `write_all`——大结果集峰值内存 ~2×（engine 物化的行 + 编码后的帧），且客户端中途断开要等全量算完才察觉。engine 本就物化全部行（`QueryResult::Rows`），无额外渐近开销；流式 DataRow 归 **Phase 4a**
+- **slow-loris / 连接上限 / 线程不 join / 优雅关闭（F3 点名，§7.3 既定代价的具体形态）**：连接无读超时也无总数上限——慢速对端（slow-loris）可永久占住一个连接线程（线程模型下每连接一线程，占满即拒新连接）；连接线程 detached 不 join；无优雅关闭路径，且 accept 循环失败后 `Engine`（含 DataDirLock）要存续到最后一个连接线程退出才释放。M3 目标是"驱动能连上跑 CRUD"非公网服务；读超时/连接上限/关闭握手归 Phase 4a 与 runtime 再评估一并处理
+- **只认 protocol 196608（F5 记录项）**：3.x 次版本请求硬错误而非回 `NegotiateProtocolVersion`——PG18 前 libpq 默认协商 3.0 不受影响；客户端显式 `max_protocol_version=latest` 会撞。归 Phase 4a 协议扩展面
+- **database 参数不校验（F6 记录项）**：trust 模式下任何 dbname 均可连（单数据目录即库的既定形态）；多数据库/校验归后续阶段
+- ~~`commit()` 失败路径泄漏 XID（F7 记录项，非本 stage 引入，登记）~~ **已修复（Stage F 收口期）**：`TxnHandle::commit` 在 `commit_txn` 失败时回退为 best-effort abort——先回放索引 undo（与 `abort()`/`Drop` 同纪律）再翻 CLOG 位，XID 不再泄漏、horizon 不再被钉死；注入钩子 `pg_txn::manager::test_hooks::set_commit_txn_force_fail`（doc-hidden thread-local）+ 回归测试 `m2b_index_txn::commit_failure_falls_back_to_abort_and_reclaims_xid`（红绿对照成立：修复前 XID 留在 active set 断言必红）
+- **BackendKeyData 不发**（无 CancelRequest 支撑，§7.2 非目标）；个别驱动若强依赖 key data 会在取消路径上失败，正常查询路径不受影响
+- **19 个 pre-existing rustdoc 警告**沿用 Stage E 登记条目（本 stage 零新增，pg-wire 的 doc job 单独验证为绿）
+
+---
+
+## Stage G（M3）：接口预留 + M3 收口（M3 出口）
+
+**状态**：✅ 完成（回归与 S2 数字见下；未 commit——等用户确认；`phase1-m3` tag 经用户确认后打）
+**工期**：预估 3–4 天
+**验收**：debug 全量 **743 绿 / 0 失败 / 1 ignored**（= Stage F 出口 739+1 + 本 stage 新增 3 个编译桩/状态机测试 + 修复会话新增 1 个 slot-0 回归测试；743 为根治修复后收口轮实测）；release 全量 **743 绿 / 0 失败**（slot0 回归测试非 debug-only,release 档同计）；`m2b_crash_rounds` 4 绿（69.9s）；**loom 双模型绿（~250s,CI 口径 `LOOM_MAX_PREEMPTIONS=2`)**——`loom_two_writers_one_reader_linearizable` / `loom_split_with_concurrent_writers` 随 flaky 家族根治一并转绿（详见"已知残留"✅ 根治条目；此前 26s 快速硬失败的预存红登记保留作历史记录）；`m3_vacuum_crash_windows` 2 绿（O2 回归复核）；`m2b_index_txn` 13 绿（F7 复核）；**S2 收口（`M2C_STRESS_SECS=300 M2C_STRESS_CONNS=100 M2C_STRESS_TPS=100` release × 3）：86 / 86 / 86 txn/s，均值 86.0 vs M2c 基线 86.8（-0.9%，噪声界 ±3% 内，<5% 上限内）——注册 + vacuum + 统计埋点全栈无统计显著回归，§12.5 通过**；clippy `--workspace --all-targets -D warnings` 绿；`cargo fmt --all --check` 绿；200 轮 churn release soak 复跑绿（8.74s）；**release 档 flaky 清偿（终审发现，Stage C 引入、非本 stage 回归）**：`vacuum_reclaim::readers_during_compaction_see_no_half_compacted_page` 为 release-only 概率性 flaky（实测 solo release 10 跑 4 败，debug 5/5 过）——reader 线程缺启动栅栏，release 下 4-tuple 页的 reclaim 快于线程调度，reader 首次被调度时 `stop` 已置位、零迭代返回，`reads > 0` 断言 flake（测试设计缺陷，非产品 bug；页一致性断言本身只在有读时才有意义）。修复 = reader 首个完整读 pass 后发 `started` 信号、主线程等信号后再 `reclaim()`（watchdog 口径保持：等不到信号 FAIL 而非挂起）；修复后 solo release 30/30 + debug 5/5 全绿
+
+### 交付内容
+
+1. **SegmentedStorage 接口预留**（tech-selection §8，`crates/pg-storage/src/segment.rs` 新模块）：`SegmentId(u64)` newtype + `SegmentState { Active, Frozen, Sealed, Merging, Retired }` 单向状态机（唯一可执行件 = 纯谓词 `can_transition_to`，使单向性可测且实现期无法静默扩边）+ `SegmentedStorage` trait（`create_segment/freeze/seal/merge`，逐方法状态机前置条件入 doc）。**WAL payload 契约落 doc**（`wal/record.rs` 的 `SegmentSeal=110`/`SegmentMerge=111` 变体注释）：Seal 载单个 segment id；Merge 载输入 id 列表（按 merge 顺序）+ 目标 id，redo 幂等语义写明。判别式为 Stage 0（M1+M2 基线）既有预留（`from_u8` 可解析、无 handler 恢复硬失败），本 stage **零新增占号、零 handler、零实现**；编译桩测试（`stub_impl_compiles` / `state_machine_is_one_way`）证明 trait 形状可实现
+2. **Tier 2 接口预留**（tech-selection §9，`crates/pg-storage/src/tier2.rs` 新模块）：`WalTailReader` trait（`tail_from(start: Lsn) -> Box<dyn Iterator<Item = Result<WalRecord>> + '_>`，§9 既定 iterator 形状；doc 契约钉死——只吐已 flush 记录、严格 LSN 升序恰好一次、拉取式天然背压（至多一条在飞、禁止内部无界缓冲）、到 flush 前沿返回 `None` 不阻塞、断点续传 = 以末条 LSN 后继再次 `tail_from`、物化 iterator 形状实现期可改回调/流式）+ `WatermarkRegistry` trait（`watermark(index_oid) -> Option<Lsn>` / `set_watermark(index_oid, lsn)`；doc 注记实现期需单调不回退）。`AccessMethod` 加 `fn freshness(&self) -> Option<Lsn> { None }` 默认方法（`pg-am-heap/src/access_method.rs`）——**默认 None = 现有 AM 零改动零行为变化**（heap/btree 为同步维护，恒新鲜，None 即正确答案；无调用方）
+3. **O2 验证清偿（只验证不实现，计划既定）**：显式回归**已存在**，归档引用并关闭 O2——`pg-engine/tests/m3_vacuum_crash_windows.rs::crash_loser_insert_entry_removed_by_vacuum`（崩溃孤儿插入：事务在飞 kill -9 → 恢复（`HeapUndoHandler` 标 ATT 残余成员 ABORTED 于 CLOG）→ `scan_dead_tuples` 规则 1 收集（`stats.dead_tuples == 1`）→ vacuum 回收（`dead_tuples(u64::MAX)` 归零 + 悬挂索引条目实际删除）；红绿口径由 Stage D 建立）+ churn 的 `crash_with_inflight_inserts` 注入轮（批量形态，`index_entries_removed == BATCH`）。本 stage 复核两测试当前绿，O2 关闭
+4. **F7 核销（Stage F 已修，本 stage 归档）**：commit 失败 XID 泄漏已在 Stage F 收口期修复（`engine.rs` `TxnHandle::commit` 失败回退 best-effort abort + auto_commit 同纪律）；回归 `m2b_index_txn.rs::commit_failure_falls_back_to_abort_and_reclaims_xid` / `auto_commit_commit_failure_reclaims_xid` 本 stage 复跑全绿（13/13），归档关闭
+5. **O4 清理**：移除 `pg-storage/Cargo.toml` 的 tokio 死依赖声明（全仓库 `.rs` 零使用复核成立——grep `tokio` 于 src/tests/benches/build.rs 零命中）；`cargo tree --workspace --edges normal` 运行时依赖图 **tokio 归零**（残留 tokio 仅在 pg-wire 的 dev-dependency 链：rust-postgres 驱动 → tokio-postgres，§10 允许的测试驱动，不进运行时图）；全量回归双档全绿（见验收行）
+6. **benchmark 落盘**：`docs/phase1-m3-benchmarks.md`（格式对齐 M2 文档）——churn 页数有界（30 轮 + 200 轮 soak）、注册开销（A：87.2 vs 86.8）、vacuum 叠加 TPS（D：88.0 vs 86.8）、waldump 吞吐（smoke ~249K records/s / ~66 MB/s）、**WAL 字节量观测（N5 首次量化：最坏档 FPI 占 64.1%、总 WAL 2.05× 于对照档；240 轮长程 62.7% 稳态复证）**、Stage G 收口 S2、手动三客户端矩阵。测量载体：`pg-engine/examples/m3_wal_bytes_probe.rs`（N5 探针，可复现）+ `pg-wire/src/bin/pg-server.rs`（手动矩阵固定端口 server，`wire_clients.rs` 头注原建议的 tiny bin 落地）
+7. **手动矩阵归档（N6）**：psql 19devel / psycopg2 2.9.12 / node-postgres pg 8.23.0 三家 CRUD + 事务全过，探针报错清单（`\d`、`SELECT version()` 报错不断连）与新发现（psycopg2 默认隐式事务包 DDL 撞 "DDL inside explicit transactions is not supported in M2b" 边界，autocommit 模式全过——`wire_clients.rs` 头注已补 autocommit 指引）落盘 benchmark 文档；Stage F 残留条目标记已归档
+8. **收口清单登记**（Stage E 终审建议）：① Stage E 性能抽查 S2 数字并入 Stage G 收口 S2 行（stats 埋点开销随全栈度量，低于噪声界）；② README 补 QueryStats 口径一句（typed API 不入统计，§6.3 另注）
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| segment 生命周期 | 无对应物（PG 堆/索引非 segment 架构；LSM 系（如 RocksDB）有 compaction 状态机） | `SegmentedStorage` trait + 单向五态机，只定契约不实现 | §8 既定：接口先行锁 Phase 3/5 方向；签名返工风险接受（预留即承诺，改动过修订记录） |
+| WAL 逻辑复制/订阅 | logical decoding slot + output plugin | `WalTailReader` 拉式 iterator 预留（断点 = 调用方自管 LSN） | §9：极简形态供 Tier 2 异步跟随；背压靠拉取模型，无 slot 状态；物化形状实现期可返工 |
+| 索引新鲜度 | PG 索引同步维护、恒新鲜，无 freshness 概念 | `freshness()` 默认 None（同步 AM 恒新鲜即 None），Tier 2 实现期接 WatermarkRegistry | §9：带默认实现的方法而非新 trait，现有 AM 零改动 |
+
+### 已知残留与后续归队
+
+- ~~**loom 模型测试预存红照旧（诚实登记，验收命令暂不通过）**~~ **已根治（2026-08-26 修复会话）**：随 flaky 家族根治一并转绿，loom 双模型现 CI 口径全绿（~250s）——见下方 ✅ 根治条目。历史登记：`LOOM_MAX_PREEMPTIONS=2 cargo test -p pg-am-btree --features loom --test btree_loom` 两模型曾稳红（`loom_two_writers_one_reader_linearizable` / `loom_split_with_concurrent_writers`，"key 0 lost across the split" 族）；二分证据（M2 出口提交 31fe4b8 同红，M2c 之后工具链/环境漂移；Stage D 已并档 `btree_concurrent::concurrent_small_pool_split_eviction_storm` 的 solo flaky 为同一底层 bug 嫌疑）经根治会话证实——根因确为并发 split 丢 committed key（slot-0 落位判定陈旧），见下方根治条目的根因分析
+- **flaky 家族成员清单（统一登记，替代此前分散条目）**：以下为同一底层 bug（并发 split 丢 committed key，签名均为 "scanner missed committed key" / "key 0 lost across the split"）的全部已知形态与实测频率——① `btree_loom::loom_two_writers_one_reader_linearizable`（稳红，~22s 快速失败）；② `btree_loom::loom_split_with_concurrent_writers`（稳红，同上）；③ `btree_concurrent::concurrent_small_pool_split_eviction_storm`（solo ~9%，实测 23 跑 2 败）；④ `btree_concurrent::concurrent_hundred_thread_smoke`（全量并行负载下偶发，solo 重跑 3/3 过，本次 Stage G 终审后又现 1 例：scanner missed committed key，btree_concurrent.rs:423）；⑤ `btree_concurrent::concurrent_duplicate_keys_lookup_all`（边界落位修复后 15 跑 1 败）。~~**家族意味着 CI 的 pg-am-btree test job 约每 11 次红 1 次**——登记不构成容忍，修复会话是该家族唯一的出口~~ **已根治（见下条 ✅ 条目）**：修复后家族四测试 release 各 20/20 连跑全绿 + 根治后全量回归 743/0 零失败，上述频率记录保留作历史
+- **✅ 家族已根治（2026-08-26 修复会话）**：根因 = `pin_leaf_for_insert` 的 slot-0 落位判定在"释放闩锁探测左邻域 → 重新取锁"的窗口内变陈旧——并发插入恰在窗口内占领 cur 左沿（slot 0），按陈旧判定落位会（a）破坏页内 `(key,tid)` 序（loom 模型 1 的 "entries out of order")、(b) 进而跨分裂丢 key（模型 2 与家族全部签名）、(c) 把精确重复插入静默落位而非报 DuplicateKey。修复（index.rs `pin_leaf_for_insert`）：重取锁后**重验证 slot-0 判定**（cur 首条目仍大于探针才落位，否则重启落位——重算 slot 落内部位置直接返回）。确定性回归 `slot0_insert_revalidates_after_relatch_window`（test hook `SLOT0_WINDOW_PARK` 把并发插入钉死在窗口内）。验证：loom 双模型绿（250s,CI 口径）+ 家族四测试 release 各 20/20 + 全量回归（见 Stage G 收口轮）。此前各条目（预存红、~9%、每 11 次红 1 次）保留作历史记录
+- **预留签名可能返工**（§8/§9 既定代价）：merge 或需携带 LSN 区间、`WalTailReader` 或改回调/流式——预留即承诺，改签名过修订记录
+- **预留 trait 零调用方**（设计使然）：`SegmentedStorage`/`WalTailReader`/`WatermarkRegistry` 仅编译桩测试消费；`freshness` 默认 None 无覆盖需求（默认值即契约）。实现期（Phase 2/3/5）首批调用方落地时补真测试
+- **手动矩阵不进 CI**（N6 既定）：客户端版本随环境漂移，CI 硬门槛维持 rust-postgres 一家；复跑命令在 benchmark 文档与 `wire_clients.rs` 头注
+- **m3_wal_bytes_probe 为测量工具**：example 非测试，无断言；N5 数字为单次实测（负载确定性高，复跑方差小），非 CI 门槛

@@ -71,9 +71,7 @@ fn indexed_table_concurrent_dml_aborts_and_checkpoints() {
 
     let tmp = TempDir::new().unwrap();
     let engine = Arc::new(Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap());
-    engine
-        .exec(None, "CREATE TABLE t (id INT, v INT)")
-        .unwrap();
+    engine.exec(None, "CREATE TABLE t (id INT, v INT)").unwrap();
     engine.create_index("t", "id").unwrap();
     // Committed pre-existing rows (the M3 delete-abort thread's targets).
     for i in 0..preloaded as i32 {
@@ -133,7 +131,10 @@ fn indexed_table_concurrent_dml_aborts_and_checkpoints() {
                         let idx = (rng.next() as usize) % live.len();
                         let id = live[idx];
                         engine
-                            .exec(None, &format!("UPDATE t SET v = {} WHERE id = {id}", id + 1))
+                            .exec(
+                                None,
+                                &format!("UPDATE t SET v = {} WHERE id = {id}", id + 1),
+                            )
                             .unwrap();
                     } else {
                         // Delete a live key (committed).
@@ -198,7 +199,10 @@ fn indexed_table_concurrent_dml_aborts_and_checkpoints() {
     // M3: the delete-aborted preloaded rows are visible and indexed.
     for round in 0..30usize {
         let id = (round * 7 % preloaded) as i32;
-        assert!(by_id.contains_key(&id), "delete-aborted row {id} not visible");
+        assert!(
+            by_id.contains_key(&id),
+            "delete-aborted row {id} not visible"
+        );
         assert!(
             engine
                 .index_lookup("t", "id", &Datum::Int4(id))

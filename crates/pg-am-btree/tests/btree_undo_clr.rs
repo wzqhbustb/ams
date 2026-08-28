@@ -247,8 +247,7 @@ fn test_clr_after_copy_crash() {
     let (_, right_slots, _) = page_state(&engine, right);
     assert_eq!(left_flags & BTREE_FLAG_SPLIT_INCOMPLETE, 0);
     assert_eq!(
-        left_slots,
-        copy_start_slot as usize,
+        left_slots, copy_start_slot as usize,
         "the left page must keep exactly the entries below the split slot"
     );
     assert_eq!(
@@ -451,13 +450,16 @@ fn test_clr_pending_insert_landed_left() {
             // first entry (key 2s), so it lands in the LEFT half.
             let pending = 2 * st.copy_start_slot as i32 - 1;
             index.insert(&key(pending), tid(PENDING_TID)).unwrap();
-            assert_eq!(
-                index.lookup(&key(pending)).unwrap(),
-                Some(tid(PENDING_TID))
-            );
+            assert_eq!(index.lookup(&key(pending)).unwrap(), Some(tid(PENDING_TID)));
             engine.wal_writer().flush().unwrap();
             std::mem::forget(engine); // kill -9: Prepare, Copy, BTreeInsert(left) durable
-            (index.meta_page(), n, st.left, st.right, st.copy_start_slot as i32)
+            (
+                index.meta_page(),
+                n,
+                st.left,
+                st.right,
+                st.copy_start_slot as i32,
+            )
         };
 
         let pending = 2 * s - 1;
@@ -525,7 +527,13 @@ fn test_clr_pending_insert_landed_right() {
             index.insert(&key(pending), tid(PENDING_TID)).unwrap();
             engine.wal_writer().flush().unwrap();
             std::mem::forget(engine); // kill -9: Prepare, Copy, BTreeInsert(right) durable
-            (index.meta_page(), n, st.left, st.right, st.copy_start_slot as i32)
+            (
+                index.meta_page(),
+                n,
+                st.left,
+                st.right,
+                st.copy_start_slot as i32,
+            )
         };
 
         let pending = 2 * s + 1;
@@ -535,7 +543,10 @@ fn test_clr_pending_insert_landed_right() {
         assert_eq!(chain_from(&engine, left), vec![left, right]);
         let (left_flags, left_slots, _) = page_state(&engine, left);
         assert_eq!(left_flags & BTREE_FLAG_SPLIT_INCOMPLETE, 0);
-        assert_eq!(left_slots, s as usize, "the left page keeps exactly its half");
+        assert_eq!(
+            left_slots, s as usize,
+            "the left page keeps exactly its half"
+        );
         index
             .validate()
             .unwrap_or_else(|e| panic!("recovered tree must validate: {e}"));
@@ -658,7 +669,13 @@ fn test_clr_right_half_deleted_in_window_unlinks() {
             }
             engine.wal_writer().flush().unwrap();
             std::mem::forget(engine); // kill -9
-            (index.meta_page(), n, st.left, st.right, st.copy_start_slot as i32)
+            (
+                index.meta_page(),
+                n,
+                st.left,
+                st.right,
+                st.copy_start_slot as i32,
+            )
         };
 
         let want: Vec<i32> = (0..s).map(|i| 2 * i).collect();
@@ -666,7 +683,11 @@ fn test_clr_right_half_deleted_in_window_unlinks() {
         assert_keys_with_pending(&index, &want, None);
         // The split was abandoned: no new root, the orphan is out of the
         // chain, and the left page is whole again.
-        assert_eq!(index.tree_level(), 0, "an abandoned root split keeps level 0");
+        assert_eq!(
+            index.tree_level(),
+            0,
+            "an abandoned root split keeps level 0"
+        );
         assert_eq!(index.root_page(), left);
         assert_eq!(
             chain_from(&engine, left),
@@ -741,8 +762,7 @@ fn test_undo_cascade_parent_full() {
     with_watchdog(|| {
         let tmp = TempDir::new().unwrap();
         let config = StorageConfig::new(tmp.path());
-        let (meta_page, n, root_before, left, right) =
-            setup_parent_full_crash(tmp.path(), &config);
+        let (meta_page, n, root_before, left, right) = setup_parent_full_crash(tmp.path(), &config);
 
         let (engine, index) = recover(tmp.path(), &config, meta_page);
         // The undo cascade split the full root: the tree grew a level.

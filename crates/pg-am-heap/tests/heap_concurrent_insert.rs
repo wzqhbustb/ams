@@ -63,7 +63,7 @@ fn concurrent_insert_unique_tids() {
         let tids = Arc::clone(&tids);
         handles.push(thread::spawn(move || {
             let mut snap = Snapshot::everything();
-            snap.current_xid = TxnId(100);
+            snap.set_current_xid(TxnId(100));
             for i in 0..PER_THREAD {
                 let id = t * PER_THREAD + i;
                 let tuple = encode_row(id);

@@ -31,9 +31,59 @@
 //! This is safe because `flush_to(commit_lsn)` fsyncs the whole WAL prefix up
 //! to the commit record, and the LSN clock is monotonic, so every earlier
 //! `PageAlloc`/`PageFree` LSN is covered.
+//!
+//! # Snapshot registry + vacuum horizon (M3 Stage A, tech-selection §3.3)
+//!
+//! [`TxnManager::snapshot`] registers every snapshot's `xmin` in
+//! `snapshot_xmins` (xmin → refcount) in the SAME critical section that
+//! reads the active set and XID clock (B1 atomicity; caller-side
+//! registration wrappers are forbidden — see the `snapshot` doc). The
+//! returned [`SnapshotGuard`] unregisters on `Drop`.
+//! [`TxnManager::oldest_snapshot_xmin`] is the vacuum horizon: the
+//! registry's smallest key, or the XID clock's current value when empty.
+//! Panic semantics (§11 O1, decided): under the default unwind policy the
+//! guard's `Drop` DOES run during unwinding, so the snapshot unregisters
+//! normally and the horizon is unaffected. Only `panic=abort` (process is
+//! dead anyway) or `mem::forget` skips the `Drop` and pins the horizon low
+//! forever — vacuum degrades to no-reclaim, which is safe, matching
+//! `auto_commit`'s existing panic cost model.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Test-only failure injection (F7 regression): when armed on the current
+/// thread, `commit_txn` fails at entry with a synthetic error, before any
+/// WAL work. Compiled in always (doc-hidden) so pg-engine integration tests
+/// can arm it without feature plumbing; production never sets it.
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    thread_local! {
+        static COMMIT_TXN_FORCE_FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    /// Arm/disarm the hook for the current thread, with a process-global
+    /// claim so two tests can't arm it concurrently.
+    pub fn set_commit_txn_force_fail(on: bool) {
+        if on {
+            assert!(
+                !ARMED.swap(true, Ordering::SeqCst),
+                "commit_txn failure hook already armed by another test"
+            );
+        } else {
+            ARMED.store(false, Ordering::SeqCst);
+        }
+        COMMIT_TXN_FORCE_FAIL.with(|c| c.set(on));
+    }
+
+    pub(crate) fn commit_txn_should_fail() -> bool {
+        COMMIT_TXN_FORCE_FAIL.with(Cell::get)
+    }
+}
 
 use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
@@ -44,8 +94,8 @@ use pg_storage::clog::{ClogAccessor, TxnState};
 // coordinator, so it must be the aliased type: identical to
 // `parking_lot::RwLock` in production builds, loom-instrumented under
 // `--cfg loom` (Stage Q; see pg_storage::sync).
-use pg_storage::sync::RwLock;
 use pg_storage::error::Result;
+use pg_storage::sync::RwLock;
 use pg_storage::txn_id::TxnIdClock;
 use pg_storage::types::{Lsn, TxnId};
 use pg_storage::wal::record::WalRecord;
@@ -119,8 +169,7 @@ pub trait RowWaiter: std::fmt::Debug + Send + Sync {
     /// Block until `blocking_xid` commits or aborts (§9.1 step 5c). The
     /// caller must hold NO page latch while blocked. Clears the wait edge
     /// on success.
-    fn wait_for(&self, self_xid: TxnId, blocking_xid: TxnId)
-        -> std::result::Result<(), TxnError>;
+    fn wait_for(&self, self_xid: TxnId, blocking_xid: TxnId) -> std::result::Result<(), TxnError>;
 
     /// Is `xid` a live, in-flight transaction?
     ///
@@ -142,6 +191,69 @@ pub trait RowWaiter: std::fmt::Debug + Send + Sync {
     fn is_active(&self, xid: TxnId) -> bool;
 }
 
+/// Lock-shared transaction state (M3 Stage A, tech-selection §3.3 v1.3):
+/// the active set and the snapshot registry live under ONE mutex so that
+/// [`TxnManager::snapshot`] reads the active set + XID clock AND registers
+/// the new snapshot's `xmin` in a single critical section (B1 atomicity —
+/// see the `snapshot` doc for why a caller-side wrapper is unsound).
+#[derive(Debug, Default)]
+struct TxnShared {
+    /// XIDs that have begun but not yet committed or aborted.
+    active: HashSet<TxnId>,
+    /// Snapshot registry: `xmin` → refcount of live snapshots taken at that
+    /// xmin (multiple snapshots may share one xmin). The vacuum horizon is
+    /// its smallest key; an empty map means "no readers anywhere", and the
+    /// horizon falls back to the XID clock's current value.
+    snapshot_xmins: BTreeMap<TxnId, usize>,
+}
+
+/// RAII token that unregisters one snapshot from the vacuum-horizon
+/// registry (M3 Stage A, tech-selection §3.3).
+///
+/// Obtained from [`TxnManager::snapshot`] together with the [`Snapshot`];
+/// `Drop` decrements the refcount of the snapshot's `xmin` and removes the
+/// key when it reaches zero. The guard is intentionally independent of the
+/// `Snapshot` value's lifetime: callers may clone or store the snapshot
+/// wherever they like as long as the guard outlives its use (the engine
+/// keeps the guard in `TxnHandle` / on the `auto_commit` frame).
+///
+/// # Panic semantics (tech-selection §11 O1 — decided, no guardrail)
+///
+/// Under the default unwind policy a panic DOES run this guard's `Drop`
+/// during unwinding (e.g. through `Engine::auto_commit`), so the registry
+/// entry is unregistered normally and the horizon is unaffected. Only
+/// `panic=abort` (process dead anyway) or `mem::forget` skips the `Drop`,
+/// leaving the entry behind: the horizon then stays pinned low forever and
+/// vacuum degrades to no-reclaim — SAFE (nothing visible is ever
+/// collected), merely ineffective. This matches the existing panic cost
+/// model, so no process-level watchdog is added.
+#[derive(Debug)]
+pub struct SnapshotGuard {
+    shared: Arc<Mutex<TxnShared>>,
+    live_snapshots: Arc<AtomicUsize>,
+    xmin: TxnId,
+}
+
+impl SnapshotGuard {
+    /// The registered `xmin` this guard pins in the horizon registry.
+    pub fn xmin(&self) -> TxnId {
+        self.xmin
+    }
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        let mut shared = self.shared.lock();
+        if let Some(count) = shared.snapshot_xmins.get_mut(&self.xmin) {
+            *count -= 1;
+            if *count == 0 {
+                shared.snapshot_xmins.remove(&self.xmin);
+            }
+        }
+        self.live_snapshots.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Coordinates XID allocation and durable commit/abort for M2a.
 ///
 /// Cheap to clone conceptually via `Arc`; hold a single instance per engine
@@ -152,8 +264,17 @@ pub struct TxnManager {
     txn_id_clock: TxnIdClock,
     wal: Arc<dyn CommitWal>,
     clog: Arc<dyn ClogAccessor>,
-    /// XIDs that have begun but not yet committed or aborted.
-    active: Mutex<HashSet<TxnId>>,
+    /// Active set + snapshot registry under ONE lock (M3 Stage A, B1):
+    /// `snapshot()` must observe active set and clock and register the new
+    /// snapshot's xmin atomically, so the two cannot live behind separate
+    /// mutexes. `Arc` because [`SnapshotGuard`] unlocks through it on Drop.
+    shared: Arc<Mutex<TxnShared>>,
+    /// Number of live registered snapshots (== sum of
+    /// `TxnShared::snapshot_xmins` refcounts). Mirrored as an atomic so the
+    /// registry count assertion (M3 Stage A guardrail) can cross-check the
+    /// registry without locking. Not a correctness mechanism —
+    /// observability only.
+    live_snapshots: Arc<AtomicUsize>,
     /// Commit/checkpoint barrier (M2c Stage P: sunk down from pg-engine,
     /// where it was introduced in Stage L). `commit_txn` / `abort_txn` hold
     /// a READ guard for their whole hard order; the checkpoint coordinator
@@ -199,7 +320,8 @@ impl TxnManager {
             txn_id_clock,
             wal,
             clog,
-            active: Mutex::new(HashSet::new()),
+            shared: Arc::new(Mutex::new(TxnShared::default())),
+            live_snapshots: Arc::new(AtomicUsize::new(0)),
             commit_barrier: Arc::new(RwLock::new(())),
             row_wait_registry: Mutex::new(HashMap::new()),
             row_wait_cv: Condvar::new(),
@@ -258,9 +380,9 @@ impl TxnManager {
     /// both steps makes the pair atomic: any `xid < snapshot.xmax` is either
     /// in `xip` or already terminal.
     pub fn begin_txn(&self) -> TxnId {
-        let mut active = self.active.lock();
+        let mut shared = self.shared.lock();
         let xid = self.txn_id_clock.alloc();
-        active.insert(xid);
+        shared.active.insert(xid);
         xid
     }
 
@@ -307,6 +429,14 @@ impl TxnManager {
         // caller — engine auto-commit, explicit TxnHandle, or direct
         // `txn_manager()` access — is covered by construction.
         let _barrier = self.commit_barrier.read();
+        // Test-only failure injection (F7 regression): fail before any WAL
+        // work, simulating a WAL-fatal commit.
+        if test_hooks::commit_txn_should_fail() {
+            return Err(pg_storage::error::StorageError::WalWriteFailed(format!(
+                "injected commit failure for xid {}",
+                xid.0
+            )));
+        }
         // 1. Append the commit record.
         let lsn = self.wal.append(WalRecord::txn_commit(xid)?)?;
         // 2. fsync it — the commit becomes durable here.
@@ -358,8 +488,9 @@ impl TxnManager {
     /// # Lock order
     ///
     /// All mutexes here are taken SEQUENTIALLY, never nested; the only
-    /// nested directions anywhere in this manager are registry → active and
-    /// registry → deadlock-victims (both inside [`Self::wait_for`]). The
+    /// nested directions anywhere in this manager are registry → shared
+    /// (active set + snapshot registry, M3 Stage A: one lock) and registry
+    /// → deadlock-victims (both inside [`Self::wait_for`]). The
     /// victims mutex is a LEAF (taken alone above, and never held while
     /// acquiring anything else anywhere), so no inversion is possible.
     fn end_txn(&self, xid: TxnId, state: TxnState) {
@@ -372,7 +503,7 @@ impl TxnManager {
         self.clog.set_state(xid, state);
         // Active-set removal AFTER the CLOG bit; see the commit_txn doc on
         // the step 3/4 ordering argument.
-        self.active.lock().remove(&xid);
+        self.shared.lock().active.remove(&xid);
         // Wake row-lock waiters (§9.1 5d) AFTER the terminal state is
         // visible; see the ordering doc above.
         let _registry = self.row_wait_registry.lock();
@@ -423,9 +554,10 @@ impl TxnManager {
     ///
     /// # Lock order
     ///
-    /// The only legal nestings are registry → active and registry →
-    /// deadlock-victims (this function holds the registry mutex and takes
-    /// those two inside it). The victims mutex is a LEAF: nothing is ever
+    /// The only legal nestings are registry → shared (active set + snapshot
+    /// registry) and registry → deadlock-victims (this function holds the
+    /// registry mutex and takes those two inside it). The victims mutex is
+    /// a LEAF: nothing is ever
     /// acquired while holding it, and the detector never holds it while
     /// taking the registry mutex (mark first, then lock-and-notify), so no
     /// inversion is possible. `end_txn` takes its locks sequentially,
@@ -458,7 +590,11 @@ impl TxnManager {
     ///   state.
     /// - [`TxnError::DeadlockVictim`] if the detector chose this
     ///   transaction to break a wait-for cycle.
-    pub fn wait_for(&self, self_xid: TxnId, blocking_xid: TxnId) -> std::result::Result<(), TxnError> {
+    pub fn wait_for(
+        &self,
+        self_xid: TxnId,
+        blocking_xid: TxnId,
+    ) -> std::result::Result<(), TxnError> {
         if self_xid == blocking_xid {
             return Err(TxnError::SelfWait(self_xid));
         }
@@ -473,7 +609,7 @@ impl TxnManager {
             // Predicate: the blocking XID has left the active set. Checked
             // while holding the registry mutex; `end_txn` notifies under
             // the same mutex after removing the XID, so no wakeup is lost.
-            if !self.active.lock().contains(&blocking_xid) {
+            if !self.shared.lock().active.contains(&blocking_xid) {
                 registry.remove(&self_xid);
                 return Ok(());
             }
@@ -483,7 +619,7 @@ impl TxnManager {
 
     /// Snapshot of the currently active XIDs (test/observability helper).
     pub fn active_xids(&self) -> Vec<TxnId> {
-        let mut v: Vec<TxnId> = self.active.lock().iter().copied().collect();
+        let mut v: Vec<TxnId> = self.shared.lock().active.iter().copied().collect();
         v.sort_unstable();
         v
     }
@@ -492,10 +628,11 @@ impl TxnManager {
     /// for how the row-lock gate uses this to tell a crashed stamper from
     /// an active one.
     pub fn is_active(&self, xid: TxnId) -> bool {
-        self.active.lock().contains(&xid)
+        self.shared.lock().active.contains(&xid)
     }
     /// Take a real Snapshot-Isolation snapshot for `current_xid`
-    /// (tech-selection §7.1).
+    /// (tech-selection §7.1), registering its `xmin` in the vacuum-horizon
+    /// registry ATOMICALLY with its construction (M3 Stage A, §3.3 v1.3 B1).
     ///
     /// The snapshot reads `xmax` from the XID clock and `xip` from the active
     /// set; `xmin` is the smallest active XID (or `xmax` when the active set
@@ -505,42 +642,121 @@ impl TxnManager {
     /// before `xip`, so this is harmless and matches PG, which also records
     /// the snapshot taker among the running XIDs.
     ///
+    /// The returned [`SnapshotGuard`] unregisters the snapshot on `Drop`;
+    /// the caller keeps it alive for exactly the snapshot's use lifetime
+    /// (transaction handle, auto-commit frame, or reader call frame — the
+    /// six engine call sites enumerated in §3.2). This is the ONLY
+    /// registered construction point in the system: `Snapshot` fields are
+    /// pg-txn-private (see `snapshot.rs` module docs), and
+    /// [`Snapshot::everything`] is the explicit never-registered special
+    /// case.
+    ///
+    /// # Why registration is sunk into this critical section (B1)
+    ///
+    /// A "construct first, let the caller register afterwards" wrapper is
+    /// FORBIDDEN: the window between construction and registration lets
+    /// vacuum compute a horizon that misses an in-flight snapshot.
+    /// Counterexample (coding-plan Stage A): U begins with xid=15, takes a
+    /// snapshot but has not registered it yet; vacuum sees an empty
+    /// registry and takes `horizon = clock.current()`; a deleter D commits;
+    /// the row with `xmax = 18` (committed) that U's snapshot must still
+    /// see is reclaimed under it. `AccessExclusive` cannot close this
+    /// window because taking the snapshot precedes ANY lock acquisition.
+    /// Registering inside the SAME critical section that reads active set +
+    /// clock makes "snapshot exists ⇒ its xmin is in the registry"
+    /// hold from the moment this function returns, and
+    /// `oldest_snapshot_xmin` reads the registry under the same lock, so a
+    /// horizon can never skip past a returned-but-alive snapshot's xmin.
+    ///
     /// # Atomicity argument
     ///
-    /// The active-set mutex is the single serialization point for membership
-    /// changes: `begin_txn` inserts, `commit_txn`/`abort_txn` remove, all
-    /// under this lock. `snapshot` holds the lock while reading **both** the
-    /// clock and the set, which defines the logical instant — `xip` and
-    /// `xmax` are mutually consistent by construction:
+    /// The shared-state mutex is the single serialization point for
+    /// membership changes: `begin_txn` inserts, `commit_txn`/`abort_txn`
+    /// remove, `snapshot` registers, all under this lock. `snapshot` holds
+    /// the lock while reading **both** the clock and the set, which defines
+    /// the logical instant — `xip` and `xmax` are mutually consistent by
+    /// construction:
     ///
     /// - Every XID in the set was allocated before its insert, and the insert
     ///   happened-before our lock acquisition, so every `xip` entry is
     ///   strictly below the `xmax` we read inside the same critical section
     ///   (the invariant `xmin <= xip[i] < xmax` holds).
-    /// - A concurrent `begin_txn` may allocate from the clock during our read
-    ///   (allocation is wait-free and takes no lock), but its XID then lands
-    ///   at or above our `xmax` and is judged "future" — invisible — which is
-    ///   correct: that begin is not yet observable to anyone.
+    /// - XID allocation and active-set insertion happen together inside this
+    ///   same lock (`begin_txn`), so no "allocated but not yet inserted" XID
+    ///   can interleave with our read; any concurrent begin either completed
+    ///   before our critical section (visible in the set) or starts after
+    ///   (its XID lands at or above our `xmax`, judged "future" — invisible
+    ///   — which is correct: that begin is not yet observable to anyone).
     /// - A concurrent commit between its CLOG-bit flip (step 3) and its
     ///   active-set removal (step 4) leaves the XID in our `xip` with
     ///   CLOG = Committed; the oracle consults `xip` before the CLOG, so the
     ///   transaction stays invisible — correct, because at the snapshot's
     ///   logical instant the commit had not completed (removal is the
     ///   completion signal).
-    pub fn snapshot(&self, current_xid: TxnId) -> Snapshot {
-        let active = self.active.lock();
+    pub fn snapshot(&self, current_xid: TxnId) -> (Snapshot, SnapshotGuard) {
+        let mut shared = self.shared.lock();
         let xmax = self.txn_id_clock.current();
-        let mut xip: SmallVec<[TxnId; 32]> = active.iter().copied().collect();
-        drop(active);
+        let mut xip: SmallVec<[TxnId; 32]> = shared.active.iter().copied().collect();
         xip.sort_unstable();
         let xmin = xip.first().copied().unwrap_or(xmax);
-        Snapshot {
+        // Register in the SAME critical section (B1, see the doc above).
+        *shared.snapshot_xmins.entry(xmin).or_insert(0) += 1;
+        self.live_snapshots.fetch_add(1, Ordering::Relaxed);
+        let guard = SnapshotGuard {
+            shared: Arc::clone(&self.shared),
+            live_snapshots: Arc::clone(&self.live_snapshots),
             xmin,
-            xmax,
-            xip,
-            current_xid,
-            curcid: 0,
+        };
+        (
+            Snapshot {
+                xmin,
+                xmax,
+                xip,
+                current_xid,
+                curcid: 0,
+            },
+            guard,
+        )
+    }
+
+    /// The vacuum horizon: the smallest `xmin` among all live registered
+    /// snapshots (tech-selection §3.3). Empty registry ⇒ fall back to the
+    /// smallest ACTIVE xid (not straight to the clock): there is a window
+    /// between `begin_txn` and `snapshot()` during which a transaction is
+    /// active but has not registered yet, and its eventual snapshot's xmin
+    /// can be as low as the smallest xid currently active (PG's OldestXmin
+    /// likewise counts both backend xids and snapshot xmins). Only with an
+    /// empty registry AND an empty active set does the horizon become the
+    /// XID clock's current value — truly no readers. Vacuum samples this
+    /// ONCE at start and uses that single horizon for the whole pass; the
+    /// §3.3 XID monotonicity argument (`new_snapshot.xmin >= horizon`)
+    /// makes snapshots taken mid-vacuum safe.
+    pub fn oldest_snapshot_xmin(&self) -> TxnId {
+        let shared = self.shared.lock();
+        match shared.snapshot_xmins.keys().next() {
+            Some(&xmin) => xmin,
+            None => shared
+                .active
+                .iter()
+                .min()
+                .copied()
+                .unwrap_or_else(|| self.txn_id_clock.current()),
         }
+    }
+
+    /// Copy of the snapshot registry (`xmin` → refcount), for tests and
+    /// observability (M3 Stage A). `Snapshot::everything()` never appears
+    /// here — it is the explicit unregistered special case.
+    #[doc(hidden)]
+    pub fn snapshot_xmin_registry(&self) -> BTreeMap<TxnId, usize> {
+        self.shared.lock().snapshot_xmins.clone()
+    }
+
+    /// Number of live registered snapshots (== sum of the registry's
+    /// refcounts; the count-assertion guardrail cross-checks this).
+    #[doc(hidden)]
+    pub fn live_registered_snapshots(&self) -> usize {
+        self.live_snapshots.load(Ordering::Relaxed)
     }
 }
 
@@ -626,7 +842,7 @@ mod tests {
     #[test]
     fn snapshot_with_empty_active_set() {
         let mgr = manager();
-        let snap = mgr.snapshot(TxnId::INVALID);
+        let (snap, _guard) = mgr.snapshot(TxnId::INVALID);
         assert!(snap.xip.is_empty());
         // Empty active set: xmin collapses to xmax = next unallocated XID.
         assert_eq!(snap.xmax, TxnId::FIRST);
@@ -641,7 +857,7 @@ mod tests {
         let t2 = mgr.begin_txn();
         let t3 = mgr.begin_txn();
 
-        let snap = mgr.snapshot(t2);
+        let (snap, _guard) = mgr.snapshot(t2);
         assert_eq!(snap.xip.as_slice(), &[t1, t2, t3], "sorted full copy");
         assert_eq!(snap.xmin, t1, "xmin = smallest active XID");
         assert_eq!(snap.xmax, TxnId(4), "xmax = next unallocated XID");
@@ -659,13 +875,13 @@ mod tests {
         let t2 = mgr.begin_txn();
         mgr.commit_txn(t1).unwrap();
 
-        let snap = mgr.snapshot(t2);
+        let (snap, _guard) = mgr.snapshot(t2);
         assert_eq!(snap.xip.as_slice(), &[t2], "committed XID leaves xip");
         assert_eq!(snap.xmin, t2, "xmin advances past the committed XID");
         assert_eq!(snap.xmax, TxnId(3));
 
         mgr.commit_txn(t2).unwrap();
-        let snap = mgr.snapshot(TxnId::INVALID);
+        let (snap, _guard2) = mgr.snapshot(TxnId::INVALID);
         assert!(snap.xip.is_empty());
         assert_eq!(snap.xmin, snap.xmax);
     }
@@ -681,7 +897,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for _ in 0..50 {
                     let xid = mgr.begin_txn();
-                    let snap = mgr.snapshot(xid);
+                    let (snap, _guard) = mgr.snapshot(xid);
                     for w in snap.xip.windows(2) {
                         assert!(w[0] < w[1], "xip sorted");
                     }
@@ -737,16 +953,16 @@ mod begin_atomicity_tests {
         // exactly the old implementation's interleaving. With the fix,
         // `snapshot()` blocks on the same lock until the insert completes.
         let slow = thread::spawn(move || {
-            let mut active = mgr2.active.lock();
+            let mut shared = mgr2.shared.lock();
             let xid = mgr2.txn_id_clock.alloc();
             thread::sleep(Duration::from_millis(50));
-            active.insert(xid);
-            drop(active);
+            shared.active.insert(xid);
+            drop(shared);
             xid
         });
 
         // While the slow begin sleeps, take a snapshot.
-        let snap = mgr.snapshot(TxnId::INVALID);
+        let (snap, _guard) = mgr.snapshot(TxnId::INVALID);
         let xid = slow.join().unwrap();
 
         // The snapshot must either predate the alloc (xid >= xmax) or have

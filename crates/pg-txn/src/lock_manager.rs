@@ -452,10 +452,10 @@ mod tests {
     /// from the spec silently.
     const CONFLICTS: [[bool; 4]; 4] = [
         // held:    AS      RE      EX      AE      requested:
-        [false, false, false, true],  // AccessShare
-        [false, false, true, true],   // RowExclusive
-        [false, true, true, true],    // Exclusive
-        [true, true, true, true],     // AccessExclusive
+        [false, false, false, true], // AccessShare
+        [false, false, true, true],  // RowExclusive
+        [false, true, true, true],   // Exclusive
+        [true, true, true, true],    // AccessExclusive
     ];
 
     #[test]

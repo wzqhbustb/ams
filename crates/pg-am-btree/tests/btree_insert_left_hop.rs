@@ -92,7 +92,11 @@ fn insert_never_migrates_an_entry_left_of_its_separator() {
     index.split_copy(&st).unwrap();
     let mut path = Vec::new();
     index.split_commit(&st, &mut path).unwrap();
-    assert_eq!(index.tree_level(), 1, "the forced split must promote a root");
+    assert_eq!(
+        index.tree_level(),
+        1,
+        "the forced split must promote a root"
+    );
 
     // Update-style churn on every key of the twin: delete the old entry,
     // insert the same key with a fresh tid — exactly what an UPDATE's index
@@ -112,7 +116,9 @@ fn insert_never_migrates_an_entry_left_of_its_separator() {
     // probes for the migrated keys descend straight onto the empty page and
     // every ownership walk terminates there. Post-fix R still holds
     // [boundary, n-1), so nothing below is affected.
-    index.delete(&key(n - 1), tid(10_000 + (n - 1) as u64)).unwrap();
+    index
+        .delete(&key(n - 1), tid(10_000 + (n - 1) as u64))
+        .unwrap();
 
     // Every surviving key must still resolve, with the latest tid. Pre-fix
     // the lookups for [boundary, n-1) returned None (the entries sit on the

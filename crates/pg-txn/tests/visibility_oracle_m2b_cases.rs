@@ -26,16 +26,18 @@ fn oracle_and_clog() -> (PgVisibilityOracle, Arc<InMemoryClogAccessor>) {
 }
 
 /// Hand-built snapshot: `xmin` is the smallest `xip` entry (or `xmax` when
-/// empty), matching `TxnManager::snapshot`.
+/// empty), matching `TxnManager::snapshot`. Uses pg-txn's unregistered
+/// test constructor — these snapshots exercise the oracle directly and
+/// never touch a `TxnManager`, so the horizon registry is irrelevant here.
 fn snap(current_xid: TxnId, xmax: TxnId, xip: &[TxnId], curcid: u32) -> Snapshot {
     let xmin = xip.iter().copied().min().unwrap_or(xmax);
-    Snapshot {
+    Snapshot::new_unregistered(
         xmin,
         xmax,
-        xip: xip.iter().copied().collect::<SmallVec<[TxnId; 32]>>(),
+        xip.iter().copied().collect::<SmallVec<[TxnId; 32]>>(),
         current_xid,
         curcid,
-    }
+    )
 }
 
 /// Case 1 (§7.2): `BEGIN(T1) → INSERT r1(cid=1) → curcid=2 →
@@ -169,14 +171,14 @@ fn case6_committed_foreign_delete_is_invisible() {
 fn test_curcid_advance_on_statement_start() {
     let t1 = TxnId(10);
     let mut snap = snap(t1, TxnId(11), &[t1], 0);
-    assert_eq!(snap.curcid, 0, "fresh snapshot starts at curcid 0");
+    assert_eq!(snap.curcid(), 0, "fresh snapshot starts at curcid 0");
 
     // Statement 1 begins: advance once, then every is_visible in the
     // statement observes the same curcid (no per-call advance).
     let cid_stmt1 = snap.advance_curcid();
     assert_eq!(cid_stmt1, 1);
-    let observed_a = snap.curcid;
-    let observed_b = snap.curcid; // a second judgment in the same statement
+    let observed_a = snap.curcid();
+    let observed_b = snap.curcid(); // a second judgment in the same statement
     assert_eq!(observed_a, observed_b, "same statement shares one curcid");
 
     // Statement 2 begins: monotone +1; statement 1's writes (t_cid=1) now

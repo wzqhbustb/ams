@@ -6,6 +6,7 @@ members = [
     "crates/pg-am-heap",
     "crates/pg-am-btree",
     "crates/pg-engine",
+    "crates/pg-wire",
 ]
 resolver = "2"
 

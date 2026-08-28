@@ -93,7 +93,7 @@ fn harness(config_tweak: impl FnOnce(&mut StorageConfig)) -> Harness {
 
 fn insert_loop_bench(c: &mut Criterion, name: &str, h: &Harness) {
     let mut snap = Snapshot::everything();
-    snap.current_xid = BENCH_XID;
+    snap.set_current_xid(BENCH_XID);
 
     // Pre-encode a pool of rows so the timed loop measures the pure insert
     // path (page acquire + WAL append + slotted write), not tuple encoding.
@@ -166,7 +166,7 @@ fn bench_txn_insert_commit(c: &mut Criterion) {
         b.iter(|| {
             let xid = mgr.begin_txn();
             let mut snap = Snapshot::everything();
-            snap.current_xid = xid;
+            snap.set_current_xid(xid);
             let tuple = &pool[next % pool.len()];
             next = next.wrapping_add(1);
             h.heap

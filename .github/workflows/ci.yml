@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,6 +61,8 @@ jobs:
       # instrumented ones, which PANIC outside `loom::model` — so the two
       # loom-aware crates must be tested with default features. Running their
       # test suites with --all-features makes every non-model test panic.
+      # (M3 Stage F: pg-wire declares NO features, so it rides the
+      # all-features branch below unchanged.)
       - name: Test (default features — loom-gated crates)
         if: matrix.crate == 'pg-storage' || matrix.crate == 'pg-am-btree'
         run: cargo test -p ${{ matrix.crate }}
@@ -91,6 +93,33 @@ jobs:
             echo "::error::direct parking_lot import outside sync.rs (see crates/pg-storage/src/sync.rs docs)"
             exit 1
           fi
+      # M3 Stage A anti-enumeration guardrail (tech-selection §3.3 v1.4):
+      # `Snapshot` fields are pg-txn-private and `TxnManager::snapshot()` is
+      # the only REGISTERED construction point. Any `Snapshot {` literal or
+      # `impl Snapshot` block outside crates/pg-txn would be an unregistered
+      # construction path (new associated-fn constructors can only appear in
+      # an impl block, and the orphan rule already confines those to
+      # pg-txn — this grep makes the invariant fail loudly instead of
+      # silently). `Snapshot::everything()` converges to the single existing
+      # impl inside pg-txn and needs no allowlist entry here.
+      # NOTE: use POSIX character classes only ([[:space:]] etc.) — \b and \s
+      # are NOT portable (BSD git-grep ERE ignores them). The exclusion
+      # pattern must account for git grep's `path:line:` output prefix (no ^
+      # anchor). This guard has been verified by positive/negative injection.
+      - name: Guard snapshot-construction registry rule
+        run: |
+          if git grep -nE "Snapshot[[:space:]]*\{" -- crates ':!crates/pg-txn' | grep -vE ':[0-9]+:[[:space:]]*(pub[[:space:]]+)?fn[[:space:]].*->[[:space:]]*Snapshot[[:space:]]*\{[[:space:]]*$'; then
+            echo "::error::'Snapshot {{' literal construction outside crates/pg-txn bypasses the horizon registry (see crates/pg-txn/src/snapshot.rs docs)"
+            exit 1
+          fi
+          if git grep -nE "impl[[:space:]]+Snapshot([[:space:]]|\{)" -- crates ':!crates/pg-txn'; then
+            echo "::error::new Snapshot associated functions outside crates/pg-txn bypass the horizon registry (everything() converges to the single impl in crates/pg-txn/src/snapshot.rs)"
+            exit 1
+          fi
+          if git grep -nE "Snapshot::new_unregistered\(" -- crates ':!crates/pg-txn'; then
+            echo "::error::Snapshot::new_unregistered is pg-txn-test-only; calling it outside crates/pg-txn bypasses the horizon registry"
+            exit 1
+          fi
 
   doc:
     name: Doc (${{ matrix.crate }})
@@ -98,7 +127,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -60,7 +60,9 @@ fn test_wait_wakes_on_commit() {
         mgr2.wait_for(waiter, blocker)
     });
 
-    wait_until("wait edge registered", || mgr.wait_edges() == vec![(waiter, blocker)]);
+    wait_until("wait edge registered", || {
+        mgr.wait_edges() == vec![(waiter, blocker)]
+    });
     assert!(mgr.active_xids().contains(&blocker));
 
     mgr.commit_txn(blocker).unwrap();
@@ -85,7 +87,9 @@ fn test_wait_wakes_on_abort() {
         mgr2.wait_for(waiter, blocker)
     });
 
-    wait_until("wait edge registered", || mgr.wait_edges() == vec![(waiter, blocker)]);
+    wait_until("wait edge registered", || {
+        mgr.wait_edges() == vec![(waiter, blocker)]
+    });
     mgr.abort_txn(blocker).unwrap();
     handle.join().unwrap().unwrap();
     assert!(mgr.wait_edges().is_empty());
@@ -133,7 +137,9 @@ fn test_many_waiters_all_wake() {
         }));
     }
 
-    wait_until("all edges registered", || mgr.wait_edges().len() == N as usize);
+    wait_until("all edges registered", || {
+        mgr.wait_edges().len() == N as usize
+    });
     mgr.commit_txn(blocker).unwrap();
     for h in handles {
         h.join().unwrap().unwrap();
@@ -153,7 +159,11 @@ fn test_wait_edges_snapshot() {
 
     mgr.register_row_wait(w2, b1);
     mgr.register_row_wait(w1, b2);
-    assert_eq!(mgr.wait_edges(), vec![(w1, b2), (w2, b1)], "sorted by waiter");
+    assert_eq!(
+        mgr.wait_edges(),
+        vec![(w1, b2), (w2, b1)],
+        "sorted by waiter"
+    );
 
     // Re-registering moves the edge (the §9.1 restart loop can re-block on
     // a different XID).

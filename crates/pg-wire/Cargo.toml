@@ -1,0 +1,30 @@
+[package]
+name = "pg-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust PG Wire — minimal PostgreSQL v3 protocol server (Phase 1 M3 Stage F)"
+
+[dependencies]
+pg-engine = { path = "../pg-engine" }
+
+# error types
+thiserror = "2"
+
+# logging (connection lifecycle, best-effort session failures)
+tracing = "0.1"
+
+[dev-dependencies]
+# integration tests drive a real server bound over a temp data dir
+tempfile = "3"
+
+# CI hard-gate client (tech-selection §10: a dev-dependency test driver is
+# allowed; it never enters the runtime dependency graph). The sync wrapper
+# matches the crate's all-blocking thread model.
+postgres = "0.19"
+
+# constructing Datum::Uuid fixtures (already in the runtime graph via
+# pg-am-heap; this edge adds nothing new)
+uuid = "1"

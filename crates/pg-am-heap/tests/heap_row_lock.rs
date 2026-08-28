@@ -108,7 +108,7 @@ fn encode_row(xid: TxnId, id: i32, name: &str) -> Vec<u8> {
 
 fn snap_for(xid: TxnId) -> Snapshot {
     let mut snap = Snapshot::everything();
-    snap.current_xid = xid;
+    snap.set_current_xid(xid);
     snap
 }
 
@@ -167,9 +167,7 @@ fn lock_only_stamp_visible_blocks_then_overwritable() {
     let handle = thread::spawn(move || {
         let xid_w = mgr2.begin_txn();
         let clog_ref: &dyn ClogAccessor = clog2.as_ref();
-        heap2
-            .lock_tuple(tid, &snap_for(xid_w), clog_ref)
-            .unwrap();
+        heap2.lock_tuple(tid, &snap_for(xid_w), clog_ref).unwrap();
         done2.store(true, Ordering::SeqCst);
         xid_w
     });

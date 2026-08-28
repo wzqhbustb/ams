@@ -102,7 +102,10 @@ fn update_with_conflict_retry(engine: &Engine, row: i32, v: i32) {
     let mut attempts = 0;
     loop {
         attempts += 1;
-        assert!(attempts <= MAX_CONFLICT_RETRIES, "conflict retried too often");
+        assert!(
+            attempts <= MAX_CONFLICT_RETRIES,
+            "conflict retried too often"
+        );
         let txn = engine.begin_txn().unwrap();
         let r = engine.exec(
             Some(&txn),
@@ -219,7 +222,10 @@ fn run_acyclic_control(engine: &Arc<Engine>, k: usize, a: i32, b: i32, iter: u64
             let mut attempts = 0;
             let victim = loop {
                 attempts += 1;
-                assert!(attempts <= MAX_CONFLICT_RETRIES, "conflict retried too often");
+                assert!(
+                    attempts <= MAX_CONFLICT_RETRIES,
+                    "conflict retried too often"
+                );
                 let txn = engine.begin_txn().unwrap();
                 let r1 = engine.exec(
                     Some(&txn),

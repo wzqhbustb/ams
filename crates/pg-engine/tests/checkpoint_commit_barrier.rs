@@ -20,7 +20,10 @@ fn open(dir: &std::path::Path) -> Engine {
 }
 
 fn row_count(engine: &Engine, table: &str) -> usize {
-    match engine.exec(None, &format!("SELECT * FROM {table}")).unwrap() {
+    match engine
+        .exec(None, &format!("SELECT * FROM {table}"))
+        .unwrap()
+    {
         QueryResult::Rows { rows, .. } => rows.len(),
         other => panic!("expected Rows, got {other:?}"),
     }
@@ -48,10 +51,7 @@ fn checkpoint_racing_commits_neither_deadlocks_nor_loses_rows() {
             for i in 0..INSERTS_PER_WRITER {
                 let id = (w * INSERTS_PER_WRITER + i) as i64;
                 engine
-                    .exec(
-                        None,
-                        &format!("INSERT INTO t VALUES ({id}, 'w{w}')"),
-                    )
+                    .exec(None, &format!("INSERT INTO t VALUES ({id}, 'w{w}')"))
                     .unwrap();
             }
         }));
@@ -119,5 +119,9 @@ fn direct_txn_manager_commit_is_checkpoint_safe() {
     drop(engine);
 
     let engine = open(tmp.path());
-    assert_eq!(row_count(&engine, "t"), 1, "direct commit must survive checkpoint + reopen");
+    assert_eq!(
+        row_count(&engine, "t"),
+        1,
+        "direct commit must survive checkpoint + reopen"
+    );
 }

@@ -125,6 +125,10 @@
   - ✅ 死锁注入 1000 环（2000 迭代）：通过（每环恰好 1 victim、无环对照组 0 误报；实测最大检测延迟 ~78ms，p99 远低于 200ms 验收线；具体 p99 未单独落盘——上界即 tick 间隔 100ms）
   - ⚠️ 挑战档 100 conn × 60min：**未执行**（保底档通过；时间成本考虑，可随时按上条命令补跑）
   - ⚠️ 并发 crash 1000 轮：**未执行**（执行了 40 轮 × 20ms 激进 checkpoint 档，修复两个 bug 后连跑全绿；1000 轮约需数小时，留给 Stage T 后续或 Phase 7 稳定性专项）
+- **M2c churn 基线（M3 Stage A 的性能对比基线，S2 协议）**：2026-08-21 实测
+  （worktree @ 2731a8b，release）：`M2C_STRESS_SECS=300 M2C_STRESS_CONNS=100
+  M2C_STRESS_TPS=100` × 5 轮取 achieved txn/s：84 / 86 / 87 / 88 / 89，
+  **均值 86.8（区间 ±3%）**。M3 Stage A/D/G 的回归判定以此为准。
 
 ## 复现
 

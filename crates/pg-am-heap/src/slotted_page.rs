@@ -37,9 +37,11 @@
 //! - Tuple regions of live (non-`Unused`) LPs lie inside
 //!   `[pd_upper, pd_special)` and never overlap.
 //!
-//! This stage is a pure in-memory format layer: no WAL, no buffer pool, no
-//! page compaction (M2a has no vacuum; physical space is reclaimed by page
-//! reorganization in a later milestone).
+//! This stage is a pure in-memory format layer: no WAL, no buffer pool.
+//! Physical space reclamation arrives with [`SlottedPage::compact`] (M3
+//! Stage B): dead slots become `Unused` and live tuple bytes are restaged
+//! contiguously, without ever moving or renumbering an LP array entry
+//! (§4.1 stage 4 — slot ids are TID components).
 
 use pg_storage::page::{PageHeader, PAGE_HEADER_SIZE};
 use pg_storage::types::{PageId, PAGE_SIZE};
@@ -138,21 +140,25 @@ impl SlottedPage {
     /// (`None` clears it to 0, Stage K). The reserved trailing 8 bytes are
     /// left untouched (they are zeroed by [`SlottedPage::init_with_special`]).
     ///
-    /// Debug-asserts that the page was initialized with exactly
-    /// [`HEAP_SPECIAL_SIZE`] bytes of special space — writing a chain pointer
-    /// onto a special-less page would corrupt tuple data. (All production
-    /// pages carry the 16B geometry, so this cannot fire in practice; it
-    /// guards against misuse on hand-rolled test pages.)
-    pub fn set_next_page(page: &mut [u8; PAGE_SIZE], next: Option<PageId>) {
-        let header = Self::header(page);
-        debug_assert_eq!(
-            header.pd_special as usize,
-            PAGE_SIZE - HEAP_SPECIAL_SIZE,
-            "set_next_page requires a heap page with HEAP_SPECIAL_SIZE special space"
-        );
+    /// Returns [`HeapError::Corrupted`] if the header geometry is inconsistent
+    /// or the page does not carry exactly [`HEAP_SPECIAL_SIZE`] bytes of
+    /// special space — symmetric with [`SlottedPage::next_page`]. The check is
+    /// a real `Result`, not a debug assertion: redo applies chain relinks to
+    /// pages recovered from disk (an untrusted source), and on a corrupt page
+    /// an unchecked write would panic out of bounds or silently land in the
+    /// tuple region.
+    pub fn set_next_page(page: &mut [u8; PAGE_SIZE], next: Option<PageId>) -> Result<()> {
+        let header = Self::checked_header(page)?;
+        if header.pd_special as usize != PAGE_SIZE - HEAP_SPECIAL_SIZE {
+            return Err(HeapError::Corrupted(format!(
+                "page chain pointer requires special_size {HEAP_SPECIAL_SIZE}, page has pd_special={}",
+                header.pd_special
+            )));
+        }
         let off = header.pd_special as usize;
         let raw = next.map(|p| p.0).unwrap_or(0);
         page[off..off + 8].copy_from_slice(&raw.to_le_bytes());
+        Ok(())
     }
 
     /// Read the page-chain forward pointer from the special space; `Ok(None)`
@@ -215,12 +221,53 @@ impl SlottedPage {
         Ok(header)
     }
 
-    /// Insert `bytes` as a new tuple, returning its slot id.
+    /// Return the first [`LpFlags::Unused`] slot available for recycling, or
+    /// `None` when the LP array has no `Unused` entry (the next tuple must
+    /// append a new LP at `slot_count`).
     ///
-    /// Prefers recycling an [`LpFlags::Unused`] slot (LP array only grows,
-    /// keeping TIDs stable); otherwise appends a new LP at `pd_lower`.
-    /// Tuple bytes are placed at `pd_upper - len`.
-    pub fn add_tuple(page: &mut [u8; PAGE_SIZE], bytes: &[u8]) -> Result<u16> {
+    /// Pure read (M3 tech-selection §4.6): slot selection is a deliberate
+    /// two-step protocol — the caller picks the slot with this function (or
+    /// `slot_count` for an append), writes it into the WAL record, and only
+    /// then places the tuple with [`SlottedPage::add_tuple_at`]. Slot
+    /// assignment is thus carried by the WAL record itself, and redo never
+    /// has to reproduce the online writer's choice by re-running first-fit
+    /// against a page that may have diverged.
+    ///
+    /// Never panics on a corrupted header: `pd_lower` is clamped into the
+    /// page before the LP array is walked (same policy as
+    /// [`SlottedPage::slot_count`]); mutation paths validate geometry via
+    /// [`SlottedPage::checked_header`] instead.
+    pub fn first_fit_slot(page: &[u8; PAGE_SIZE]) -> Option<u16> {
+        let header = Self::header(page);
+        let pd_lower = (header.pd_lower as usize).min(PAGE_SIZE);
+        let slot_count = pd_lower.saturating_sub(PAGE_HEADER_SIZE) / LINE_POINTER_SIZE;
+        // Reads the LP array directly; `line_pointer()` would re-decode the
+        // header per slot.
+        for slot in 0..slot_count {
+            let off = PAGE_HEADER_SIZE + slot * LINE_POINTER_SIZE;
+            let lp =
+                LinePointer::from_le_bytes(page[off..off + LINE_POINTER_SIZE].try_into().unwrap());
+            if lp.flags() == LpFlags::Unused {
+                return Some(slot as u16);
+            }
+        }
+        None
+    }
+
+    /// Insert `bytes` at the caller-selected `slot` (§4.6 slot addressing).
+    ///
+    /// `slot` must be either exactly `slot_count(page)` — appending a new LP
+    /// at `pd_lower`, which costs an extra [`LINE_POINTER_SIZE`] of free
+    /// space — or an existing [`LpFlags::Unused`] slot, which is recycled in
+    /// place. Tuple bytes are placed at `pd_upper - len`.
+    ///
+    /// Anything else is [`HeapError::InvalidSlot`]: an out-of-range slot, or
+    /// one still referencing a tuple. Online writers and redo both address
+    /// slots explicitly, so a mismatch means the WAL stream and the page
+    /// disagree — that must hard-fail, never silently relocate the tuple
+    /// (redo maps the error to `MetadataCorrupted`, same as the pre-§4.6
+    /// slot-divergence check).
+    pub fn add_tuple_at(page: &mut [u8; PAGE_SIZE], slot: u16, bytes: &[u8]) -> Result<()> {
         let len = bytes.len();
         let header = Self::checked_header(page)?;
         // The largest tuple that can ever fit: special space is reserved for
@@ -238,25 +285,22 @@ impl SlottedPage {
         }
 
         let slot_count = (header.pd_lower as usize - PAGE_HEADER_SIZE) / LINE_POINTER_SIZE;
-
-        // Find a recyclable Unused slot (first-fit). Reads the LP array
-        // directly; `line_pointer()` would re-decode the header per slot.
-        let mut recycled_slot = None;
-        for slot in 0..slot_count {
-            let off = PAGE_HEADER_SIZE + slot * LINE_POINTER_SIZE;
+        let appending = if slot as usize > slot_count {
+            return Err(HeapError::InvalidSlot(slot));
+        } else if slot as usize == slot_count {
+            true
+        } else {
+            // Recycling: only an Unused LP may be overwritten.
+            let off = PAGE_HEADER_SIZE + slot as usize * LINE_POINTER_SIZE;
             let lp =
                 LinePointer::from_le_bytes(page[off..off + LINE_POINTER_SIZE].try_into().unwrap());
-            if lp.flags() == LpFlags::Unused {
-                recycled_slot = Some(slot as u16);
-                break;
+            if lp.flags() != LpFlags::Unused {
+                return Err(HeapError::InvalidSlot(slot));
             }
-        }
-
-        let lp_cost = if recycled_slot.is_some() {
-            0
-        } else {
-            LINE_POINTER_SIZE
+            false
         };
+
+        let lp_cost = if appending { LINE_POINTER_SIZE } else { 0 };
         let free = (header.pd_upper - header.pd_lower) as usize;
         if free < len + lp_cost {
             return Err(HeapError::PageFull {
@@ -268,34 +312,152 @@ impl SlottedPage {
         // Place the tuple bytes at the top of the free space.
         let new_upper = header.pd_upper as usize - len;
         page[new_upper..new_upper + len].copy_from_slice(bytes);
-
-        let slot = match recycled_slot {
-            Some(slot) => {
-                Self::set_line_pointer(
-                    page,
-                    slot,
-                    LinePointer::new(new_upper as u16, LpFlags::Normal, len as u16),
-                );
-                slot
-            }
-            None => {
-                let slot = slot_count as u16;
-                Self::set_line_pointer(
-                    page,
-                    slot,
-                    LinePointer::new(new_upper as u16, LpFlags::Normal, len as u16),
-                );
-                let header = Self::header(page);
-                Self::set_pd_lower(page, header.pd_lower + LINE_POINTER_SIZE as u16);
-                slot
-            }
-        };
+        Self::set_line_pointer(
+            page,
+            slot,
+            LinePointer::new(new_upper as u16, LpFlags::Normal, len as u16),
+        );
+        if appending {
+            Self::set_pd_lower(page, header.pd_lower + LINE_POINTER_SIZE as u16);
+        }
         Self::set_pd_upper(page, new_upper as u16);
 
         if cfg!(debug_assertions) {
             debug_assert_invariants(page);
         }
+        Ok(())
+    }
+
+    /// Insert `bytes` as a new tuple, returning its slot id.
+    ///
+    /// Prefers recycling an [`LpFlags::Unused`] slot (LP array only grows,
+    /// keeping TIDs stable); otherwise appends a new LP at `pd_lower`.
+    ///
+    /// Since §4.6 this is just the composition of the two explicit steps —
+    /// [`SlottedPage::first_fit_slot`] (falling back to `slot_count`) plus
+    /// [`SlottedPage::add_tuple_at`] — and its external behavior is unchanged.
+    /// Callers that write WAL must NOT use this convenience wrapper: they
+    /// pick the slot first, log it, then place at it (see `HeapAM::insert`).
+    pub fn add_tuple(page: &mut [u8; PAGE_SIZE], bytes: &[u8]) -> Result<u16> {
+        let slot = Self::first_fit_slot(page).unwrap_or(Self::slot_count(page) as u16);
+        Self::add_tuple_at(page, slot, bytes)?;
         Ok(slot)
+    }
+
+    /// Compact the page in place (M3 Stage B, tech-selection §4.5): kill the
+    /// dead slots listed in `dead_slots` (LP → [`LpFlags::Unused`], the same
+    /// semantics as [`SlottedPage::delete_tuple`]), move the surviving tuple
+    /// bytes into a contiguous region ending at `pd_special`, reclaiming the
+    /// holes the killed tuples and earlier fragmentation left, and reset
+    /// `pd_upper` accordingly.
+    ///
+    /// HARD INVARIANT (§4.1 stage 4): LP array entries are never moved or
+    /// renumbered — a slot id is a TID component referenced by index entries
+    /// and HOT `t_ctid`s. Only tuple *bytes* relocate; each surviving LP
+    /// keeps its slot, flags, and length and is re-pointed at its tuple's new
+    /// offset. `pd_lower` is unchanged, so `slot_count` is too.
+    ///
+    /// `dead_slots` must be strictly ascending — the exact order the
+    /// `HeapCleanup` WAL payload carries, so the online path and its redo
+    /// handler run the same function on the same arguments and converge
+    /// byte-for-byte ("replay = re-execute the same physical operation",
+    /// §4.5 replay convergence). Each listed slot must reference a live (`Normal`)
+    /// or `Dead` line pointer; an `Unused` one means the caller and the page
+    /// disagree (e.g. a replay the `pd_lsn` guard should have skipped) and
+    /// is a hard error, never a silent skip.
+    ///
+    /// # Kill-list contract (caller's obligation)
+    ///
+    /// `compact()` is a purely physical primitive: it does NOT consult MVCC
+    /// visibility or HOT chain structure. The caller (Stage C's vacuum)
+    /// guarantees every listed slot is reclaimable. For HOT chains this means
+    /// the chain must be ENTIRELY dead — never kill:
+    /// (a) any member still referenced by a predecessor's `t_ctid` pointer
+    ///     (a killed middle/tail member leaves a dangling `t_ctid` pointing at
+    ///     an `Unused`, later recycled, slot — the chain walks into garbage);
+    /// (b) the chain ROOT while any member is still alive (nothing points at
+    ///     the root via `t_ctid` — the INDEX entry does: killing it strands
+    ///     the live members from both seqscan and index scan, and once the
+    ///     root's slot is recycled the index entry resolves to the WRONG row).
+    /// The chain-liveness decision — which versions any snapshot can still
+    /// reach — belongs to `scan_dead_tuples`' horizon logic plus chain
+    /// grouping (tech-selection §4.4), not here.
+    ///
+    /// Deterministic layout: surviving tuples are restaged in ascending slot
+    /// order, packed downward from `pd_special`; the abandoned data region is
+    /// zeroed. Identical pre-image + identical `dead_slots` ⇒ identical
+    /// post-image bytes.
+    pub fn compact(page: &mut [u8; PAGE_SIZE], dead_slots: &[u16]) -> Result<()> {
+        let header = Self::checked_header(page)?;
+        let slot_count = (header.pd_lower as usize - PAGE_HEADER_SIZE) / LINE_POINTER_SIZE;
+
+        // Validate the kill list BEFORE mutating anything: strictly
+        // ascending (the WAL payload contract), in range, and each slot
+        // holding a tuple (Normal or Dead). Redirect is never written by
+        // this system; Unused means the slot is already dead space.
+        let mut prev: Option<u16> = None;
+        for &slot in dead_slots {
+            if prev.is_some_and(|p| slot <= p) {
+                return Err(HeapError::InvalidArgument(format!(
+                    "compact dead_slots must be strictly ascending, got {slot} after {}",
+                    prev.unwrap()
+                )));
+            }
+            prev = Some(slot);
+            let lp = Self::line_pointer(page, slot)?;
+            if !matches!(lp.flags(), LpFlags::Normal | LpFlags::Dead) {
+                return Err(HeapError::InvalidSlot(slot));
+            }
+        }
+
+        // Stage the surviving tuples (bytes copied out, ascending slot
+        // order). Any non-Unused LP not on the kill list keeps its bytes —
+        // including Dead entries the caller chose not to kill.
+        let pd_special = header.pd_special as usize;
+        let mut staged: Vec<(u16, LpFlags, u16, Vec<u8>)> = Vec::new();
+        for slot in 0..slot_count as u16 {
+            let off = PAGE_HEADER_SIZE + slot as usize * LINE_POINTER_SIZE;
+            let lp =
+                LinePointer::from_le_bytes(page[off..off + LINE_POINTER_SIZE].try_into().unwrap());
+            if lp.flags() == LpFlags::Unused || dead_slots.binary_search(&slot).is_ok() {
+                continue;
+            }
+            let (o, l) = (lp.off() as usize, lp.len() as usize);
+            if o < header.pd_upper as usize || o + l > pd_special {
+                return Err(HeapError::Corrupted(format!(
+                    "slot {slot}: tuple region [{o}, {}) outside [{}, {pd_special})",
+                    o + l,
+                    header.pd_upper
+                )));
+            }
+            staged.push((slot, lp.flags(), lp.len(), page[o..o + l].to_vec()));
+        }
+
+        // Clear the entire data region (the staged bytes are safe in the
+        // side buffer), then restage downward from pd_special.
+        page[header.pd_upper as usize..pd_special].fill(0);
+        let mut cursor = pd_special;
+        for (slot, flags, len, bytes) in &staged {
+            cursor -= *len as usize;
+            page[cursor..cursor + *len as usize].copy_from_slice(bytes);
+            Self::set_line_pointer(page, *slot, LinePointer::new(cursor as u16, *flags, *len));
+        }
+
+        // Kill the dead slots (delete_tuple semantics: flags → Unused,
+        // offset/length kept for forensic value).
+        for &slot in dead_slots {
+            let lp = Self::line_pointer(page, slot)?;
+            Self::set_line_pointer(page, slot, lp.with_flags(LpFlags::Unused));
+        }
+
+        // pd_lower never moves (LP array stable); pd_upper absorbs every
+        // reclaimed hole.
+        Self::set_pd_upper(page, cursor as u16);
+
+        if cfg!(debug_assertions) {
+            debug_assert_invariants(page);
+        }
+        Ok(())
     }
 
     /// Mark the tuple at `slot` as deleted (LP → [`LpFlags::Unused`]).
@@ -536,10 +698,10 @@ mod tests {
         // A freshly initialized page has no successor.
         assert_eq!(SlottedPage::next_page(&page).unwrap(), None);
 
-        SlottedPage::set_next_page(&mut page, Some(PageId(42)));
+        SlottedPage::set_next_page(&mut page, Some(PageId(42))).unwrap();
         assert_eq!(SlottedPage::next_page(&page).unwrap(), Some(PageId(42)));
 
-        SlottedPage::set_next_page(&mut page, None);
+        SlottedPage::set_next_page(&mut page, None).unwrap();
         assert_eq!(SlottedPage::next_page(&page).unwrap(), None);
 
         // The reserved trailing 8 bytes stay zero.
@@ -555,6 +717,13 @@ mod tests {
         let page = fresh_page();
         assert!(matches!(
             SlottedPage::next_page(&page),
+            Err(HeapError::Corrupted(_))
+        ));
+        // Writing one must be a hard error too (F2): the page may come from
+        // disk during redo, so the check cannot be a debug-only assertion.
+        let mut page = fresh_page();
+        assert!(matches!(
+            SlottedPage::set_next_page(&mut page, Some(PageId(42))),
             Err(HeapError::Corrupted(_))
         ));
     }
@@ -573,7 +742,7 @@ mod tests {
         // The special space is not usable for tuples.
         assert_eq!(n, (PAGE_SIZE - HEAP_SPECIAL_SIZE - PAGE_HEADER_SIZE) / 104);
         // And the chain pointer survives a full page.
-        SlottedPage::set_next_page(&mut page, Some(PageId(7)));
+        SlottedPage::set_next_page(&mut page, Some(PageId(7))).unwrap();
         assert_eq!(SlottedPage::next_page(&page).unwrap(), Some(PageId(7)));
         debug_assert_invariants(&page);
     }

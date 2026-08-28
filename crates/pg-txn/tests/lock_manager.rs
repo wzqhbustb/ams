@@ -54,11 +54,15 @@ fn spawn_acquire(lm: &Arc<LockManager>, x: TxnId, t: Oid, m: LockMode) -> JoinHa
 }
 
 fn waiters_of(lm: &LockManager, t: Oid) -> Vec<(TxnId, LockMode)> {
-    lm.table_lock_state(t).map(|s| s.waiters).unwrap_or_default()
+    lm.table_lock_state(t)
+        .map(|s| s.waiters)
+        .unwrap_or_default()
 }
 
 fn granted_of(lm: &LockManager, t: Oid) -> Vec<(TxnId, LockMode)> {
-    lm.table_lock_state(t).map(|s| s.granted).unwrap_or_default()
+    lm.table_lock_state(t)
+        .map(|s| s.granted)
+        .unwrap_or_default()
 }
 
 /// Full 4×4 grant matrix (§9.2): with `held` granted to another XID, a
@@ -138,8 +142,14 @@ fn test_upgrade_waits_then_completes() {
     // KEEPING its AccessShare grant (PG-style upgrade wait).
     let up = spawn_acquire(&lm, xid(1), table(1), AccessExclusive);
     wait_until("upgrade queued", || waiters_of(&lm, table(1)).len() == 1);
-    assert!(lm.is_granted(xid(1), table(1), AccessShare), "old grant retained while waiting");
-    assert!(!lm.is_granted(xid(1), table(1), AccessExclusive), "upgrade not yet granted");
+    assert!(
+        lm.is_granted(xid(1), table(1), AccessShare),
+        "old grant retained while waiting"
+    );
+    assert!(
+        !lm.is_granted(xid(1), table(1), AccessExclusive),
+        "upgrade not yet granted"
+    );
 
     lm.release_all(xid(2));
     up.join().unwrap();
@@ -168,7 +178,10 @@ fn test_fifo_fairness_no_barging() {
         vec![(xid(2), AccessExclusive), (xid(3), AccessShare)],
         "FIFO order: B ahead of C"
     );
-    assert!(!lm.is_granted(xid(3), table(1), AccessShare), "C must not barge");
+    assert!(
+        !lm.is_granted(xid(3), table(1), AccessShare),
+        "C must not barge"
+    );
 
     // A releases: B (head) is granted; C still waits because AccessShare
     // conflicts with B's fresh AccessExclusive.
@@ -176,7 +189,10 @@ fn test_fifo_fairness_no_barging() {
     wait_until("B granted after A releases", || {
         lm.is_granted(xid(2), table(1), AccessExclusive)
     });
-    assert!(!lm.is_granted(xid(3), table(1), AccessShare), "C waits behind B's grant");
+    assert!(
+        !lm.is_granted(xid(3), table(1), AccessShare),
+        "C waits behind B's grant"
+    );
 
     // B releases: C finally proceeds.
     lm.release_all(xid(2));

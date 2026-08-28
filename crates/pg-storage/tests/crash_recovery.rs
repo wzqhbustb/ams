@@ -360,6 +360,11 @@ fn run_manual_crash_test(
     child.kill().expect("failed to kill child");
     child.wait().ok();
 
+    // M3 Stage E F1: the SIGKILLed child left its `{data_dir}/lock` file
+    // behind; the harness plays the documented operator action for crash
+    // residue (remove the stale lock) before the parent reopens.
+    let _ = fs::remove_file(data_dir.join("lock"));
+
     // Clean up the marker so it does not confuse subsequent openings.
     let _ = fs::remove_file(data_dir.join(READY_MARKER));
 

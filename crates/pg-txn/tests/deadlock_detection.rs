@@ -59,8 +59,12 @@ fn rig(interval: Duration) -> Rig {
         .with_deadlock_victims(Arc::clone(&victims)),
     );
     let lm = Arc::new(LockManager::new().with_deadlock_victims(Arc::clone(&victims)));
-    let detector =
-        DeadlockDetector::start(Arc::clone(&mgr), Arc::clone(&lm), Arc::clone(&victims), interval);
+    let detector = DeadlockDetector::start(
+        Arc::clone(&mgr),
+        Arc::clone(&lm),
+        Arc::clone(&victims),
+        interval,
+    );
     Rig {
         mgr,
         lm,
@@ -120,7 +124,9 @@ fn run_table_ring(n: usize, interval: Duration) -> Duration {
     for i in 0..n - 1 {
         let lm = Arc::clone(&rig.lm);
         let (xid, want) = (xids[i], tables[(i + 1) % n]);
-        handles.push(thread::spawn(move || lm.acquire(xid, want, LockMode::Exclusive)));
+        handles.push(thread::spawn(move || {
+            lm.acquire(xid, want, LockMode::Exclusive)
+        }));
     }
     wait_until("all non-youngest waiters queued", || {
         rig.lm
@@ -166,7 +172,10 @@ fn run_table_ring(n: usize, interval: Duration) -> Duration {
     for &xid in &xids {
         rig.mgr.abort_txn(xid).unwrap();
     }
-    assert!(rig.victims.marked().is_empty(), "victim flag must be consumed");
+    assert!(
+        rig.victims.marked().is_empty(),
+        "victim flag must be consumed"
+    );
     assert!(
         rig.lm.table_lock_states().is_empty(),
         "all locks released at the end"
@@ -206,9 +215,9 @@ fn test_deadlock_row_lock_cycle() {
     let rig = rig(DEFAULT_DEADLOCK_INTERVAL);
     let a = rig.mgr.begin_txn();
     let b = rig.mgr.begin_txn(); // younger → victim
-    // Inject the cycle's edges directly (the §9.1 5-step protocol would
-    // register these under page latches; the detector only reads the
-    // registry, so direct injection is equivalent at this level).
+                                 // Inject the cycle's edges directly (the §9.1 5-step protocol would
+                                 // register these under page latches; the detector only reads the
+                                 // registry, so direct injection is equivalent at this level).
     rig.mgr.register_row_wait(a, b);
     rig.mgr.register_row_wait(b, a);
 
@@ -435,7 +444,10 @@ fn test_detector_tick_latency_and_cpu_budget() {
     durations.sort_unstable();
     // Nearest-rank p99 (see the fn doc for why N > 100 matters).
     let p99 = durations[(durations.len() * 99).div_ceil(100) - 1];
-    assert!(p99 <= Duration::from_millis(5), "tick p99 {p99:?} exceeds 5ms");
+    assert!(
+        p99 <= Duration::from_millis(5),
+        "tick p99 {p99:?} exceeds 5ms"
+    );
     let busy: Duration = durations.iter().sum();
     assert!(
         busy * 100 < wall,
@@ -519,9 +531,9 @@ fn test_shared_victim_double_ring() {
     let lm = Arc::clone(&rig.lm);
     let hb = thread::spawn(move || lm.acquire(b, T_C, LockMode::Exclusive));
     wait_until("B queued behind A on T_C", || {
-        rig.lm.table_lock_state(T_C).is_some_and(|s| {
-            s.waiters.len() == 2 && s.waiters[0].0 == a && s.waiters[1].0 == b
-        })
+        rig.lm
+            .table_lock_state(T_C)
+            .is_some_and(|s| s.waiters.len() == 2 && s.waiters[0].0 == a && s.waiters[1].0 == b)
     });
 
     // C queues on T_A: ring 1 (A→C, C→A) closes. Parked C via channel so we
@@ -698,7 +710,10 @@ fn test_detector_churn_soak() {
     // The detector must actually have fired during the soak: with 8 threads
     // cross-acquiring Exclusive locks on 4 tables for 3s, cycles are
     // constant — zero victims would mean detection silently no-oped.
-    assert!(total_victims > 0, "soak produced no deadlock victims at all");
+    assert!(
+        total_victims > 0,
+        "soak produced no deadlock victims at all"
+    );
     assert_eq!(rig.detector.panic_count(), 0, "detector tick panicked");
     eprintln!("churn soak: {total_victims} victim aborts across {THREADS} threads in {SOAK:?}");
 

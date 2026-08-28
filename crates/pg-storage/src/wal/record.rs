@@ -36,7 +36,9 @@ pub enum WalRecordType {
     BTreeDelete = 6,
     /// Heap HOT update (M2 logic; value reserved).
     HeapHotUpdate = 7,
-    /// Heap cleanup (M2 logic; value reserved).
+    /// Heap cleanup: vacuum page compaction + optional chain unlink (M3
+    /// Stage B implements; the discriminant itself is the Stage-0-reserved
+    /// value, not a new assignment).
     HeapCleanup = 8,
 
     /// Full page image written before the first modification of a page after a
@@ -77,9 +79,22 @@ pub enum WalRecordType {
     /// Logical time-series operation (Phase 2+).
     LogicalTimeSeries = 103,
 
-    /// Segment seal operation (Phase 3+).
+    /// Segment seal operation (Phase 3+; reserved at Stage 0, the M1+M2 baseline).
+    ///
+    /// Payload contract (M3 Stage G, tech-selection §8 — no payload struct or
+    /// redo handler yet; recovery hard-fails on this discriminant until one
+    /// is registered): exactly one [`crate::segment::SegmentId`] — the
+    /// segment being sealed. bincode-serialized like all M1–M3 payloads.
     SegmentSeal = 110,
-    /// Segment merge operation (Phase 3+).
+    /// Segment merge operation (Phase 3+; reserved at Stage 0, the M1+M2 baseline).
+    ///
+    /// Payload contract (M3 Stage G, tech-selection §8 — no payload struct or
+    /// redo handler yet; recovery hard-fails on this discriminant until one
+    /// is registered): the input [`crate::segment::SegmentId`] list (merge
+    /// sources, in merge order) followed by the target `SegmentId` (the
+    /// merge output). Redo retires the inputs and installs the target;
+    /// the record must be sufficient to reconstruct that outcome
+    /// idempotently.
     SegmentMerge = 111,
 }
 
@@ -205,6 +220,53 @@ pub struct HeapHotUpdateRecord {
     /// The `t_xmax` stamped onto the old version.
     pub xmax: TxnId,
 }
+
+/// Payload for a `HeapCleanup` record (M3 Stage B, tech-selection §4.5):
+/// physical compaction of one heap page plus an optional page-chain unlink.
+///
+/// Redo calls the SAME [`SlottedPage::compact`](pg_am_heap) the online path
+/// uses, with the same arguments — replay convergence is "replay =
+/// re-execute the same physical operation" (§4.5 重放收敛性), never a
+/// parallel reimplementation. `dead_slots` is therefore written in ascending
+/// order: identical input yields identical output on both sides.
+///
+/// # Field-order invariant
+///
+/// `dead_slots` is deliberately the LAST field (same contract as
+/// [`BTreeSplitCLRRecord::separator_key`], post-Stage-S fix B5): the analysis
+/// phase prefix-decodes only the fixed-size leading page ids and never
+/// touches the variable-length tail — bincode's standard config imposes no
+/// size limit, so a full decode there would trust a corrupt length prefix on
+/// a CRC-valid record with an unbounded allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeapCleanupRecord {
+    /// The page being compacted (dead slots killed, live bytes defragmented).
+    pub page_id: PageId,
+    /// Chain unlink: the predecessor page whose `next_page` pointer is
+    /// relinked when the compacted page became empty and was spliced out of
+    /// the relation's page chain. `PageId::INVALID` when no unlink happened
+    /// (compaction only — the only shape Stage B produces online; the unlink
+    /// fields exist so Stage C's page reclamation can log under the same
+    /// record type).
+    pub unlink_prev_page: PageId,
+    /// Relink target written into the predecessor's `next_page`: the unlinked
+    /// page's own successor at unlink time (`PageId::INVALID` = the unlinked
+    /// page was the chain tail). Meaningless when `unlink_prev_page` is
+    /// `INVALID`.
+    pub unlink_next_page: PageId,
+    /// Dead slots killed on `page_id`, ascending (see the struct docs).
+    /// LAST field — see the field-order invariant.
+    pub dead_slots: Vec<u16>,
+}
+
+/// Maximum accepted length of a [`HeapCleanupRecord::dead_slots`] (defense in
+/// depth, mirroring [`MAX_CLR_SEPARATOR_KEY_BYTES`]): a page can never hold
+/// more line pointers than the tuple area fits 4-byte entries, so a decoded
+/// kill list longer than that trusts a corrupt length prefix. pg-storage
+/// cannot depend on pg-am-heap, so the bound is re-derived from
+/// [`PAGE_SIZE`](crate::types::PAGE_SIZE) here: `(PAGE_SIZE - 32 header - 16
+/// special) / 4 per LP`.
+pub const MAX_HEAP_CLEANUP_SLOTS: usize = (crate::types::PAGE_SIZE - 32 - 16) / 4;
 
 /// Payload for a `BTreeInsert` record: one index entry placed at a slot.
 ///
@@ -414,6 +476,29 @@ impl HeapHotUpdateRecord {
         Ok(bincode::serde::decode_from_slice(payload, bincode_config())
             .map_err(|e| StorageError::Serialize(e.to_string()))?
             .0)
+    }
+}
+
+impl HeapCleanupRecord {
+    /// Decode a `HeapCleanup` payload (see [`HeapInsertRecord::decode`]).
+    ///
+    /// Defense in depth (same policy as [`BTreeSplitCLRRecord::decode`]): the
+    /// decoded `dead_slots` is rejected when it exceeds
+    /// [`MAX_HEAP_CLEANUP_SLOTS`] — bincode's standard config has no size
+    /// limit, so a corrupt length prefix on a CRC-valid record must not be
+    /// trusted blindly; a page can never hold that many line pointers.
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let rec: Self = bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0;
+        if rec.dead_slots.len() > MAX_HEAP_CLEANUP_SLOTS {
+            return Err(StorageError::Serialize(format!(
+                "HeapCleanup dead_slots length {} exceeds maximum {}",
+                rec.dead_slots.len(),
+                MAX_HEAP_CLEANUP_SLOTS
+            )));
+        }
+        Ok(rec)
     }
 }
 
@@ -750,6 +835,54 @@ impl WalRecord {
         Ok(rec)
     }
 
+    /// Create a `HeapCleanup` record (M3 Stage B, §4.5): physical compaction
+    /// of `page_id` killing `dead_slots` (must be ascending — the redo
+    /// handler re-runs the same `compact()` with these exact arguments), plus
+    /// an optional page-chain unlink (`unlink_prev_page` /
+    /// `unlink_next_page`; both `PageId::INVALID` when the page stays in the
+    /// chain).
+    ///
+    /// Vacuum is not transactional, so the record's `txn_id` stays `INVALID`:
+    /// the change is purely physical and must be replayed regardless of any
+    /// transaction outcome.
+    pub fn heap_cleanup(
+        page_id: PageId,
+        dead_slots: Vec<u16>,
+        unlink_prev_page: PageId,
+        unlink_next_page: PageId,
+    ) -> Result<Self> {
+        // Hard validation, not a debug assertion (F3): under the WAL-first
+        // protocol a violating record would be appended before `compact()`
+        // rejects it, and every subsequent recovery would hard-fail on the
+        // poison record — a bricked data directory. Reject BEFORE encoding:
+        // replay convergence (§4.5) rests on the strictly-ascending kill
+        // list, and a list longer than a page's maximum LP count can never
+        // be legitimate (same bound [`HeapCleanupRecord::decode`] enforces).
+        if dead_slots.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(StorageError::Serialize(
+                "HeapCleanup dead_slots must be strictly ascending".to_string(),
+            ));
+        }
+        if dead_slots.len() > MAX_HEAP_CLEANUP_SLOTS {
+            return Err(StorageError::Serialize(format!(
+                "HeapCleanup dead_slots length {} exceeds maximum {}",
+                dead_slots.len(),
+                MAX_HEAP_CLEANUP_SLOTS
+            )));
+        }
+        let payload = bincode::serde::encode_to_vec(
+            HeapCleanupRecord {
+                page_id,
+                unlink_prev_page,
+                unlink_next_page,
+                dead_slots,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HeapCleanup, payload))
+    }
+
     /// Create a `BTreeInsert` record (leaf/internal entry or meta-page append).
     ///
     /// `level`/`flags` describe the target page so redo can initialize a
@@ -1019,7 +1152,9 @@ impl WalRecord {
 }
 
 /// Return the shared bincode configuration used across the storage crate.
-pub(crate) fn bincode_config() -> bincode::config::Configuration {
+/// `pub` (not `pub(crate)`) so binary targets under `src/bin/` (separate
+/// crates linking this lib, e.g. pg-waldump) share the exact same config.
+pub fn bincode_config() -> bincode::config::Configuration {
     bincode::config::standard()
 }
 

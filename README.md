@@ -87,6 +87,9 @@ one):
 - **Engine API**: `CREATE TABLE` / `CREATE INDEX`, `INSERT` / `SELECT` /
   `UPDATE` / `DELETE` — both as typed methods and via a SQL-string `exec(...)`;
   `DROP TABLE` as a typed method only (not yet in the SQL subset).
+- **Observability (M3)**: the `QueryStats` ring buffer records only the SQL
+  text path (`Engine::exec`); the typed API (`Engine::scan` / `insert` /
+  `update` / `delete`, …) is deliberately NOT counted (tech-selection §6.3).
 
 ## Quick start
 

@@ -43,7 +43,7 @@ fn insert_rows(engine: &Engine, n: i64) -> Vec<Tid> {
     let col_types = [ColumnType::Int8, ColumnType::Int8];
     let xid = engine.txn_manager().begin_txn();
     let mut snap = Snapshot::everything();
-    snap.current_xid = xid;
+    snap.set_current_xid(xid);
     let mut tids = Vec::with_capacity(n as usize);
     for i in 0..n {
         let tuple = encode_tuple(
