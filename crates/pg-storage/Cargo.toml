@@ -8,9 +8,6 @@ license.workspace = true
 description = "pg_rust storage engine — Phase 1 M1 (Page, WAL, BufferPool, LSN)"
 
 [dependencies]
-# async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
-
 # concurrency primitives
 parking_lot = "0.12"
 

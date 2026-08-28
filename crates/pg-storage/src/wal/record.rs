@@ -79,9 +79,22 @@ pub enum WalRecordType {
     /// Logical time-series operation (Phase 2+).
     LogicalTimeSeries = 103,
 
-    /// Segment seal operation (Phase 3+).
+    /// Segment seal operation (Phase 3+; reserved at Stage 0, the M1+M2 baseline).
+    ///
+    /// Payload contract (M3 Stage G, tech-selection §8 — no payload struct or
+    /// redo handler yet; recovery hard-fails on this discriminant until one
+    /// is registered): exactly one [`crate::segment::SegmentId`] — the
+    /// segment being sealed. bincode-serialized like all M1–M3 payloads.
     SegmentSeal = 110,
-    /// Segment merge operation (Phase 3+).
+    /// Segment merge operation (Phase 3+; reserved at Stage 0, the M1+M2 baseline).
+    ///
+    /// Payload contract (M3 Stage G, tech-selection §8 — no payload struct or
+    /// redo handler yet; recovery hard-fails on this discriminant until one
+    /// is registered): the input [`crate::segment::SegmentId`] list (merge
+    /// sources, in merge order) followed by the target `SegmentId` (the
+    /// merge output). Redo retires the inputs and installs the target;
+    /// the record must be sufficient to reconstruct that outcome
+    /// idempotently.
     SegmentMerge = 111,
 }
 

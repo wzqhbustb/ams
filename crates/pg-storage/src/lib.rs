@@ -11,6 +11,11 @@
 //! `pd_lsn` ([`mod@page`]), the commit-status abstraction ([`clog`]), and the
 //! redo-dispatch registry used by recovery ([`recovery`]).
 //!
+//! M3 Stage G adds two **interface reservations** (contracts only, no
+//! implementation — tech-selection §8/§9): [`segment`] for the segment-based
+//! storages of Phase 3/5, and [`tier2`] for asynchronous Tier 2 index
+//! followership (WAL tailing + per-index freshness watermarks).
+//!
 //! M2c Stage Q adds the [`sync`] alias layer: production builds re-export
 //! `parking_lot` / `std::sync::atomic` unchanged, while `--features loom`
 //! (test-only model builds) swaps in loom's instrumented primitives so
@@ -40,8 +45,10 @@ pub mod page;
 pub mod page_allocator;
 pub mod positioned_file;
 pub mod recovery;
+pub mod segment;
 pub mod superblock;
 pub mod sync;
+pub mod tier2;
 pub mod txn_id;
 pub mod types;
 pub mod wal;

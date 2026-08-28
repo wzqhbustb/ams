@@ -16,16 +16,20 @@
 //!   -c "UPDATE t SET name = 'b' WHERE id = 1" -c "DELETE FROM t WHERE id = 1" \
 //!   -c "BEGIN" -c "INSERT INTO t VALUES (2, 'x')" -c "COMMIT"
 //!
-//! # psycopg2 (autocommit off exercises BEGIN/COMMIT interception):
+//! # psycopg2 (autocommit off exercises BEGIN/COMMIT interception;
+//! # set autocommit FIRST for DDL — the engine rejects DDL inside explicit
+//! # transactions (M2b boundary), and psycopg2's default implicit-txn wraps
+//! # every statement; archived matrix result: docs/phase1-m3-benchmarks.md):
 //! python3 - <<'PY'
 //! import psycopg2
 //! c = psycopg2.connect("host=127.0.0.1 port=55432 user=pg_rust dbname=pg_rust")
+//! c.autocommit = True
 //! cur = c.cursor()
-//! cur.execute("CREATE TABLE t (id INT, name TEXT)"); c.commit()
-//! cur.execute("INSERT INTO t VALUES (1, 'a')"); c.commit()
+//! cur.execute("CREATE TABLE t (id INT, name TEXT)")
+//! cur.execute("INSERT INTO t VALUES (1, 'a')")
 //! cur.execute("SELECT * FROM t"); print(cur.fetchall())
-//! cur.execute("UPDATE t SET name = 'b' WHERE id = 1"); c.commit()
-//! cur.execute("DELETE FROM t WHERE id = 1"); c.commit()
+//! cur.execute("UPDATE t SET name = 'b' WHERE id = 1")
+//! cur.execute("DELETE FROM t WHERE id = 1")
 //! PY
 //!
 //! # node-postgres:

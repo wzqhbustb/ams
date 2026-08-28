@@ -12,7 +12,7 @@
 
 use pg_storage::clog::ClogAccessor;
 use pg_storage::recovery::RedoHandler;
-use pg_storage::types::{Oid, PageId, Tid, TxnId};
+use pg_storage::types::{Lsn, Oid, PageId, Tid, TxnId};
 use pg_txn::Snapshot;
 
 use crate::tuple::{ColumnType, Datum};
@@ -138,6 +138,21 @@ pub trait AccessMethod: Send + Sync {
     /// Returned to an upper layer for registration because `pg-storage` (which
     /// owns the registry) cannot depend on this crate.
     fn redo_handlers(&self) -> Vec<Box<dyn RedoHandler>>;
+
+    /// M3 Stage G reservation (tech-selection §9): freshness watermark of
+    /// this AM's contents — the WAL LSN up to which the AM reflects the base
+    /// table. The planner/executor will use it to decide "index scan vs.
+    /// full-table fallback" for asynchronously-maintained Tier 2 indexes.
+    ///
+    /// **Default `None` = "no freshness tracking"**, which is also the
+    /// correct answer for every synchronous AM (heap, B+Tree): they are
+    /// maintained in-transaction, so they are always fresh and never need a
+    /// planner fallback decision. The default means this reservation changes
+    /// NOTHING about the existing AMs. Tier 2 implementations are expected
+    /// to answer from a `pg_storage::tier2::WatermarkRegistry`.
+    fn freshness(&self) -> Option<Lsn> {
+        None
+    }
 }
 
 /// AMs that support tuple updates.
