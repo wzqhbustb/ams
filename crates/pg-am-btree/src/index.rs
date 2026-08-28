@@ -307,6 +307,51 @@ thread_local! {
     /// One-shot (auto-clears). Never set outside tests.
     #[doc(hidden)]
     pub static SPLIT_COMMIT_ROOT_CKPT_HOOK: Cell<bool> = const { Cell::new(false) };
+
+    /// Test hook (slot-0 stale-verdict regression, `test-hooks` feature):
+    /// while true **in the current thread**, `pin_leaf_for_insert`'s
+    /// no-non-empty-left branch parks inside the drop-and-re-latch window
+    /// (cur's latch dropped, not yet re-acquired) until
+    /// [`SLOT0_WINDOW_RELEASE`] is set, so a paired thread can land an
+    /// insert in the exact window the slot-0 re-validation covers.
+    /// Thread-local so parallel tests cannot consume each other's arming.
+    /// Never set outside tests.
+    #[doc(hidden)]
+    pub static SLOT0_WINDOW_PARK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Cross-thread signals for [`SLOT0_WINDOW_PARK`] (see there): `ENTERED`
+/// counts parkings (the paired thread waits for the first one),
+/// `RELEASE` ends the park. Global (not thread-local) because the two
+/// parties are different threads; only the arming test touches them.
+/// Compiled only under `test-hooks`.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static SLOT0_WINDOW_ENTERED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static SLOT0_WINDOW_RELEASE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Park inside the slot-0 re-latch window while [`SLOT0_WINDOW_PARK`] is
+/// armed (see there). Bounded so a broken pairing cannot wedge the thread.
+/// Compiled only under `test-hooks`.
+#[cfg(feature = "test-hooks")]
+fn slot0_window_hook() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    if !SLOT0_WINDOW_PARK.with(|c| c.get()) {
+        return;
+    }
+    SLOT0_WINDOW_ENTERED.fetch_add(1, AtomicOrdering::SeqCst);
+    let mut spins = 0usize;
+    while !SLOT0_WINDOW_RELEASE.load(AtomicOrdering::SeqCst) {
+        std::thread::yield_now();
+        spins += 1;
+        if spins > (1usize << 28) {
+            break;
+        }
+    }
 }
 
 /// Consume one injected undo-cascade failure (see [`UNDO_CASCADE_FAILURES`]);
@@ -1406,7 +1451,12 @@ impl BTreeIndex {
     ///   our right boundary — so we hold the nearest non-empty RIGHT
     ///   sibling's write latch through the apply (coupled rightward, which
     ///   needs no drop). If its first entry sorts at or below the probe,
-    ///   the placement moves right instead.
+    ///   the placement moves right instead. cur itself was unlatched while
+    ///   the left neighborhood was probed, so its slot-0 position is
+    ///   RE-VALIDATED after the re-latch (a concurrent insert may have
+    ///   claimed cur's left edge in the window; inserting at the stale
+    ///   slot 0 would break the page's `(key, tid)` order and mask a
+    ///   `DuplicateKey`); a failed re-validation restarts the placement.
     /// - the chain holds no non-empty page at all: nothing exists to
     ///   invert with; no side latch is taken.
     ///
@@ -1605,7 +1655,31 @@ impl BTreeIndex {
             // No non-empty page left of cur: re-latch cur and hold the
             // nearest non-empty RIGHT sibling through the apply (see the fn
             // doc for the mirror race this closes).
+            #[cfg(feature = "test-hooks")]
+            slot0_window_hook();
             guard = self.buffer_pool.pin_mut_without_fpi(cur_id)?;
+            // Re-validate cur itself, exactly as the left-neighbor branch
+            // above does: cur was UNLATCHED between the slot computation
+            // and this re-latch, so a concurrent insert may have claimed
+            // its left edge in the window. Without this check the caller
+            // would insert at the STALE slot 0, ahead of an entry that
+            // sorts below the probe — breaking the page's (key, tid) order
+            // (and silently duplicating an exact re-insert instead of
+            // failing DuplicateKey). Restart the placement; the recomputed
+            // slot lands interior (pos > 0) and returns immediately.
+            let still_left_edge = {
+                let page = as_page_mut(&mut guard);
+                let count = SlottedPage::slot_count(page);
+                if count == 0 {
+                    true
+                } else {
+                    let (fk, ft) = page::decode_leaf_entry(entry_bytes(page, 0)?)?;
+                    (fk, ft) > (key, *tid)
+                }
+            };
+            if !still_left_edge {
+                continue;
+            }
             let mut rnext = BtreePage::next(as_page_mut(&mut guard))?;
             let mut right = None;
             while rnext != PageId::INVALID {

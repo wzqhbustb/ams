@@ -80,3 +80,83 @@ fn stale_prev_boundary_misplacement() {
     assert_eq!(all, want, "key 51 run out of order across the boundary");
     index.validate().unwrap();
 }
+
+/// Regression for the concurrent lost-key family root cause: a slot-0
+/// (left-edge) insert whose placement verdict went STALE across
+/// `pin_leaf_for_insert`'s drop-and-re-latch window used to land at slot 0
+/// even after a concurrent insert claimed the page's left edge in the
+/// window — breaking the page's `(key, tid)` order (validate's "entries
+/// out of order"), which then stranded keys across splits ("key lost
+/// across the split", "scanner missed committed key") and inverted
+/// duplicate-run tid order.
+///
+/// Deterministic: thread A inserts the LARGER key into the empty root
+/// leaf, which routes through the slot-0 protocol; the test hook parks A
+/// inside the unlatched window until the main thread has landed the
+/// SMALLER key — strictly inside the window. Pre-fix, A then inserts at
+/// the stale slot 0 and `validate` fails with "entries out of order at
+/// slot 1"; post-fix, A's re-validation restarts the placement and key 1
+/// lands at slot 1.
+#[test]
+fn slot0_insert_revalidates_after_relatch_window() {
+    use pg_am_btree::index::{SLOT0_WINDOW_ENTERED, SLOT0_WINDOW_PARK, SLOT0_WINDOW_RELEASE};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+    let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+    let meta_page = {
+        let am = BTreeAM::new(
+            Arc::clone(engine.buffer_pool()),
+            Arc::clone(engine.wal_writer()),
+        );
+        am.create_index(REL_OID, ColumnType::Int4)
+            .unwrap()
+            .meta_page()
+    };
+
+    SLOT0_WINDOW_ENTERED.store(0, Ordering::SeqCst);
+    SLOT0_WINDOW_RELEASE.store(false, Ordering::SeqCst);
+
+    // Thread A inserts the LARGER key: it lands at slot 0 of the empty
+    // root leaf and parks in the drop-and-re-latch window holding NO latch.
+    let pool = Arc::clone(engine.buffer_pool());
+    let wal = Arc::clone(engine.wal_writer());
+    let a = std::thread::spawn(move || {
+        SLOT0_WINDOW_PARK.with(|c| c.set(true));
+        let am = BTreeAM::new(pool, wal);
+        let mut index = am.open_index(REL_OID, meta_page, ColumnType::Int4).unwrap();
+        index.insert(&key(1), tid(1)).unwrap();
+    });
+
+    // Wait (bounded) for A to park inside the window, then land the
+    // SMALLER key — strictly inside A's unlatched window.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while SLOT0_WINDOW_ENTERED.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "thread A never reached the slot-0 re-latch window"
+        );
+        std::thread::yield_now();
+    }
+    {
+        let am = BTreeAM::new(
+            Arc::clone(engine.buffer_pool()),
+            Arc::clone(engine.wal_writer()),
+        );
+        let mut index = am.open_index(REL_OID, meta_page, ColumnType::Int4).unwrap();
+        index.insert(&key(0), tid(0)).unwrap();
+    }
+    SLOT0_WINDOW_RELEASE.store(true, Ordering::SeqCst);
+    a.join().unwrap();
+
+    let am = BTreeAM::new(
+        Arc::clone(engine.buffer_pool()),
+        Arc::clone(engine.wal_writer()),
+    );
+    let index = am.open_index(REL_OID, meta_page, ColumnType::Int4).unwrap();
+    assert_eq!(index.lookup(&key(0)).unwrap(), Some(tid(0)));
+    assert_eq!(index.lookup(&key(1)).unwrap(), Some(tid(1)));
+    index.validate().unwrap();
+}
