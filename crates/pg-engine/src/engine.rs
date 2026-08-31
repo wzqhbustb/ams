@@ -2246,8 +2246,10 @@ impl Engine {
     /// transaction ends. In auto-commit mode the locks are stamped with the
     /// statement's own short-lived transaction and released when it
     /// commits — allowed, but only meaningful inside an explicit
-    /// transaction (same as PG). `FOR SHARE` parses but returns
-    /// [`EngineError::Unsupported`] (multixact is a later stage).
+    /// transaction (same as PG). `FOR SHARE` (M2c Stage S "multixact
+    /// lite") likewise takes `RowExclusive` and stamps each result row
+    /// with a shared row lock (`HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_IS_SHARE`);
+    /// the row stays visible to all snapshots.
     ///
     /// # Query statistics (M3 Stage E, tech-selection §6.3)
     ///

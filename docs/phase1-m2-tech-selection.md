@@ -387,6 +387,12 @@ hint 回写路径必须**先**读 CLOG（读到已提交或已回滚），才允
 **理由**：Phase 2 HNSW 存 4KB 向量必须走 TOAST；不做 TOAST 则 M2 到 Phase 2 之间要
 返工整个 tuple 编码。
 
+（Supersede 注，2026-08-31：上述"必须走 TOAST"的假设已被 Phase 2 M4 设计取代——
+HNSW 向量自存于 `pg-am-hnsw` 自有节点存储，与 `pg-am-heap` 零依赖，不走 heap TOAST；
+且 M2 实际只交付了指针编解码，chunk 表 I/O 未实现、写路径从不触发。现状为大值内联至
+单页容量、超限 `TupleTooLarge` 响亮报错。heap TOAST chunk I/O 本体归 Phase 4a，
+完整决策记录见 ROADMAP.md "Phase 2 · TOAST 决策"。）
+
 **代价**：Catalog 需要 `reltoastrelid` 字段；TOAST 表的可见性判断复用主表的 xmin/xmax
 （TOAST tuple 头也是 64 字节，与主表一致）。
 
@@ -870,6 +876,9 @@ M1 `WalRecord::encode` 限制单条 payload ≤ 64KB，而 100K 活跃事务的 
 - M1 `CheckpointEndRecord`（`record.rs:122-130`）**v1 payload = 3 字段**：`checkpoint_lsn / next_page_id / next_txn_id`；M2 **v2 payload = 6 字段**（新增 `next_oid / att_file / dpt_file`）。
 - **版本判定通道**：复用 `WalRecord.flags: u16` 的**高 4 位**作为 record payload version（低 12 位保留给 record 自身 flags）。M1 已写入 `flags=0`，故所有 M1 record 隐式为 v1。M2 emit CheckpointEnd 时写 `flags = (1 << 12)`（version=1，M2）。
 - **decode 分支**：`CheckpointEndRecord::decode(bytes, flags)` 按 `flags >> 12` 分派：
+  （实现偏离脚注，2026-08-31：M1 冻结的 32B 记录头实际为 `flags: u8`，代码以
+  **u8 高 4 位 `flags >> 4`** 分派——`crates/pg-storage/src/wal/record.rs:676`；
+  偏离原因见 record.rs `CHECKPOINT_END_VERSION_V2` 注释，coding-plan Stage N 表已如实记录）
   - `0`（v1，来自 M1）：只读 3 字段，`next_oid` 默认 `16384`（PG 保留 OID 上限），`att_file / dpt_file` 默认空串。Analysis 阶段遇到空 `att_file` 视作"无活跃事务快照"，从 checkpoint_lsn 起做 full scan 重建 ATT。
   - `1`（v2，来自 M2）：读全 6 字段。
 - **前向 crash 保护**：M2 首次启动若读到 M1 v1 CheckpointEnd，走上述默认值路径，不写回 v2 格式（保持 recovery 只读性）；直到 M2 自己下一次 emit CheckpointEnd 才升级为 v2。
@@ -1228,10 +1237,10 @@ pub trait Vacuumable {
 
 明确推迟到后续阶段的内容：
 
-- **HOT chain 完整实现**：M2c 有基础版；HOT prune 推迟到 M3 vacuum
+- **HOT chain 完整实现**：M2c 有基础版；~~HOT prune 推迟到 M3 vacuum~~（口径回改，2026-08-31：M3 实际交付为整链回收、**部分死链不 prune**——M3 O3 决策，prune 需 LP_REDIRECT 页格式变更；归 Phase 7 随页格式演进，见 ROADMAP 附录技术债登记）
 - **数据页 checksum**：M1 现状（无）延续到 M2；Phase 7 引入
 - **Row-level Security predicate**：Phase 6
-- **Sequence（自增列 SERIAL）**：M3
+- **Sequence（自增列 SERIAL）**：~~M3~~（口径回改，2026-08-31：M3 O6 决定不做；归 Phase 4a，ROADMAP 已补录）
 - **触发器 / 存储过程**：Phase 4a
 - **CTAS / MATERIALIZED VIEW**：Phase 4a
 - **VACUUM FULL / CLUSTER**：Phase 7a

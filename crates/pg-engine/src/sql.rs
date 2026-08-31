@@ -20,9 +20,9 @@
 //!   `<>`/`!=` (only `=` / `<` / `>`), parenthesized expressions, and
 //!   arithmetic in statements.
 //! - `FOR NO KEY UPDATE` / `FOR KEY SHARE` (only the bare `FOR UPDATE` /
-//!   `FOR SHARE` forms). `FOR SHARE` parses but execution fails with
-//!   `Unsupported` — shared row locks need multixact, a later stage
-//!   (tech-selection §9.1).
+//!   `FOR SHARE` forms). `FOR SHARE` is fully implemented since M2c
+//!   Stage S ("multixact lite"): it stamps a shared row lock
+//!   (`HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_IS_SHARE`) on each result row.
 
 #![allow(missing_docs)]
 
@@ -76,8 +76,9 @@ pub enum Statement {
 pub enum LockClause {
     /// `FOR UPDATE`: exclusive row lock via the lock-only `t_xmax` stamp.
     ForUpdate,
-    /// `FOR SHARE`: parses, but execution returns `Unsupported` — shared
-    /// row locks require multixact, deferred to a later stage.
+    /// `FOR SHARE`: shared row lock (M2c Stage S "multixact lite"):
+    /// stamps `HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_IS_SHARE` on each result
+    /// row; the row stays visible to all snapshots.
     ForShare,
 }
 

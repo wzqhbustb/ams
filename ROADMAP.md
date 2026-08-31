@@ -191,7 +191,7 @@ Phase 4b + Phase 5b + Phase 6 → Phase 7
 | Snapshot 机制 | **LSN-based snapshot**（与"单一 WAL + 单一 LSN"根契约一致）；snapshot = {xmin_lsn, xmax_lsn, active_xacts: ATT 快照}；无 XID wraparound 问题。默认隔离级别：Snapshot Isolation（SI）；RC（每语句新快照）可选；SSI 推迟到 Phase 7d |
 | Visibility Oracle | is_visible(xmin, xmax, snapshot) 统一判断，所有 AM 共享 |
 | Lock Manager | 行级锁（基于 tuple header xmax 字段，S/X 模式），表级锁（4 标准模式），等待队列 + 死锁检测（wait-for graph，100ms 周期）。IS/IX 意向锁推迟到 Phase 6 ALTER TABLE/VACUUM FULL 支持时再加 |
-| B+Tree Index | Latch coupling 读，乐观/悲观插入，叶子页分裂，实现 AccessMethod trait |
+| B+Tree Index | Latch coupling 读，乐观/悲观插入，叶子页分裂，实现 AccessMethod trait。**页合并明确不做**（只分裂不合并，删除只回收条目不回收页）：合并需 latch 左兄弟 + 父页删 downlink，违反 Blink 单向锁序（DOWN/RIGHT）的全部并发正确性论证；残留为 delete-drain 空页的有界空间膨胀（churn 实测 ~0.18 页/轮，验收界 0.25 页/轮）。归属 Phase 5b（多 AM GC 协调器——安全释放页需要 horizon 推进 + 在线增量回收 + 后台调度能力） |
 | 崩溃恢复 | 完整 ARIES 变体：Analysis → Redo → Undo，CLR 保证嵌套崩溃安全 |
 | Checkpoint | Fuzzy Checkpoint：收集 ATT+DPT，后台刷脏页，更新超级块 |
 | Full Page Image | 每个 checkpoint 周期内页首次修改时记录完整页副本，防止 torn page |
@@ -300,6 +300,12 @@ HNSW 是 6 种 AM 中工程量最大的：
 
 ### Phase 2 SQL 示例
 
+**TOAST 决策（Phase 2 前置，2026-08-31 决策，解除"隐形前置阻塞"）：**
+
+- **HNSW 向量不走 heap TOAST**：向量自存于 `pg-am-hnsw` 自有节点存储（M4 内存连续 arena，M5 节点页布局）——距离计算在图遍历热路径上，向量必须与图同驻，回堆取向量不可行。M2 选型 §四"Phase 2 HNSW 存 4KB 向量必须走 TOAST"的假设被 M4 设计（`pg-am-hnsw` 与 `pg-am-heap` 零依赖）取代。
+- **VECTOR(n) 堆内列值内联存储**：dim ≤ 2000 为上限（与 M5 单页节点布局可行域对齐），超限响亮报错；M5 开放问题 O1（超 2000 维节点页溢出方案）维持归 M5。
+- **heap TOAST chunk I/O 本体归 Phase 4a**（见 Phase 4a 交付物表）：Phase 1 现状为大值内联至单页容量、超限 `TupleTooLarge` 响亮报错——Phase 2 全程（2a/2b/2c）不依赖 heap TOAST，阻塞解除且无功能缩量。
+
 ```sql
 -- 通过 PG Wire Protocol 调用（Phase 1 M3 的最小子集即可）
 INSERT INTO memories (id, content, embedding) VALUES ('m1', 'hello', '[0.1, 0.2, ...]');
@@ -394,6 +400,8 @@ LIMIT 10;
 | 单路索引扫描 | 查询优化器能为单个谓词选择 B+Tree / HNSW / 倒排索引 |
 | PG Wire Protocol 基础版 | Simple Query + Extended Query（参数绑定），文本/二进制结果格式 |
 | EXPLAIN | 显示单路扫描计划 + 代价估算 |
+| heap TOAST chunk I/O | Phase 1 推迟项：>8KB 文本/JSONB/超维向量的溢出存储（chunk 表读写 + 主行 20B 指针解析；WAL 复用 `HeapInsert`/`HeapDelete`，指针格式已冻结）。现状为大值内联至单页容量、超限响亮报错，无非缩量。衔接 TOAST 压缩（Phase 7b） |
+| Sequence（SERIAL） | Phase 1 裁剪项（M2 §十八曾列 M3、M3 O6 决定不做）：`nextval`/`currval` + 目录登记，DataFusion SQL 层就位后落地 |
 
 ### 验证标准
 
@@ -526,7 +534,7 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 | 时间范围查询 | WHERE created_at BETWEEN ... AND ... 自动路由到时序索引 | Phase 4a（planner 路由） |
 | Graph AM（轻量版） | 邻接表存储，支持有向/无向边，边属性（JSONB），3 跳以内 BFS/DFS | Phase 4a（SQL 层就绪） |
 | 图查询语法 | SQL 扩展（LATERAL 递归或类 Cypher 子句） | Phase 4a |
-| 多 AM 统一 GC 协调器 | 统一的 Vacuum 协调：基于 oldest_active_snapshot 推进，回收死元组时通知所有引用该 TID 的索引。**含 Vacuum 在线化**：heap/B+Tree 的在线渐进式 vacuum 作为协调器的第一个消费者落地（页级 TOCTOU 判定重验证、节流/背压、增量进度追踪、后台调度生命周期）；M3 的离线 vacuum 交付物（水位线注册表、压实原语、索引通知路径、`HeapCleanup`/`PageFree` WAL 族）全部作为其底层能力直接复用 | ≥2 个 AM 落地（与 4b 正交） |
+| 多 AM 统一 GC 协调器 | 统一的 Vacuum 协调：基于 oldest_active_snapshot 推进，回收死元组时通知所有引用该 TID 的索引。**含 Vacuum 在线化**：heap/B+Tree 的在线渐进式 vacuum 与 **B+Tree 页合并 + 页内死空间压实**（Phase 1 M2 推迟项：delete-drain 空页合并 + 页释放、叶页死空间回收，需突破单向锁序并复用 horizon 安全判定）作为协调器的第一批消费者落地（页级 TOCTOU 判定重验证、节流/背压、增量进度追踪、后台调度生命周期）；同窗口清偿的 Phase 1 小项：vacuum 索引清理批量/按页合并接口（替代逐条随机下探）、无锁读者跨 relation 页复用的 chain 代际校验、vacuum 崩溃窗口②消窗（unlink→free 间崩溃的单页泄漏，需 PageFree payload 版本化）；M3 的离线 vacuum 交付物（水位线注册表、压实原语、索引通知路径、`HeapCleanup`/`PageFree` WAL 族）全部作为其底层能力直接复用 | ≥2 个 AM 落地（与 4b 正交） |
 | 图参与 Fusion | 图遍历结果可与向量/全文/结构化联合检索 | Phase 4b（MultiIndexScan 算子） |
 | 时序参与 Fusion | 时序索引加入 MultiIndexScan，支持"最近 7 天 + 语义相似 + 关键词匹配"组合 | Phase 4b |
 
@@ -572,6 +580,9 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 | RLS（Row Level Security） | Agent 级别的行级安全策略，多 Agent 数据隔离 |
 | 多租户配额 | Agent 维度的存储/查询配额限制 |
 | IS/IX 意向锁 | 支持 ALTER TABLE / VACUUM FULL 等表级操作与行级操作协调 |
+| 完整 multixact | Phase 1 推迟项：共享行锁的持久段存储、页外成员集合、崩溃后精确恢复（当前为单 bit + 内存持有者注册表简版，崩溃即弃靠"死 XID 章视为 aborted"兜底）。同窗口落地 lock_timeout / NOWAIT / SKIP LOCKED |
+| 子事务与语句级回滚 | Phase 1 裁剪项：SAVEPOINT / failed-txn 态 / 语句失败不毁事务；落地时重审 EPQ（EvalPlanQual）与 cmin/cmax combo CID、`lock_tuple` 覆盖 `t_cid` 有损三处挂账 |
+| 系统表化与目录扩容 | pg_type 族 catalog 探针（psql `\d` 可用）、QueryStats 系统表化（替代内存 ring buffer）、Catalog 多页化（解除系统表单页容量上限，当前 ~70–80 表触顶报 CatalogFull） |
 
 ### 验证标准
 
@@ -614,6 +625,22 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
   "合法空洞即 WAL 结尾"。**解决方向**：引入类 PostgreSQL 的 WAL page header（含
   `xlp_pageaddr` 连续性校验 + page magic），使 receiver 能通过 page header 判断页面
   是否完整接收。此项必须在 WAL Shipping 实现前落地。
+- **WAL/Recovery 加固专项（Phase 1 残留一簇，修复方案均已记录在 stage_spec）**：
+  ① ~~回收页撕页暴露~~ **已提前至 Phase 2 M4 修复**（2026-08-31 决策：Phase 2 新 AM
+  上线后页回收更频繁、暴露概率上升，见 docs/phase2-m4-coding-plan.md）；
+  ② split-CLR redo 同构不对称窗口（`force_reload_from_disk`
+  修复模式已知）；③ WAL 撕裂尾 header 自 CRC（PG xl_crc 模式，消除 payload_len
+  bit-rot 放大的静默截断窗口）；④ `reserve_and_append` >32B 洞漏检（推进前校验
+  payload 长度 + IO 失败毒化 writer）；⑤ `open_at` 起始段缺失的 warn + 空基线降级
+  未实现；⑥ analysis/replay catch-all 对 `MetadataCorrupted`/`WalReadFailed` 仍
+  warn+break 的静默截断面。
+- **目录损坏修复工具**：系统页头损坏且已有用户 DDL 时当前拒绝打开且无修复路径
+  （自愈 rewrite 会孤儿化用户表）；7a 备份恢复工具族一并交付。
+- **恢复性能**：三遍全量扫描合并（find_latest 可短路）+ undo 两处全页扫描
+  （`scan_split_incomplete_pages`/`find_parent_page`）大库恢复 I/O 优化。
+- **长跑稳定性专项**：并发 crash 1000 轮、100 conn × 60min 挑战档纳入 7a 验收
+  （Phase 1 未执行项，命令见 docs/phase1-m2-benchmarks.md §复现）；loser 索引补偿的
+  WAL 段回收边界随 WAL archiving 落地自然消解。
 
 ### Phase 7b：性能与压缩（3–4 个月）
 
@@ -624,6 +651,8 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 | SIMD 全面优化 | 覆盖所有距离函数、B+Tree 比较、CRC 校验 |
 | io_uring | Linux 异步 I/O |
 | 大页内存 | 减少 TLB miss |
+| Phase 1 性能债清偿 | batch commit 摊薄 fsync（M1/M2 未达标项根治）、commit/checkpoint barrier 收窄到临界段、ClogBuffer 分片、allocation_lock 下去 fsync 等待、B+Tree 悲观写"安全节点"提前释放、hint bit 写回接线（替代每次 CLOG 查询）、CLOCK-Pro / freelist bitmap / WAL 段复用与压缩 / 多文件数据存储、TOAST 压缩（LZ4/PGLZ，前提是 Phase 4a 的 TOAST 本体） |
+| B+Tree 结构维护 | tid 分隔符（重复 key 跨内部页 ~20 万同 key 退化根治）+ stale 内部分隔键间隙楔死根治（分隔键维护/内部层左跳协议，消除持久响亮 Unsupported 面）；落地前以概率论证 + REINDEX 逃生门为既定口径 |
 
 ### Phase 7c：完整 CBO（4–6 个月）
 
@@ -762,3 +791,91 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 | 连接协议 | **PG Wire Protocol 最小子集（Phase 1 M3 起）+ Extended Query（Phase 4a）** | SQL 是 Agent 已经熟悉的接口（pgvector/Qdrant 都用 SQL）；Phase 1 M3 实现最小子集仅需 ~500 行 Rust 代码 |
 | PG Wire 实现 | 自研（参考 PostgreSQL 官方协议文档 + pgwire crate） | 协议消息类型多但每条简单；~3000 行 Rust 可覆盖 psql/SQLAlchemy/Prisma 兼容；自研可控性高 |
 | 图索引 V1 | 邻接表 + B+Tree（Phase 5） | 先验证图语义，避免过早做原生图存储；性能不足时再引入专用 Graph AM |
+
+---
+
+## 附录：Phase 1 遗留技术债登记（2026-08-31 补录）
+
+Phase 1（M1/M2/M3）收口时全部以"预留接口 + 文档声明"形式挂账的推迟项，此处统一登记
+phase 归属。标 ✅正文 的项同时已写入对应 phase 的交付物表/前置技术债节（双向可追溯）；
+其余以此表为唯一归属记录。出处均为 `docs/stage_spec.md` 各 stage"已知残留与后续归队"
+小节与代码注释，逐项核实于 2026-08-31。
+
+### A 类：正确性相关
+
+| # | 事项 | 状态 | 归属 |
+|---|------|------|------|
+| A1 | 回收页撕页暴露（freelist 复用页 `needs_fpi=false` 假设不成立） | 未处理，修复候选已列 | **Phase 2 M4**（2026-08-31 决策提前：Phase 2 新 AM 页回收更频繁、暴露概率上升；修复候选 = split_prepare 对复用右页补 log_page_init，见 docs/phase2-m4-coding-plan.md） |
+| A2 | split-CLR redo 同构不对称窗口（四连条件触发） | 理论残留，修复模式已知 | Phase 7a 加固专项 ✅正文 |
+| A3 | WAL 撕裂尾 header 无自 CRC（payload_len bit-rot 静默截断面） | 接受（CRC 兜底），方案已知 | Phase 7a 加固专项 ✅正文 |
+| A4 | `reserve_and_append` 可留 >32B 洞逃过 reader 前探 | 待修，方案已写 | Phase 7a 加固专项 ✅正文 |
+| A5 | `open_at` 起始段缺失 warn + 空基线降级未实现 | 完全未做 | Phase 7a 加固专项 ✅正文 |
+| A6 | replay catch-all 对特定错误仍 warn+break（pub API 直调静默截断面） | 有兜底不完备 | Phase 7a 加固专项 ✅正文 |
+| A7 | WAL LSN 空洞 vs WAL Shipping 连续性校验 | 有方案未实现 | Phase 7a（前置技术债，原有记录）✅正文 |
+| A8 | stale 内部分隔键间隙楔死（耗尽重启预算 → 插入持久响亮 Unsupported） | 响亮失败兜底；stage_spec 归属记录自相矛盾（Q 说归 S，S 未做），以此表为准 | Phase 7b（B+Tree 结构维护）✅正文；此前口径 = 概率论证 + REINDEX 逃生门 |
+| A9 | Catalog 单页容量上限（~70–80 表触顶报 CatalogFull） | 有保护性兜底 | Phase 6（Catalog 多页化）✅正文 |
+| A10 | 目录系统页损坏 + 已有用户 DDL → 拒开且无修复工具 | 响亮失败兜底 | Phase 7a（目录修复工具）✅正文 |
+| A11 | 裸 `Engine::scan`/`index_lookup` 不取 AccessShare，与 DDL 有竞态缺口 | 已文档化 | Phase 4a（SQL 层接管后裸 API 收敛或加锁） |
+| A12 | 裸 `txn_manager()` commit 不释放表锁（XID/horizon 泄漏面） | 已文档化 | Phase 4a（同 A11 一并收敛） |
+| A13 | panic 泄漏链（panic=abort/forget 钉死 horizon） | 已核销为既定进程级语义 | —（改 panic 策略时需重估） |
+| A14 | 无锁读者撞跨 relation 页复用窗口（MVCC 兜底，一次可重试错误） | 观察项 | Phase 5b（读者侧 chain 代际校验）✅正文 |
+| A15 | vacuum 崩溃窗口② 单页泄漏（消窗需 PageFree payload 版本化） | 既定取舍，测试钉死口径 | Phase 5b（在线化时消窗）✅正文 |
+| A16 | loser 索引补偿的 WAL 段回收边界 | 已知边界 | Phase 7a（随 WAL archiving 自然消解）✅正文 |
+| A17 | 虚假 DeadlockVictim 残余窗口 | 已核销（语义安全可重试） | — |
+| A18 | 跨页 UPDATE 空间复查重启无上界 | 观察项（对手有进展必终止） | Phase 7b 复核 |
+| A19 | `lock_tuple` 覆盖 `t_cid` 有损（当前 executor 不可达） | TODO 挂账 | Phase 6（随子事务/EPQ 重审）✅正文 |
+
+### B 类：性能债
+
+| # | 事项 | 归属 |
+|---|------|------|
+| B1 | fsync 封顶全家（WAL 吞吐 / 并发 TPS / heap INSERT 未达标；根治 = batch commit + O_DIRECT + io_uring） | Phase 7b ✅正文（batch commit 已点名） |
+| B2 | commit/checkpoint barrier 写锁覆盖整个 checkpoint | Phase 7b ✅正文 |
+| B3 | ClogBuffer 全局单锁（命中也写锁 + 锁内 I/O） | Phase 7b ✅正文 |
+| B4 | allocation_lock 下等组提交 fsync | Phase 7b ✅正文 |
+| B5 | hint bit 写回 no-op（每次 tuple 访问一次 CLOG 查询） | Phase 7b ✅正文 |
+| B6 | B+Tree 悲观写全路径 X latch（无"安全节点"提前释放） | Phase 7b ✅正文 |
+| B7 | CLOCK-Pro / freelist bitmap / WAL 段复用与压缩 / 多文件数据存储 / fallocate | Phase 7b ✅正文 |
+| B8 | 恢复三遍全量扫描合并 + undo 两处全页扫描 | Phase 7a（恢复性能）✅正文 |
+| B9 | 行锁唤醒盖戳无公平性 | 接受（与 PG 行为一致），需要时再做 |
+| B10 | vacuum 索引清理逐条随机下探 O（死行×索引数） | Phase 5b（批量/按页合并接口）✅正文 |
+| B11 | 快照 registry 全局单锁 | 已验收无显著回归；分片备选保留，Phase 7b 复核 |
+| B12 | TOAST 压缩（LZ4/PGLZ） | Phase 7b ✅正文（前提：Phase 4a 的 TOAST 本体） |
+
+### C 类：功能裁剪
+
+| # | 事项 | 归属 |
+|---|------|------|
+| C1 | B+Tree 页合并（delete-drain 空页有界膨胀 ~0.18 页/轮，验收界 0.25） | Phase 5b ✅正文 |
+| C2 | B+Tree 页内死空间压实（`remove_entry_at` 只缩 LP 数组） | Phase 5b ✅正文 |
+| C3 | 重复 key 跨内部页退化（~20 万同 key；tid 分隔符根治） | Phase 7b ✅正文 |
+| C4 | 唯一索引不执行 / 无 DROP INDEX / 无多列索引 | Phase 4a（SQL 层就绪后落地） |
+| C5 | 在线建索引（当前阻塞式 bulk load + Exclusive 表锁） | Phase 5b（复用在线化基础设施：后台调度 + 节流 + 追赶写入；暂定归口） |
+| C6 | 子事务 / 语句级回滚 / 事务内 DDL | Phase 6 ✅正文 |
+| C7 | EPQ（EvalPlanQual） | Phase 6（随子事务重审）✅正文 |
+| C8 | cmin/cmax combo CID | Phase 6（随子事务重审）✅正文 |
+| C9 | TOAST chunk 表 I/O 未实现（M2 承诺 Stage I 交付未兑现） | **Phase 4a ✅正文**；Phase 2 不依赖（向量自存 + dim ≤ 2000 内联，见 Phase 2 TOAST 决策） |
+| C10 | SSI | Phase 7d（原有记录）✅正文 |
+| C11 | IS/IX 意向锁 | Phase 6（原有记录）✅正文 |
+| C12 | 完整 multixact（持久段 + 页外成员 + 崩溃精确恢复） | Phase 6 ✅正文 |
+| C13 | lock_timeout / NOWAIT / SKIP LOCKED | Phase 6 ✅正文 |
+| C14 | Sequence（SERIAL）（M2 文档曾列 M3，M3 O6 决定不做） | Phase 4a ✅正文 |
+| C15 | 执行器只有 seq scan / SQL 硬编码子集 | Phase 4a/7c 路线图主线，非债 |
+| C16 | pg-wire 细项：流式结果集、slow-loris 防护/读超时/连接上限/优雅关闭、protocol 版本协商、CancelRequest/BackendKeyData、Timestamptz/Uuid 真 OID | Phase 4a（Extended Query 同窗口）/ Phase 6（完整协议） |
+| C17 | psql catalog 探针（`\d`/`pg_type` 族） | Phase 6（系统表化）✅正文 |
+| C18 | QueryStats 系统表化 / 跨进程 live 诊断 / 死锁检测器 tracing 告警 / 数据目录锁活性检测 / waldump 段长自描述 | Phase 6 ✅正文 / Phase 4a / Phase 7a / Phase 7a / Phase 7a |
+| C19 | segment/tier2 契约桩、WAL record 100-111 硬失败 | Phase 2/3/5 各自主线，刻意防护，非债 |
+| C20 | RLS/触发器/存储过程/CTAS/MV/并行查询/逻辑复制/XID freeze | Phase 6 / 4a / 4a / 4a / 4b+ / 7d / 永不做（M2 §十八原有记录） |
+
+### D 类：工程/文档债处理记录
+
+| # | 事项 | 处理 |
+|---|------|------|
+| D1 | FOR SHARE 过期注释（sql.rs×2、engine.rs×1） | **已清偿 2026-08-31**（注释对齐 Stage S 实现） |
+| D2 | M2 文档口径漂移（§十八 HOT prune / Sequence） | **已清偿 2026-08-31**（口径回改 + 指向本登记） |
+| D3 | stage_spec `flags >> 12` 残留笔记 | **已清偿 2026-08-31**（核实实现为 u8 `flags >> 4`，笔记改为已核实状态；tech-selection §11.4 加偏离脚注） |
+| D4 | 长跑未执行：btree 1h soak / 100conn×60min / 并发 crash 1000 轮 | **执行中 2026-08-31**（三项已启动，结果落盘 docs/phase1-m2-benchmarks.md §复现）；后续同类长跑归 Phase 7a 稳定性专项 ✅正文 |
+| D5 | 测试补强项（post-copy 插入回归输入、段回收/快照损坏/checkpoint 介入 split/二次崩溃/mid-checkpoint kill 覆盖） | Phase 7a 稳定性专项 |
+| D6 | loom 模型未覆盖多级树父页递归 split | 需要时专项（随 Phase 7a 评估；线程压测兜底维持） |
+| D7 | CI 无 nightly benchmark job | **已清偿 2026-08-31**（`.github/workflows/bench-nightly.yml`，criterion `--quick`；baseline 回归比对归 Phase 4b） |
+| D8 | 手动三客户端矩阵不进 CI / `m3_wal_bytes_probe` 无断言 | Phase 4a（驱动兼容矩阵随 Extended Query 进 CI） |

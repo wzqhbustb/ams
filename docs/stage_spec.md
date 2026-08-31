@@ -242,7 +242,7 @@ split 的 Copy redo 语义是"从既有左页重算搬运"，bulk load 的页是
 - both-past 跳过的回归测试输入不含 post-copy 插入，对新旧行为不可区分（待补强）
 - 测试缺口：小段 + 段回收、快照 CRC 损坏降级、孤儿快照、checkpoint 介入 split 三步、恢复中二次崩溃
 - `evict_frame` 刷盘失败帧泄漏（pre-existing，非本 stage 引入）→ **已修复**（Stage Q 终审：改为先刷盘后摘映射）
-- coding plan Stage N 表格 `flags >> 12` 系笔误（实现为 `>> 4`），待回写
+- ~~coding plan Stage N 表格 `flags >> 12` 系笔误（实现为 `>> 4`），待回写~~ **已核实**：`>> 12` 出自 tech-selection §11.4（其假设 `WalRecord.flags: u16`，版本号占高 4 位）；M1 已冻结 32B 记录头为 `flags: u8`，实现实际取 u8 高 4 位 `flags >> 4`（`pg-storage/src/wal/record.rs` `CheckpointEndRecord::decode`，偏离原因已在 `CHECKPOINT_END_VERSION_V2` 文档注释注明），coding plan Stage N 表格已如实记录 `>> 4`，无需再回写
 - ~~kill -9 撕裂尾部被误判 WAL corrupted~~ **已修复（Stage T 压测抓出）**：writer 被 kill 时记录只写了前缀、预分配段的未写部分读回全零 → CRC 失败被当中段损坏。修复：`is_torn_tail` 双重判定（header LSN == 读取位置 + 记录之后全零）放行撕裂尾部，中段真损坏维持硬报错；真实现场前后对照验证 + 两个确定性单测
 
 ---
