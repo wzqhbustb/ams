@@ -129,7 +129,7 @@ impl Catalog {
     /// happen to decode as `Dead` silently hides every row, and a torn
     /// tuple region fails decode outright. After read-back, the snapshot is
     /// therefore validated against the fixed bootstrap content
-    /// ([`Catalog::validate_content`]).
+    /// (`Catalog::validate_content`).
     ///
     /// A validation failure splits two ways (Stage K):
     ///

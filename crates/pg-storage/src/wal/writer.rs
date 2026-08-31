@@ -61,7 +61,7 @@ impl WalWriter {
     ///
     /// Checkpoints may have recycled segments older than the redo point; the
     /// resume scan therefore starts at the oldest segment still on disk (see
-    /// [`Self::discover_resume_lsn`]), so a `wal` directory whose numbering
+    /// `Self::discover_resume_lsn`), so a `wal` directory whose numbering
     /// does not start at segment 0 is handled correctly. Callers that know
     /// the checkpoint redo LSN should prefer
     /// [`Self::open_with_scan_start`]: the oldest retained segment can begin

@@ -2,7 +2,7 @@
 //!
 //! Finishes incomplete B+Tree splits detected during redo. Each incomplete
 //! split reached Prepare (and optionally Copy) but never Commit before the
-//! crash. The handler calls [`finish_incomplete_split`] to complete the
+//! crash. The handler calls `finish_incomplete_split` to complete the
 //! split, which emits a `BTreeSplitCLR` so the result is durable.
 //!
 //! # Detection beyond the WAL tail (post-Stage-S review H3)
@@ -14,7 +14,7 @@
 //! and the page's `SPLIT_INCOMPLETE` flag would stay set forever (writes to
 //! that key range wedge on the restart budget; for a root split the whole
 //! index). The undo pass therefore additionally **scans allocated pages for
-//! the flag** ([`scan_split_incomplete_pages`]). A page scan is consistent
+//! the flag** (`scan_split_incomplete_pages`). A page scan is consistent
 //! with the existing undo cost model (`find_parent_page` already scans
 //! `1..next_page_id` per finished split) and recovery is rare and
 //! single-threaded. The alternatives were rejected: persisting an

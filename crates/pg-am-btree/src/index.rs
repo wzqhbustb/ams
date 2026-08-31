@@ -40,7 +40,7 @@
 //!   smaller/reused tid inserted into a boundary run would strand at the
 //!   right leaf's slot 0, breaking chain order and the `DuplicateKey` check
 //!   (Stage T deadlock-stress + final-review findings; see
-//!   [`BTreeIndex::descend_to_leaf_for_insert`]). Lookups and deletes keep
+//!   (`BTreeIndex::descend_to_leaf_for_insert`). Lookups and deletes keep
 //!   the unrestricted left walk — they LOCATE an existing entry, which a
 //!   split-boundary duplicate run can legitimately place on either side of
 //!   a separator — plus one extension: an empty leaf with a left sibling

@@ -1815,7 +1815,7 @@ impl Engine {
     ///
     /// 1. Take the table's `AccessExclusive` lock under a short-lived
     ///    **maintenance XID**, auto-commit style — the `create_table` /
-    ///    `drop_table` precedent: [`Self::auto_commit`] allocates the XID,
+    ///    `drop_table` precedent: `Self::auto_commit` allocates the XID,
     ///    enters the active set, and routes both the success and the
     ///    failure path through `release_all(xid)`, so the lock's lifetime
     ///    is the maintenance transaction's. Then take the vacuum horizon

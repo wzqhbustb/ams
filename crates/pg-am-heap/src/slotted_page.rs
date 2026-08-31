@@ -123,7 +123,7 @@ impl SlottedPage {
     ///
     /// Infallible: derives the count from `pd_lower` arithmetic only. A
     /// corrupted header yields a garbage count but never panics; mutation and
-    /// dereference paths go through [`SlottedPage::checked_header`] instead.
+    /// dereference paths go through `SlottedPage::checked_header` instead.
     pub fn slot_count(page: &[u8; PAGE_SIZE]) -> usize {
         let header = Self::header(page);
         (header.pd_lower as usize).saturating_sub(PAGE_HEADER_SIZE) / LINE_POINTER_SIZE
@@ -236,7 +236,7 @@ impl SlottedPage {
     /// Never panics on a corrupted header: `pd_lower` is clamped into the
     /// page before the LP array is walked (same policy as
     /// [`SlottedPage::slot_count`]); mutation paths validate geometry via
-    /// [`SlottedPage::checked_header`] instead.
+    /// `SlottedPage::checked_header` instead.
     pub fn first_fit_slot(page: &[u8; PAGE_SIZE]) -> Option<u16> {
         let header = Self::header(page);
         let pd_lower = (header.pd_lower as usize).min(PAGE_SIZE);

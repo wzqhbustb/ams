@@ -18,7 +18,7 @@
 //!   `t_xmax` stamp it is blocked on (§9.1 step 5a registry).
 //! - **Table-lock edges** — for every table, each queued waiter → every
 //!   granted holder whose mode conflicts with the waiter's mode
-//!   ([`LockMode::conflicts_with`]).
+//!   ([`LockMode::conflicts_with`](crate::lock_manager::LockMode::conflicts_with)).
 //!
 //! A waiter blocked ONLY by FIFO queue position (its mode is compatible with
 //! the granted set, but a conflicting request is queued ahead of it) gets NO

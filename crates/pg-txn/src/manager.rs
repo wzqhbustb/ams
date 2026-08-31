@@ -543,7 +543,7 @@ impl TxnManager {
     ///
     /// Returns immediately when `blocking_xid` is already terminated
     /// (committed/aborted XIDs are removed from the active set by
-    /// [`Self::end_txn`]). Spurious wakeups are handled by looping on the
+    /// (`Self::end_txn`). Spurious wakeups are handled by looping on the
     /// predicate; the wakeup sources are `end_txn`'s broadcast and the
     /// deadlock detector's [`Self::notify_row_waiters`] (Stage R).
     ///

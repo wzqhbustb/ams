@@ -224,7 +224,7 @@ pub struct HeapHotUpdateRecord {
 /// Payload for a `HeapCleanup` record (M3 Stage B, tech-selection §4.5):
 /// physical compaction of one heap page plus an optional page-chain unlink.
 ///
-/// Redo calls the SAME [`SlottedPage::compact`](pg_am_heap) the online path
+/// Redo calls the SAME `SlottedPage::compact` (pg-am-heap) the online path
 /// uses, with the same arguments — replay convergence is "replay =
 /// re-execute the same physical operation" (§4.5 重放收敛性), never a
 /// parallel reimplementation. `dead_slots` is therefore written in ascending

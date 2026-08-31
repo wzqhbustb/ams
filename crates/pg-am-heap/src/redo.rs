@@ -5,7 +5,7 @@
 //! [`HeapUpdateHandler`], [`HeapDeleteHandler`], [`HeapHotUpdateHandler`],
 //! [`HeapCleanupRedoHandler`]. They are
 //! stateless — the buffer pool and page allocator arrive via [`RedoContext`] —
-//! so [`crate::heap_am::HeapAM::redo_handlers`] can hand fresh boxes to the
+//! so `HeapAM::redo_handlers` can hand fresh boxes to the
 //! recovery registry (which `pg-storage` cannot construct itself, as it must
 //! not depend on this crate).
 //!

@@ -74,7 +74,7 @@ impl WalReader {
     /// zero header (uninitialized padding) is treated as a clean end-of-WAL
     /// marker, and so is a CRC-failing record that is provably a torn tail
     /// (header pins it to this position, nothing but zeros after it — see
-    /// [`Self::is_torn_tail`]): a crash can interrupt the writer mid-record,
+    /// (`Self::is_torn_tail`): a crash can interrupt the writer mid-record,
     /// and the preallocated segment makes the unwritten remainder read back
     /// as zeros instead of a short read. Any other decode or CRC failure is
     /// returned as an error.

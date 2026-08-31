@@ -667,6 +667,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - share 持有者注册表（H5）条目在真实 delete/update 盖戳时由 gate 的 `note_stamp_overwrite` **即时摘除**（非惰性）；惰性修剪只覆盖崩溃持有者残留（死 XID 章视为 aborted 兜底）——盖章在摘除后失败会在两者间留一个无注册项的锁章，仅延迟等待、无正确性影响（P2-4 实测澄清）
 - `m2b_crash_rounds` 默认 25 轮（CI 口径），plan 的 1000 轮口径需手工跑 → Stage T 的崩溃自动化承接
 - ~~Multixact 简版记不住共享锁持有者集合，因此不支持"多个事务同时持共享锁后其中之一升级"~~ **已修复（H5）**：堆 AM 内存持有者注册表支持 share/share 共存与升级等待；仍归 Phase 6 的是完整 multixact（持久段、成员集合溢出的页外存储、崩溃后仍精确的持有者恢复——当前注册表崩溃即弃，靠"死 XID 章视为 aborted"兜底，与无 WAL 锁章的设计一致）
+- **✅ C2 级联路径专项深审（2026-08-28,Phase 2 前置清偿）**：`finish_incomplete_split` / `ensure_downlink_slot` / `split_page_in_undo` / `apply_split_clr` 全路径逐行审计，**未发现正确性缺陷**。此前未独立验证的关键声明逐条复核成立：① `choose_split_slot` 返回值域限定 `(1..count)`（index.rs:3144），级联右页首项读取不存在越界面；② 落侧选择 `entry_cmp(.., false)` 走内部页 `(key, child)` 全序，与在线级联同规则；③ level 降序 + 左页 id 决胜键的排序使级联永不撞上仍带 `SPLIT_INCOMPLETE` 标志的页（`split_page_in_undo` 的响亮报错确为不可达防御）；④ 互为递归深度以 4-bit level 上界（`ensure_root_promotion_fits` 双调用点齐备）；⑤ 级联每级独立 CLR + 前像 FPI + 完整刷盘，崩溃于级联中途的再收敛（重放已完成 CLR 为幂等空转、原始 split 重推导落点）逻辑闭合；⑥ redo 与 undo 共享 `apply_split_clr` 且 CLR redo 清 tracker，与 H3 页扫描的标志判据互不矛盾。测试覆盖映射（`btree_undo_clr` 13/13 绿，57s）：三种收尾计划（Move/NoMove/Unlink）、C1 窗口内插入落左/落右、窗口内删除、级联父满/级联中途崩溃注入/多级级联、H3 扫描双形态——无覆盖缺口。两条非阻塞观察：**(a)** 级联产生的孤儿页（unlink 的空右页、崩溃轮次间重复分配的右孪/新根保留页）按轮泄漏数页，与"既定泄漏"哲学一致但未在泄漏清单中显式列名，已补记于此；**(b)** `choose_split_slot` 的 `PageFull` 兜底在 undo 期意味着恢复失败（库打不开）——键长上界论证其不可达，但它是"恢复响亮失败"面，若将来放宽 `MAX_INDEX_KEY_BYTES` 需重估
 
 ---
 
