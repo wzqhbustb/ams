@@ -805,8 +805,8 @@ phase 归属。标 ✅正文 的项同时已写入对应 phase 的交付物表/�
 
 | # | 事项 | 状态 | 归属 |
 |---|------|------|------|
-| A1 | 回收页撕页暴露（freelist 复用页 `needs_fpi=false` 假设不成立） | 未处理，修复候选已列 | **Phase 2 M4**（2026-08-31 决策提前：Phase 2 新 AM 页回收更频繁、暴露概率上升；修复候选 = split_prepare 对复用右页补 log_page_init，见 docs/phase2-m4-coding-plan.md） |
-| A2 | split-CLR redo 同构不对称窗口（四连条件触发） | 理论残留，修复模式已知 | Phase 7a 加固专项 ✅正文 |
+| A1 | 回收页撕页暴露（freelist 复用页 `needs_fpi=false` 假设不成立） | **已修复 2026-08-31（M4 Stage A）**：审计确认唯一未覆盖消费者为 btree 在线 split 右页，在 `split_prepare_on_guards` 单一收口点补 `log_page_init`（post-image FPI）；红→绿测试两枚（`btree_split_crash.rs`：FPI 先于 Prepare 断言 + 手工撕页恢复）；`new_page` 统一处理方案经论证否决（FPI 双门控时序，理由见 buffer_pool.rs:424 注释） | ~~Phase 2 M4~~ **已清偿** |
+| A2 | split-CLR redo 同构不对称窗口（四连条件触发）；2026-08-31 审计追加同族项：undo 路径两处新根预留（`index.rs:3421/3607`）仅余"首 sector 新、其余撕裂"的通用撕页窗口；2026-08-31 review 再登记两条：① (FPI, record) 间 checkpoint begin 微窗口（checkpoint begin 落在 log_page_init 与 Prepare 两条相邻 append 之间时 redo 从 begin LSN 起跳过该 FPI，全系统 ensure_fpi 调用对同型存在，A1 已把暴露面收窄到纳秒级窗口；候选根治：redo 点 = min(begin_lsn, DPT 最小 rec_lsn)，或 FPI+owning record 对 checkpoint_lsn 发布原子化）；② `force_reload_from_disk` 信任撕裂盘镜像的 pd_lsn（`redo.rs:254-258`,Stage D 遗留——anchor-mismatch 分支以 `disk_lsn >= record.lsn` 放行盘上镜像，撕裂页 pd_lsn 不可信；根治需页校验和或 Copy 后对右页补 post-image FPI) | 理论残留，修复模式已知 | Phase 7a 加固专项 ✅正文（同族项随本项一并处理） |
 | A3 | WAL 撕裂尾 header 无自 CRC（payload_len bit-rot 静默截断面） | 接受（CRC 兜底），方案已知 | Phase 7a 加固专项 ✅正文 |
 | A4 | `reserve_and_append` 可留 >32B 洞逃过 reader 前探 | 待修，方案已写 | Phase 7a 加固专项 ✅正文 |
 | A5 | `open_at` 起始段缺失 warn + 空基线降级未实现 | 完全未做 | Phase 7a 加固专项 ✅正文 |
@@ -824,6 +824,7 @@ phase 归属。标 ✅正文 的项同时已写入对应 phase 的交付物表/�
 | A17 | 虚假 DeadlockVictim 残余窗口 | 已核销（语义安全可重试） | — |
 | A18 | 跨页 UPDATE 空间复查重启无上界 | 观察项（对手有进展必终止） | Phase 7b 复核 |
 | A19 | `lock_tuple` 覆盖 `t_cid` 有损（当前 executor 不可达） | TODO 挂账 | Phase 6（随子事务/EPQ 重审）✅正文 |
+| A20 | WAL fsync 永久失败无恢复路径（`crates/pg-storage/src/wal/writer.rs`：fsync/dup 失败 → `shutdown=true` fail-stop，之后所有 append 永久失败直至进程重启；语义安全不丢数据，但一次磁盘满/EIO 即写路径可用性悬崖——错误未上抛事务层做"abort + 上报"高层决策，也无 segment 轮换/重试；代码内 TODO(M2+) 挂账）。交互链未闭合：fsync 失败前最后一个 segment 可能已撕裂在盘上，重启 recovery 扫到该撕裂尾时与 A3（payload_len bit-rot 截断面）/ A5（起始段缺失降级）三者叠加，"fsync 失败 → 撕裂尾 → 恢复"的端到端处置口径未写 | fail-stop 兜底，无恢复路径 | Phase 7a（WAL/Recovery 加固簇；消窗候选：错误上抛高层决策 / segment 轮换重试 / 撕裂尾链式处置口径随 A3/A5 一并定） |
 
 ### B 类：性能债
 
@@ -874,8 +875,9 @@ phase 归属。标 ✅正文 的项同时已写入对应 phase 的交付物表/�
 | D1 | FOR SHARE 过期注释（sql.rs×2、engine.rs×1） | **已清偿 2026-08-31**（注释对齐 Stage S 实现） |
 | D2 | M2 文档口径漂移（§十八 HOT prune / Sequence） | **已清偿 2026-08-31**（口径回改 + 指向本登记） |
 | D3 | stage_spec `flags >> 12` 残留笔记 | **已清偿 2026-08-31**（核实实现为 u8 `flags >> 4`，笔记改为已核实状态；tech-selection §11.4 加偏离脚注） |
-| D4 | 长跑未执行：btree 1h soak / 100conn×60min / 并发 crash 1000 轮 | **执行中 2026-08-31**（三项已启动，结果落盘 docs/phase1-m2-benchmarks.md §复现）；后续同类长跑归 Phase 7a 稳定性专项 ✅正文 |
+| D4 | 长跑未执行：btree 1h soak / 100conn×60min / 并发 crash 1000 轮 | **已清偿 2026-08-31**（三项全绿：soak 3606s、挑战档 3608s、并发 crash 3911s；数字已落盘 docs/phase1-m2-benchmarks.md §复现）；后续同类长跑归 Phase 7a 稳定性专项 ✅正文 |
 | D5 | 测试补强项（post-copy 插入回归输入、段回收/快照损坏/checkpoint 介入 split/二次崩溃/mid-checkpoint kill 覆盖） | Phase 7a 稳定性专项 |
 | D6 | loom 模型未覆盖多级树父页递归 split | 需要时专项（随 Phase 7a 评估；线程压测兜底维持） |
 | D7 | CI 无 nightly benchmark job | **已清偿 2026-08-31**（`.github/workflows/bench-nightly.yml`，criterion `--quick`；baseline 回归比对归 Phase 4b） |
 | D8 | 手动三客户端矩阵不进 CI / `m3_wal_bytes_probe` 无断言 | Phase 4a（驱动兼容矩阵随 Extended Query 进 CI） |
+| D9 | `crates/pg-engine/src/sql.rs` `#![allow(missing_docs)]`（SQL parser 模块豁免 crate 级 rustdoc 纪律；D 类此前登记的都是"过期文档"，这是唯一的"缺失文档"豁免项） | 未处理：登记挂账，低优先级；补齐 sql.rs 公开项 rustdoc 后移除豁免，回归全 workspace 统一 `#![warn(missing_docs)]` 口径 |

@@ -123,8 +123,9 @@
   - ✅ 保底压测 50 conn × 100 txn/s × 30min：通过（1802.7s，终态堆↔索引一致、无泄漏）
   - ✅ 1000 轮 crash（单线程 harness，含 split-in-progress）：通过（3043s）
   - ✅ 死锁注入 1000 环（2000 迭代）：通过（每环恰好 1 victim、无环对照组 0 误报；实测最大检测延迟 ~78ms，p99 远低于 200ms 验收线；具体 p99 未单独落盘——上界即 tick 间隔 100ms）
-  - ⚠️ 挑战档 100 conn × 60min：**未执行**（保底档通过；时间成本考虑，可随时按上条命令补跑）
-  - ⚠️ 并发 crash 1000 轮：**未执行**（执行了 40 轮 × 20ms 激进 checkpoint 档，修复两个 bug 后连跑全绿；1000 轮约需数小时，留给 Stage T 后续或 Phase 7 稳定性专项）
+  - ⚠️ 挑战档 100 conn × 60min：~~未执行~~ **已执行通过（2026-08-31）**：3607.9s 全绿，83764 txns、36572 次校验 SELECT，终态一致（achieved 23 txn/s < 100 配速目标——fsync 封顶下配速达标率不足，与 WAL/TPS 未达标项同根因，稳定性验收口径为"全程无错误、终态一致"）
+  - ⚠️ 并发 crash 1000 轮：~~未执行~~ **已执行通过（2026-08-31）**：3911.4s 全绿（此前执行了 40 轮 × 20ms 激进 checkpoint 档，修复两个 bug 后连跑全绿）
+  - ✅ btree 1h soak（`BTREE_SOAK_SECS=3600`，M2c Stage Q 遗留未执行项）：**已执行通过（2026-08-31）**，3606.2s，`soak_mixed_insert_scan_no_miss` 无 miss
 - **M2c churn 基线（M3 Stage A 的性能对比基线，S2 协议）**：2026-08-21 实测
   （worktree @ 2731a8b，release）：`M2C_STRESS_SECS=300 M2C_STRESS_CONNS=100
   M2C_STRESS_TPS=100` × 5 轮取 achieved txn/s：84 / 86 / 87 / 88 / 89，

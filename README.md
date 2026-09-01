@@ -5,10 +5,12 @@ transactions, and concurrent B+Tree indexing — built toward a unified
 multi-modal engine for **AI-agent memory** (vector + full-text + graph +
 time-series, with structured metadata).
 
-> **Status (build in public):** Phase 1 M2 is complete. What exists today is a
-> working, crash-safe storage/transaction **library** — not yet a server you can
-> connect to with `psql`. The SQL wire protocol (Phase 1 M3) is the next
-> milestone. See [Roadmap](#roadmap).
+> **Status (build in public):** Phase 1 is complete (tag `phase1-m3`). What
+> exists today is a working, crash-safe storage/transaction **library** plus a
+> minimal PostgreSQL wire-protocol server — `psql` and standard PG drivers can
+> connect and run basic CRUD. Phase 2 (HNSW vector index) is now underway:
+> M4 Stage A (the `pg-am-hnsw` crate foundations) is done. See
+> [Roadmap](#roadmap).
 
 ---
 
@@ -42,16 +44,22 @@ proven.
 | Phase 1 M2a | Single-statement auto-commit + heap + B+Tree | ✅ done |
 | Phase 1 M2b | Multi-statement transactions + MVCC (SI) | ✅ done |
 | Phase 1 M2c | Lock management + deadlock detection + concurrent B+Tree | ✅ done |
-| Phase 1 M3 | Vacuum + observability + minimal PG Wire | 🚧 next |
-| Phase 2+ | HNSW, inverted index, fusion, … | 📋 planned |
+| Phase 1 M3 | Vacuum + observability + minimal PG Wire | ✅ done |
+| Phase 2 M4 | In-memory HNSW foundations (`pg-am-hnsw`) | 🚧 in progress (Stage A done) |
+| Phase 2 M5+ | HNSW WAL + persistence, concurrency, … | 📋 planned |
 
 ## Architecture
 
-Six library crates, strictly layered (a lower layer never depends on a higher
-one):
+Seven library crates in the stack, strictly layered (a lower layer never
+depends on a higher one), plus a wire-protocol server on top. `pg-am-hnsw`
+(Phase 2 M4, in progress) is a standalone eighth crate that joins the AM layer
+when persistence lands in M5:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
+│  pg-wire     PostgreSQL v3 wire protocol (Simple Query) │
+│              psql / PG drivers can connect (pg-server)  │
+├─────────────────────────────────────────────────────────┤
 │  pg-engine   top-level assembly: catalog + AMs + txn    │
 │              SQL-string execution, DDL/DML, checkpoint  │
 ├─────────────────────────────────────────────────────────┤
@@ -90,6 +98,13 @@ one):
 - **Observability (M3)**: the `QueryStats` ring buffer records only the SQL
   text path (`Engine::exec`); the typed API (`Engine::scan` / `insert` /
   `update` / `delete`, …) is deliberately NOT counted (tech-selection §6.3).
+- **PG Wire (M3)**: a minimal PostgreSQL v3 wire-protocol server (`pg-server`)
+  — Simple Query + text results, trust auth. `psql`, psycopg2, node-postgres
+  and rust-postgres can connect and run CRUD + transactions. Extended Query /
+  COPY / TLS land in Phase 4a/6.
+- **Vacuum (M3)**: offline `Engine::vacuum(table)` — dead-tuple scan at a
+  snapshot-registered horizon, index cleanup, in-page compaction and page
+  freeing. Online/incremental vacuum is Phase 5b.
 
 ## Quick start
 
@@ -131,8 +146,10 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-**Requirements:** Rust 1.86+ (MSRV). No database server process — the engine
-runs inside your process.
+**Requirements:** Rust 1.86+ (MSRV). The engine runs inside your process; an
+optional `pg-server` binary (`cargo run -p pg-wire --bin pg-server -- <addr>
+<data-dir>`) exposes the same engine over the PostgreSQL wire protocol for
+`psql` / PG drivers.
 
 ## Roadmap & progress
 
@@ -141,8 +158,8 @@ The full plan (with rationale, time estimates, and risk register) is in
 
 | Phase | What it delivers | Status |
 |-------|------------------|--------|
-| **1 — Storage base + row store + tx + B+Tree** | Page / WAL / BufferPool (M1) · MVCC + crash recovery + locking (M2) · vacuum + observability + minimal PG Wire (M3) | ✅ M1, M2 done · 🚧 M3 next |
-| **2 — HNSW vector index** | in-memory graph (2a) → WAL + persistence (2b) → concurrency control (2c) | 📋 planned |
+| **1 — Storage base + row store + tx + B+Tree** | Page / WAL / BufferPool (M1) · MVCC + crash recovery + locking (M2) · vacuum + observability + minimal PG Wire (M3) | ✅ done (tag `phase1-m3`) |
+| **2 — HNSW vector index** | in-memory graph (2a) → WAL + persistence (2b) → concurrency control (2c) | 🚧 M4 (= 2a) underway: Stage A done |
 | **3 — Inverted index** | BM25 full-text, segment-based storage, merge | 📋 planned |
 | **4 — SQL + multi-path fusion** | DataFusion + PG Wire extended (4a) → fusion planner (4b) | 📋 planned |
 | **5a — Time-series + columnar** (parallel with 2/3/4a) | TTL partitions, columnar projection, distillation SDK stub | 📋 planned |
@@ -150,10 +167,10 @@ The full plan (with rationale, time estimates, and risk register) is in
 | **6 — Protocol + multi-agent isolation** | full PG protocol, MCP server, row-level security | 📋 planned |
 | **7 — Production** | observability, compression, CBO, high availability | 📋 planned |
 
-The next milestone is **Phase 1 M3**: basic vacuum (reclaim dead tuples), an
-observability surface (WAL dump, lock/transaction introspection, buffer-pool
-stats), and a minimal PostgreSQL wire protocol so `psql` and standard PG
-drivers can connect.
+The current work is **Phase 2 M4**: the in-memory HNSW graph (insert /
+search / neighborhood-selection heuristics), distance functions, and a
+deterministic snapshot format — Stage A (crate foundations, encoding, distance,
+PRNG) is done; Stage B (the core algorithm) is next.
 
 Per-stage design decisions and deviations from PostgreSQL are documented in
 [docs/](docs/), particularly `docs/stage_spec.md` (what was actually built).
@@ -173,7 +190,7 @@ From [ROADMAP.md](ROADMAP.md):
 
 Correctness is the priority, so the test surface is heavy:
 
-- **600+ tests** across the workspace, run in CI on both Linux and macOS.
+- **797 tests** across the workspace, run in CI on both Linux and macOS.
 - **Crash recovery**: `kill -9`-style round-trip tests that replay real WAL
   streams (checkpoint + split + HOT + lock combinations) and re-verify state.
 - **`loom` model checking**: the B+Tree latch choreography is model-checked
@@ -182,7 +199,8 @@ Correctness is the priority, so the test surface is heavy:
 - **`proptest`**: property-based tests for the page allocator and WAL record
   round-trips.
 - **CI**: `rustfmt`, `clippy -D warnings`, MSRV check, per-crate test matrix,
-  loom, and rustdoc-with-warnings-as-errors.
+  loom, and rustdoc-with-warnings-as-errors; plus a nightly criterion-bench
+  job and a coverage job (tarpaulin).
 
 ## License
 
