@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -62,7 +62,9 @@ jobs:
       # loom-aware crates must be tested with default features. Running their
       # test suites with --all-features makes every non-model test panic.
       # (M3 Stage F: pg-wire declares NO features, so it rides the
-      # all-features branch below unchanged.)
+      # all-features branch below unchanged. Phase 2 M4 Stage A: pg-am-hnsw
+      # has no loom model and declares no features either — same
+      # classification, non-loom branch.)
       - name: Test (default features — loom-gated crates)
         if: matrix.crate == 'pg-storage' || matrix.crate == 'pg-am-btree'
         run: cargo test -p ${{ matrix.crate }}
@@ -127,7 +129,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -135,3 +137,29 @@ jobs:
       - run: cargo doc -p ${{ matrix.crate }} --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  # Phase 2 M4 Stage A: coverage job (tech-selection §8.2 v1.3, §12) — there
+  # was no pre-existing coverage toolchain in this CI, so this job is new.
+  # tarpaulin requires Linux (ptrace); it cannot run on the macOS dev box,
+  # so the Stage E "coverage >= 90%" verdict comes from this CI report.
+  coverage:
+    name: Coverage (pg-am-hnsw)
+    runs-on: ubuntu-latest
+    # cargo-tarpaulin builds from source on first run (rust-cache amortizes
+    # it afterwards); the budget covers a cold cache with room to spare.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+      # Only pg-am-hnsw is instrumented — the M4 coverage gate (§12) applies
+      # to the new crate; Phase 1 crates keep their existing test jobs.
+      - name: Run tarpaulin
+        run: cargo tarpaulin -p pg-am-hnsw --out Xml --output-dir coverage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-pg-am-hnsw
+          path: coverage/cobertura.xml
+          if-no-files-found: error

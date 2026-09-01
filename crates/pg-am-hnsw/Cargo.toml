@@ -1,0 +1,21 @@
+[package]
+name = "pg-am-hnsw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust in-memory HNSW vector index — Phase 2 M4 (Stage A: encoding, distance, PRNG)"
+
+[dependencies]
+# error types
+thiserror = "2"
+
+# CRC32 prefix for the snapshot byte stream (tech-selection §7, §10: same
+# crate pg-storage's WAL/checkpoint path uses — "formats hand-written,
+# mature primitives reused")
+crc32fast = "1.3"
+
+# M4 direct dependencies are frozen at {thiserror, crc32fast} (tech-selection
+# §2 v1.5): the pg-storage edge is deferred to M5, when WAL/buffer-pool
+# integration creates a real consumer. Do not add dependencies before then.

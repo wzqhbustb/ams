@@ -548,6 +548,174 @@ fn test_root_split_on_recycled_page_crash_recovers() {
 }
 
 // ---------------------------------------------------------------------
+// Phase 2 M4 A1 (docs/stage_spec.md:879, ROADMAP.md appendix A1): a
+// freelist-recycled split right page must be FPI-logged at Prepare time
+// ---------------------------------------------------------------------
+
+/// `split_prepare` on a freelist-RECYCLED right page must emit a post-image
+/// FPI of the freshly initialized right page BEFORE the `BTreeSplitPrepare`
+/// record that names it. `BufferPool::new_page` clears `needs_fpi`
+/// unconditionally ("new page, no old image" — false for a recycled page,
+/// whose previous tenant's bytes are still on disk), so without this FPI
+/// the recycled page's first modification in the checkpoint cycle is not
+/// FPI-protected and a torn first flush is unrecoverable (the companion
+/// test below simulates exactly that tear). kill -9 cannot tear a
+/// page-cache pwrite, so the deterministic probe is the WAL shape itself;
+/// pre-fix there is no FPI for the right page anywhere in the WAL.
+#[test]
+fn test_split_prepare_logs_page_init_for_recycled_right_page() {
+    use pg_storage::wal::reader::WalReader;
+    use pg_storage::wal::record::{BTreeSplitPrepareRecord, FullPageImageRecord, WalRecordType};
+
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+    let (engine, index, _n) = create_and_fill(tmp.path(), &config);
+
+    // Previous tenant: heap-style bytes (`pd_upper == PAGE_SIZE`, no btree
+    // special space) made durable, then freed. The split's right twin pops
+    // it (freelist pop is LIFO with a single entry).
+    let victim = {
+        let mut guard = engine.buffer_pool().new_page().unwrap();
+        SlottedPage::init(guard.page_mut().try_into().unwrap());
+        guard.page_id()
+    };
+    engine.buffer_pool().flush(victim).unwrap();
+    engine.page_allocator().lock().free_page(victim).unwrap();
+
+    let st = index.split_prepare(index.root_page()).unwrap();
+    assert_eq!(
+        st.right, victim,
+        "freelist LIFO must hand the split the recycled page"
+    );
+    engine.wal_writer().flush().unwrap();
+
+    // WAL shape: a FullPageImage of the right page precedes the Prepare
+    // record that names it (the init's durability anchor).
+    let mut reader = WalReader::open(tmp.path().join("wal"), config.wal_segment_size).unwrap();
+    let mut fpis: Vec<(u64, PageId)> = Vec::new();
+    let mut prepares: Vec<(u64, PageId)> = Vec::new();
+    loop {
+        let lsn = reader.current_lsn();
+        match reader.next_record() {
+            Ok(Some(rec)) => match rec.record_type {
+                WalRecordType::FullPageImage => {
+                    let fpi: FullPageImageRecord = bincode::serde::decode_from_slice(
+                        &rec.payload,
+                        bincode::config::standard(),
+                    )
+                    .unwrap()
+                    .0;
+                    fpis.push((lsn.0, fpi.page_id));
+                }
+                WalRecordType::BTreeSplitPrepare => {
+                    let prep = BTreeSplitPrepareRecord::decode(&rec.payload).unwrap();
+                    prepares.push((lsn.0, prep.new_right_page));
+                }
+                _ => {}
+            },
+            Ok(None) => break,
+            Err(e) => panic!("WAL scan failed at {lsn:?}: {e}"),
+        }
+    }
+    let prep_lsn = prepares
+        .iter()
+        .find(|(_, p)| *p == st.right)
+        .expect("split prepare record for the right page")
+        .0;
+    assert!(
+        fpis.iter().any(|(l, p)| *p == st.right && *l < prep_lsn),
+        "the recycled right page's init FPI must precede its Prepare record \
+         (A1: without it a torn first flush is unrecoverable)"
+    );
+    drop(engine);
+}
+
+/// End-to-end consequence of the A1 fix: a power loss tears the recycled
+/// right page's post-copy flush — sector 0 (`pd_lsn`) lands from the NEW
+/// image, every later sector keeps the previous tenant's bytes. Redo then
+/// reads `pd_lsn == copy LSN`; without the init FPI the pd_lsn-guarded
+/// Prepare / Copy redo both skip, and the parent keeps a committed downlink
+/// to a half-predecessor page. With it, unconditional FPI replay restores
+/// the freshly initialized page and Prepare / Copy re-apply on top.
+#[test]
+fn test_recycled_split_right_page_torn_write_recovers() {
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+
+    let (meta_page, n, right, copy_lsn, predecessor, data_path) = {
+        let (engine, mut index, n) = create_and_fill(tmp.path(), &config);
+
+        // Previous tenant, same shape as the WAL-shape test above.
+        let (victim, predecessor) = {
+            let mut guard = engine.buffer_pool().new_page().unwrap();
+            let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+            SlottedPage::init(page);
+            let image = *page;
+            let id = guard.page_id();
+            drop(guard);
+            engine.buffer_pool().flush(id).unwrap();
+            (id, image)
+        };
+        engine.page_allocator().lock().free_page(victim).unwrap();
+
+        // Drive the root-leaf split one step at a time so the Copy LSN —
+        // the right page's final pd_lsn (Commit does not touch it) — is
+        // known exactly.
+        let st = index.split_prepare(index.root_page()).unwrap();
+        assert_eq!(st.right, victim, "the right twin must be the recycled page");
+        let copy_lsn = index.split_copy(&st).unwrap();
+        index.split_commit(&st, &mut Vec::new()).unwrap();
+        engine.wal_writer().flush().unwrap();
+        let data_path = engine
+            .page_allocator()
+            .lock()
+            .data_file_path()
+            .to_path_buf();
+        std::mem::forget(engine); // kill -9
+        (
+            index.meta_page(),
+            n,
+            st.right,
+            copy_lsn,
+            predecessor,
+            data_path,
+        )
+    };
+
+    // The torn write: sector 0 from the new (post-copy) image — its pd_lsn
+    // is the Copy LSN — over the previous tenant's remaining sectors.
+    use std::os::unix::fs::FileExt;
+    let mut torn = predecessor;
+    torn[0..8].copy_from_slice(&copy_lsn.0.to_le_bytes());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&data_path)
+        .unwrap();
+    file.write_all_at(&torn, (right.0 - 1) * PAGE_SIZE as u64)
+        .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    // Recovery: the init FPI replayed unconditionally restores the freshly
+    // initialized right page; Prepare and Copy then re-apply under the
+    // usual pd_lsn guards and the committed two-level tree comes back
+    // whole. (Pre-fix the failure is asymmetric, not "both records are
+    // skipped": Prepare IS skipped — the torn sector-0 pd_lsn already reads
+    // as the Copy LSN, which is past Prepare — but Copy takes the MAIN redo
+    // path, where `right_lsn == copy lsn` yields `move_to_right = false`
+    // (redo.rs:326-332): the left page is rebuilt by truncation WITHOUT the
+    // entries being moved anywhere, so they are silently lost and the leaf
+    // chain walks onto the previous tenant's bytes.)
+    let (engine, index) = recover(tmp.path(), &config, meta_page);
+    assert_eq!(index.tree_level(), 1);
+    assert_all_keys(&index, n);
+    index
+        .validate()
+        .unwrap_or_else(|e| panic!("torn recycled right page must recover via its init FPI: {e}"));
+    drop(engine);
+}
+
+// ---------------------------------------------------------------------
 // Stage T P0: split Commit's cycle FPIs must precede the Commit record
 // ---------------------------------------------------------------------
 

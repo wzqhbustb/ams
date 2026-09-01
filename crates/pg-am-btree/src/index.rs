@@ -2294,7 +2294,10 @@ impl BTreeIndex {
     /// §13.3 step 1: allocate the right sibling and emit + apply
     /// `BTreeSplitPrepare` (link `left.next = right`, set
     /// `SPLIT_INCOMPLETE` on the left page, initialize the right page
-    /// header). The split point is the median slot.
+    /// header). The split point is the median slot. The right page's
+    /// initialization is FPI-logged before the Prepare record — the page
+    /// may be freelist-recycled, with a previous tenant's image on disk
+    /// (A1; see `split_prepare_on_guards`).
     ///
     /// Refuses to split a page that is itself `SPLIT_INCOMPLETE`
     /// ([`BTreeError::Unsupported`]): such a page's previous split lost its
@@ -2364,13 +2367,51 @@ impl BTreeIndex {
 
         let right = right_guard.page_id();
 
-        let rec = WalRecord::btree_split_prepare(left, right, level, old_next, high_key)?;
-        let lsn = self.wal_writer.append(rec)?;
+        // A1 (docs/stage_spec.md:879, ROADMAP.md appendix A1): the allocator
+        // may hand a freelist-RECYCLED page whose previous tenant's image is
+        // still on disk, and `BufferPool::new_page` clears `needs_fpi`
+        // unconditionally — its "new page has no old on-disk image"
+        // assumption is false for a recycled page, so the page's first
+        // modification in this checkpoint cycle owes an FPI the double gate
+        // would never emit. A power loss tearing the recycled page's first
+        // flush then leaves recovery a torn image whose sector-0 `pd_lsn`
+        // can already be the Copy LSN: the pd_lsn-guarded Prepare/Copy redo
+        // would skip, and the tree would keep a half-predecessor right page.
+        // Fix here, at the single choke point every online split funnels
+        // through (the public step API, the pessimistic insert path, and
+        // cascading parent splits): initialize the right page and make the
+        // initialization durable with a post-image FPI BEFORE the Prepare
+        // record — the same pattern as `create`, `create_new_root` and
+        // `split_page_in_undo`. Unconditional FPI replay then restores the
+        // freshly initialized page no matter how the flush tore, and
+        // Prepare/Copy re-apply on top under the usual pd_lsn guards.
+        //
+        // Why not inside `BufferPool::new_page` (the other recorded
+        // candidate): the FPI gate also requires `pd_lsn < checkpoint_lsn`,
+        // but the first `pin_mut` after `new_page` only runs after the AM
+        // has already initialized the page and stamped a post-checkpoint
+        // pd_lsn, so a `needs_fpi` flag raised there would never fire in the
+        // cycle that matters. Nor can an FPI simply be forced past the gate:
+        // a post-init image landing after its owning init record is harmless
+        // in itself — the real hazard is that an FPI armed at `new_page`
+        // time stays live for the rest of the checkpoint cycle, so a
+        // third-party re-pin can fire it while the page sits in a
+        // mid-protocol state (e.g. SPLIT_INCOMPLETE, after Prepare has
+        // applied), capturing that intermediate image at a WAL position
+        // after the records that own the state — the exact inversion Stage
+        // T P0 forbids.
         {
             let page = as_page_mut(right_guard);
             BtreePage::init_right_page(page, left, old_next, level);
-            stamp_pd_lsn(page, lsn);
         }
+        log_page_init(&self.wal_writer, right, as_page_mut(right_guard))?;
+
+        let rec = WalRecord::btree_split_prepare(left, right, level, old_next, high_key)?;
+        let lsn = self.wal_writer.append(rec)?;
+        // The right page already matches the Prepare record's effects (the
+        // init above is exactly what Prepare redo re-applies); only advance
+        // its pd_lsn so redo recognizes the record as applied.
+        stamp_pd_lsn(as_page_mut(right_guard), lsn);
         {
             let page = as_page_mut(left_guard);
             BtreePage::apply_prepare_left(page, right)?;
@@ -3602,8 +3643,16 @@ fn split_page_in_undo(
         // 4-bit level bound before allocating the new root (post-Stage-S C2
         // deep review; see ensure_root_promotion_fits).
         ensure_root_promotion_fits(level)?;
-        // Reserve the new root page id; `apply_split_clr` writes its content
-        // (a full re-initialization, so no FPI is needed for it).
+        // Reserve the new root page id. Its crash safety does NOT rest on
+        // "apply_split_clr fully re-initializes it, so no FPI is needed" —
+        // that is the A1 fallacy: a torn flush of the post-CLR page could
+        // leave a garbage `pd_lsn >= clr_lsn` that the next recovery reads
+        // as "already applied", skipping the CLR. What actually makes the
+        // new root safe is `emit_and_apply_clr` (below): it appends a
+        // pre-image FullPageImage for every page the CLR touches — this one
+        // included — BEFORE the CLR; unconditional FPI replay restores the
+        // image and patches `pd_lsn` to the FPI's own LSN (still below the
+        // CLR's), so the CLR re-applies cleanly on top.
         let new_root_id = pool.new_page()?.page_id();
         let mp = find_meta_page_for_root(pool, page_allocator, left_page)?;
         (PageId::INVALID, new_root_id, mp, 1u16)

@@ -5,6 +5,7 @@ members = [
     "crates/pg-catalog",
     "crates/pg-am-heap",
     "crates/pg-am-btree",
+    "crates/pg-am-hnsw",
     "crates/pg-engine",
     "crates/pg-wire",
 ]

@@ -132,6 +132,15 @@ node := flags:u8 | reserved:u8 | vector:f32[dim] (LE) |
   `u32::MAX`(`NodeId::INVALID`);`node_count > 0` 时 `entry_point` 必须
   `< node_count` 且 `max_level` 等于入口节点的最高层号，load 端逐条校验，
   违例响亮报错。
+- **max_level 校验加严两条（v1.6，Stage A 实现比本节原文更严，以代码为准
+  回改）**:① 空图强制 `max_level == 0`（无节点即无层，非 0 即响亮报错）;
+  ② 任何节点的最高层（`level_count - 1`）不得超过 `max_level`——入口点是
+  全图最高节点。实现位置：`encoding.rs` `decode_snapshot_body` 的 load 校验
+  清单第 8/9 条。
+- **`m_max0` 校验（v1.7 闭合，原 v1.6 契约空白登记）**:`m_max0 >= m` 已加入
+  `HnswParams::new` 构造校验与快照 load 参数重跑（`m_max0 == 0` 或 `< m` 响亮
+  报错；实现：`params.rs`、`encoding.rs` 快照头校验）。Stage B 的邻居列表
+  shrink 逻辑（§4.2 的 `M_max0 = 2M` 口径）可直接消费，无契约空白。
 - **`flags:u8` 预留 M6 删除（tombstone）位，M4 恒 0**(v1.2);load 时遇非 0
   flags 即未知版本内容，响亮报错而非静默忽略。`reserved:u8` 恒 0，同口径。
 - `vector` 与 `neighbors` 同记录紧邻排布，为 M5"节点页 = 若干 node 记录"
@@ -264,10 +273,12 @@ recall;hnswlib 允许选中集少于 M 是其性能取向，我们取连通性�
 这恰是 §4.1 跨平台确定性成立的机制；可向量化的只有元素级 f32 差/方，
 收益有限。性能预期按纯标量估计，验收数字已留余量。)
 
-**入口校验（v1.3 补充）**:`insert` / `search` 拒绝 **NaN** 分量（以及
-`dim = 0` 的图构造）——NaN 让一切距离比较静默返回 false，图照常插入但
-recall 悄悄劣化，且确定性不受影响所以 §8.3 的对拍抓不到它；入口响亮报错
-是唯一防线。Cosine 的零向量报错（上表）同为此类。
+**入口校验（v1.3 补充；v1.6 加严）**:`insert` / `search` 拒绝 **NaN** 与
+**±inf** 分量（以及 `dim = 0` 的图构造）——NaN 让一切距离比较静默返回
+false，图照常插入但 recall 悄悄劣化，且确定性不受影响所以 §8.3 的对拍抓不到
+它；±inf 同型（cosine 的 `inf/inf`、L2 的 `inf−inf` 静默产出 NaN),v1.6 起
+按 `!is_finite()` 一并拒绝。入口响亮报错是唯一防线。Cosine 的零向量报错
+（上表）同为此类。
 
 **理由**：
 
@@ -329,9 +340,10 @@ Hnsw {
   v1.3 修正——与 pg-storage 既有惯例一致：`checkpoint.rs` 快照与 FreelistMeta
   均为前缀 CRC，检测 bit-rot 而非静默产出"合法但错"的图）;`save(path)` /
   `load(path)` 两个 API,load 全量校验（维度一致、NodeId 稠密、邻接端点
-  存在、**NaN 分量拒绝**——v1.4 闭环：load 也是图内容入口，我们自己的
-  save 产不出 NaN、CRC 挡位翻转，此条属 belt-and-suspenders，但"入口响亮
-  报错"（§5）应对所有入口成立），坏文件响亮报错。
+  存在、**非有限（NaN/±inf）分量拒绝**——v1.4 闭环：load 也是图内容入口，
+  我们自己的 save 产不出 NaN、CRC 挡位翻转，此条属 belt-and-suspenders，但
+  "入口响亮报错"（§5）应对所有入口成立；v1.6 起与 §5 同口径按
+  `!is_finite()` 拒绝 ±inf），坏文件响亮报错。
 
 **代价**：放弃"直接加载 hnswlib 预构建图"的便利——该便利的唯一场景是省一次
 建图时间，而 §8 的 harness 本来就要从 fvecs 原始数据建图，需求实际不存在。
@@ -520,3 +532,5 @@ Cosine/IP 的 recall 质量归 M6 真用该度量的场景验证（届时补对�
 | v1.3 | 2026-08-31 | 第三轮对抗审查修复（P2×2 + P3×6 + nano×5):§4.3 开关归属修正（extend/keep_pruned 是论文 Algorithm 4 开关、extend 全层 false;hnswlib 是无开关固定启发式——v1.0"hnswlib 默认组合、仅第 0 层 true"不成立，keep_pruned=true 改自证理由）;§8.2 CI 清单校正（matrix 实为 clippy/test/doc 三个、fmt 无 matrix）+ 新建 coverage job 入清单（tarpaulin 非现成工具链、Linux-only)+ 数据集下载走 HTTP 镜像（v1.4 证伪撤回）；§3 快照头全字段定宽 + params 语义钉死（构造期三参数入快照、ef_search_default 不进、load 采用快照参数）;§4.1 确定性实现前提钉死（构造期 (distance,NodeId) 决胜、禁 HashMap 迭代序、PRNG 状态不进快照）;§5 NaN/dim=0 入口拒绝 + 自动向量化表述修正（f64 累加不可重结合恰是确定性机制）;§7 CRC32 改前缀（对齐 checkpoint.rs/FreelistMeta 惯例）;§8.3 对拍条件改为 ef=节点数（256 死重）;§10 dev-dep 措辞与 §8.2 对齐（criterion 0.5 沿用）;§12 CI 门槛钉 ef_search=64;§4.2 充分条件补 ef 口径 |
 | v1.4 | 2026-08-31 | 第四轮审查修复（P2×1 + nano×2):§8.1 下载渠道事实修正——实测证伪"HTTP 镜像"（官方仅 FTP;CI = ftp 直连 + artifact 缓存为首选、连通性实测归 coding plan,备选自托管 release，本地 ftp 不通时手动取回 datasets/);修订记录日期全部更正为 2026-08-31（文件创建时间佐证，v1.0-v1.3 均实际发生于该日）;§7 load 校验补 NaN 分量拒绝（belt-and-suspenders 闭环 §5 入口防线） |
 | v1.5 | 2026-08-31 | 第五轮（coding-plan 审查回流）:§2 依赖落地修正——"只依赖 pg-storage"在 M4 无消费者，照原样加 = 空挂死依赖（M3 O4 立规对象）；修正为 M4 直依赖 {thiserror, crc32fast}、pg-storage 缓至 M5;§10 依赖口径澄清段同步改写（原 v1.1 段落描述的传递依赖取舍随 v1.5 不再存在，两节直接相反属冻结文档内部矛盾） |
+| v1.6 | 2026-08-31 | 第六轮（Stage A 对抗审查回流，以代码为准回改）:§3 补 max_level 校验加严两条（空图强制 `max_level == 0`；任何节点最高层 ≤ max_level；实现位于 `encoding.rs` `decode_snapshot_body` 校验清单第 8/9 条）;§3 登记 `m_max0` 全链零校验的契约空白（归 Stage B 前评估，Stage B shrink 逻辑消费 m_max0);§5 入口校验与 §7 load 校验同步加严为 `!is_finite()`(NaN 与 ±inf 同口径拒绝，cosine 的 `inf/inf` 静默 NaN 收口） |
+| v1.7 | 2026-08-31 | Stage A review 修复轮（用户确认）:§3 `m_max0` 契约空白闭合——`m_max0 >= m` 加入 `HnswParams::new` 构造校验与快照 load 参数重跑（`params.rs` / `encoding.rs` 快照头校验，负例测试两枚）；§3 v1.6 的"契约空白登记"条改写为闭合状态 |

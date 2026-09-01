@@ -423,8 +423,23 @@ impl BufferPool {
 
     /// Allocate a new page and return it pinned for writing.
     ///
-    /// The page content is zero-filled. A new page does not need an FPI
-    /// because there is no previous on-disk version to restore.
+    /// The page content is zero-filled and `needs_fpi` is cleared: the FPI
+    /// gate treats the page as having no previous on-disk version. For a
+    /// page that extends the data file that is literally true; for a
+    /// freelist-RECYCLED page the previous tenant's image is still on disk,
+    /// so the CALLER must make its initialization durable (a post-image
+    /// `FullPageImage` — the AMs' `log_page_init` pattern — before the
+    /// first modifying record), or a power loss tearing the recycled page's
+    /// first flush leaves recovery a torn image the pd_lsn-guarded redo
+    /// may skip (A1: docs/stage_spec.md:879, ROADMAP.md appendix A1). This
+    /// cannot be handled here: the FPI gate also requires
+    /// `pd_lsn < checkpoint_lsn`, and by the first re-`pin_mut` the AM's
+    /// own init has already stamped a post-checkpoint pd_lsn, so a
+    /// `needs_fpi` flag raised at allocation would never fire in the cycle
+    /// that matters. Every AM page-init path (heap `create_heap` /
+    /// `extend_chain`, btree `create` / `create_new_root` /
+    /// `split_prepare_on_guards` / `split_page_in_undo` / bulkload) logs
+    /// its init accordingly.
     pub fn new_page(&self) -> Result<PageGuardMut<'_>> {
         let page_id = {
             let mut allocator = self.page_allocator.lock();
@@ -435,9 +450,10 @@ impl BufferPool {
 
         {
             let mut meta = self.frames[frame_id.0].meta.lock();
-            // New pages have no on-disk previous version, so they do not need an
-            // FPI before the first modification. They are already pinned and
-            // referenced by alloc_frame.
+            // The FPI gate is waived for freshly allocated pages (see the
+            // doc above: true for file-extension pages; recycled pages are
+            // the caller's `log_page_init` responsibility — A1). The frame
+            // is already pinned and referenced by alloc_frame.
             meta.needs_fpi = false;
             meta.dirty = true;
         }

@@ -882,6 +882,8 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **窗口① churn 轮次的阶段④ WAL 为空**：churn 的已提交删/改条目都被 eager 维护先行删除，手驱阶段④全部 EntryNotFound；"索引清理 WAL 有实质内容"的窗口① 变体由 `m3_vacuum_crash_windows.rs`（loser 条目）覆盖
 - **性能口径**：vacuum 叠加 A 注册开销后的 churn TPS 对比见 `docs/phase1-m2-benchmarks.md` 基线条目与本 stage 验收行（S2 协议）
 - **WAL 流量观测**（压实 FPI 放大，N5）~~归 Stage G benchmark~~ **已在 Stage G 落盘**（`docs/phase1-m3-benchmarks.md` N5 节）
+- **(FPI, record) 间 checkpoint begin 微窗口**（2026-08-31 M4 Stage A 对抗审查登记）：checkpoint begin 落在 `log_page_init`（FPI）与 Prepare 两条相邻 append 之间时，redo 从 begin LSN 开始会跳过该 FPI——全系统所有 `ensure_fpi` 调用对同型存在（非 A1 修复引入），A1 已把暴露面收窄到纳秒级窗口；候选根治：redo 点 = min(begin_lsn, DPT 最小 rec_lsn)，或 FPI+owning record 对 checkpoint_lsn 发布原子化。随 Phase 7a 加固专项一并处理（ROADMAP 附录 A2）
+- **`force_reload_from_disk` 信任撕裂盘镜像的 pd_lsn**（`crates/pg-am-btree/src/redo.rs:254-258`,Stage D 遗留，2026-08-31 M4 Stage A 对抗审查登记）:Copy redo 的 anchor-mismatch 分支以 `disk_lsn >= record.lsn` 放行盘上镜像，但撕裂页的 pd_lsn 本身不可信；根治需页校验和或 Copy 后对右页补 post-image FPI。随 Phase 7a 加固专项一并处理（ROADMAP 附录 A2）
 
 ---
 
@@ -1018,3 +1020,42 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **预留 trait 零调用方**（设计使然）：`SegmentedStorage`/`WalTailReader`/`WatermarkRegistry` 仅编译桩测试消费；`freshness` 默认 None 无覆盖需求（默认值即契约）。实现期（Phase 2/3/5）首批调用方落地时补真测试
 - **手动矩阵不进 CI**（N6 既定）：客户端版本随环境漂移，CI 硬门槛维持 rust-postgres 一家；复跑命令在 benchmark 文档与 `wire_clients.rs` 头注
 - **m3_wal_bytes_probe 为测量工具**：example 非测试，无断言；N5 数字为单次实测（负载确定性高，复跑方差小），非 CI 门槛
+
+---
+
+## Stage A（M4）：pg-am-hnsw 地基（encoding / distance / PRNG / 参数校验）+ A1 清偿
+
+**状态**：✅ 完成（本 crate 52 绿；clippy/fmt/doc 全绿；全量回归见验收行；PHASE2-M4-StageA commit 随本次收口建立）
+**工期**：预估 3–4 天（v1.3 上修，含 coverage plumbing 半天）
+**验收**：`pg-am-hnsw` 52 测试全绿（encoding 编解码往返 + load-validation 负例全家 / distance 三度量 f64 累加器对拍 / rng 几何分布与显式种子确定性 / params 构造期校验负例——含收口期新增 m_max0 两枚）；A1 红→绿测试两枚（`pg-am-btree/tests/btree_split_crash.rs:550-712`：FPI 先于 Prepare 断言 + 手工撕页恢复）修复前红、修复后绿；clippy `-p pg-am-hnsw --all-targets -D warnings` 绿；`cargo fmt --all --check` 绿；doc（`RUSTDOCFLAGS=-D warnings`）绿；全量 workspace 回归 797 绿 / 0 失败（= M3 出口 743 + 本 crate 52 + A1 测试 2）。**验收第 2 条（CI 全 job 绿且新 crate 在三 matrix 实际执行，查日志非绿勾）需 push 后由 CI 闭环**——本地零命中护栏结论见交付内容 4，CI 侧覆盖在 commit 后自动生效（护栏走 `git grep`，untracked 不参与）
+
+### 交付内容
+
+1. **新 crate `crates/pg-am-hnsw`**（workspace member，1634 行 / 8 文件，52 测试全绿）：
+   - `params.rs`（152 行）：`NodeId` newtype（§3 稳定性契约：稠密递增 / 永不复用 / 快照往返稳定）+ `HnswParams` 构造期校验（§4.2/§4.4）。**含 m_max0 契约空白闭合（2026-08-31 收口期，原登记"归 Stage B 开工前评估"提前清偿）**：`m_max0 >= m` 校验入 `HnswParams::new` 与快照头 load 双路径（`encoding.rs` 头校验重跑，违例报 `Corrupted`），负例测试两枚；tech-selection §3 登记条随 v1.7 闭合
+   - `encoding.rs`（859 行）：冻结快照字节流原语（§3）——header / node-record 编解码、CRC32 前缀约定（§7，与 pg-storage WAL/checkpoint 同 crate `crc32fast`）、完整 load-validation 清单（`node_count` 上界校验、`level_count == top + 1` 恒等式、非有限分量拒绝等）；对抗 review 的 P1-1（decode `node_count` 上界）/ P1-2（`params_from_header` 的 `ef_search_default` 改显式入参）/ P2-1（`!is_finite()` 加固）落此
+   - `distance.rs`（285 行）：L2² / cosine / 负内积，f32 元素 + f64 累加器标量循环（§5）——不可重结合 f64 链即跨平台确定性机制，禁 fast-math 类优化
+   - `rng.rs`（215 行）：手写显式种子 xoshiro256** + 几何分布 level 抽取（§4.1）；不用 `rand` crate（§10）
+   - `error.rs`（51 行）：`HnswError`（thiserror，workspace 惯例）
+   - `graph.rs` / `snapshot.rs`：占位模块（Stage B / Stage C 主体，lib.rs 头注已写明归属）
+2. **A1 清偿（回收页撕页暴露，ROADMAP 债表 A1 划销）**：审计确认唯一未覆盖消费者 = btree 在线 split 右页；在 `pg-am-btree/src/index.rs` `split_prepare_on_guards` 单一收口点补 `log_page_init`（post-image FPI）；`new_page` 统一处理方案经论证否决（FPI 双门控时序，理由见 `buffer_pool.rs:424` 注释）
+3. **CI 注册五件事一次做全**（coding-plan §8.2 v1.3）：① workspace `members` 加 pg-am-hnsw；② clippy / test / doc 三 crate matrix 加 crate（fmt 单 job 无 matrix、msrv 为 workspace 级 `cargo check --workspace --all-features`，两者天然覆盖）；③ loom 豁免分支归类——本 crate 无 loom 模型、零 features，走非 loom 分支（ci.yml 注释注明）；④ 护栏核对（结论见下条）；⑤ coverage job 新建（tarpaulin，Linux-only runner，cobertura.xml artifact 上传——本机 macOS 不可跑，Stage E 覆盖率判定以 CI 报告为准）
+4. **grep 护栏核对结论（CI 任务④"预期零命中，写明核对结论"落盘，本地实测含 untracked 新 crate）**：四条全零命中——① `use parking_lot` 直引（sync-alias 护栏适用范围）；② `Snapshot {` 字面构造；③ `impl Snapshot` 块；④ `Snapshot::new_unregistered(` 调用（快照模块类型命名用 `SnapshotHeader` / `SnapshotFile` 复合名，按 v1.3 具名 hazard 规避 Snapshot 护栏误伤）。另核 `HashMap` / `parking_lot` 全量：源码零命中（唯一命中为 `graph.rs:15` 注释 "HashMap/HashSet iteration order is banned"——即禁令条文本身）
+
+### 与 pgvector·hnswlib 的 trade-off
+
+| 维度 | pgvector / hnswlib | 本实现 | 取舍 |
+|---|---|---|---|
+| 存储形态 | pgvector 页式磁盘索引（接入 PG buffer/WAL）；hnswlib 纯内存 + 自有 save/load | Stage A 纯内存 + 冻结快照字节流格式；WAL/buffer-pool 接入归 M5 | §2 既定：先把确定性内核与冻结格式钉死，存储接入晚一个 milestone；pg-storage 依赖边缓至 M5（P2-2 修正，直依赖冻结 {thiserror, crc32fast}） |
+| 随机数 | hnswlib 用 `std::mt19937` 默认种子 | 手写 xoshiro256**，显式种子贯穿 | §4.1/§10：确定性三前提之一（可复现测试 + 快照可重放），不引 `rand` crate |
+| 距离计算 | hnswlib SIMD（SSE/AVX）+ f32 累加 | 标量循环 + f64 累加器，禁重结合优化 | §5：跨平台/跨编译器位级确定优先于速度；性能优化留待 benchmark 驱动另行评估 |
+| 参数校验 | 构造期弱校验，非法参数运行期才暴露 | 构造期全量校验 + 快照 load 重跑头校验（`m_max0 < m` 拒载） | §4.2/§4.4：契约违例在边界处响亮失败，不进图结构 |
+| 快照格式 | hnswlib 自有二进制（无版本化演进契约） | 冻结字节流 + CRC32 前缀 + 完整 load-validation 清单 | §3/§7：格式即契约，坏载响亮 `Corrupted` 而非静默错图 |
+
+### 已知残留与后续归队
+
+- **encode 侧两个拒绝分支实际不可达（nano 登记，本条即登记）**：`encoding.rs:190`（`level_count > 255`）与 `encoding.rs:205`（单级邻居数 > 65535）——几何分布层级上界与 m_max/m_max0 参数上界使两分支在合法参数下不可达；Stage E tarpaulin 报告会显示未覆盖，届时用 `#[cfg(test)]` 构造触达或在覆盖率门槛登记豁免
+- **MSRV 1.86 本机不可验（P3-6 登记）**：开发机无 1.86 工具链，MSRV 仅靠 CI msrv job 把关；代码未用新语法/新 API，风险低
+- **审计分支归属偏离 plan v1.3（P3-5 登记）**：方案要求"审计 PR 只含 rustdoc + stage_spec，M4 文档从 merge 后的 main 另开 PR"；实际 `444ab9b` 已把 M4 文档（coding-plan / tech-selection）提交到审计分支，且混入 `bench-nightly.yml`（D7）与 Phase 1 收尾残留。merge 策略（整支 merge 接受偏离 vs 拆分）待用户决策
+- **graph / snapshot 为占位模块**：HNSW 核心算法（论文 Algorithm 1/2/4/5，§4/§6，含 shrink 逻辑消费 m_max0）归 Stage B；`save`/`load` 文件 API（§7）归 Stage C
+- **pg-storage 依赖边缓至 M5**（P2-2 既定）：M4 直依赖冻结 {thiserror, crc32fast}，M5 WAL/buffer-pool 集成时才有真实消费者
