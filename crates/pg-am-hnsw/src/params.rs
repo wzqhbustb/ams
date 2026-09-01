@@ -29,22 +29,45 @@ impl NodeId {
 /// part of its state — they go into the snapshot header (§3).
 /// `ef_search_default` is a query-time default (§4.4) and does **not** enter
 /// the snapshot; overriding it is a per-query action.
+///
+/// The fields are **private** (2026-08-31 second review): with `pub` fields a
+/// caller could build an unvalidated instance via struct literal or mutate
+/// after `new`, bypassing the §4.2/§4.4 invariants entirely. Read through the
+/// getters; construct through [`HnswParams::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswParams {
+    m: u16,
+    m_max0: u16,
+    ef_construction: u32,
+    ef_search_default: u32,
+}
+
+impl HnswParams {
     /// Maximum out-edges per node per non-zero layer (`M`, §4.2) — the main
     /// recall/memory knob.
-    pub m: u16,
+    pub fn m(&self) -> u16 {
+        self.m
+    }
+
     /// Maximum out-edges per node on layer 0 (`M_max0 = 2M`, §4.2); layer 0
     /// holds every node, so its cap is relaxed to protect recall.
-    pub m_max0: u16,
+    pub fn m_max0(&self) -> u16 {
+        self.m_max0
+    }
+
     /// Construction-time candidate pool size (`ef_construction`, §4.2);
     /// affects recall more than `ef_search`.
-    pub ef_construction: u32,
+    pub fn ef_construction(&self) -> u32 {
+        self.ef_construction
+    }
+
     /// Query-time default beam width (`ef_search`, §4.4). The `>= M`
     /// constraint applies to this **construction default** only — per-query
     /// `ef` may go below `M` (coding plan Stage B invariant: each query
     /// checks `ef >= k` and nothing else).
-    pub ef_search_default: u32,
+    pub fn ef_search_default(&self) -> u32 {
+        self.ef_search_default
+    }
 }
 
 impl HnswParams {

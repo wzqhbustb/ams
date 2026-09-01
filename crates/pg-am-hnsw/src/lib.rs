@@ -1,4 +1,4 @@
-//! pg_rust in-memory HNSW vector index — Phase 2 M4 (Stage A).
+//! pg_rust in-memory HNSW vector index — Phase 2 M4 (Stages A–B done).
 //!
 //! Stage A delivers the foundations every later stage builds on (coding plan
 //! Stage A; tech-selection references per module):
@@ -16,10 +16,13 @@
 //! - [`rng`]: hand-written, explicitly-seeded xoshiro256** plus the
 //!   geometric level draw (§4.1); no `rand` crate (§10).
 //! - [`error`]: [`HnswError`] (thiserror, workspace convention).
+//! - [`graph`]: the HNSW core — [`Hnsw`] with the §6 SoA layout, insert
+//!   (paper Algorithm 1) with the §4.3 heuristic on both the select and the
+//!   shrink side (Algorithm 4, one shared function), and greedy descent +
+//!   level-0 beam search (Algorithms 2/5).
 //!
-//! [`graph`] (the HNSW core — paper Algorithms 1/2/4/5, §4/§6) is Stage B;
-//! [`snapshot`] (the `save`/`load` file API, §7) is Stage C. Both are
-//! placeholder modules for now.
+//! [`snapshot`] (the `save`/`load` file API, §7) is Stage C and still a
+//! placeholder module.
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
@@ -33,4 +36,5 @@ pub mod rng;
 pub mod snapshot;
 
 pub use error::{HnswError, Result};
+pub use graph::{Hnsw, Metric};
 pub use params::{HnswParams, NodeId};

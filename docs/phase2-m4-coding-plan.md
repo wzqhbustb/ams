@@ -114,7 +114,7 @@ merge(v1.3 修正——初稿误写"已 merge")——开工前先 merge；注意
 |------|--------|
 | crate 骨架 | `crates/pg-am-hnsw/`:`Cargo.toml`(**直依赖只有 `thiserror` + `crc32fast`,pg-storage 缓至 M5——选型 §2 v1.5**)、`lib.rs`（模块布局：`error` / `params` / `encoding` / `distance` / `rng` / `graph` / `snapshot`)、`NodeId(u32)` newtype(`NodeId::INVALID = u32::MAX`)、`HnswParams { m, m_max0, ef_construction, ef_search_default }` + 构造校验（含 `ef_search_default ≥ M`)、`HnswError`(thiserror 沿用既有惯例） |
 | **CI 注册五件事（§8.2 v1.3，一次做全）** | ① workspace 根 `Cargo.toml` `members` 加 `crates/pg-am-hnsw`;② ci.yml **三个** crate matrix(clippy/test/doc——fmt 单 job 无 matrix）加 crate;③ loom 豁免分支归类（M4 无 loom 模型，走非 loom 分支）;④ 核对 grep 护栏分支（sync-alias / Snapshot 构造等）对新 crate 的适用性（预期零命中，写明核对结论；**msrv job 为 workspace 级 `cargo check --workspace --all-features`,members 注册即自动覆盖，无 per-crate 注册点**——v1.1 补注;**具名 hazard(v1.3)**：快照模块的类型命名必须避开 `Snapshot`——CI 的 Snapshot 构造护栏 grep 覆盖 pg-txn 外全部 crates,`Snapshot {` 字面构造与 `impl Snapshot` 都会误伤，`SnapshotHeader`/`SnapshotFile` 等复合名安全）;⑤ coverage job **新建**（tarpaulin,Linux-only runner,artifact 上传——本机 macOS 不可跑，Stage E 的覆盖率判定以 CI 报告为准；**此 plumbing 单独可吃半天，已计入工期上修**) |
-| 编码原语（§3 冻结） | `encoding.rs`:node 记录 encode/decode(`flags:u8 | reserved:u8 | vector:f32[dim] | level_count:u8 | per-level {count:u16 | NodeId 列表}`)、快照头定宽编解码（magic/format_version/dim/m/m_max0/ef_construction/node_count/entry_point/max_level)、CRC32 前缀封装（复用 crc32fast);**load 校验清单一次写全**:magic/version、参数校验重跑、`entry_point < node_count`（空图哨兵）、`max_level` == 入口节点最高层、`level_count == levels+1` 恒等式、NodeId 稠密、邻接端点存在、flags/reserved 为 0、**NaN 分量拒绝** |
+| 编码原语（§3 冻结） | `encoding.rs`:node 记录 encode/decode(`flags:u8 | reserved:u8 | vector:f32[dim] | level_count:u8 | per-level {count:u16 | NodeId 列表}`)、快照头定宽编解码（magic/format_version/dim/m/m_max0/ef_construction/node_count/entry_point/max_level)、CRC32 前缀封装（复用 crc32fast);**load 校验清单一次写全**:magic/version、参数校验重跑、`entry_point < node_count`（空图哨兵）、`max_level` == 入口节点最高层、`level_count == levels+1` 恒等式、NodeId 稠密、邻接端点存在**且目标拥有该边层级**（v1.8 补——Stage B 第三轮审查 P2，原清单漏检，合法 CRC 的越层级边可通过 decode 并在重建后遍历 panic)、flags/reserved 为 0、**NaN 分量拒绝** |
 | 距离函数（§5) | `distance.rs`:`l2_squared` / `cosine` / `negative_inner_product`,f32 元素 + f64 累加标量循环；已知答案测试（手工算的三维/四维向量组，含 Cosine 零向量报错、NaN 拒绝、dim=0 拒绝）+ 与 f64 参考实现的 1e-12 容差对拍——**对拍输入为 f32 值**（随机 f64 转 f32 会引入 ~1e-7 表示误差打穿容差，v1.3 钉死）；该测试的真实价值 = 证明"累加器没被意外写成 f32"(960 维下 f32 累加误差 ~1e-5 ≫ 1e-12，一抓一个准） |
 | PRNG(§4.1) | `rng.rs`:xoshiro256\*\*（公开测试向量做已知答案测试）、`next_level(m)` 封装（高 53 位转换 + `u==0.0` redraw + level 上界断言）;**确定性测试**：同 seed 两实例产同一 level 序列 |
 | **A1 回收页撕页修复（pg-storage,2026-08-31 用户决策入 M4 scope,ROADMAP 附录 A1)** | ✅ **已完成（2026-08-31）**：审计确认唯一未覆盖消费者为 btree 在线 split 右页，`split_prepare_on_guards` 单一收口点补 `log_page_init`（post-image FPI；`new_page` 统一处理因 FPI 双门控时序被论证否决，理由见 `buffer_pool.rs:424` 注释）；红→绿测试两枚（`btree_split_crash.rs`：复用右页 FPI 先于 Prepare + 手工撕页恢复），全量回归全绿。ROADMAP 附录 A1 已划销。~~原任务描述：freelist 复用页不再享受"新页无旧镜像"假设……~~ |
@@ -144,6 +144,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p pg-am-hnsw --no-deps
 
 **归属**:M4 算法主体
 **前置**:Stage A
+**状态**:✅ 完成（2026-08-31）——crate 71 测试双档全绿（debug/release）；对抗审查 P1 零 / P2×1（M6 不对称率口径修订，回改 ROADMAP + 选型 §9）/ P3×3；交付内容与已知残留见 `docs/stage_spec.md`「Stage B（M4）」归档
 **目标**：论文 Algorithm 1/2/4/5 的完整忠实实现 + 属性测试四件套 + 合成数据
 对拍全绿。这是 M4 的"心脏 stage",review 权重最高。
 
@@ -152,7 +153,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p pg-am-hnsw --no-deps
 | 图结构与层级生成 | `graph.rs`:§6 SoA 布局（`vectors` 连续 arena / `levels` / `adjacency` / `entry_point` / `max_level`);`insert` 入口：NodeId 分配（稠密递增）、层级抽签（A 的 `next_level`)、空图首节点成入口 |
 | 搜索（Algorithm 2/5) | 逐层贪心下降 + 第 0 层 ef 束搜索；候选堆与结果堆排序键 = `(distance, NodeId)`;`search(query, k, ef: Option<usize>)`；不变式钉死（v1.3):**逐查询只校验 `ef ≥ k`**（允许 ef < M);`ef_search ≥ M` 约束的是构造参数缺省（`ef_search_default ≥ M` 已在 Stage A 的 HnswParams 校验），两条互不混用；visited 用 bitset（硬约束②) |
 | 插入（Algorithm 1) | 各层邻居选择 + 双边连接 + 超限时**收缩**(shrink）同样走启发式（硬约束"两侧")；首层入口点/最大层更新 |
-| 邻居选择启发式（Algorithm 4) | `extend_candidates = false` 全层 + `keep_pruned = true`;**simple（取最近 M）对照路径**并存（编译期/构造参数开关，不进公开 API,§4.3 A/B 实验用） |
+| 邻居选择启发式（Algorithm 4) | `extend_candidates = false` 全层 + `keep_pruned = true`;**simple（取最近 M）对照路径**并存（**运行时构造参数开关**——`NeighborSelection` + `#[doc(hidden)] new_with_neighbor_selection`;reachable but unsupported：下游可达、隐藏于文档、零稳定性保证，采完 A/B 数据即可删除，§4.3 A/B 实验用） |
 | 已知小图逐步测试 | 手工构造的 5–10 节点插入序列：每步后的邻接表与论文手工推演逐步对拍（算法忠实度的最直接证据） |
 | 属性测试四件套（§9) | ① 全节点入口可达（BFS on 第 0 层）;② 双向边不对称率统计（口径建立，M6 验收复用）;③ 层分布与几何期望卡方拟合（固定 seed 确定性成立；**尾部层面期望频数 < 5,必须合并尾箱再做卡方**——v1.1 补充，不合箱的检验在统计上无效）;④ ef 单调性（合成数据）——**断言粒度为聚合均值不降，不是逐查询不降**(v1.1 修正：beam 搜索的遍历集随 ef 变化，单查询 recall 允许偶发回落，逐查询硬断言是"确定性但设计错误的 flaky") |
 | 合成数据对拍（§8.3) | 随机高斯/均匀混合数据（dim ∈ {2, 16, 128},N ∈ {1k, 10k}),`ef = 节点数` 结果与暴力扫描**完全一致**；连通性前提失败的诊断路径（先查连通性再查距离）写入测试注释 |
@@ -328,6 +329,10 @@ A (地基/CI/编码/距离/PRNG)
 | v1.4 | 2026-08-31 | 第三轮审查修复（P3×1 + nano×2):§10/§2 矛盾消解——tech-selection §10 依赖口径澄清段按 v1.5 改写（传递依赖取舍已随依赖缓期消失，冻结文档两节直接相反）;plan 头部引用升 tech-selection v1.5;两处"续插回推升 v1.5"改指 v1.6(v1.5 已被依赖修正消费，活指令版本号不可悬空） |
 | v1.5 | 2026-08-31 | Phase 2 前置 TOAST 决策补录（非对抗审查轮，用户决策）:M4/M5 不依赖 heap TOAST（向量自存节点存储、与 pg-am-heap 零依赖）;VECTOR(n) 堆内列值内联、dim ≤ 2000 上限；heap TOAST chunk I/O 归 Phase 4a——硬约束速查新增 TOAST 条、遗留与归队登记 Phase 4a 归属；同步 ROADMAP.md"Phase 2 · TOAST 决策"与 M2 选型 §四 supersede 注 |
 | v1.6 | 2026-08-31 | A1 回收页撕页修复入 M4 scope（用户决策，自 Phase 7a 加固专项提前）:Stage A 任务表新增 pg-storage 修复行（含动既有 crate 的理由与全量回归要求）;ROADMAP 附录 A1 归属同步改为 Phase 2 M4、7a 加固专项该项划销 |
+| v1.7 | 2026-08-31 | Stage B 收口登记（实现期事实回流，非对抗审查轮）:Stage B 标 ✅ 完成；选型 §9 ① 连通性按实测改写为**参数区间事实**（极端参数 shrink 斩断桥接边，B 任务表"全节点入口可达"的成立区间 = 默认/近默认参数，B2 属性矩阵已按此执行，极端参数断裂另有钉死测试）;M6 不对称率 <1% 字面口径被 B2 实测基线（聚合 15.35%）证伪，回改 ROADMAP/ROADMAP-changes 为增量口径（D10）——Stage D 的 A/B 数据采集与 Stage E 审查面不受影响 |
+| v1.8 | 2026-08-31 | Stage B 第三轮审查回流（P1×1 + P2×1 + P3×3，以代码为准）:**P1** beam 准入改完整 (distance, NodeId) 决胜（满 beam 等距小 id 候选置换大 id——原距离-only 比较让平局席位取决于发现序；break 提前终止保持论文距离-only 语义不变）+ 边界测试；**P2** Stage A 校验清单补第 10 条层级归属半句（本行上表同步）；**P3** prop1 补 directed 断言（原只断言 undirected，与"入口可达"名实不符）、prop2 加 [0.05, 0.30] 回归带（守护 15.35% 基线，原 `missing <= total` 形同虚设）、A/B 开关 `#[doc(hidden)]` 措辞精确化（reachable but unsupported：下游可达但零稳定性保证） |
+| v1.9 | 2026-08-31 | 复核遗留（nano，文档口径统一）:Stage B 任务行"编译期/构造参数开关，不进公开 API"改"运行时构造参数开关 + reachable but unsupported"，与源码 rustdoc 及选型 §4.3 v1.11 对齐 |
+| v1.10 | 2026-08-31 | Stage B 第四轮审查回流（P2×2 + P3×3）:**P2-1** Stage A 校验清单再补第 11 条（邻接表良构：严格升序/无自环/度数 ≤ m_max(level)）；**P2-2** encode/decode 对称（`validate_graph_data` 读写共用，encode 先验后写）；**P3** 属性④ ef 阶梯补 64 + 0.95 绝对下限（原阶梯跳过 §12 门槛值且只断言单调）、§8.3 对拍查询集同分布修正、IP 图层面覆盖经"连通性前提 + 可达分量精确对拍"补齐（非度量下部分可达为合法现象） |
 
 ## 第一周做什么
 

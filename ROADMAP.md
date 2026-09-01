@@ -292,7 +292,7 @@ HNSW 是 6 种 AM 中工程量最大的：
 
 **验证标准：**
 - 100 并发 INSERT + DELETE 持续运行 24 小时，图结构语义一致：
-  - 双向边不对称率 < 1%
+  - 双向边不对称率相对单线程基线的增量 < 1%（基线 = M4 Stage B 实测聚合 15.35%，逐 cell 8.9%–17.1%——HNSW shrink 单侧删边的固有不对称，hnswlib/pgvector 同量级；<1% 约束的是并发/崩溃/修复引入的**增量**，非绝对率。2026-08-31 M4 Stage B 对抗审查 P2-1 修订：原字面口径经实测证伪，正确实现也永远过不了绝对 <1%）
   - recall@10 不低于崩溃前 95%
   - 无悬挂节点（所有节点可从入口点可达）
 - 并发 abort 后 HNSW 搜索精度（recall@10）≥ 单线程基线的 95%
@@ -881,3 +881,4 @@ phase 归属。标 ✅正文 的项同时已写入对应 phase 的交付物表/�
 | D7 | CI 无 nightly benchmark job | **已清偿 2026-08-31**（`.github/workflows/bench-nightly.yml`，criterion `--quick`；baseline 回归比对归 Phase 4b） |
 | D8 | 手动三客户端矩阵不进 CI / `m3_wal_bytes_probe` 无断言 | Phase 4a（驱动兼容矩阵随 Extended Query 进 CI） |
 | D9 | `crates/pg-engine/src/sql.rs` `#![allow(missing_docs)]`（SQL parser 模块豁免 crate 级 rustdoc 纪律；D 类此前登记的都是"过期文档"，这是唯一的"缺失文档"豁免项） | 未处理：登记挂账，低优先级；补齐 sql.rs 公开项 rustdoc 后移除豁免，回归全 workspace 统一 `#![warn(missing_docs)]` 口径 |
+| D10 | M6「双向边不对称率 < 1%」字面口径被 M4 实测证伪（HNSW shrink 单侧删边固有 15% 量级有向不对称，正确实现也过不了绝对 <1%） | **已清偿 2026-08-31**（M4 Stage B 对抗审查 P2-1）：ROADMAP Phase 2 验证标准与 ROADMAP-changes A5/§3.1 改**增量口径**（基线 = Stage B 实测聚合 15.35%，<1% 约束并发/崩溃引入的增量）；tech-selection §9② 落盘基线数字 |

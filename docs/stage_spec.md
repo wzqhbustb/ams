@@ -1059,3 +1059,44 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **审计分支归属偏离 plan v1.3（P3-5 登记）**：方案要求"审计 PR 只含 rustdoc + stage_spec，M4 文档从 merge 后的 main 另开 PR"；实际 `444ab9b` 已把 M4 文档（coding-plan / tech-selection）提交到审计分支，且混入 `bench-nightly.yml`（D7）与 Phase 1 收尾残留。merge 策略（整支 merge 接受偏离 vs 拆分）待用户决策
 - **graph / snapshot 为占位模块**：HNSW 核心算法（论文 Algorithm 1/2/4/5，§4/§6，含 shrink 逻辑消费 m_max0）归 Stage B；`save`/`load` 文件 API（§7）归 Stage C
 - **pg-storage 依赖边缓至 M5**（P2-2 既定）：M4 直依赖冻结 {thiserror, crc32fast}，M5 WAL/buffer-pool 集成时才有真实消费者
+
+---
+
+## Stage B（M4）：HNSW 核心算法（graph.rs 算法主体 + 属性四件套 + 暴力对拍）
+
+**状态**：✅ 完成（crate 71 测试双档全绿；clippy/fmt/doc 零警告；全量 workspace 回归见验收行；未 commit——等用户确认，message 前缀 `PHASE2-M4-StageB`）
+**工期**：预估 4–6 天
+**验收**：`cargo test -p pg-am-hnsw` **71 绿 / 0 失败**（Stage A 52 + B1 新增 12 + B2 新增 7）；`--release` 同绿（对拍套件 release 7.4s / debug 102.5s——release 为大图耗时口径）；已知小图逐步对拍全绿（8 节点手工推演 trace，含 shrink/遮挡/tie/断边逐步断言）；属性四件套全绿（矩阵见交付内容 3）；合成对拍全等（dim{2,16,128}×N{1k,10k} + 960 维冒烟）；simple vs heuristic A/B 开关可编译可运行（`new_with_neighbor_selection`，数据 Stage D 采）；clippy `-p pg-am-hnsw --all-targets -D warnings` 绿；fmt 绿；doc（`RUSTDOCFLAGS=-D warnings`）绿；`HashMap|HashSet|parking_lot` grep 算法路径零命中（唯一命中为模块文档禁令条文）；对抗审查一轮：**P1 零** / P2×1（文档侧，已修订）/ P3×3 / nano×2（见残留）
+
+### 交付内容
+
+1. **`graph.rs` 算法主体**（17 行占位 → 1168 行，实现 ~560 + 测试 ~600）：§6 SoA 布局（vectors 连续 arena / 每节点层级 / 逐层邻接表恒按 NodeId 升序 / entry_point / max_level）；`insert`（Algorithm 1：NodeId 稠密递增 + `next_level` 抽签 + 空图首节点成入口 + 逐层贪心下降 + 各层选择/双边连接/超限 shrink + 入口更新仅当新节点更高）；`search`（Algorithm 2/5：候选 min-heap `Reverse<Cand>` + 结果 max-heap，`Cand` 全序 = `(distance, NodeId ascending)`，break 条件距离-only 与论文一致；逐查询只校验 `ef ≥ k`，`ef=None` 走构造缺省）；`select_neighbors`（Algorithm 4：`extend_candidates=false` 全层 + `keep_pruned=true` 按距离升序补位；**选择侧与收缩侧同一函数**，`Cand::dist` 单点承载参考点角色——shrink 侧以 owner 向量重算距离）；visited = `Vec<u64>` bitset；入口校验 funnel 到 `metric.distance(v,v)` 自距离（复用 §5 冻结校验唯一实现，NaN/±inf/cosine 零向量/维度错全覆盖）；u32 NodeId 耗尽提前一格拒绝（保 INVALID 哨兵）
+2. **A/B 对照开关**：`NeighborSelection { Heuristic, Simple }` + `#[doc(hidden)] new_with_neighbor_selection`（运行时构造参数，不进公开 API 契约——Stage D probe 同二进制环境变量切档用）；`Hnsw::new` 恒 Heuristic
+3. **属性测试四件套**（`tests/hnsw_properties.rs` + `tests/common/mod.rs`，多 seed × 多 dim × 多 N 矩阵）：① 入口可达（默认参数区间 10 cell 全成立；**参数区间事实**入注释——极端参数 M=2/M_max0=2/ef_c=4 下 shrink 斩断桥接边，N=300 有向可达仅 3，另设钉死测试断言该已知行为）；② 不对称率口径建立（**默认参数聚合 15.35%，逐 cell 8.9%–17.1%**——M6 复用）；③ 层分布卡方（N=20k，M=4×2 seed + M=16×1 seed，尾箱按期望 <5 合并、df=bins−1、α=0.001 标准表，全过）；④ ef 单调性（k=10，ef 阶梯 {10..320}，3 cell × 64 查询，**聚合均值不降**口径）
+4. **合成数据暴力对拍**（`tests/hnsw_bruteforce.rs`）：MixtureGen 高斯/均匀混合（复用 crate xoshiro，零新依赖）；`ef=节点数` flood 与暴力 oracle 全等（L2 主矩阵 + Cosine cell + k=10 前缀切片 + 960 维 N=1k 冒烟）；§8.3 诊断顺序（先连通性后距离）写入代码与注释
+5. **对抗审查两轮 + 修复清零**：第一轮 P1 零（Algorithm 1/2/4/5 逐行无偏差——break 键、堆方向、shrink 参考点、下降起始层、M_max0/M_max 口径、keep_pruned 基准、入口更新时机逐项排除）；**P2-1（文档侧，已修订）**：M6「不对称率 <1%」字面口径被 ② 的实测基线证伪（shrink 单侧删边固有不对称，hnswlib/pgvector 同量级），ROADMAP Phase 2 验证标准 + ROADMAP-changes A5/§3.1 改**增量口径**，tech-selection §9 落盘基线，ROADMAP 债表 D10 登记清偿；**P3-1** 注释笔误（40→300 节点）已修；**P3-2** oracle 局限注记已落 `common/mod.rs`；**P3-3** visited 分配登记（见残留）。**第二轮（换攻击面：负距离/退化数据/极端参数/确定性缝隙/整数边界/Stage C 读面，行为 bug 仍为零）**：P1-1 `HnswParams` 字段私有化（pub 字段可经字面量/事后变异完全绕过 §4.2/§4.4 校验——与 m_max0 空白同类；16 处 getter 化，含首轮机械漏改的 9 处）；P3 手工推演注释块三处中间推理修正（期望表与代码均正确，错在推导文字：step 5 幻影候选 `(25,0)` 与遮挡归功、step 4 伪平局"钉死严格性"不成立、step 7 括号注自相矛盾）+ prop3 seed 201 卡方 17.516 登记补落测试注释；nano×6 全修（rng m≥2 release 行为入 doc / 入口追踪测试补入口身份断言 / simple 模式注释过强改写 / Cand 注释维度上界改述 / 卡方临界表覆盖界注记 / lib.rs 头注分期）。另：第二轮前的顺手修复——insert 去 clone（先连边后发布新节点邻接，语义等价论证入注释）、`into_sorted_vec` 化、邻接非扁平 CSR 登记（见残留首条）。**第三轮（beam 决胜序/快照层级校验/属性断言强度）**：P1 `search_layer` 准入改完整 (distance, NodeId) 决胜（满 beam 等距小 id 置换大 id worst——原距离-only 让平局席位取决于发现序；break 提前终止保持论文距离-only）+ 手工构造图边界测试（红→绿成立）；P2 §3 校验清单第 10 条补层级归属（level-L 边要求目标 `level_count > L`）+ 合法 CRC 越层级边负例——新校验当场抓获 encoding fixture 自身的语义非法（node 2 的 level-1 边指向只有 level 0 的 node 1，fixture 生而带病，随修）；P3×3：prop1 补 directed 断言（原名实不符：只断言 undirected）、prop2 加 [0.05, 0.30] 回归带守护 15.35% 基线（原 `missing <= total` 形同虚设）、A/B 开关 `#[doc(hidden)]` 措辞精确化（reachable but unsupported：下游可调但零稳定性保证）
+
+6. **第四轮审查（快照良构性/读写对称/测试强度）+ 修复清零**：**P2-1** §3 校验清单补第 11 条——邻接表良构性（严格升序无重复无降序 / 无自环 / 度数 ≤ m_max(level)）：`push_edge` 的 binary_search 以规范序为前提，缺失时 Stage C 重建会静默插错位；实测 `[1,1,0]` 畸形流可干净通过旧 decode；**P2-2** 写入/读取对称——`validate_graph_data` + `SnapshotHeader::validate_construction_params` 提取为读写共用，encode 先验后写（原 encode 接受自己读不回的头部：`node_count:0, entry_point:7` 可正常编码、decode 才失败；负例 `encode_rejects_unloadable_header` 钉死）；**P3×3**：prop4 ef 阶梯补 64（§12 门槛值，原阶梯恰好跳过）+ 0.95 绝对下限（原只断言单调，均匀退化也能过）；对拍/属性的查询集改同分布（沿同一 MixtureGen 流续抽——另起生成器会重抽簇心，实测 recall@10 0.989 vs 1.000 @ ef=64）；IP 图层面覆盖补齐——`flood_search_ip_metric_respects_reachable_component`：ef=N 洪泛恰返回有向可达分量（1889/2000 钉死为区间观测，IP 非度量下部分可达合法）且逐位全等。四轮合计：P1×2 / P2×4 / P3 与 nano 若干，全部修复或登记清零。（过程如实登记：第四轮重构 `directed_reachable_count` 时曾引入 `.len()` 误用——计数恒等 node_count，被 prop1 极端参数钉死测试当场抓获（directed 300 > undirected 9 在数学上不可能），钉死测试正是为此而设；已修为逐位计数并复跑全绿）
+
+### 与 pgvector·hnswlib 的 trade-off
+
+| 维度 | pgvector / hnswlib | 本实现 | 取舍 |
+|---|---|---|---|
+| 排序决胜 | hnswlib 距离比较为主，并列行为实现定义 | 全链路 `(distance, NodeId ascending)` 全序（堆 Ord / 最终排序 / 补位） | §4.1 确定性三前提：同 seed 同插入序列 = 字节级同构图，测试钉死 |
+| visited 结构 | hnswlib visited-list pool + 代际戳复用 | 每次 `search_layer` 调用分配 `Vec<u64>` bitset（1M 节点 = 125KB/次） | M4 无并发无复用需求，简单优先；Stage D 基准若显示分配可测再做代际戳复用（P3-3 登记） |
+| 启发式开关 | hnswlib 无开关固定启发式 | `NeighborSelection` A/B 对照路径 doc-hidden 并存 | §4.3 A/B 实验用；不进公开 API，simple 路径随时可删 |
+| 双向边不对称 | 同型固有（shrink 单侧删边），文档不承诺阈值 | 实测基线 15.35% 落盘，M6 验收改增量口径 | 口径冲突由 M4 实测提前引爆（P2-1），避免 M6 红灯误诊 |
+| M_max0/M_max | hnswlib：select 侧 M、shrink 侧 M_max/M_max0 | 同语义全程统一（select 含第 0 层用 M，shrink 第 0 层 M_max0） | 忠实论文/hnswlib；审查逐项核对无偏差 |
+
+### 已知残留与后续归队
+
+- **邻接存储非扁平 CSR（第二轮 review D1 登记）**：`vectors` 是真连续 arena，但邻接为 `Vec<Vec<Vec<NodeId>>>`——每节点每层一个独立小堆分配（1M 节点 ≈ 百万级小 allocation），缓存局部性与建图耗时可能在 Stage D 的 1M benchmark 显形；届时用数据决定是否改扁平 CSR（offsets + 连续边数组），改动同时波及 §3 编码对应与 node_adjacency 读面，需过修订记录
+- **visited bitset 每调用分配**（P3-3 登记）：insert 每层 O(N) 清零；release 全套 1.4s 实测无碍；Stage D 建图耗时进预算时改 `&mut` 复用 + 代际戳
+- **暴力 oracle 经 `g.vector(id)` 取向量**（P3-2 登记，注记已落代码）：arena 索引 bug 会使对拍两侧同错（tautology 于向量内容；覆盖率/排序不受影响）；缓解件 = distance 已知答案测试 + 手工图独立 positions 对拍
+- **nano×2 登记**：`search_layer` 多 entry point 初始 results 可超 ef 不修剪 + 重复 ep 重复入堆（当前唯一调用形态为单元素 slice，不可达；Stage C/D 若引入多入口调用需走同一 admission 路径）；`push_edge` 重复边 release 静默跳过（debug_assert 仅调试期，不可达防御）
+- **prop3 seed 201 卡方统计量 17.516（p≈0.004）偏小概率侧**：α=0.001 下通过且确定性成立，已如实登记于测试注释
+- **`search` 空图 + `k > ef` 返回 `Err("ef < k")` 而非空集**（2026-09-01 第三轮 review 登记）：graph.rs 先查 `ef < k` 再查空图，故文档"空图返回空向量"仅在 `ef ≥ k` 或 `k = 0` 时成立；语义自洽（`ef ≥ k` 是唯一逐查询不变式，先于空图校验生效），非 bug，属文档口径略含糊
+- **`prop1_known_disconnect_at_extreme_params_pinned` 钉死精确计数（directed=3 / undirected=9）**（2026-09-01 第三轮 review 登记）：确定性强但脆弱，任何算法/PRNG 改动会击穿；意图（把 M=2 断裂固化为"已知行为"而非隐藏）正确，属可接受回归钉
+- **Stage D 前置提醒（2026-09-01 第三轮 review 登记）**：`flood == brute-force` 对拍的前提是第 0 层连通；属性① 已把"全节点可达"如实收窄为默认/近默认参数区间事实，Stage D 的 recall harness 应保持"先验连通性、后验 recall"的诊断顺序（B2 已示范；R1 fallback 上调参数方向为增连通，无风险）
+- **Stage C 需要 `pub(crate) fn from_parts(...)` 重建入口**（graph 私有字段对 snapshot 模块不可见）：Stage C 开工时加，B1 刻意未预埋
+- **Cosine/IP 的 recall 质量验证归 M6**（§12 v1.2 既定）；M6 删除/并发/增量不对称率验收同归 M6

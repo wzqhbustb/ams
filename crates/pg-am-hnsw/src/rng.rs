@@ -63,6 +63,13 @@ impl Xoshiro256StarStar {
     /// Draw a node's top level (§4.1): geometric distribution,
     /// `level = floor(-ln(u) * m_L)` with `m_L = 1/ln(M)`.
     ///
+    /// **Precondition: `m >= 2`** (enforced by `HnswParams` construction
+    /// validation, the only production caller). The debug assertion below
+    /// guards genuine invariant violations (§11 R2); in release builds an
+    /// out-of-contract `m < 2` does not panic — it saturates (`m = 1` → 255,
+    /// `m = 0` → 0), which is why the precondition lives at the params
+    /// boundary.
+    ///
     /// The frozen u64→f64 conversion (§4.1 v1.2) takes the **top 53 bits**:
     /// `u = (r >> 11) as f64 * 2⁻⁵³`, giving `u ∈ [0, 1)`. `u == 0.0` is a
     /// legal sample (probability 2⁻⁵³) and is handled by **redraw**, not by

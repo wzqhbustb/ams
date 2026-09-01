@@ -246,7 +246,10 @@ recall;hnswlib 允许选中集少于 M 是其性能取向，我们取连通性�
 超过 `M_max`/`M_max0` 时的收缩（shrink)**——只做选择不做收缩会让邻居表
 无界增长，recall 虚高且内存失控。
 **代价**：实现复杂度高于 simple（候选堆 + 遮挡判定，选择 + 收缩两处接入），
-但这是一次性成本；simple 路径保留为编译期可开关的对照组，不进公开 API。
+但这是一次性成本；simple 路径保留为对照组——**运行时构造参数开关**
+（`NeighborSelection` + `#[doc(hidden)] new_with_neighbor_selection`,v1.11
+口径统一：reachable but unsupported——下游可达、隐藏于文档、零稳定性保证，
+采完 A/B 数据即可删除；v1.0 的"编译期开关，不进公开 API"两处表述均不准）。
 
 ### 4.4 搜索（ef_search）
 
@@ -291,6 +294,11 @@ false，图照常插入但 recall 悄悄劣化，且确定性不受影响所以 
 
 **代价**：f64 累加器比纯 f32 标量慢 ~10-20%（可测但不影响 P99 < 20ms 目标
   的量级）；若基准显示宽裕，不再回头优化。
+
+**实现注记（v1.8）**：三度量的分发枚举 `Metric { L2, Cosine, InnerProduct }`
+位于 `graph.rs` 而非 `distance.rs`——§3 冻结快照头不含 metric 字段，它是图
+实例的运行时属性（load 时由调用方重新供给），`distance.rs` 只承载三个纯
+函数。以代码为准，本节登记归属事实。
 
 ---
 
@@ -417,6 +425,15 @@ ftp 依赖，代价是多一步托管）;**本地开发**在 ftp 不通的网络
   图连通（§9 不变式①）**——ef ≥ 节点数时 beam 从不淘汰候选，搜索洪泛整个
   连通分量；离开连通性前提，"ef 足够大即精确"不是 HNSW 的普适性质，对拍
   失败时先要查连通性而不是查距离函数。
+- **查询集与数据同分布**（v1.12,Stage B 第四轮审查 P3）：基准方法论惯例
+  （sift/gist 自带同分布查询集）；合成数据侧的实现 = 查询沿**同一个**
+  MixtureGen 流继续抽（簇心在构造期抽取，另起生成器会把查询打到别的
+  团块上——实测 recall@10 0.989 vs 同分布 1.000 @ ef=64）。
+- **InnerProduct 的推广口径**（v1.12，同轮 P3）：IP 非度量，有向可达分量
+  不完整是合法现象（实测 1889/2000，默认参数）——flood 等价模式对 IP 必须
+  带连通性前提执行：ef = N 洪泛恰返回**有向可达分量**（不多不少）且按冻结
+  序逐位全等；可达计数钉死为区间观测（非不变式）。图层面 IP 覆盖即此 cell,
+  recall 质量验收仍归 M6（§12 v1.2）。
 - 邻居选择启发式 A/B(§4.3):simple vs heuristic 在 siftsmall 上的 recall
   对照实验随 harness 交付，作为参数冻结的证据附件。
 
@@ -428,9 +445,13 @@ Phase 1 的方法论（对抗审查、watchdog、红绿对照）全部沿用；M
 两个标志性手段的替代形态：
 
 - **loom → 属性测试 + 对拍**：图不变式属性测试——① 全节点从入口点可达
-  （连通性）;② 双向边不对称率统计（M6 验收 <1% 的口径在 M4 先建立测法）;
-  ③ 层分布与几何期望的卡方拟合（seed 固定下确定性成立）;④ 搜索单调性：
-  ef 增大 recall 不降。
+  （连通性；**参数区间事实**：极端参数 M=2/M_max0=2/ef_c=4 下 shrink 可斩断
+  最后桥接边致第 0 层不连通——Stage B 实测 N=300 有向可达仅 3，默认参数区间
+  方成立，2026-08-31 Stage B 登记）;② 双向边不对称率统计（M6 验收 <1% 的
+  口径在 M4 先建立测法；**Stage B 实测基线：默认参数聚合 15.35%，逐 cell
+  8.9%–17.1%**——shrink 单侧删边的固有不对称，M6 的 <1% 已修订为相对该基线
+  的增量口径，见 ROADMAP Phase 2 验证标准）;③ 层分布与几何期望的卡方拟合
+  （seed 固定下确定性成立）;④ 搜索单调性：ef 增大 recall 不降。
 - **崩溃注入 → 快照往返等价**:`save → load → search` 与内存原图逐查询
   结果全等（字节级同构图的直接推论）。
 - 单测覆盖率 ≥ 90%(ROADMAP 口径）,tarpaulin 报告进 CI artifact。
@@ -534,3 +555,8 @@ Cosine/IP 的 recall 质量归 M6 真用该度量的场景验证（届时补对�
 | v1.5 | 2026-08-31 | 第五轮（coding-plan 审查回流）:§2 依赖落地修正——"只依赖 pg-storage"在 M4 无消费者，照原样加 = 空挂死依赖（M3 O4 立规对象）；修正为 M4 直依赖 {thiserror, crc32fast}、pg-storage 缓至 M5;§10 依赖口径澄清段同步改写（原 v1.1 段落描述的传递依赖取舍随 v1.5 不再存在，两节直接相反属冻结文档内部矛盾） |
 | v1.6 | 2026-08-31 | 第六轮（Stage A 对抗审查回流，以代码为准回改）:§3 补 max_level 校验加严两条（空图强制 `max_level == 0`；任何节点最高层 ≤ max_level；实现位于 `encoding.rs` `decode_snapshot_body` 校验清单第 8/9 条）;§3 登记 `m_max0` 全链零校验的契约空白（归 Stage B 前评估，Stage B shrink 逻辑消费 m_max0);§5 入口校验与 §7 load 校验同步加严为 `!is_finite()`(NaN 与 ±inf 同口径拒绝，cosine 的 `inf/inf` 静默 NaN 收口） |
 | v1.7 | 2026-08-31 | Stage A review 修复轮（用户确认）:§3 `m_max0` 契约空白闭合——`m_max0 >= m` 加入 `HnswParams::new` 构造校验与快照 load 参数重跑（`params.rs` / `encoding.rs` 快照头校验，负例测试两枚）；§3 v1.6 的"契约空白登记"条改写为闭合状态 |
+| v1.8 | 2026-08-31 | Stage B 对抗审查回流（P1 零 / P2×1 / P3×3）:§9 ① 连通性改写为**参数区间事实**（极端参数 M=2/M_max0=2/ef_c=4 下 shrink 可斩断桥接边，N=300 有向可达仅 3；默认区间成立）；§9 ② 不对称率实测基线落盘（默认参数聚合 15.35%，逐 cell 8.9%–17.1%）并据此证伪 ROADMAP M6 "<1%" 字面口径——已回改 ROADMAP Phase 2 验证标准与 ROADMAP-changes A5/§3.1 为**增量口径**（P2-1，文档债 D10 登记清偿）；§5 补 `Metric` 枚举归属注记（graph.rs，快照头无 metric 字段，运行时属性）。P3-1 注释笔误（40→300 节点）与 P3-2 oracle 局限注记已落测试代码 |
+| v1.9 | 2026-08-31 | Stage B 第二轮审查回流（换攻击面：负距离/退化数据/极端参数/确定性缝隙/整数边界/Stage C 读面——行为 bug 仍为零）:**P1-1** `HnswParams` 字段私有化（`pub` 字段可经结构字面量/事后变异完全绕过 §4.2/§4.4 校验，与 m_max0 空白同类），改私有 + getter，波及面 16 处 getter 化（含首轮漏改的 encoding/properties 9 处）；**P3** 手工推演注释块三处中间推理修正（step 5 幻影候选/遮挡归功、step 4 伪平局钉死、step 7 括号注矛盾——期望表与代码均正确，错在推导文字；prop3 seed 201 卡方 17.516 登记补落测试注释）；**nano**:rng `next_level` m≥2 前提 release 行为入 doc、入口追踪测试 else 分支补入口身份断言、Cand 注释维度上界改述 u16 上限、卡方临界表覆盖界注记 |
+| v1.10 | 2026-08-31 | Stage B 第三轮审查回流（P1×1 + P2×1 + P3×3，以代码为准）:**P1** `search_layer` 准入改完整 (distance, NodeId) 决胜——原距离-only 比较在满 beam 平局时让结果集席位取决于发现序，与 §4.1 冻结全序冲突；等距小 id 候选现置换大 id worst,break 提前终止保持论文距离-only 语义不变（§4.4 语义细化，纸面行为变化仅限平局席位）；**P2** §3 load 校验清单第 10 条补层级归属半边（level-L 边要求目标 `level_count > L`——原清单"邻接端点存在"漏检，合法 CRC 的越层级边可通过 decode 并在 Stage C 重建后遍历 panic；新校验当场抓获 encoding 测试 fixture 自身的语义非法——node 2 的 level-1 边指向只有 level 0 的 node 1，fixture 随修）;**P3** prop1 补 directed 断言、prop2 加 [0.05, 0.30] 回归带守护 15.35% 基线、A/B 开关 `#[doc(hidden)]` 措辞精确化（reachable but unsupported） |
+| v1.11 | 2026-08-31 | 复核遗留（nano，文档口径统一）:§4.3 "simple 路径保留为编译期可开关的对照组，不进公开 API"改写为**运行时构造参数开关 + reachable but unsupported**（v1.0 两处表述均不准：开关形式是运行时非编译期；"不进公开 API"与下游可调的事实矛盾）；coding-plan Stage B 任务行同条同步 |
+| v1.12 | 2026-08-31 | Stage B 第四轮审查回流（P2×2 + P3×3，以代码为准）:**P2-1** §3 校验清单补第 11 条邻接表良构性（严格升序=无重复无降序/无自环/度数 ≤ m_max(level)——`push_edge` 的 binary_search 前提，缺失时 Stage C 重建静默插错位；畸形流实测可干净通过旧 decode）；**P2-2** 写入/读取对称：`validate_graph_data` + `SnapshotHeader::validate_construction_params` 提取为读写共用，encode 先验后写（原 encode 接受自己读不回的头部——pub 字段可构造 `node_count:0, entry_point:7` 之流）；**P3** prop4 ef 阶梯补 64（§12 门槛值）+ 0.95 绝对下限、查询集同分布修正入 §8.3、§8.3 补 IP 推广口径（flood 恰返回有向可达分量，可达计数 1889/2000 钉死为区间观测） |
