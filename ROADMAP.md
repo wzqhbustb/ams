@@ -504,7 +504,7 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 |------|------|
 | TimeSeries AM | 时间分区存储（按天/小时自动分区），范围扫描，降采样聚合（segment merge 复用需等 Phase 3 的 Tier-2 异步链路就绪） |
 | TTL 自动过期 | 声明式 TTL（WITH ts_partition = 'day', ttl = '90d'），后台自动清理过期分区 |
-| 列存投影原型 | 时序/记忆分析场景的轻量列存物化视图，Tier 2 异步维护，验证 HTAP 架构可行性 |
+| 列存投影原型 | 时序/记忆分析场景的轻量列存物化视图，Tier 2 异步维护，验证 HTAP 架构可行性；**原型不含压缩编码**（plain 列布局即可，编码/压缩归 Phase 7b 生产版，2026-09-02 口径补登） |
 
 ### 5a.2 SDK 层交付物（必做，但不在内核）
 
@@ -646,7 +646,7 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 
 | 模块 | 说明 |
 |------|------|
-| 列存投影生产版 | 通用 AP 场景的列式物化视图，Tier 2 异步维护，向量化扫描 |
+| 列存投影生产版 | 通用 AP 场景的列式物化视图，Tier 2 异步维护，向量化扫描；**列式编码明细（原未列出，2026-09-02 补登）**：字典编码 / RLE / bit-packing 按列类型自动选择 + 块级压缩（LZ4/zstd 选型随 7b 开工定，对齐 PG 14+ TOAST/备份链的算法面） |
 | 向量压缩 | Scalar Quantization (SQ) / Product Quantization (PQ)，自动策略选择 |
 | SIMD 全面优化 | 覆盖所有距离函数、B+Tree 比较、CRC 校验 |
 | io_uring | Linux 异步 I/O |
@@ -867,6 +867,7 @@ phase 归属。标 ✅正文 的项同时已写入对应 phase 的交付物表/�
 | C18 | QueryStats 系统表化 / 跨进程 live 诊断 / 死锁检测器 tracing 告警 / 数据目录锁活性检测 / waldump 段长自描述 | Phase 6 ✅正文 / Phase 4a / Phase 7a / Phase 7a / Phase 7a |
 | C19 | segment/tier2 契约桩、WAL record 100-111 硬失败 | Phase 2/3/5 各自主线，刻意防护，非债 |
 | C20 | RLS/触发器/存储过程/CTAS/MV/并行查询/逻辑复制/XID freeze | Phase 6 / 4a / 4a / 4a / 4b+ / 7d / 永不做（M2 §十八原有记录） |
+| C21 | 多字符集 / `client_encoding` 转码（2026-09-02 补登）：现状 UTF8-only 硬编码（`pg-wire/src/session.rs` 固定回报 server/client_encoding=UTF8，非 UTF8 startup 参数拒绝，无转码层）；PG 支持 ~40 种 server encoding + 连接级双向转码 | **决策待定**：接受 UTF8-only 则写入「显式战略边界」表作正式产品决策；若做兼容面则归 Phase 6（pg-wire 完整协议窗口，与 C16 同批） |
 
 ### D 类：工程/文档债处理记录
 

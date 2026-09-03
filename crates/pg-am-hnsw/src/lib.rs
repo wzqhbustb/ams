@@ -1,4 +1,4 @@
-//! pg_rust in-memory HNSW vector index — Phase 2 M4 (Stages A–B done).
+//! pg_rust in-memory HNSW vector index — Phase 2 M4 (Stages A–C done).
 //!
 //! Stage A delivers the foundations every later stage builds on (coding plan
 //! Stage A; tech-selection references per module):
@@ -20,9 +20,10 @@
 //!   (paper Algorithm 1) with the §4.3 heuristic on both the select and the
 //!   shrink side (Algorithm 4, one shared function), and greedy descent +
 //!   level-0 beam search (Algorithms 2/5).
-//!
-//! [`snapshot`] (the `save`/`load` file API, §7) is Stage C and still a
-//! placeholder module.
+//! - [`snapshot`]: the `save`/`load` file API (§7, Stage C) — atomic file
+//!   writes, the full load-validation checklist, and read-only
+//!   snapshot-loaded graphs (continuation-insert semantics punted to
+//!   tech-selection v1.6).
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]

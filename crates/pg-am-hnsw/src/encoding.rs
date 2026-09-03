@@ -22,7 +22,9 @@
 //! - `dim` lives only in the header; node records do not embed it (the graph
 //!   never mixes dimensions).
 //! - `level_count` = number of levels the node appears on = top level + 1;
-//!   level 0 always exists, so `level_count >= 1`.
+//!   level 0 always exists, so `level_count >= 1`. Load additionally
+//!   accepts only `level_count <= 64` ([`MAX_LEVEL_COUNT`], checklist item
+//!   12 — an acceptance tightening, not a format change).
 //! - Empty graph: `node_count == 0`, `entry_point == u32::MAX`
 //!   ([`NodeId::INVALID`]), `max_level == 0` (no nodes, no levels).
 //! - `flags` / `reserved` are always 0 in M4 (`flags` is pre-allocated for
@@ -33,8 +35,13 @@
 //!   stays out (§3 v1.3).
 //!
 //! This module is byte-stream only: the `save(path)`/`load(path)` file API
-//! is Stage C ([`crate::snapshot`]). The full load-validation checklist
-//! lives in [`decode_snapshot_body`].
+//! lives in [`crate::snapshot`] (Stage C). The full load-validation
+//! checklist lives in [`decode_snapshot_body`]; the write path is the
+//! streaming [`BodyEncoder`] (2026-09-02 Stage C review P2-1), with
+//! [`encode_snapshot_body`] as a thin wrapper over it — one encoder
+//! implementation, no drift.
+
+use std::io::Write;
 
 use crate::error::{HnswError, Result};
 use crate::params::{HnswParams, NodeId};
@@ -55,6 +62,21 @@ pub const CRC32_SIZE: usize = 4;
 /// `entry_point` encoding for an empty graph (§3 v1.2) — the raw value of
 /// [`NodeId::INVALID`].
 pub const EMPTY_GRAPH_ENTRY_POINT: u32 = u32::MAX;
+
+/// Load-acceptance cap on a record's `level_count` (checklist item 12,
+/// 2026-09-02 review P2-2). **Not a format change** — the encoding is
+/// untouched; this only tightens what load accepts (and therefore what the
+/// write path produces, via the shared validation helpers).
+///
+/// Justification: the level draw is geometric with P(level ≥ L) = M⁻ˡ, and
+/// `rng::Xoshiro256StarStar::next_level` hard-bounds the draw at
+/// floor(53·ln2 / ln M) ≤ 53 (at M = 2), so no buildable graph ever
+/// exceeds level_count = 54 — 64 clears every legal graph with margin.
+/// Without the cap, a legal-CRC record could claim 255 mostly-empty levels
+/// and the SoA rebuild would pay the per-level `Vec` headers (24 B/level
+/// vs 2 B/level on disk) — a memory amplification on pathological (but
+/// format-legal) input.
+pub const MAX_LEVEL_COUNT: usize = 64;
 
 /// Fixed-width snapshot header (§3). Only the construction parameters are
 /// carried; `ef_search_default` is query-time state and absent by design.
@@ -197,11 +219,24 @@ pub fn encode_node_record(
             "level_count = 0 is unencodable: level 0 always exists (§3)".to_string(),
         ));
     }
-    if neighbors.len() > usize::from(u8::MAX) {
+    if neighbors.len() > MAX_LEVEL_COUNT {
         return Err(HnswError::InvalidArgument(format!(
-            "level_count {} does not fit u8",
+            "level_count {} > {MAX_LEVEL_COUNT} (checklist item 12; 2026-09-02 review round 5 P3: the pub codec must refuse what the decoder refuses — the decoder enforces the same cap at its parse point. Two guardrails, one rule, one constant)",
             neighbors.len()
         )));
+    }
+    // 2026-09-02 review round 6 P3: the pub codec must also refuse
+    // non-finite vector components — decode_node_record rejects them at its
+    // parse point (§5/§7), so a standalone encode must not emit them. The
+    // BodyEncoder path is already guarded upstream by
+    // `validate_record_basics`; this line is the symmetry defense for
+    // independent codec users. Two guardrails, one rule.
+    for (i, &x) in vector.iter().enumerate() {
+        if !x.is_finite() {
+            return Err(HnswError::InvalidArgument(format!(
+                "non-finite vector component (NaN or ±inf) at index {i} (§5/§7 — the decoder rejects this at its parse point; write/read symmetry)"
+            )));
+        }
     }
     out.push(0); // flags — always 0 in M4 (§3: reserved for the M6 tombstone bit)
     out.push(0); // reserved — always 0
@@ -243,7 +278,10 @@ fn take<'a>(cursor: &mut &'a [u8], n: usize, what: &str) -> Result<&'a [u8]> {
 /// walk the stream with the cursor).
 ///
 /// Per-record load validation (§3, §5/§7): `flags == 0`, `reserved == 0`,
-/// `level_count >= 1`, and **non-finite component rejection** (NaN or ±inf)
+/// `level_count >= 1`, `level_count <= MAX_LEVEL_COUNT` (checklist item 12,
+/// enforced here at the parse point before any per-level allocation —
+/// 2026-09-02 review round 4 P2-2), and **non-finite component rejection**
+/// (NaN or ±inf)
 /// — our own encoder never produces one and the CRC catches bit-flips, but
 /// entry validation holds at every entry point (§7 v1.4 belt-and-suspenders;
 /// ±inf added 2026-08-31: cosine's inf/inf would silently produce NaN).
@@ -278,6 +316,18 @@ pub fn decode_node_record(bytes: &[u8], dim: u16) -> Result<(NodeRecord, usize)>
             "level_count = 0: level 0 always exists (level_count = top level + 1, §3)".to_string(),
         ));
     }
+    // Checklist item 12, enforced AT THE PARSE POINT (2026-09-02 review
+    // round 4 P2-2): reject before allocating any per-level Vec — without
+    // this, a forged record could claim 255 levels and the decode would
+    // allocate the nested Vec skeleton before `validate_record_basics`
+    // ever ran. Same rule, same constant, two lines of defense:
+    // `validate_record_basics` keeps the check for the write / one-shot
+    // paths, which never pass through this function.
+    if usize::from(level_count) > MAX_LEVEL_COUNT {
+        return Err(HnswError::Corrupted(format!(
+            "level_count {level_count} > {MAX_LEVEL_COUNT} (checklist item 12: the geometric draw is hard-bounded at level 53 even at M = 2, so no legal graph can reach this, §4.1)"
+        )));
+    }
     let mut neighbors = Vec::with_capacity(usize::from(level_count));
     for _ in 0..level_count {
         let count = u16::from_le_bytes(take(&mut cursor, 2, "neighbor_count")?.try_into().unwrap());
@@ -305,39 +355,185 @@ pub struct SnapshotFileData {
 /// Encode a snapshot body (header + node records, no CRC prefix — wrap with
 /// [`wrap_crc32`] for the on-disk form, §7).
 ///
-/// **Write/read symmetry** (2026-08-31 review P2): the write path runs the
-/// same construction-parameter and graph-data validation the read path
-/// would — a producer-side bug fails here, at write time, instead of
+/// **Thin wrapper over [`BodyEncoder`]** (2026-09-02 Stage C review P2-1):
+/// the streaming encoder is the single write-path implementation; this
+/// function just streams into a `Vec`. **Write/read symmetry** (2026-08-31
+/// review P2): the write path runs the same graph-data validation the read
+/// path would, so a producer-side bug fails here, at write time, instead of
 /// materializing as a corrupt file that only decode can diagnose.
 pub fn encode_snapshot_body(header: &SnapshotHeader, nodes: &[NodeRecord]) -> Result<Vec<u8>> {
-    header.validate_construction_params()?;
-    validate_graph_data(header, nodes)?;
-    let mut out = Vec::new();
-    out.extend_from_slice(&header.encode());
+    // `saturating_sub`: a level_count = 0 record saturates to top level 0.
+    // The saturation never masks a defect: the first line of defense is
+    // `push_record`'s summary/record consistency check (2026-09-02 review),
+    // which rejects both level_count = 0 ("disagrees with the levels
+    // summary") and level_count > 256 (the truncating `as u8` here then
+    // disagrees with the real count); anything above MAX_LEVEL_COUNT is
+    // rejected by `validate_record_basics` and by `encode_node_record`
+    // itself (checklist item 12, round 5 P3). All unreachable from decode,
+    // where level_count is a u8 by construction.
+    let levels: Vec<u8> = nodes
+        .iter()
+        .map(|rec| rec.neighbors.len().saturating_sub(1) as u8)
+        .collect();
+    let mut enc = BodyEncoder::new(*header, levels, Vec::new())?;
     for rec in nodes {
-        encode_node_record(&mut out, header.dim, &rec.vector, &rec.neighbors)?;
+        enc.push_record(&rec.vector, &rec.neighbors)?;
     }
-    Ok(out)
+    let (crc, body) = enc.finish()?;
+    debug_assert_eq!(
+        crc,
+        crc32fast::hash(&body),
+        "incremental and one-shot CRC32 must agree"
+    );
+    Ok(body)
+}
+
+/// Streaming snapshot-body encoder (§3/§7) — **the single write-path
+/// implementation**. [`encode_snapshot_body`] streams into a `Vec` through
+/// it; [`crate::snapshot::save`] streams into a file through it (2026-09-02
+/// Stage C review P2-1: no `Vec<NodeRecord>` materialization, so save's
+/// memory peak is graph + 1 byte/node + one record + the `BufWriter`
+/// buffer instead of ~3× the file size).
+///
+/// The encoder writes **body bytes only** (header + node records, §3) and
+/// computes the CRC32 incrementally alongside; [`BodyEncoder::finish`]
+/// returns the hash. The on-disk §7 layout is `crc32 prefix + body`, so a
+/// file-writing caller reserves 4 placeholder bytes up front and
+/// backpatches the CRC after finishing — the resulting bytes are identical
+/// to `crc LE ++ body` from [`wrap_crc32`] (the format stays frozen).
+///
+/// Validation is inlined into the stream and is exactly the graph-data
+/// validation the read path runs (write/read symmetry, shared helpers with
+/// `validate_graph_data`): the construction-parameter re-run and the
+/// entry-point/`max_level` relations at [`new`](BodyEncoder::new) (against
+/// the whole-graph `levels` summary), per-record checks at
+/// [`push_record`](BodyEncoder::push_record) (vector length/finiteness,
+/// `level_count >= 1`, top level ≤ `max_level`, adjacency ascending without
+/// duplicates or self-loops, endpoints < `node_count`, targets having the
+/// edge's level, degree caps). Stream-level checks (magic, format version,
+/// CRC, truncation) stay decode-only. A validation failure means the caller
+/// has already written a prefix of the body — harmless behind
+/// `save`'s write-temp-then-rename protocol, which discards the partial
+/// temporary file and never touches the target.
+pub struct BodyEncoder<W: Write> {
+    inner: W,
+    hasher: crc32fast::Hasher,
+    header: SnapshotHeader,
+    /// Whole-graph top-level summary, 1 byte/node (`levels[i]` = node `i`'s
+    /// top level == level_count − 1): supports the entry/`max_level`
+    /// relations and the "target has the edge's level" check without
+    /// materializing node records.
+    levels: Vec<u8>,
+    written: u32,
+    scratch: Vec<u8>,
+}
+
+impl<W: Write> BodyEncoder<W> {
+    /// Validate the header (construction-parameter re-run, record count, and
+    /// the entry-point/`max_level` relations against `levels`) and write
+    /// the fixed-width header. `levels.len()` must equal
+    /// `header.node_count`; `levels[i]` is node `i`'s top level.
+    pub fn new(header: SnapshotHeader, levels: Vec<u8>, inner: W) -> Result<Self> {
+        header.validate_construction_params()?;
+        if header.node_count as usize != levels.len() {
+            return Err(HnswError::Corrupted(format!(
+                "header node_count {} != {} node records",
+                header.node_count,
+                levels.len()
+            )));
+        }
+        validate_entry_and_max_level(&header, &levels)?;
+        let mut enc = Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            header,
+            levels,
+            written: 0,
+            scratch: Vec::new(),
+        };
+        let header_bytes = header.encode();
+        enc.write_hashed(&header_bytes)?;
+        Ok(enc)
+    }
+
+    /// Validate and append one node record. Position is identity (§3): the
+    /// next record pushed *is* `NodeId(self.written)`, which is also the
+    /// index the validation messages report.
+    pub fn push_record(&mut self, vector: &[f32], neighbors: &[Vec<NodeId>]) -> Result<()> {
+        if self.written == self.header.node_count {
+            return Err(HnswError::Corrupted(format!(
+                "more node records pushed than header node_count {}",
+                self.header.node_count
+            )));
+        }
+        let i = self.written as usize;
+        // The caller-supplied `levels` summary must agree with the record
+        // actually being pushed (2026-09-02 review): decode derives the
+        // per-node top levels from the records themselves, so a
+        // summary/record mismatch would emit a body the read path rejects
+        // (or accepts under different entry/max_level semantics) — the
+        // write/read symmetry contract requires failing here instead. With
+        // this check, "top level <= max_level" (validated on the summary at
+        // construction) also holds per record.
+        if neighbors.len() != usize::from(self.levels[i]) + 1 {
+            return Err(HnswError::Corrupted(format!(
+                "node {i}: record level_count {} disagrees with the levels summary ({}); the summary and the records must agree (§3)",
+                neighbors.len(),
+                usize::from(self.levels[i]) + 1
+            )));
+        }
+        validate_record_basics(&self.header, i, vector, neighbors.len())?;
+        validate_adjacency(&self.header, &self.levels, i, neighbors)?;
+        self.scratch.clear();
+        encode_node_record(&mut self.scratch, self.header.dim, vector, neighbors)?;
+        self.hasher.update(&self.scratch);
+        self.inner.write_all(&self.scratch)?;
+        self.written += 1;
+        Ok(())
+    }
+
+    /// Verify the record count and finish: returns the incremental CRC32 of
+    /// everything written (the §7 prefix value) and the underlying writer.
+    pub fn finish(self) -> Result<(u32, W)> {
+        if self.written != self.header.node_count {
+            return Err(HnswError::Corrupted(format!(
+                "header node_count {} != {} node records",
+                self.header.node_count, self.written
+            )));
+        }
+        Ok((self.hasher.finalize(), self.inner))
+    }
+
+    fn write_hashed(&mut self, bytes: &[u8]) -> Result<()> {
+        self.hasher.update(bytes);
+        self.inner.write_all(bytes)?;
+        Ok(())
+    }
 }
 
 /// Graph-data validation shared by the write and read paths (2026-08-31
 /// review P2 ×2). Stream-level checks (magic / version / CRC / truncation /
 /// trailing bytes) stay decode-only; everything about the *graph's*
-/// well-formedness lives here:
+/// well-formedness lives in the three helpers below, which this function
+/// composes for the materialized-record (decode) path and [`BodyEncoder`]
+/// composes for the streaming (write) path (2026-09-02 Stage C review
+/// P2-1 — one validation implementation, no drift):
 ///
 /// - record count matches `node_count`;
 /// - every record: `vector.len() == dim`, all components finite,
-///   `level_count >= 1`;
+///   `level_count >= 1` ([`validate_record_basics`]);
 /// - empty graph: entry-point sentinel + `max_level == 0`; non-empty:
 ///   `entry_point < node_count`, `max_level` == the entry node's top level,
-///   and no node's top level exceeds `max_level`;
+///   and no node's top level exceeds `max_level`
+///   ([`validate_entry_and_max_level`]);
 /// - every adjacency list: endpoints exist (`< node_count`); the target has
 ///   the edge's level (`level_count > level`, checklist item 10); the list
 ///   is **strictly ascending** (the canonical order `push_edge`'s binary
 ///   search assumes — no duplicates, no descent); **no self-loops**; and
 ///   **degree ≤ m_max(level)** (`m_max0` on level 0, `m` elsewhere — a
 ///   quiescent graph never exceeds the cap; the insert-time `m_max + 1`
-///   transient is unobservable behind `&mut self`).
+///   transient is unobservable behind `&mut self`)
+///   ([`validate_adjacency`]).
 fn validate_graph_data(header: &SnapshotHeader, nodes: &[NodeRecord]) -> Result<()> {
     if header.node_count as usize != nodes.len() {
         return Err(HnswError::Corrupted(format!(
@@ -347,27 +543,70 @@ fn validate_graph_data(header: &SnapshotHeader, nodes: &[NodeRecord]) -> Result<
         )));
     }
     for (i, rec) in nodes.iter().enumerate() {
-        if rec.vector.len() != usize::from(header.dim) {
+        validate_record_basics(header, i, &rec.vector, rec.neighbors.len())?;
+    }
+    // Safe `as u8`: the decode path is the only caller, and there
+    // `level_count` is a u8 by construction (≤ 255 lists per record).
+    let levels: Vec<u8> = nodes
+        .iter()
+        .map(|rec| (rec.neighbors.len() - 1) as u8)
+        .collect();
+    validate_entry_and_max_level(header, &levels)?;
+    for (i, rec) in nodes.iter().enumerate() {
+        validate_adjacency(header, &levels, i, &rec.neighbors)?;
+    }
+    Ok(())
+}
+
+/// Per-record basics shared by the read and write paths: exact `dim` match,
+/// all components finite (§5/§7 NaN/±inf rejection), and
+/// `1 <= level_count <= MAX_LEVEL_COUNT` (level 0 always exists, §3; the
+/// upper bound is checklist item 12, 2026-09-02 review P2-2). The decode
+/// path has an earlier line of defense for the cap — `decode_node_record`
+/// rejects it at the parse point, before allocating per-level Vecs (review
+/// round 4 P2-2); this instance covers the write / one-shot paths, which
+/// never pass through the parser. Two lines of defense, one rule, one
+/// constant.
+fn validate_record_basics(
+    header: &SnapshotHeader,
+    i: usize,
+    vector: &[f32],
+    level_count: usize,
+) -> Result<()> {
+    if vector.len() != usize::from(header.dim) {
+        return Err(HnswError::Corrupted(format!(
+            "node {i}: vector has {} components, header dim is {} (§3)",
+            vector.len(),
+            header.dim
+        )));
+    }
+    for (c, &x) in vector.iter().enumerate() {
+        if !x.is_finite() {
             return Err(HnswError::Corrupted(format!(
-                "node {i}: vector has {} components, header dim is {} (§3)",
-                rec.vector.len(),
-                header.dim
-            )));
-        }
-        for (c, &x) in rec.vector.iter().enumerate() {
-            if !x.is_finite() {
-                return Err(HnswError::Corrupted(format!(
-                    "node {i}: non-finite component (NaN or ±inf) at index {c} (§5)"
-                )));
-            }
-        }
-        if rec.neighbors.is_empty() {
-            return Err(HnswError::Corrupted(format!(
-                "node {i}: level_count = 0 (level 0 always exists, §3)"
+                "node {i}: non-finite component (NaN or ±inf) at index {c} (§5)"
             )));
         }
     }
+    if level_count == 0 {
+        return Err(HnswError::Corrupted(format!(
+            "node {i}: level_count = 0 (level 0 always exists, §3)"
+        )));
+    }
+    if level_count > MAX_LEVEL_COUNT {
+        return Err(HnswError::Corrupted(format!(
+            "node {i}: level_count {level_count} > {MAX_LEVEL_COUNT} (checklist item 12: the geometric draw is hard-bounded at level 53 even at M = 2, so no legal graph can reach this, §4.1)"
+        )));
+    }
+    Ok(())
+}
 
+/// Entry-point/`max_level` relations against the whole-graph top-level
+/// summary (`levels[i]` = node `i`'s top level; `levels.len()` is already
+/// known to equal `node_count`): empty graphs carry the sentinel and
+/// `max_level == 0`; non-empty graphs have `entry_point < node_count`,
+/// `max_level` == the entry node's top level, and no node above
+/// `max_level` (the entry point is the graph's highest node).
+fn validate_entry_and_max_level(header: &SnapshotHeader, levels: &[u8]) -> Result<()> {
     if header.node_count == 0 {
         if header.entry_point != EMPTY_GRAPH_ENTRY_POINT {
             return Err(HnswError::Corrupted(format!(
@@ -388,66 +627,76 @@ fn validate_graph_data(header: &SnapshotHeader, nodes: &[NodeRecord]) -> Result<
                 header.entry_point, header.node_count
             )));
         }
-        let entry_top = nodes[header.entry_point as usize].neighbors.len() - 1;
-        if usize::from(header.max_level) != entry_top {
+        let entry_top = levels[header.entry_point as usize];
+        if header.max_level != entry_top {
             return Err(HnswError::Corrupted(format!(
                 "max_level {} != entry node's top level {entry_top} (§3)",
                 header.max_level
             )));
         }
     }
-
-    for (i, rec) in nodes.iter().enumerate() {
-        let top = rec.neighbors.len() - 1;
-        if top > usize::from(header.max_level) {
+    for (i, &top) in levels.iter().enumerate() {
+        if top > header.max_level {
             return Err(HnswError::Corrupted(format!(
                 "node {i} top level {top} exceeds max_level {} (the entry point is the highest node)",
                 header.max_level
             )));
         }
-        for (level, list) in rec.neighbors.iter().enumerate() {
-            let cap = if level == 0 {
-                usize::from(header.m_max0)
-            } else {
-                usize::from(header.m)
-            };
-            if list.len() > cap {
+    }
+    Ok(())
+}
+
+/// Per-node adjacency well-formedness shared by the read and write paths
+/// (checklist items 10–11): degree ≤ `m_max(level)`, no self-loops,
+/// strictly ascending (the canonical order — no duplicates, no descent),
+/// endpoints exist, and the target *has* the edge's level (HNSW edges only
+/// ever connect nodes that both have the level).
+fn validate_adjacency(
+    header: &SnapshotHeader,
+    levels: &[u8],
+    i: usize,
+    neighbors: &[Vec<NodeId>],
+) -> Result<()> {
+    for (level, list) in neighbors.iter().enumerate() {
+        let cap = if level == 0 {
+            usize::from(header.m_max0)
+        } else {
+            usize::from(header.m)
+        };
+        if list.len() > cap {
+            return Err(HnswError::Corrupted(format!(
+                "node {i} level {level}: degree {} exceeds m_max({level}) = {cap} (a quiescent graph never exceeds the cap, §4.2)",
+                list.len()
+            )));
+        }
+        for (j, n) in list.iter().enumerate() {
+            if n.0 as usize == i {
                 return Err(HnswError::Corrupted(format!(
-                    "node {i} level {level}: degree {} exceeds m_max({level}) = {cap} (a quiescent graph never exceeds the cap, §4.2)",
-                    list.len()
+                    "node {i} level {level}: self-loop (an adjacency list never contains its owner, §3)"
                 )));
             }
-            for (j, n) in list.iter().enumerate() {
-                if n.0 as usize == i {
-                    return Err(HnswError::Corrupted(format!(
-                        "node {i} level {level}: self-loop (an adjacency list never contains its owner, §3)"
-                    )));
-                }
-                if j > 0 && list[j - 1] >= *n {
-                    return Err(HnswError::Corrupted(format!(
-                        "node {i} level {level}: adjacency list not strictly ascending ({:?} then {:?} — the canonical order has no duplicates and no descent, §3)",
-                        list[j - 1], *n
-                    )));
-                }
-                if n.0 >= header.node_count {
-                    return Err(HnswError::Corrupted(format!(
-                        "node {i} level {level}: neighbor {} >= node_count {} (adjacency endpoint does not exist)",
-                        n.0, header.node_count
-                    )));
-                }
-                // Checklist item 10: an edge on `level` requires the target
-                // to *have* that level — its record must carry at least
-                // `level + 1` adjacency lists. Without this a legal-CRC
-                // snapshot passes decode and the Stage C rebuild panics
-                // indexing `adjacency[target][level]` on traversal
-                // (2026-08-31 review P2).
-                if level >= nodes[n.0 as usize].neighbors.len() {
-                    return Err(HnswError::Corrupted(format!(
-                        "node {i} level {level}: neighbor {} has no level {level} (its level_count is {}; an edge requires both endpoints to have the level, §3)",
-                        n.0,
-                        nodes[n.0 as usize].neighbors.len()
-                    )));
-                }
+            if j > 0 && list[j - 1] >= *n {
+                return Err(HnswError::Corrupted(format!(
+                    "node {i} level {level}: adjacency list not strictly ascending ({:?} then {:?} — the canonical order has no duplicates and no descent, §3)",
+                    list[j - 1], *n
+                )));
+            }
+            if n.0 >= header.node_count {
+                return Err(HnswError::Corrupted(format!(
+                    "node {i} level {level}: neighbor {} >= node_count {} (adjacency endpoint does not exist)",
+                    n.0, header.node_count
+                )));
+            }
+            // Checklist item 10: an edge on `level` requires the target to
+            // *have* that level (2026-08-31 review P2). `levels[target]`
+            // is the target's top level, so `level > levels[target]` is
+            // exactly "level_count <= level".
+            if level > usize::from(levels[n.0 as usize]) {
+                return Err(HnswError::Corrupted(format!(
+                    "node {i} level {level}: neighbor {} has no level {level} (its level_count is {}; an edge requires both endpoints to have the level, §3)",
+                    n.0,
+                    usize::from(levels[n.0 as usize]) + 1
+                )));
             }
         }
     }
@@ -486,6 +735,12 @@ fn validate_graph_data(header: &SnapshotHeader, nodes: &[NodeRecord]) -> Result<
 ///     strictly ascending (the canonical order `push_edge`'s binary search
 ///     assumes — no duplicates, no descent), no self-loops, and
 ///     degree ≤ `m_max(level)` (`m_max0` on level 0, `m` elsewhere).
+/// 12. every record's `level_count <= 64` ([`MAX_LEVEL_COUNT`], 2026-09-02
+///     review P2-2): the geometric level draw is hard-bounded at level 53
+///     even at M = 2 (§4.1), so no legal graph can exceed this — the cap
+///     only rejects pathological legal-CRC input whose per-level `Vec`
+///     headers would otherwise amplify memory ~12× over the on-disk bytes
+///     at the SoA rebuild.
 ///
 /// Items 2 and 8–11 live in `validate_graph_data`, which
 /// [`encode_snapshot_body`] also runs (write/read symmetry: the write path
@@ -558,6 +813,79 @@ pub fn unwrap_crc32(bytes: &[u8]) -> Result<&[u8]> {
     Ok(body)
 }
 
+/// Maximum legal **body** size (header + records, no CRC prefix) for a
+/// snapshot with this (already header-validated) header — 2026-09-02 review
+/// round 4 P2-1.
+///
+/// Per-record maximum, from the frozen checklist: flags + reserved (2 B),
+/// the vector (4·dim B), the level_count byte (1 B), level 0's neighbor
+/// list (2 B count + 4·m_max0 B of ids — the degree cap of checklist item
+/// 11), and at most 63 further levels (checklist item 12 caps
+/// `level_count` at 64) at 2 + 4·m bytes each. All arithmetic is u64:
+/// node_count (u32) × the per-record maximum cannot overflow.
+///
+/// Legality: encode produces exact sizes and decode rejects trailing bytes
+/// (checklist item 7), so the [min, max] interval does not shrink the
+/// legal acceptance set — [`crate::snapshot::load`] uses it to turn
+/// "reject after reading the whole file" into "reject without reading"
+/// for files that claim a small header but are physically huge (trailing
+/// garbage or a hostile sparse file).
+pub fn max_body_size(header: &SnapshotHeader) -> u64 {
+    let per_record_max = 2
+        + 4 * u64::from(header.dim)
+        + 1
+        + (2 + 4 * u64::from(header.m_max0))
+        + 63 * (2 + 4 * u64::from(header.m));
+    SNAPSHOT_HEADER_SIZE as u64 + u64::from(header.node_count) * per_record_max
+}
+
+/// Records-only counterpart of [`max_body_size`] (2026-09-02 review round
+/// 7): `max_body_size` counts header + records — the CRC-protected body in
+/// [`unwrap_crc32`]'s sense — while [`crate::snapshot::load`]'s pre-read
+/// length cross-checks hold **records-only** lengths (file length minus
+/// the 29-byte CRC+header prefix). Comparing across the two conventions
+/// leaves the pre-read gate 25 bytes loose (the safe direction — the CRC
+/// still rejects the over-read tail — but not the exact ceiling the
+/// format promises). Subtract the header and compare like with like;
+/// saturating for symmetry with the rest of the length arithmetic.
+pub fn max_records_size(header: &SnapshotHeader) -> u64 {
+    max_body_size(header).saturating_sub(SNAPSHOT_HEADER_SIZE as u64)
+}
+
+/// Conservative upper bound on the **in-memory footprint** of loading a
+/// snapshot with this (already header-validated) header — 2026-09-02
+/// review round 6 P2. A file-size budget cannot express this: the §6 SoA
+/// materialization amplifies the on-disk bytes (a per-level `Vec` header
+/// is 24 B vs 2 B on disk), so the bound is derived from the header and
+/// the frozen caps alone. Per node:
+///
+/// - vector bytes `4·dim`, charged twice (the SoA arena + the decode-time
+///   `NodeRecord` heap — both coexist transiently during load);
+/// - the `levels` byte;
+/// - `Vec` headers: the adjacency outer `Vec` (24 B) + the decode-time
+///   `NodeRecord` struct (two `Vec` headers, 48 B) + its neighbors outer
+///   `Vec` (24 B);
+/// - per-level inner `Vec` headers: 24 B × [`MAX_LEVEL_COUNT`], charged
+///   twice (SoA + decode) — the conservative part: a real graph has
+///   ≈ log_M N levels, far below 64;
+/// - neighbor-id payload: `4·m_max0` (level 0) + `63 × 4·m` (checklist
+///   item 11 degree caps), also charged twice.
+///
+/// All arithmetic is u64 (`node_count` is u32; the product cannot
+/// overflow). This is deliberately an upper bound, not an estimate of the
+/// realistic shape — [`crate::snapshot::load_with_budget`] compares it
+/// against the caller's memory budget before any decode/materialization.
+pub fn max_memory_estimate(header: &SnapshotHeader) -> u64 {
+    let dim = u64::from(header.dim);
+    let (m, m_max0) = (u64::from(header.m), u64::from(header.m_max0));
+    let per_node = 2 * (4 * dim) // arena vector + decode-time vector heap
+        + 1 // levels byte
+        + 24 + 48 + 24 // adjacency outer + NodeRecord struct + decode neighbors outer
+        + 2 * 24 * MAX_LEVEL_COUNT as u64 // per-level Vec headers, SoA + decode
+        + 2 * (4 * m_max0 + 63 * 4 * m); // neighbor-id payload, SoA + decode
+    u64::from(header.node_count) * per_node
+}
+
 /// The [`HnswParams`] a snapshot restores (§3: load adopts the snapshot's
 /// construction parameters). `ef_search_default` is query-time state and
 /// stays out of the snapshot, so it is an explicit caller input — a
@@ -616,6 +944,24 @@ mod tests {
         encode_snapshot_body(&sample_header(), &sample_nodes()).unwrap()
     }
 
+    /// Round 7: `max_records_size` is `max_body_size` minus exactly the
+    /// fixed-width header — the records-only ceiling `snapshot::load`'s
+    /// pre-read gate compares against. An empty graph has zero legal
+    /// records bytes, so ANY trailing byte crosses the boundary.
+    #[test]
+    fn max_records_size_is_header_exclusive() {
+        let h = sample_header();
+        assert_eq!(
+            max_records_size(&h),
+            max_body_size(&h) - SNAPSHOT_HEADER_SIZE as u64
+        );
+        let mut empty = h;
+        empty.node_count = 0;
+        empty.entry_point = u32::MAX; // the empty-graph sentinel
+        empty.max_level = 0;
+        assert_eq!(max_records_size(&empty), 0);
+    }
+
     /// Encode WITHOUT the graph-data validation (test-only): produces the
     /// byte streams `encode_snapshot_body` now refuses, so decode-side
     /// negative tests still have invalid-but-well-formed streams to reject
@@ -668,6 +1014,73 @@ mod tests {
         let data = decode_snapshot_body(unwrap_crc32(&wrapped).unwrap()).unwrap();
         assert_eq!(data.header, header);
         assert_eq!(data.nodes, nodes);
+    }
+
+    #[test]
+    fn body_encoder_matches_one_shot_and_checks_counts() {
+        // 2026-09-02 Stage C review P2-1: the streaming encoder is the
+        // single write-path implementation — its bytes and CRC must equal
+        // the one-shot wrapper's, and its count checks must fire loudly.
+        let (header, nodes) = (sample_header(), sample_nodes());
+        let levels: Vec<u8> = nodes
+            .iter()
+            .map(|r| (r.neighbors.len() - 1) as u8)
+            .collect();
+        let mut enc = BodyEncoder::new(header, levels.clone(), Vec::new()).unwrap();
+        for rec in &nodes {
+            enc.push_record(&rec.vector, &rec.neighbors).unwrap();
+        }
+        let (crc, body) = enc.finish().unwrap();
+        assert_eq!(body, encode_snapshot_body(&header, &nodes).unwrap());
+        assert_eq!(crc, crc32fast::hash(&body));
+        // ... and the CRC is exactly the §7 prefix wrap_crc32 would write.
+        assert_eq!(wrap_crc32(&body)[..CRC32_SIZE], crc.to_le_bytes());
+
+        // finish before all records are pushed: loud.
+        let enc = BodyEncoder::new(header, levels.clone(), Vec::new()).unwrap();
+        assert!(matches!(enc.finish(), Err(HnswError::Corrupted(_))));
+        // pushing past node_count: loud.
+        let mut enc = BodyEncoder::new(header, levels, Vec::new()).unwrap();
+        for rec in &nodes {
+            enc.push_record(&rec.vector, &rec.neighbors).unwrap();
+        }
+        assert!(matches!(
+            enc.push_record(&nodes[0].vector, &nodes[0].neighbors),
+            Err(HnswError::Corrupted(_))
+        ));
+        // levels/node_count mismatch at construction: loud.
+        assert!(matches!(
+            BodyEncoder::new(header, vec![0], Vec::new()),
+            Err(HnswError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn body_encoder_rejects_summary_record_disagreement() {
+        // 2026-09-02 review: the caller-supplied levels summary must agree
+        // with each record pushed — otherwise the encoder would emit a body
+        // its own decode rejects (write/read asymmetry). Both production
+        // call sites are consistent by construction, but BodyEncoder is a
+        // pub API, so the check is a real error, not a debug_assert.
+        let (header, nodes) = (sample_header(), sample_nodes());
+        let mut levels: Vec<u8> = nodes
+            .iter()
+            .map(|r| (r.neighbors.len() - 1) as u8)
+            .collect();
+        // Lie about node 0's top level (the summary stays self-consistent
+        // with the header: node 0 is not the entry point and 1 <= max_level).
+        levels[0] = 1;
+        let mut enc = BodyEncoder::new(header, levels, Vec::new()).unwrap();
+        let err = enc
+            .push_record(&nodes[0].vector, &nodes[0].neighbors)
+            .unwrap_err();
+        assert!(
+            matches!(err, HnswError::Corrupted(_))
+                && err
+                    .to_string()
+                    .contains("disagrees with the levels summary"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1121,5 +1534,48 @@ mod tests {
             encode_node_record(&mut buf, 3, &[1.0, 2.0], &[vec![]]),
             Err(HnswError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn encode_node_record_enforces_the_level_count_cap() {
+        // 2026-09-02 review round 5 P3: the pub codec must refuse what the
+        // decoder refuses — 65 levels is rejected (same MAX_LEVEL_COUNT
+        // rule as the decoder's parse point), 64 passes (the boundary is
+        // aligned with decode, which the integration suite's
+        // level_count_at_cap_loads proves end to end).
+        let mut buf = Vec::new();
+        let err = encode_node_record(&mut buf, 2, &[1.0, 0.0], &vec![Vec::new(); 65]).unwrap_err();
+        assert!(
+            matches!(err, HnswError::InvalidArgument(_)),
+            "unexpected variant: {err}"
+        );
+        assert!(
+            err.to_string().contains("level_count"),
+            "unexpected message: {err}"
+        );
+        let mut buf = Vec::new();
+        encode_node_record(&mut buf, 2, &[1.0, 0.0], &vec![Vec::new(); 64]).unwrap();
+    }
+
+    #[test]
+    fn encode_node_record_rejects_non_finite_components() {
+        // 2026-09-02 review round 6 P3: NaN and ±inf are refused at encode
+        // (the decoder rejects them at its parse point, §5/§7 — write/read
+        // symmetry at the pub codec level).
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut buf = Vec::new();
+            let err = encode_node_record(&mut buf, 2, &[bad, 0.0], &[vec![]]).unwrap_err();
+            assert!(
+                matches!(err, HnswError::InvalidArgument(_)),
+                "unexpected variant: {err}"
+            );
+            assert!(
+                err.to_string().contains("non-finite"),
+                "unexpected message: {err}"
+            );
+        }
+        // Finite vectors (including -0.0) are unaffected.
+        let mut buf = Vec::new();
+        encode_node_record(&mut buf, 2, &[-0.0, 1.0], &[vec![]]).unwrap();
     }
 }

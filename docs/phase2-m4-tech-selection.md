@@ -73,7 +73,9 @@ M4 没有消费者——编码/距离/PRNG 全手写，CRC 走 `crc32fast` 直�
 - 与 Phase 1 的分层纪律一致：AM 各成 crate（heap / btree 分立），依赖单向
   无环。HNSW 的页布局、WAL 记录、并发模型都与 B+Tree 完全不同，塞进
   `pg-am-btree` 只会污染后者的模块边界。
-- M4 的依赖面刻意收窄：`pg-am-hnsw` 只依赖 `pg-storage`（类型与错误）——
+- M4 的依赖面刻意收窄：`pg-am-hnsw` 直依赖仅 `{thiserror, crc32fast}`（v1.14
+  校正——本行原文"只依赖 `pg-storage`（类型与错误）"与上方 v1.5 修正块直接
+  矛盾，系 v1.5 漏改的正文残留；`pg-storage` 依赖缓至 M5)——
   **不依赖** `pg-txn` / `pg-catalog` / `pg-engine`，使 M4 的测试矩阵与
   Phase 1 全量回归完全解耦，编译与测试都快。
 - M5 接入 WAL/Buffer Pool 时再加 `pg-storage` 的 buffer_pool/wal 特性依赖，
@@ -111,10 +113,12 @@ node := flags:u8 | reserved:u8 | vector:f32[dim] (LE) |
   宽度如上，不再有松字段）。
 - **params 语义（v1.3 钉死）**：入快照的只有**构造期参数**
   `m / m_max0 / ef_construction`——它们决定图形态，是图状态的一部分；
-  `ef_search_default` 是查询期缺省，**不进快照**。load 策略：采用快照
-  内的构造参数还原图（不另传参）；调用方想改 `ef_search_default` 是
-  查询期动作，与快照无关。magic 不符 / format_version 未知 / 参数越界
-  （`m < 2`、`ef_construction < m` 等构造校验重跑）均响亮报错。
+  `ef_search_default` 是查询期缺省，**不进快照**。load 策略（v1.14 校正）：
+  采用快照内的构造参数还原图；`metric` 与 `ef_search_default` 由
+  `load(path, metric, ef_search_default)` 入参供给（前者 §3 不进快照，
+  错配静默改变语义但不可能 panic——Cosine+零向量在 load 处响亮拒绝；
+  后者按快照的 `m` 重跑 §4.4 校验）。magic 不符 / format_version 未知 /
+  参数越界（`m < 2`、`ef_construction < m` 等构造校验重跑）均响亮报错。
 
 - 小端定长字段，手写编解码（§10 零依赖传统），不加自描述开销。
 - **`dim` 只存快照头，节点记录不内嵌**——维度是图实例级固定参数（上文已
@@ -256,8 +260,14 @@ recall;hnswlib 允许选中集少于 M 是其性能取向，我们取连通性�
 - 贪心搜索：从入口点逐层下降（每层 greedy 到局部最近点），第 0 层用
   `ef_search` 大小的候选堆做 beam search——论文 Algorithm 2/5 原样实现。
 - `ef_search` 为**查询时参数**（`search(query, k, ef: Option<usize>)`，缺省
-  用 `ef_search_default = 64`），不进图状态——M6 的 SQL 层需要按查询调。
-- 不变式：`ef ≥ k`；`ef_search ≥ M`。校验失败即参数错误，不静默截断。
+  用图状态里的 `ef_search_default`——它进 `HnswParams` 但**不进快照**（§3），
+  load 时由调用方入参供给并按快照 `m` 重跑校验（v1.14 校正：原文"不进图
+  状态"不准确——它不进的是快照，不是图状态；load 后图的查询缺省即入参值），
+  M6 的 SQL 层需要按查询调。
+- 不变式（v1.16 校正，对齐 coding plan Stage B v1.3 钉死口径）：**逐查询只校验
+  `ef ≥ k`**（允许 ef < M）；`ef_search_default ≥ M` 约束的是**构造参数缺省**
+  （`HnswParams::new` 与快照 load 重跑），不是查询路径不变式——两条互不混用。
+  校验失败即参数错误，不静默截断。
 
 ---
 
@@ -346,12 +356,14 @@ Hnsw {
   二进制图。
 - 自定义快照：§3 定宽头 + node 记录流 + **CRC32 前缀**(`crc32(4B) + body`,
   v1.3 修正——与 pg-storage 既有惯例一致：`checkpoint.rs` 快照与 FreelistMeta
-  均为前缀 CRC，检测 bit-rot 而非静默产出"合法但错"的图）;`save(path)` /
-  `load(path)` 两个 API,load 全量校验（维度一致、NodeId 稠密、邻接端点
-  存在、**非有限（NaN/±inf）分量拒绝**——v1.4 闭环：load 也是图内容入口，
-  我们自己的 save 产不出 NaN、CRC 挡位翻转，此条属 belt-and-suspenders，但
-  "入口响亮报错"（§5）应对所有入口成立；v1.6 起与 §5 同口径按
-  `!is_finite()` 拒绝 ±inf），坏文件响亮报错。
+  均为前缀 CRC，检测 bit-rot 而非静默产出"合法但错"的图）;API 为
+  `save(graph, path)` / `load(path, metric, ef_search_default)`(v1.14 校正——
+  v1.0–v1.13 写的 `load(path)` 是占位描述：metric 不进快照（§3）由调用方供给，
+  `ef_search_default` 是查询期状态（§3 v1.3）由 load 入参重跑 §4.4 校验）,load
+  全量校验（维度一致、NodeId 稠密、邻接端点存在、**非有限（NaN/±inf）分量拒绝**
+  ——v1.4 闭环：load 也是图内容入口，我们自己的 save 产不出 NaN、CRC 挡位翻转，
+  此条属 belt-and-suspenders，但"入口响亮报错"（§5）应对所有入口成立；v1.6 起与
+  §5 同口径按 `!is_finite()` 拒绝 ±inf），坏文件响亮报错。
 
 **代价**：放弃"直接加载 hnswlib 预构建图"的便利——该便利的唯一场景是省一次
 建图时间，而 §8 的 harness 本来就要从 fvecs 原始数据建图，需求实际不存在。
@@ -560,3 +572,9 @@ Cosine/IP 的 recall 质量归 M6 真用该度量的场景验证（届时补对�
 | v1.10 | 2026-08-31 | Stage B 第三轮审查回流（P1×1 + P2×1 + P3×3，以代码为准）:**P1** `search_layer` 准入改完整 (distance, NodeId) 决胜——原距离-only 比较在满 beam 平局时让结果集席位取决于发现序，与 §4.1 冻结全序冲突；等距小 id 候选现置换大 id worst,break 提前终止保持论文距离-only 语义不变（§4.4 语义细化，纸面行为变化仅限平局席位）；**P2** §3 load 校验清单第 10 条补层级归属半边（level-L 边要求目标 `level_count > L`——原清单"邻接端点存在"漏检，合法 CRC 的越层级边可通过 decode 并在 Stage C 重建后遍历 panic；新校验当场抓获 encoding 测试 fixture 自身的语义非法——node 2 的 level-1 边指向只有 level 0 的 node 1，fixture 随修）;**P3** prop1 补 directed 断言、prop2 加 [0.05, 0.30] 回归带守护 15.35% 基线、A/B 开关 `#[doc(hidden)]` 措辞精确化（reachable but unsupported） |
 | v1.11 | 2026-08-31 | 复核遗留（nano，文档口径统一）:§4.3 "simple 路径保留为编译期可开关的对照组，不进公开 API"改写为**运行时构造参数开关 + reachable but unsupported**（v1.0 两处表述均不准：开关形式是运行时非编译期；"不进公开 API"与下游可调的事实矛盾）；coding-plan Stage B 任务行同条同步 |
 | v1.12 | 2026-08-31 | Stage B 第四轮审查回流（P2×2 + P3×3，以代码为准）:**P2-1** §3 校验清单补第 11 条邻接表良构性（严格升序=无重复无降序/无自环/度数 ≤ m_max(level)——`push_edge` 的 binary_search 前提，缺失时 Stage C 重建静默插错位；畸形流实测可干净通过旧 decode）；**P2-2** 写入/读取对称：`validate_graph_data` + `SnapshotHeader::validate_construction_params` 提取为读写共用，encode 先验后写（原 encode 接受自己读不回的头部——pub 字段可构造 `node_count:0, entry_point:7` 之流）；**P3** prop4 ef 阶梯补 64（§12 门槛值）+ 0.95 绝对下限、查询集同分布修正入 §8.3、§8.3 补 IP 推广口径（flood 恰返回有向可达分量，可达计数 1889/2000 钉死为区间观测） |
+| v1.13 | 2026-09-02 | Stage C 收口回流（实现期事实 + 对抗审查一轮，P1 零）:§7 落地形态——save 为**流式编码**(`BodyEncoder<W: io::Write>`：增量 CRC32 + 4B 占位 + finish 时 seek 回填，盘上字节布局与一次性 `wrap_crc32(body)` 完全一致，§3 冻结不动）+ 同目录临时文件原子 rename（进程内并发安全：独立临时名；跨进程不保证）,**不 fsync**（快照是基准/调试通道，持久化语义归 M5);§3 校验实现重构为读写共享三 helper（单一校验实现，decode 行为不变，既有负例单测原样全绿为证）;load 保守默认兑现（`insert` → `InvalidOperation`;graph `from_parts` 重建入口 + `read_only` 单点把关）；审查 P2-1：save 原全量物化峰值 ~3× 文件（1M gist ~4GB 快照 → ~16GB,OOM 风险）已随流式化消除，**load 剩余峰值 ≈2× 文件（NodeRecord 物化）登记为 Stage D 跑批前评估项**（连同 §11 R3 ~4GB 内存门槛与机器规格）；§3 格式自 Stage C 实际写盘起事实冻结（snapshot.rs 模块文档声明） |
+| v1.14 | 2026-09-02 | Stage C 第三轮审查回流（用户外审，P1×2 + P2×4 + P3 批，以代码为准）:**P1-1** save 临时文件改 `OpenOptions::create_new`（O_EXCL 不跟随预置符号链接）+ 撞名重试上限 1024——原可预测名 + `File::create` 在共享可写目录下可覆写任意文件；**P1-2** load 新增校验第 6 段：Cosine 逐节点零向量检查（§5 入口校验覆盖 load 入口）——L2 快照以 Cosine load 曾在 search 路径 `expect` panic，metric 契约细化为"错配静默改变语义但不可能 panic";**P2** load 校验顺序重构（定长前缀预读 → header → `ef_search_default` 提前校验 → node_count 长度交叉检查（除法形式）→ 全量读 + CRC + 完整清单），校验清单新增第 12 条 `level_count ≤ 64`（几何分布硬上界 53 @ M=2,64 双倍余量；病态形态"255 空层 × 24B Vec 头"绝对值放大被封顶，~12× 比值系 SoA 固有，结构性修复归 Stage D 扁平 CSR 评估）,load 威胁模型声明（CRC 防 bit-rot 不防恶意，非对抗来源假设）,rename 原子替换 POSIX-only 口径；**文档勘误**:§7 `load(path)` 占位签名更正为 `load(path, metric, ef_search_default)`、§2 依赖句与 v1.5 修正块的矛盾正文残留清除、stage_spec "load 峰值 ≈2×" 改两段式口径;**P3** v1 golden bytes 格式钉（红 = 漂移必须升 FORMAT_VERSION)、往返断言位级化、自定义参数 cell |
+| v1.15 | 2026-09-02 | Stage C 第四轮审查回流（用户外审，P2×2 + P3×1，以代码为准）:**P2-1** load 体积上限检查——`encoding::max_body_size` 由已验证 header 按第 11/12 条 cap 导出格式合法最大体积，超界（尾随垃圾/稀疏大文件）不读 body 即拒（[min, max] 区间不缩小合法接受集：encode 精确体积 + decode 本就拒尾随字节）;**P2-2** `level_count ≤ 64` 前移到 `decode_node_record` 解析点（原在 decode 完成后才检查，恶意 65–255 层记录可在拒绝前制造成倍嵌套 Vec 分配）——两道防线、一条规则、一个常量;**P3** prefix 读取错误分类（`UnexpectedEof` → Corrupted 截断；EISDIR/权限等 → Io，对齐 error.rs 声明）;文档勘误：§3 params 块与 §4.4 的 load/ef_search_default 语义按实际 API 更正（ef_search_default 进 HnswParams 图状态但不进快照、load 入参供给） |
+| v1.16 | 2026-09-02 | Stage C 第五轮审查回流（用户外审，P1×1 + P2×1 + P3×1，以代码为准）:**P1** load 非普通文件闸门（`!metadata.is_file()` → `InvalidArgument`;FIFO/设备 metadata 长度不可信，原 `file_len - 29` 在 debug 下下溢 panic——违反"损坏输入不 panic"契约；长度差改 saturating_sub 作纵深）;**P2** 新增 `load_with_budget(path, metric, ef_search_default, max_bytes)`——调用方硬预算（读 body 前拒 + `take()` 封顶读，封死 metadata→read 的 TOCTOU 拉大窗口）,`load` 为其薄封装（不设预算、面向可信本地基准文件，威胁模型写明）;**P3** `encode_node_record` 补 `level_count ≤ 64`（公共 codec 写读对称——原 encode 接受 65 层而 decode 拒绝）;文档勘误：§4.4 不变式行按 v1.3 口径更正（逐查询只校验 `ef ≥ k`;`ef_search_default ≥ M` 是构造缺省约束）、stage_spec golden 钉为 174B（前三轮记录误写 336B)、save 复杂度表述改两遍线性 |
+| v1.17 | 2026-09-02 | Stage C 第六轮审查回流（用户外审，P1×1 + P2×1 + P3×1，以代码为准）:**P1** 长度运算纯函数化全 saturating（读封顶路径仍有裸减法：陈旧 metadata / 预算 < 29B 可二次下溢）;**P2** §7 预算体系完善——`LoadBudget { max_file_bytes, max_memory_bytes }`：字节预算 ≠ 内存预算，物化放大由 `max_memory_estimate`（第 11/12 条 cap 导出的保守上界，按 64 层计费；1M gist 估 ~19.2GB ≈ 现实峰值 2.4×，宁严勿宽，虚高项注释写明）在 decode/物化前拦截;**P3** codec 写读对称最后一块：`encode_node_record` 补逐分量 `is_finite()`（原接受 NaN 而 decode 拒）——至此 encode/decode 校验面完全对齐 |
+| v1.18 | 2026-09-02 | Stage C 第七轮审查回流（用户外审，口径/登记类×4，以代码为准）:并发测试的 `saves_in_flight` 采样前移到 load 返回 Ok 的瞬间、先于 `assert_identical`（"Ok 返回点仪表 > 0"的证明强度与措辞对齐）;§7 体积上限拆出 records-only 口径 `max_records_size`（= `max_body_size` − 25B header）——check 5 max 与 `read_cap` 此前跨口径比较，预读闸门松 25B（安全方向，CRC 兜底；修复后为精确上限，空图 + 1B 尾随即预读拒）;**NeighborSelection 不进 §3 快照格式**（`from_parts` 硬编码 Heuristic）补登残留——开放续插时 Simple 建的图会静默按 Heuristic 续插，与 metric 残留同类，续插定夺时一并裁决（格式升版 vs 显式拒绝）;save(目录) → Io 与 load(目录) → InvalidArgument 的分类不对称写入 save rustdoc（刻意：原子替换协议不预检目标，预检即 TOCTOU 谎言） |

@@ -36,6 +36,34 @@ fn lookup(engine: &Engine, key: i32) -> bool {
         .is_some()
 }
 
+/// The two F7 failure-injection tests below arm the process-global
+/// commit-fail hook (`pg_txn::manager::test_hooks`); its ARMED claim panics
+/// on concurrent arming, so the pair must be serialized, and disarm must be
+/// panic-safe (2026-09-02: the pair raced under parallel test scheduling —
+/// latent since the Stage F F7 fix, surfaced by a Stage C workspace run).
+struct CommitFailHookGuard(std::sync::MutexGuard<'static, ()>);
+
+static COMMIT_FAIL_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl CommitFailHookGuard {
+    /// Arm the hook under the file-local lock; drop the returned guard to
+    /// disarm (Drop also runs on panic, so a failing test cannot wedge its
+    /// sibling — the poisoned lock is recovered via `into_inner`).
+    fn arm() -> Self {
+        let guard = COMMIT_FAIL_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pg_txn::manager::test_hooks::set_commit_txn_force_fail(true);
+        Self(guard)
+    }
+}
+
+impl Drop for CommitFailHookGuard {
+    fn drop(&mut self) {
+        pg_txn::manager::test_hooks::set_commit_txn_force_fail(false);
+    }
+}
+
 /// INSERT inside an explicit txn, then ABORT: the index entry must be gone
 /// AND the heap scan must be empty.
 #[test]
@@ -371,9 +399,9 @@ fn commit_failure_falls_back_to_abort_and_reclaims_xid() {
     let xid = txn.xid();
 
     // Arm the hook: commit_txn fails at entry, before any WAL work.
-    pg_txn::manager::test_hooks::set_commit_txn_force_fail(true);
+    let hook = CommitFailHookGuard::arm();
     let res = txn.commit();
-    pg_txn::manager::test_hooks::set_commit_txn_force_fail(false);
+    drop(hook); // disarm before the normal-commit checks below
     assert!(res.is_err(), "the injected commit failure must surface");
 
     // The fallback abort removed the XID from the active set (pre-fix: it
@@ -405,9 +433,9 @@ fn commit_failure_falls_back_to_abort_and_reclaims_xid() {
 fn auto_commit_commit_failure_reclaims_xid() {
     use pg_am_btree::key::encode_key;
     let (_tmp, engine) = setup();
-    pg_txn::manager::test_hooks::set_commit_txn_force_fail(true);
+    let hook = CommitFailHookGuard::arm();
     let res = engine.exec(None, "INSERT INTO t VALUES (11)");
-    pg_txn::manager::test_hooks::set_commit_txn_force_fail(false);
+    drop(hook); // disarm before the normal-commit checks below
     assert!(res.is_err(), "the injected commit failure must surface");
     assert!(
         engine.active_xids().is_empty(),

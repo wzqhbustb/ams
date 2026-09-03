@@ -45,6 +45,12 @@ pub enum HnswError {
     /// open question punted to tech-selection v1.6).
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
+
+    /// Filesystem failure in the snapshot file API (introduced in Stage C):
+    /// `save`/`load` surface I/O errors (missing file, permission denied,
+    /// short write, failed rename) through this variant instead of panicking.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// A convenient type alias for HNSW AM results.

@@ -54,7 +54,12 @@ impl Metric {
     /// Dispatch to the frozen distance functions (§5). Never re-implemented
     /// here — the f64-accumulator chains in [`crate::distance`] are the
     /// cross-platform determinism mechanism.
-    fn distance(self, a: &[f32], b: &[f32]) -> Result<f64> {
+    ///
+    /// `pub(crate)` (2026-09-02 review P1-2): [`crate::snapshot::load`]
+    /// reuses this funnel for the cosine zero-vector check — the same
+    /// implementation behind `validate_entry_vector`, so §5 entry
+    /// validation stays single-sourced at every entry point, load included.
+    pub(crate) fn distance(self, a: &[f32], b: &[f32]) -> Result<f64> {
         match self {
             Metric::L2 => distance::l2_squared(a, b),
             Metric::Cosine => distance::cosine(a, b),
@@ -159,6 +164,11 @@ pub struct Hnsw {
     /// Top level of the entry-point node; 0 for an empty graph (§3 encoding
     /// invariant: empty graph => `max_level == 0`).
     max_level: u8,
+    /// Stage C: `true` iff the graph was rebuilt from a snapshot by
+    /// [`crate::snapshot::load`] — such graphs reject [`Hnsw::insert`]
+    /// (coding plan Stage C conservative default: continuation-insert
+    /// semantics are an open question punted to tech-selection v1.6).
+    read_only: bool,
 }
 
 impl Hnsw {
@@ -211,6 +221,82 @@ impl Hnsw {
             adjacency: Vec::new(),
             entry_point: None,
             max_level: 0,
+            read_only: false,
+        })
+    }
+
+    /// Rebuild a graph from the parts of a fully validated snapshot (Stage
+    /// C, §7 — the SoA counterpart of [`crate::encoding::SnapshotFileData`]).
+    ///
+    /// `pub(crate)`: the only caller is [`crate::snapshot`], which owns the
+    /// dependency on [`crate::encoding`] (dependency direction: snapshot →
+    /// {encoding, graph}; graph never sees the byte-stream layer).
+    ///
+    /// The decode checklist in [`crate::encoding`] has already validated
+    /// everything expensive (structure, adjacency well-formedness, entry
+    /// point / max_level relations), so only cheap internal-consistency
+    /// `debug_assert`s run here — they are tripwires for a broken caller,
+    /// not input validation.
+    ///
+    /// The rebuilt graph is **read-only** (`read_only = true`): `insert`
+    /// rejects it with [`HnswError::InvalidOperation`]. The `rng` is
+    /// therefore inert (no level is ever drawn); `seed` only keeps the
+    /// field initialized, and any future continuation-insert semantics
+    /// (tech-selection v1.6 open question) would revisit it. The same is
+    /// true of the neighbor-selection mode below: the §3 format does not
+    /// carry it, so a graph built with `Simple` would silently continue
+    /// with `Heuristic` if continuation-insert ever opened — the same
+    /// class of residual as the caller-supplied metric (registered in the
+    /// stage_spec Stage C residual list, 2026-09-02 round 7).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        dim: u16,
+        metric: Metric,
+        params: HnswParams,
+        entry_point: Option<NodeId>,
+        max_level: u8,
+        vectors: Vec<f32>,
+        levels: Vec<u8>,
+        adjacency: Vec<Vec<Vec<NodeId>>>,
+        seed: u64,
+    ) -> Result<Self> {
+        let n = levels.len();
+        debug_assert_eq!(adjacency.len(), n, "levels/adjacency length mismatch");
+        debug_assert_eq!(
+            vectors.len(),
+            n * usize::from(dim),
+            "arena length != node_count * dim"
+        );
+        debug_assert!(
+            levels
+                .iter()
+                .zip(&adjacency)
+                .all(|(&l, a)| a.len() == usize::from(l) + 1),
+            "levels[i] must equal adjacency[i].len() - 1 (§3/§6 identity)"
+        );
+        debug_assert_eq!(
+            entry_point.is_some(),
+            n > 0,
+            "empty graphs have no entry point"
+        );
+        debug_assert!(
+            entry_point.is_none_or(|ep| { ep.index() < n && levels[ep.index()] == max_level }),
+            "entry point must exist and sit at max_level"
+        );
+        Ok(Self {
+            dim,
+            metric,
+            params,
+            // The §4.3 production path: selection mode only matters at
+            // insert time, and a read-only graph never inserts.
+            selection: NeighborSelection::Heuristic,
+            rng: Xoshiro256StarStar::new(seed),
+            vectors,
+            levels,
+            adjacency,
+            entry_point,
+            max_level,
+            read_only: true,
         })
     }
 
@@ -245,6 +331,17 @@ impl Hnsw {
     /// encoding invariant, so Stage C can serialize this value verbatim).
     pub fn max_level(&self) -> u8 {
         self.max_level
+    }
+
+    /// Whether this graph is read-only (Stage C): graphs rebuilt from a
+    /// snapshot by [`crate::snapshot::load`] are read-only and reject
+    /// [`Hnsw::insert`] with [`HnswError::InvalidOperation`] (coding plan
+    /// Stage C conservative default — continuation-insert semantics are an
+    /// open question punted to tech-selection v1.6). Graphs built by
+    /// [`Hnsw::new`] are never read-only; [`save`](crate::snapshot::save)
+    /// does not change this flag on the saved graph.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Top level of `node` (== `level_count - 1` in the §3 encoding).
@@ -289,7 +386,19 @@ impl Hnsw {
     /// errors at *every* entry point, including the first insert into an
     /// empty graph (which computes no pairwise distances, so the check is
     /// done explicitly here via the metric's self-distance).
+    ///
+    /// A snapshot-loaded graph is read-only and rejects every insert with
+    /// [`HnswError::InvalidOperation`] (Stage C conservative default — see
+    /// [`Hnsw::is_read_only`]).
     pub fn insert(&mut self, vector: &[f32]) -> Result<NodeId> {
+        // Stage C conservative default (coding plan): a snapshot-loaded
+        // graph rejects inserts — continuation-insert semantics are an open
+        // question punted to tech-selection v1.6.
+        if self.read_only {
+            return Err(HnswError::InvalidOperation(
+                "snapshot-loaded graph is read-only: continuation-insert semantics are an open question (tech-selection v1.6 pending, coding plan Stage C conservative default)".to_string(),
+            ));
+        }
         self.validate_entry_vector(vector, "insert")?;
         if self.node_count() == u32::MAX as usize {
             // Defensive: ~4 billion nodes. The INVALID sentinel must stay
@@ -715,6 +824,7 @@ mod tests {
             adjacency: vec![vec![vec![NodeId(1)]], vec![vec![NodeId(0)]]],
             entry_point: Some(NodeId(1)),
             max_level: 0,
+            read_only: false,
         };
         let w = g.search_layer(&[0.0], &[NodeId(1)], 1, 0);
         assert_eq!(

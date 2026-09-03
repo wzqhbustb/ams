@@ -181,8 +181,9 @@ cargo test -p pg-am-hnsw --release   # 大图属性测试的耗时口径
 
 **归属**:M4 序列化
 **前置**:Stage A（编码原语）;B 的图结构 API 冻结后接口不再动
-**目标**：§7 的 `save(path)` / `load(path)` 落地；往返等价成为 M4 的"崩溃注入
-等价物"。
+**状态**:✅ 完成（2026-09-02)——crate 123 测试双档全绿（snapshot_roundtrip 40 枚：往返等价矩阵三度量×3 seed×dim{2,16,128} + 自定义参数 cell + 边界形态 + 只读契约 + 损坏文件套件 + symlink/FIFO/并发重叠证明/golden bytes);workspace 868 绿；对抗审查七轮：第一轮 P2×1（内存峰值 → 流式 `BodyEncoder`)、第二轮零、**第三轮（用户外审）P1×2**（符号链接覆写 → `create_new`；Cosine load 零向量 panic → load 校验）、**第四轮（用户外审）P2×2**（体积上限 `max_body_size`;level cap 前移解析点）、**第五轮（用户外审）P1×1**（非普通文件长度下溢 panic → `is_file` 闸门）+ P2×1（`load_with_budget` 调用方硬预算）+ P3×1（codec level cap 对称）、**第六轮（用户外审）P1×1**（读封顶路径二次下溢 → 长度运算纯函数化全 saturating）+ P2×1（`LoadBudget` 加内存预算闸门 `max_memory_estimate`)+ P3×1（codec NaN 有限性对称）、**第七轮（用户外审）口径×2**（并发重叠采样前移至 Ok 返回点；体积上限拆 records-only 口径 `max_records_size`，预读闸门由松 25B 收紧为精确），全部修复清零；交付内容与已知残留见 `docs/stage_spec.md`「Stage C(M4)」归档
+**目标**：§7 的 `save(graph, path)` / `load(path, metric, ef_search_default)`
+落地（v1.13 校正签名——原文 `save(path)`/`load(path)` 为占位描述）；往返等价成为 M4 的"崩溃注入等价物"。
 
 | 任务 | 交付物 |
 |------|--------|
@@ -333,6 +334,12 @@ A (地基/CI/编码/距离/PRNG)
 | v1.8 | 2026-08-31 | Stage B 第三轮审查回流（P1×1 + P2×1 + P3×3，以代码为准）:**P1** beam 准入改完整 (distance, NodeId) 决胜（满 beam 等距小 id 候选置换大 id——原距离-only 比较让平局席位取决于发现序；break 提前终止保持论文距离-only 语义不变）+ 边界测试；**P2** Stage A 校验清单补第 10 条层级归属半句（本行上表同步）；**P3** prop1 补 directed 断言（原只断言 undirected，与"入口可达"名实不符）、prop2 加 [0.05, 0.30] 回归带（守护 15.35% 基线，原 `missing <= total` 形同虚设）、A/B 开关 `#[doc(hidden)]` 措辞精确化（reachable but unsupported：下游可达但零稳定性保证） |
 | v1.9 | 2026-08-31 | 复核遗留（nano，文档口径统一）:Stage B 任务行"编译期/构造参数开关，不进公开 API"改"运行时构造参数开关 + reachable but unsupported"，与源码 rustdoc 及选型 §4.3 v1.11 对齐 |
 | v1.10 | 2026-08-31 | Stage B 第四轮审查回流（P2×2 + P3×3）:**P2-1** Stage A 校验清单再补第 11 条（邻接表良构：严格升序/无自环/度数 ≤ m_max(level)）；**P2-2** encode/decode 对称（`validate_graph_data` 读写共用，encode 先验后写）；**P3** 属性④ ef 阶梯补 64 + 0.95 绝对下限（原阶梯跳过 §12 门槛值且只断言单调）、§8.3 对拍查询集同分布修正、IP 图层面覆盖经"连通性前提 + 可达分量精确对拍"补齐（非度量下部分可达为合法现象） |
+| v1.11 | 2026-09-02 | Stage C 收口登记（实现期事实回流，对抗审查一轮 P1 零）:Stage C 标 ✅ 完成；save 落地形态为流式 `BodyEncoder`(encoding.rs 单一编码器——`encode_snapshot_body` 降为薄封装，校验拆三共享 helper 读写同组实现；review P2-1：原全量物化峰值 ~3× 文件，1M gist 会 OOM)+ 临时文件原子 rename、不 fsync;load 侧廉价一半（decode 后 drop 文件字节），剩余峰值 ≈2× 文件（NodeRecord 物化）登记归 Stage D 跑批前评估（连同选型 §11 R3);§3 格式自 Stage C 实际写盘起事实冻结 |
+| v1.12 | 2026-09-02 | Stage C 第三轮审查回流（用户外审，P1×2 + P2×4 + P3 批，全部修复清零）:save 临时文件 `create_new` 化（P1-1 符号链接覆写）;load 六段校验顺序重构（ef_search_default 与长度交叉检查提前到读 body 前）+ Cosine 零向量 load 校验（P1-2 search panic);§3 校验清单第 12 条 `level_count ≤ 64`;golden bytes 格式钉等测试加固；同批修正文档口径（load 峰值两段式、校验清单 11→12 项）;**commit 拆分纪律**：工作区含一枚与 Stage C 无关的 pg-engine F7 测试竞态修复（m2b_index_txn 串行化），提交时拆独立 commit，不混入 `PHASE2-M4-StageC` |
+| v1.13 | 2026-09-02 | Stage C 第四轮审查回流（用户外审，P2×2 + P3×1）:load 体积上限 `max_body_size`（格式导出最大合法体积，尾随垃圾/稀疏大文件不读 body 即拒）;level cap 前移 `decode_node_record` 解析点（原解完才查，恶意 65–255 层可在拒绝前制造嵌套 Vec 分配）;prefix 读取 I/O 错误分类修正（目录 → Io，截断 → Corrupted);Stage C 目标行签名勘误（`save(graph, path)` / `load(path, metric, ef_search_default)`)；并发 reader 活性保证（≥1 次成功 load);README 三处 M4 进度表述陈旧同步刷新 |
+| v1.14 | 2026-09-02 | Stage C 第五轮审查回流（用户外审，P1×1 + P2×1 + P3×1）:load 非普通文件闸门（`is_file` 拒 FIFO/设备/目录，根除 metadata 长度下溢 panic);`load_with_budget` 调用方硬预算 + `take()` 封顶读（`load` 降为薄封装，威胁模型写明）;`encode_node_record` 补 level cap（codec 写读对称）;并发测试改重叠保证（writer 收工以 reader 成功为条件）;文档勘误：golden 钉 174B、save 两遍线性 |
+| v1.15 | 2026-09-02 | Stage C 第六轮审查回流（用户外审，P1×1 + P2×1 + P3×1）:读封顶路径二次下溢修复——预算下限前置（< 29B 先于 open 拒）+ 长度运算抽纯函数全 saturating（单测先红后绿，抓到 `29 + max_body` 在 u64::MAX 的裸加溢出）;`LoadBudget` 加 `max_memory_bytes` 内存闸门（`max_memory_estimate` 按 cap 导出的保守上界在物化前拒——字节预算 ≠ 内存预算，病态 64 层形态 RSS 放大 ~13×);`encode_node_record` 补 NaN/±inf 有限性检查（codec 写读对称收口）;并发测试改时间重叠证明（`saves_in_flight` 仪表） |
+| v1.16 | 2026-09-02 | Stage C 第七轮审查回流（用户外审，口径/登记类×4，均为安全方向、非行为缺陷）:并发重叠证明的仪表采样前移到 load 返回 Ok 的瞬间（原在 `assert_identical` 之后，断言期间启动的 save 会误计重叠）;check 5 max 侧与 `read_cap` 改用 records-only 口径 `encoding::max_records_size`（原与 header-inclusive 的 `max_body_size` 跨口径比较，预读闸门松 25B——CRC 仍兜底，但"精确格式上限"声明不成立；空图 + 1B 尾随边界测试钉死，红→绿成立）;NeighborSelection 不进 §3 快照（`from_parts` 硬编码 Heuristic）补登残留清单——续插语义开放时随 seed/read_only 一并裁决;save/load 目录分类不对称（save → Io / load → InvalidArgument，刻意不预检目标防 TOCTOU）写入 save rustdoc 并补测试断言 |
 
 ## 第一周做什么
 

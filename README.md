@@ -9,8 +9,8 @@ time-series, with structured metadata).
 > exists today is a working, crash-safe storage/transaction **library** plus a
 > minimal PostgreSQL wire-protocol server — `psql` and standard PG drivers can
 > connect and run basic CRUD. Phase 2 (HNSW vector index) is now underway:
-> M4 Stage A (the `pg-am-hnsw` crate foundations) is done. See
-> [Roadmap](#roadmap).
+> M4 Stages A–C (crate foundations, the core graph algorithm, and the
+> snapshot save/load file API) are done. See [Roadmap](#roadmap).
 
 ---
 
@@ -45,7 +45,7 @@ proven.
 | Phase 1 M2b | Multi-statement transactions + MVCC (SI) | ✅ done |
 | Phase 1 M2c | Lock management + deadlock detection + concurrent B+Tree | ✅ done |
 | Phase 1 M3 | Vacuum + observability + minimal PG Wire | ✅ done |
-| Phase 2 M4 | In-memory HNSW foundations (`pg-am-hnsw`) | 🚧 in progress (Stage A done) |
+| Phase 2 M4 | In-memory HNSW foundations (`pg-am-hnsw`) | 🚧 in progress (Stages A–C done) |
 | Phase 2 M5+ | HNSW WAL + persistence, concurrency, … | 📋 planned |
 
 ## Architecture
@@ -159,7 +159,7 @@ The full plan (with rationale, time estimates, and risk register) is in
 | Phase | What it delivers | Status |
 |-------|------------------|--------|
 | **1 — Storage base + row store + tx + B+Tree** | Page / WAL / BufferPool (M1) · MVCC + crash recovery + locking (M2) · vacuum + observability + minimal PG Wire (M3) | ✅ done (tag `phase1-m3`) |
-| **2 — HNSW vector index** | in-memory graph (2a) → WAL + persistence (2b) → concurrency control (2c) | 🚧 M4 (= 2a) underway: Stage A done |
+| **2 — HNSW vector index** | in-memory graph (2a) → WAL + persistence (2b) → concurrency control (2c) | 🚧 M4 (= 2a) underway: Stages A–C done |
 | **3 — Inverted index** | BM25 full-text, segment-based storage, merge | 📋 planned |
 | **4 — SQL + multi-path fusion** | DataFusion + PG Wire extended (4a) → fusion planner (4b) | 📋 planned |
 | **5a — Time-series + columnar** (parallel with 2/3/4a) | TTL partitions, columnar projection, distillation SDK stub | 📋 planned |
@@ -169,8 +169,9 @@ The full plan (with rationale, time estimates, and risk register) is in
 
 The current work is **Phase 2 M4**: the in-memory HNSW graph (insert /
 search / neighborhood-selection heuristics), distance functions, and a
-deterministic snapshot format — Stage A (crate foundations, encoding, distance,
-PRNG) is done; Stage B (the core algorithm) is next.
+deterministic snapshot format — Stages A–C (crate foundations, the core
+algorithm, snapshot save/load) are done; Stage D (recall harness + 1M
+acceptance) is next.
 
 Per-stage design decisions and deviations from PostgreSQL are documented in
 [docs/](docs/), particularly `docs/stage_spec.md` (what was actually built).
@@ -190,7 +191,7 @@ From [ROADMAP.md](ROADMAP.md):
 
 Correctness is the priority, so the test surface is heavy:
 
-- **797 tests** across the workspace, run in CI on both Linux and macOS.
+- **868 tests** across the workspace, run in CI on both Linux and macOS.
 - **Crash recovery**: `kill -9`-style round-trip tests that replay real WAL
   streams (checkpoint + split + HOT + lock combinations) and re-verify state.
 - **`loom` model checking**: the B+Tree latch choreography is model-checked
