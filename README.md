@@ -191,7 +191,7 @@ From [ROADMAP.md](ROADMAP.md):
 
 Correctness is the priority, so the test surface is heavy:
 
-- **868 tests** across the workspace, run in CI on both Linux and macOS.
+- **881 tests** across the workspace, run in CI on both Linux and macOS.
 - **Crash recovery**: `kill -9`-style round-trip tests that replay real WAL
   streams (checkpoint + split + HOT + lock combinations) and re-verify state.
 - **`loom` model checking**: the B+Tree latch choreography is model-checked

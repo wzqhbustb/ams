@@ -231,8 +231,8 @@ cargo test -p pg-am-hnsw --test snapshot_roundtrip
 # CI 硬门槛
 cargo test -p pg-am-hnsw --release --test recall_siftsmall
 # 1M 验收(手动/nightly)
-DATASET=datasets/sift cargo run -p pg-am-hnsw --release --example m4_recall_probe
-DATASET=datasets/gist cargo run -p pg-am-hnsw --release --example m4_recall_probe
+M4_DATASET=datasets/sift M4_SNAPSHOT=1 cargo run -p pg-am-hnsw --release --example m4_recall_probe
+M4_DATASET=datasets/gist M4_SNAPSHOT=1 cargo run -p pg-am-hnsw --release --example m4_recall_probe
 ```
 
 ---
@@ -340,6 +340,10 @@ A (地基/CI/编码/距离/PRNG)
 | v1.14 | 2026-09-02 | Stage C 第五轮审查回流（用户外审，P1×1 + P2×1 + P3×1）:load 非普通文件闸门（`is_file` 拒 FIFO/设备/目录，根除 metadata 长度下溢 panic);`load_with_budget` 调用方硬预算 + `take()` 封顶读（`load` 降为薄封装，威胁模型写明）;`encode_node_record` 补 level cap（codec 写读对称）;并发测试改重叠保证（writer 收工以 reader 成功为条件）;文档勘误：golden 钉 174B、save 两遍线性 |
 | v1.15 | 2026-09-02 | Stage C 第六轮审查回流（用户外审，P1×1 + P2×1 + P3×1）:读封顶路径二次下溢修复——预算下限前置（< 29B 先于 open 拒）+ 长度运算抽纯函数全 saturating（单测先红后绿，抓到 `29 + max_body` 在 u64::MAX 的裸加溢出）;`LoadBudget` 加 `max_memory_bytes` 内存闸门（`max_memory_estimate` 按 cap 导出的保守上界在物化前拒——字节预算 ≠ 内存预算，病态 64 层形态 RSS 放大 ~13×);`encode_node_record` 补 NaN/±inf 有限性检查（codec 写读对称收口）;并发测试改时间重叠证明（`saves_in_flight` 仪表） |
 | v1.16 | 2026-09-02 | Stage C 第七轮审查回流（用户外审，口径/登记类×4，均为安全方向、非行为缺陷）:并发重叠证明的仪表采样前移到 load 返回 Ok 的瞬间（原在 `assert_identical` 之后，断言期间启动的 save 会误计重叠）;check 5 max 侧与 `read_cap` 改用 records-only 口径 `encoding::max_records_size`（原与 header-inclusive 的 `max_body_size` 跨口径比较，预读闸门松 25B——CRC 仍兜底，但"精确格式上限"声明不成立；空图 + 1B 尾随边界测试钉死，红→绿成立）;NeighborSelection 不进 §3 快照（`from_parts` 硬编码 Heuristic）补登残留清单——续插语义开放时随 seed/read_only 一并裁决;save/load 目录分类不对称（save → Io / load → InvalidArgument，刻意不预检目标防 TOCTOU）写入 save rustdoc 并补测试断言 |
+| v1.17 | 2026-09-03 | Stage D 开工 + 第二轮外审回流（P1×3 + P2×6 + nano×4，全部修复清零）:fetch 脚本套娃布局修复 + SHA-256 钉死/`.part` 原子发布/`.done` 完成标记（siftsmall 钉值不设覆盖口）;recall-gate job 注册进 ci.yml（D-5 五件清单提前落地，不再等 D-1;URL 经 `vars.M4_SIFTSMALL_URL` 可切方案 2);ftp 探针 verdict 修无效结论漏洞（HTTPS control 失败即 job 红）;dataset.rs 伪造 dim 预算闸门（u16 上限，分配前拒）+ metadata 后整记录截断检测 + `recall_at_k` 完整性校验（新增 base_count 参数：越界/重复/短行全响亮）;probe 冻结口径对齐（1 轮预热 + 3 轮取中位）+ 参数严格解析（畸形/越界响亮 panic）+ 全参数输出（A/B 单变量可 diff 证明）+ `drop(base)` 削 gist 峰值;percentile 最近秩 off-by-one 修复（P99 原报 max）;§阶段 D 验收命令勘误（`DATASET=` → `M4_DATASET=` + 补 `M4_SNAPSHOT=1`);benchmarks 数字按冻结口径重测落盘 |
+| v1.18 | 2026-09-07 | Stage D 第三轮外审回流（3 项，全部修复清零）:fetch 脚本 `.done` 跳过架空摘要防线——skip 分支改为与当前期望 SHA-256 比对，不一致即 STALE 清理重走全流程（错误期望在下载后校验处 fail loud，不 brick 不静默）;probe `M4_SNAPSHOT` 收严为显式 0|1（原 `==1` 使 2 等值静默禁用快照，违背"非法参数响亮失败");dataset 模块资源预算双轨——新增 `read_fvecs_with_budget`/`read_ivecs_with_budget`（文件字节预算在读前拦截，对齐 snapshot load/load_with_budget 先例与威胁模型措辞），既有 `read_fvecs`/`read_ivecs` 降为可信本地 unlimited 薄封装 |
+| v1.19 | 2026-09-07 | Stage D 第四轮外审回流（P1×1 + P2×2，全部修复清零）:dataset.rs TOCTOU 预算突破封堵——读取走 `take(min(budget, file_len)+1)` 物理封顶 + 干净 EOF 后 1 字节增长探针（partial-dim 路径截获越界增长；无限流测试钉死读取精确停在 file_len+1,RSS 封顶 min(budget, file_len)+单记录）;dataset.rs 非普通文件闸门（open 后同 fd `is_file()`,/dev/zero 不再报 Ok(0 行）、FIFO 握手测试对齐 snapshot 先例、目录同拒）;fetch 脚本 skip 分支补 payload 核验（`.done` 只证明"上次解压成功"不证明"此刻完整"——三类文件存在且非空才许 skip，缺失则保留已验证 archive 重解压恢复，实测删 query 文件可检出并自愈） |
+| v1.20 | 2026-09-07 | Stage D 第五轮外审回流（P2×1 + 登记×1）:fetch `.done` 升级 v2 清单（逐文件 SHA-256 + 字节数 + 文件名），skip 核验从"存在非空"升为逐文件哈希比对——截断（51600B→4B）与同长度篡改均可检出并经已验证 archive 自愈（亲验）;旧单行格式 .done 视为不可信自动重建，免迁移。dataset 预算口径登记：字节预算 ≠ 内存预算（Vec-of-Vec 逐记录头放大，64MB dim=1 实测 RSS ~329MB ≈ 5×;dim ≥ 128 时 ~1.01×)——rustdoc 写明放大系数上界公式，专用内存预算登记为残留不实现 |
 
 ## 第一周做什么
 

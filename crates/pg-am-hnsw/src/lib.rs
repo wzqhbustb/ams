@@ -24,10 +24,13 @@
 //!   writes, the full load-validation checklist, and read-only
 //!   snapshot-loaded graphs (continuation-insert semantics punted to
 //!   tech-selection v1.6).
+//! - [`dataset`]: fvecs/ivecs parsing and recall@k scoring (Stage D local
+//!   toolchain) — shared by the recall probe and the CI hard gate.
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod dataset;
 pub mod distance;
 pub mod encoding;
 pub mod error;

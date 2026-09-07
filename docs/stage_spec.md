@@ -1057,6 +1057,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **encode 侧两个拒绝分支实际不可达（nano 登记，本条即登记）**：`encoding.rs:190`（`level_count > 255`）与 `encoding.rs:205`（单级邻居数 > 65535）——几何分布层级上界与 m_max/m_max0 参数上界使两分支在合法参数下不可达；Stage E tarpaulin 报告会显示未覆盖，届时用 `#[cfg(test)]` 构造触达或在覆盖率门槛登记豁免
 - **MSRV 1.86 本机不可验（P3-6 登记）**：开发机无 1.86 工具链，MSRV 仅靠 CI msrv job 把关；代码未用新语法/新 API，风险低
 - **审计分支归属偏离 plan v1.3（P3-5 登记）**：方案要求"审计 PR 只含 rustdoc + stage_spec，M4 文档从 merge 后的 main 另开 PR"；实际 `444ab9b` 已把 M4 文档（coding-plan / tech-selection）提交到审计分支，且混入 `bench-nightly.yml`（D7）与 Phase 1 收尾残留。merge 策略（整支 merge 接受偏离 vs 拆分）待用户决策
+- **Stage C 提交拆分偏离（2026-09-03 登记）**：coding-plan v1.12 登记的三笔拆分计划（StageB → pg-engine F7 flake 修复独立 commit → StageC）未完全执行——用户实际提交为两笔（`bef5267` StageB、`3c5326f` StageC），pg-engine flake 修复（`m2b_index_txn.rs`，36 行）混入了 StageC commit。影响限于历史可读性，无代码风险；记录为既成事实，后续 stage 恢复拆分纪律
 - **graph / snapshot 为占位模块**：HNSW 核心算法（论文 Algorithm 1/2/4/5，§4/§6，含 shrink 逻辑消费 m_max0）归 Stage B；`save`/`load` 文件 API（§7）归 Stage C
 - **pg-storage 依赖边缓至 M5**（P2-2 既定）：M4 直依赖冻结 {thiserror, crc32fast}，M5 WAL/buffer-pool 集成时才有真实消费者
 

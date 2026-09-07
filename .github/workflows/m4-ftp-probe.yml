@@ -1,0 +1,69 @@
+# Phase 2 M4 Stage D task D-1 (coding plan 阶段 D 第一行): measure whether a
+# GitHub-hosted runner can reach the OFFICIAL texmex dataset source
+# (ftp://ftp.irisa.fr/local/texmex/corpus/) before the recall-gate data
+# pipeline is built on it. The local dev box probe (2026-09-03, macOS):
+# TCP/21 to ftp.irisa.fr never established (timeout); plain HTTP on the same
+# host answers 403. That is a local-network signal only — runner egress is
+# shaped differently, so this workflow is the decisive measurement.
+#
+# Verdict rules (recorded into docs/phase2-m4-benchmarks.md by Stage D):
+#   - ftp reachable  -> scheme 1: direct ftp fetch + actions/cache.
+#   - ftp blocked    -> scheme 2: one-shot retrieval, self-hosted via a
+#                       GitHub release asset (fetch URL then switches).
+# The HTTPS control fetch MUST succeed; if it fails too, runner egress is
+# broken in general and the ftp verdict is meaningless. The Verdict step
+# therefore FAILS THE JOB when the control fails (2026-09-03, Stage D round
+# 2 fix: previously the control was also continue-on-error and the verdict
+# ignored its outcome, so a double failure could still exit green and
+# "conclude" scheme 2).
+#
+# Disposable: delete this file once the verdict is recorded (or keep it
+# push-trigger-scoped to this branch only — it must never land on main).
+name: M4 D-1 dataset-source probe
+
+on:
+  push:
+    branches: [rustdoc-cleanup-c2-audit]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Probe dataset sources
+    runs-on: ubuntu-latest
+    steps:
+      - name: Official FTP source (ftp.irisa.fr)
+        id: ftp
+        continue-on-error: true
+        run: |
+          curl -fsSL --max-time 60 -r 0-1023 \
+            ftp://ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz \
+            -o probe.bin -w "ftp_bytes=%{size_download} ftp_exit=%{exitcode}\n"
+      - name: HTTPS control (huggingface mirror)
+        id: https
+        continue-on-error: true
+        run: |
+          curl -fsSL --max-time 60 -r 0-1023 \
+            https://huggingface.co/datasets/vecdata/siftsmall/resolve/main/siftsmall.tar.gz \
+            -o probe.bin -w "https_bytes=%{size_download} https_exit=%{exitcode}\n"
+      - name: Verdict
+        run: |
+          {
+            echo "## D-1 probe verdict"
+            echo "- FTP outcome: ${{ steps.ftp.outcome }} (ftp_bytes/ftp_exit above; 0 bytes + exit 28 = control connection blocked/timeout)"
+            echo "- HTTPS control outcome: ${{ steps.https.outcome }} (must be success — else runner egress itself is broken)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # The verdict is only meaningful if general egress works: a failed
+          # HTTPS control invalidates the whole measurement, so fail the job
+          # instead of letting a green run "conclude" scheme 2.
+          if [ "${{ steps.https.outcome }}" != "success" ]; then
+            echo "- **INVALID: HTTPS control failed — runner egress broken, ftp verdict meaningless**" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::error::HTTPS control failed; probe result is invalid (runner egress broken), ftp verdict meaningless"
+            exit 1
+          fi
+          {
+            if [ "${{ steps.ftp.outcome }}" = "success" ]; then
+              echo "- **conclusion: scheme 1 (direct ftp + actions/cache) is viable**"
+            else
+              echo "- **conclusion: scheme 2 (self-hosted GitHub release asset) is required**"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"

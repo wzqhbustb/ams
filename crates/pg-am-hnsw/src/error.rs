@@ -22,9 +22,10 @@ pub enum HnswError {
     #[error("cosine distance undefined for a zero vector")]
     ZeroVector,
 
-    /// Snapshot bytes are malformed or fail a load-validation checklist item
-    /// (§3, §7). Corrupted bytes must never cause a panic (Stage G hardening
-    /// style, inherited from Phase 1).
+    /// Data-file bytes are malformed or fail a validation checklist item —
+    /// snapshots (§3, §7, Stage C) or benchmark dataset files (fvecs/ivecs,
+    /// `dataset` module, Stage D). Corrupted bytes must never cause a panic
+    /// (Stage G hardening style, inherited from Phase 1).
     #[error("corrupted data: {0}")]
     Corrupted(String),
 

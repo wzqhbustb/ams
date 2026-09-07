@@ -163,3 +163,50 @@ jobs:
           name: coverage-pg-am-hnsw
           path: coverage/cobertura.xml
           if-no-files-found: error
+
+  # Phase 2 M4 Stage D (coding plan 阶段 D "CI 数据管道手术" v1.3): the
+  # siftsmall recall hard gate as a standing line of defense. The plan's
+  # five-item registration checklist, item by item:
+  #   (1) fetch step: scripts/fetch_datasets.sh siftsmall. URL resolution
+  #       order: vars.M4_SIFTSMALL_URL -> the script's built-in default
+  #       (official ftp). Once the D-1 runner verdict lands, if ftp is
+  #       blocked we point the repo variable at the self-hosted release
+  #       asset (scheme 2) — zero changes to this job or the script.
+  #   (2) actions/cache@v4: path = datasets/, key =
+  #       m4-dataset-siftsmall-5304531 (dataset name + byte size). The
+  #       fetched payload is not content-addressable from the workflow side,
+  #       so the key uses byte size + a version prefix — bump the key when
+  #       the dataset changes.
+  #   (3) ownership: a NEW recall-gate job, deliberately NOT added to the
+  #       existing test matrix — matrix jobs have no dataset, and the gate
+  #       test skipping there is the designed, harmless behavior.
+  #   (4) M4_REQUIRE_DATASET=1 is set at STEP level env on the gate step
+  #       only; it never leaks into other steps or jobs.
+  #   (5) guardrail cross-check (2026-09-03, manual review conclusion
+  #       recorded here): the existing grep guardrails (loom job) scope
+  #       `git grep` to crates/... — no overlap with datasets/ or .github/,
+  #       so the new steps below cannot affect them; no new grep step is
+  #       needed.
+  recall-gate:
+    name: Recall gate (siftsmall)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache siftsmall dataset
+        uses: actions/cache@v4
+        with:
+          path: datasets/
+          key: m4-dataset-siftsmall-5304531
+      - name: Fetch siftsmall
+        env:
+          M4_DATASET_URL_SIFTSMALL: ${{ vars.M4_SIFTSMALL_URL }}
+        run: scripts/fetch_datasets.sh siftsmall
+      # --release is the contract's pinned tier. (Debug was measured after
+      # Stage D round 1: 62.4 s for the gate suite — recorded in
+      # docs/phase2-m4-benchmarks.md §3; release keeps the runner fast.)
+      - name: Recall hard gate
+        run: cargo test -p pg-am-hnsw --release --test recall_siftsmall
+        env:
+          M4_REQUIRE_DATASET: "1"
