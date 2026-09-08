@@ -34,6 +34,12 @@ jobs:
       - name: Official FTP source (ftp.irisa.fr)
         id: ftp
         continue-on-error: true
+        # Fidelity note (2026-09-08 Stage E self-review): this probes a 1 KiB
+        # RANGE request (curl REST) — it proves control+data channel
+        # reachability, not that a full multi-GB download survives (long
+        # transfers can still be cut mid-stream). Scheme 1, if chosen, is
+        # additionally exercised by the real fetch in the recall-gate job,
+        # which is where a flaky full download would surface.
         run: |
           curl -fsSL --max-time 60 -r 0-1023 \
             ftp://ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz \

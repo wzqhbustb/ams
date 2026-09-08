@@ -30,7 +30,8 @@ jobs:
       # 无需手动拼 --measurement-time/--warm-up-time/--sample-size。
       # 取舍：nightly 只验证全部 bench 可运行不崩溃（smoke），数字仅供
       # 浏览，不做 baseline 硬门槛比对——baseline 持久化与回归比对归
-      # Phase 4b 专项。全部 17 个 bench target（crates/*/benches/）在
+      # Phase 4b 专项。全部 18 个 bench target（crates/*/benches/；2026-09-08
+      # Phase 2 M4 Stage E 起含 pg-am-hnsw 的 hnsw_build_search）在
       # quick 模式下预计远低于 15 分钟，timeout-minutes: 30 留足余量。
       - name: Run criterion smoke subset
         run: cargo bench --workspace -- --quick

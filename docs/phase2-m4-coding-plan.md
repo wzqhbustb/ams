@@ -230,7 +230,9 @@ cargo test -p pg-am-hnsw --test snapshot_roundtrip
 ```bash
 # CI 硬门槛
 cargo test -p pg-am-hnsw --release --test recall_siftsmall
-# 1M 验收(手动/nightly)
+# 1M 验收(手动/nightly;sift/gist 未钉值,round 8 起需显式放行或先钉值)
+M4_DATASET_ALLOW_UNPINNED_SIFT=1 bash scripts/fetch_datasets.sh sift   # 或设 M4_DATASET_SHA256_SIFT 钉值,gist 同
+M4_DATASET_ALLOW_UNPINNED_GIST=1 bash scripts/fetch_datasets.sh gist
 M4_DATASET=datasets/sift M4_SNAPSHOT=1 cargo run -p pg-am-hnsw --release --example m4_recall_probe
 M4_DATASET=datasets/gist M4_SNAPSHOT=1 cargo run -p pg-am-hnsw --release --example m4_recall_probe
 ```
@@ -240,7 +242,9 @@ M4_DATASET=datasets/gist M4_SNAPSHOT=1 cargo run -p pg-am-hnsw --release --examp
 ## 阶段 E:M4 收口（2–3 天）
 
 **归属**:M4 出口
-**前置**:D
+**前置**:D(v1.24 偏差登记：E 的本地任务——criterion bench、对抗审查——经用户
+指示在 D 未闭环时先行开工，因其不消费 D-1/D-6 结论；E 的**收口判项**(CI 覆盖率
+判定、stage_spec 归档、出口 tag）仍须 D 闭环后完成，此前 E 不算收口）
 **目标**：覆盖率达标、性能防回退设施就位、对抗审查两轮完成、文档归档、出口
 tag。
 
@@ -344,6 +348,11 @@ A (地基/CI/编码/距离/PRNG)
 | v1.18 | 2026-09-07 | Stage D 第三轮外审回流（3 项，全部修复清零）:fetch 脚本 `.done` 跳过架空摘要防线——skip 分支改为与当前期望 SHA-256 比对，不一致即 STALE 清理重走全流程（错误期望在下载后校验处 fail loud，不 brick 不静默）;probe `M4_SNAPSHOT` 收严为显式 0|1（原 `==1` 使 2 等值静默禁用快照，违背"非法参数响亮失败");dataset 模块资源预算双轨——新增 `read_fvecs_with_budget`/`read_ivecs_with_budget`（文件字节预算在读前拦截，对齐 snapshot load/load_with_budget 先例与威胁模型措辞），既有 `read_fvecs`/`read_ivecs` 降为可信本地 unlimited 薄封装 |
 | v1.19 | 2026-09-07 | Stage D 第四轮外审回流（P1×1 + P2×2，全部修复清零）:dataset.rs TOCTOU 预算突破封堵——读取走 `take(min(budget, file_len)+1)` 物理封顶 + 干净 EOF 后 1 字节增长探针（partial-dim 路径截获越界增长；无限流测试钉死读取精确停在 file_len+1,RSS 封顶 min(budget, file_len)+单记录）;dataset.rs 非普通文件闸门（open 后同 fd `is_file()`,/dev/zero 不再报 Ok(0 行）、FIFO 握手测试对齐 snapshot 先例、目录同拒）;fetch 脚本 skip 分支补 payload 核验（`.done` 只证明"上次解压成功"不证明"此刻完整"——三类文件存在且非空才许 skip，缺失则保留已验证 archive 重解压恢复，实测删 query 文件可检出并自愈） |
 | v1.20 | 2026-09-07 | Stage D 第五轮外审回流（P2×1 + 登记×1）:fetch `.done` 升级 v2 清单（逐文件 SHA-256 + 字节数 + 文件名），skip 核验从"存在非空"升为逐文件哈希比对——截断（51600B→4B）与同长度篡改均可检出并经已验证 archive 自愈（亲验）;旧单行格式 .done 视为不可信自动重建，免迁移。dataset 预算口径登记：字节预算 ≠ 内存预算（Vec-of-Vec 逐记录头放大，64MB dim=1 实测 RSS ~329MB ≈ 5×;dim ≥ 128 时 ~1.01×)——rustdoc 写明放大系数上界公式，专用内存预算登记为残留不实现 |
+| v1.21 | 2026-09-08 | Stage E 开工（用户确认 Stage D 主体收口后）:criterion bench 落地（`benches/hnsw_build_search.rs`,10k×128d 建图 ~1844 inserts/s + 查询 ~6783 qps 回归基线,`[[bench]]` 注册,bench-nightly 自动发现零接线;MSRV 1.86 `cargo +1.86.0 check --benches` 亲验）;**对抗审查两轮**:第一轮 P1 零 + **P2-1**(max_memory_estimate 漏计文件映像 + Vec 倍增读法,合法大 dim 快照 1.65× 击穿内存闸门——修复:精确预留读法 + 闸门加文件映像项,外审场景实测峰值 460→265MB、闸门 412.7MB 重新成立)+ P3×3（零长度路径跳过增长探针 / min_record_size 双抄归一 / probe 快照段补 loaded 图逐查询 diff + recall 重算）;第二轮复核四项全部实测成立,新面仅 2 P3（LoadBudget 字段 rustdoc 同步；pg-engine 测试 guard 在新 rustc 下 dead_code 红 workspace clippy——`#[expect]` 修复）+ 1 nano（宽松预算+并发增长竞态角落,威胁模型外,注释登记） |
+| v1.22 | 2026-09-08 | Stage E 第三轮外审回流（P1×2 + P2×4 + P3×2,全部修复清零）:**P1** fetch 脚本 tar 归档 symlink/hardlink/device 成员可移动任意文件（解压前成员类型+路径白名单 `verify_archive_members`,bsdtar/GNU 双兼容）+ `.done` 残缺 manifest 配空目录误判 verified（结构校验+skip 前强制 check_payload);**P2** dataset.rs FIFO 无写端在 open 内永久阻塞（闸门移 open 前 `fs::metadata`,swap 竞态作残留 TOCTOU 登记）+ 快照读取 Vec 倍增击穿内存闸门（v1.21 nano 升级为 P2 真修:`read_body_capped` 分块读永不 realloc,超预留即 Corrupted)+ fetch 下载/解压无尺寸上限、坏归档持续复用（每数据集归档上限+`gzip -t` 门,失败删残件）+ README Stage D 状态陈旧；**P3** probe M4_SELECTION 非 Unicode 静默回退（`env_string` 统一严格语义,`M4_REQUIRE_DATASET` 同修——门槛变量静默降级为跳过正是它要防的）+ 快照等价探针只比 NodeId（改全 `(NodeId,f64)` 序列 `to_bits` 位级）。workspace 双档 884 绿,probe recall 0.9990 无回归 |
+| v1.23 | 2026-09-08 | Stage E 第七轮外审回流（fetch 脚本信任链 3 项 + 文档口径 1 项,全部修复清零）:① **.done 自签绕过**——完整性锚点从 manifest 迁到已验证归档:skip 要求归档在场+sha 校验+`tar -xzO` 逐成员流式重算 payload 哈希比对盘上文件,manifest payload 行降为冗余快路径（权威注释入格式定义）;② 尺寸上限执行点前移——`curl --max-filesize`(有 Content-Length 前置拒绝)+ `head -c cap+1` 流式硬截断兜底,`.part` 永超不过 cap+1,失败零残留;③ 解压双闸门——逐成员+总量尺寸上限（`verify_archive_sizes`,不解析 -tv 尺寸列:bsdtar/GNU 列偏移不同)+ 发布前 staging 精确文件集校验（额外成员响亮拒绝）;④ README 口径修正——Stage D 标 done 有误:D-1/D-6 未闭环则 D 未收口,而 §阶段E 前置=D,README 改为"A–C done,D closing,E in flight"并写明 E 按宣告前置只能在 D 之后收口 |
+| v1.24 | 2026-09-08 | Stage E 第八轮外审回流（2 项处置 + 1 项证伪——**证伪结论 v1.25 更正，见下**）:① **超限归档复用永久失败——证伪**(round ≤5 的旧行为,round 6/7 已闭环):亲验两条路径——超限 `.part` 在发布前即删零残留;旧版遗留的超限/伪造正式归档过复用门 plausibility 校验后 SHA 比对失败即删件,重跑自愈,无死循环。② **无钉值三元组联合伪造**——属实(原理性:无外部锚点时自洽伪造不可区分),处置为消除静默:未钉值数据集( sift/gist)下载与 skip 均须显式 `M4_DATASET_ALLOW_UNPINNED_<NAME>=1`,否则响亮拒绝并提示钉值路径;放行后每次运行(含 skip)打 UNPINNED WARNING(三元组伪造不可检出系用户显式选择);§阶段D 与 benchmarks §5 跑批命令同步勘误。③ **README "E in flight" 与前置:D 冲突**——修计划而非粉饰:§阶段E 前置行登记偏差(E 本地任务先行开工系用户指示且不消费 D-1/D-6;收口判项仍须 D 闭环) |
+| v1.25 | 2026-09-08 | Stage E 第九轮外审回流（1 项修复 + 1 项自我更正）:① **unpinned + 成员/解压尺寸校验失败 = 永久 brick——属实,已修**:该校验失败分支原只删 staging 不删归档,而复用门 `archive_plausible` 不查成员、unpinned 路径又无 SHA 兜底,坏归档被无限复用、切良好源不下载——修复:两个失败分支均 `rm -f "$archive"`(fetch_datasets.sh:615-632);本地 HTTP 源完整复现链亲验(坏 symlink 档拒绝+删档 exit 1 → 换好源重新下载 ok → 正常 skip)。② **更正 v1.24 ①的"证伪"结论**:该结论只对压缩超限(plausibility 删)与钉值(SHA 不符删)两条路径成立,对 unpinned + 成员/尺寸校验失败不成立——我上一轮把部分路径的验证推广成了全称判断,教训:证伪性结论必须穷举失败分支×钉值状态的组合矩阵,两条已验证路径不能代表第三条。外审复核同时确认残留①(opt-in 闸门+每次 WARNING)与③(README/plan 前置口径)已妥处 |
 
 ## 第一周做什么
 

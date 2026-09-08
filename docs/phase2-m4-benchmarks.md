@@ -97,9 +97,13 @@ round 2 起打印全部生效参数),A/B 单变量可证。延迟为冻结口径
   走 release URL(`fetch_datasets.sh` 的 URL 覆盖点已预留;siftsmall 的 SHA-256
   已钉死,sift/gist 摘要在数据就位时补钉)。
 
-跑批命令(数据就位后即可执行):
+跑批命令(数据就位后即可执行;round 8 起 sift/gist 未钉值,需显式
+`M4_DATASET_ALLOW_UNPINNED_<NAME>=1` 放行或先设 `M4_DATASET_SHA256_<NAME>` 钉值——
+数据就位时按上条补钉钉值为正路):
 
 ```bash
+M4_DATASET_ALLOW_UNPINNED_SIFT=1 bash scripts/fetch_datasets.sh sift   # 或钉值,下同
+M4_DATASET_ALLOW_UNPINNED_GIST=1 bash scripts/fetch_datasets.sh gist
 M4_DATASET=datasets/sift M4_SNAPSHOT=1 cargo run -p pg-am-hnsw --release --example m4_recall_probe
 M4_DATASET=datasets/gist M4_SNAPSHOT=1 cargo run -p pg-am-hnsw --release --example m4_recall_probe
 ```

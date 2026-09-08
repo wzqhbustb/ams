@@ -37,7 +37,20 @@ fn siftsmall_recall_gate() {
     let gt_path = dir.join("siftsmall_groundtruth.ivecs");
     let present = base_path.exists() && query_path.exists() && gt_path.exists();
     if !present {
-        if std::env::var("M4_REQUIRE_DATASET").as_deref() == Ok("1") {
+        // 2026-09-08, Stage E review round 3 P3: read the trigger STRICTLY —
+        // the pre-fix `as_deref() == Ok("1")` swallowed
+        // `VarError::NotUnicode`, silently DOWNGRADING a (mis-)set gate
+        // trigger into a skip. In a gate context that is the "green but
+        // never ran" failure mode this variable exists to prevent, so a
+        // non-Unicode value panics with the variable name.
+        let require = match std::env::var("M4_REQUIRE_DATASET") {
+            Ok(v) => v == "1",
+            Err(std::env::VarError::NotPresent) => false,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("M4_REQUIRE_DATASET is set but not valid Unicode")
+            }
+        };
+        if require {
             panic!(
                 "M4_REQUIRE_DATASET=1 but siftsmall is missing at {} — the gate step must fetch it (scripts/fetch_datasets.sh) or the cache key is wrong; this panic is the anti-'green but never ran' property",
                 dir.display()

@@ -47,8 +47,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::*;
 use pg_am_hnsw::encoding::{
-    encode_node_record, max_memory_estimate, wrap_crc32, BodyEncoder, NodeRecord, SnapshotHeader,
-    EMPTY_GRAPH_ENTRY_POINT, SNAPSHOT_HEADER_SIZE,
+    encode_node_record, max_memory_estimate, max_records_size, wrap_crc32, BodyEncoder, NodeRecord,
+    SnapshotHeader, CRC32_SIZE, EMPTY_GRAPH_ENTRY_POINT, SNAPSHOT_HEADER_SIZE,
 };
 use pg_am_hnsw::snapshot::LoadBudget;
 use pg_am_hnsw::{snapshot, Hnsw, HnswError, HnswParams, Metric, NodeId};
@@ -1516,13 +1516,25 @@ fn load_with_budget_memory_estimate_gate() {
 
     let estimate = max_memory_estimate(&header);
     let file_len = std::fs::metadata(tmp.path()).unwrap().len();
-    eprintln!("memory probe: file {file_len} B, estimate {estimate} B");
+    // 2026-09-08 Stage E review round 1 P2-1: the gate now charges the
+    // file-image buffer ON TOP of the heap-materialization estimate (the
+    // pre-fix gate compared the estimate alone and a legal snapshot peaked
+    // at 1.65× it). The image term is the read CAP — recomputed here from
+    // the pub ceiling (`read_cap` itself is snapshot.rs-private):
+    // min(file budget, 29 + max_records_size) + 1. For this fixture the cap
+    // is far above the real file length (all adjacency lists are empty,
+    // the ceiling charges full degree caps) — conservative, as designed.
+    let file_image = max_records_size(&header)
+        .saturating_add((CRC32_SIZE + SNAPSHOT_HEADER_SIZE) as u64)
+        .saturating_add(1);
+    let peak = estimate + file_image;
+    eprintln!("memory probe: file {file_len} B, estimate {estimate} B, peak gate {peak} B");
     assert!(estimate > u64::from(header.node_count) * 1_000);
 
-    // One byte below the estimate: rejected before the body is read.
+    // One byte below estimate + image: rejected before the body is read.
     let budget = LoadBudget {
         max_file_bytes: u64::MAX,
-        max_memory_bytes: estimate - 1,
+        max_memory_bytes: peak - 1,
     };
     let err = snapshot::load_with_budget(tmp.path(), Metric::L2, 64, budget).unwrap_err();
     assert!(
@@ -1530,11 +1542,22 @@ fn load_with_budget_memory_estimate_gate() {
         "expected InvalidArgument, got: {err}"
     );
     assert!(err.to_string().contains("memory budget"), "message: {err}");
-
-    // At the estimate: loads fine, structure intact.
+    // The pre-fix boundary (the bare estimate) must reject too — that is
+    // the hole round 1 P2-1 closed.
     let budget = LoadBudget {
         max_file_bytes: u64::MAX,
         max_memory_bytes: estimate,
+    };
+    let err = snapshot::load_with_budget(tmp.path(), Metric::L2, 64, budget).unwrap_err();
+    assert!(
+        matches!(err, HnswError::InvalidArgument(_)),
+        "budget at the bare estimate must now reject (file image uncharged pre-fix), got: {err}"
+    );
+
+    // At estimate + image: loads fine, structure intact.
+    let budget = LoadBudget {
+        max_file_bytes: u64::MAX,
+        max_memory_bytes: peak,
     };
     let g = snapshot::load_with_budget(tmp.path(), Metric::L2, 64, budget).unwrap();
     assert_eq!(g.node_count(), 1000);

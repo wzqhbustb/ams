@@ -63,21 +63,48 @@ use pg_am_hnsw::dataset::{read_fvecs, read_ivecs, recall_at_k};
 use pg_am_hnsw::graph::{Hnsw, NeighborSelection};
 use pg_am_hnsw::{snapshot, HnswParams, Metric};
 
-/// Strict env parsing: absent -> default; present but malformed or out of
-/// the target type's range -> loud panic naming the variable, the value,
-/// and the expected type (see module docs for why no silent fallback).
+/// Strict env parsing: absent -> default; present but malformed, out of
+/// the target type's range, or NON-UNICODE -> loud panic naming the
+/// variable, the value, and the expected type (see module docs for why no
+/// silent fallback). 2026-09-08 Stage E self-review: the pre-fix
+/// `Err(_) => default` also swallowed `VarError::NotUnicode` — a set but
+/// non-UTF8 value silently fell back, the same hole the strict contract
+/// was written to close.
 fn env_parse<T>(name: &str, default: T) -> T
 where
     T: std::str::FromStr + Copy,
 {
     match std::env::var(name) {
-        Err(_) => default,
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "{name} is set but not valid Unicode (expected {})",
+                std::any::type_name::<T>()
+            )
+        }
         Ok(v) => v.parse().unwrap_or_else(|_| {
             panic!(
                 "{name}={v:?} is malformed or out of range (expected {})",
                 std::any::type_name::<T>()
             )
         }),
+    }
+}
+
+/// Strict env READ for string-valued variables (2026-09-08, Stage E review
+/// round 3 P3 — finding 3): identical semantics to `env_parse` — unset ->
+/// None (the caller applies its default), non-Unicode -> loud panic naming
+/// the variable. The pre-fix M4_SELECTION match had `Err(_) => heuristic`,
+/// which swallowed NotUnicode and silently changed the measured
+/// configuration; routing every string variable (M4_DATASET, M4_SELECTION)
+/// through here keeps one strict path for all env reads.
+fn env_string(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("{name} is set but not valid Unicode")
+        }
+        Ok(v) => Some(v),
     }
 }
 
@@ -121,17 +148,20 @@ fn median3(mut v: [f64; 3]) -> f64 {
 
 fn main() {
     let dir = PathBuf::from(
-        std::env::var("M4_DATASET").expect("usage: M4_DATASET=<dir> [M4_EF=64] [M4_K=10] [M4_SEED=42] [M4_M=16] [M4_EF_CONSTRUCTION=200] [M4_SELECTION=heuristic|simple] [M4_SNAPSHOT=1]"),
+        env_string("M4_DATASET").expect("usage: M4_DATASET=<dir> [M4_EF=64] [M4_K=10] [M4_SEED=42] [M4_M=16] [M4_EF_CONSTRUCTION=200] [M4_SELECTION=heuristic|simple] [M4_SNAPSHOT=1]"),
     );
     let ef: usize = env_parse("M4_EF", 64);
     let k: usize = env_parse("M4_K", 10);
     let seed: u64 = env_parse("M4_SEED", 42);
     let m: u16 = env_parse("M4_M", 16);
     let ef_construction: u32 = env_parse("M4_EF_CONSTRUCTION", 200);
-    let selection = match std::env::var("M4_SELECTION").as_deref() {
-        Ok("simple") => NeighborSelection::Simple,
-        Ok("heuristic") | Err(_) => NeighborSelection::Heuristic,
-        Ok(other) => panic!("M4_SELECTION must be heuristic|simple, got {other:?}"),
+    let selection = match env_string("M4_SELECTION").as_deref() {
+        Some("simple") => NeighborSelection::Simple,
+        // Unset -> default; non-Unicode already panicked in env_string
+        // (round 3 P3 finding 3 — the pre-fix Err(_) arm silently degraded
+        // a non-UTF8 value to heuristic).
+        None | Some("heuristic") => NeighborSelection::Heuristic,
+        Some(other) => panic!("M4_SELECTION must be heuristic|simple, got {other:?}"),
     };
     let do_snapshot = match env_parse::<u8>("M4_SNAPSHOT", 0) {
         0 => false,
@@ -198,12 +228,17 @@ fn main() {
     // Warmup round (untimed). recall is deterministic given (seed, params,
     // selection) — the graph never changes after the build — so it is
     // scored once from this round's retrieved sets, not re-scored per round
-    // (2026-09-03, Stage D review round 2).
-    let mut retrieved = Vec::with_capacity(queries.len());
+    // (2026-09-03, Stage D review round 2). The FULL (NodeId, f64) results
+    // are kept: the M4_SNAPSHOT equivalence diff compares distances bitwise,
+    // not just ids (2026-09-08, Stage E review round 3 P3 — finding 4).
+    let mut retrieved_full: Vec<Vec<(pg_am_hnsw::NodeId, f64)>> = Vec::with_capacity(queries.len());
     for q in &queries {
-        let res = graph.search(q, k, Some(ef)).unwrap();
-        retrieved.push(res.into_iter().map(|(id, _)| id).collect());
+        retrieved_full.push(graph.search(q, k, Some(ef)).unwrap());
     }
+    let retrieved: Vec<Vec<pg_am_hnsw::NodeId>> = retrieved_full
+        .iter()
+        .map(|r| r.iter().map(|(id, _)| *id).collect())
+        .collect();
     let base_count = u32::try_from(base.len()).expect("base_count must fit u32");
     let recall = recall_at_k(&gt, &retrieved, k, base_count).unwrap();
     println!("recall_at_{k}={recall:.4}");
@@ -256,10 +291,39 @@ fn main() {
         let load_seconds = t.elapsed().as_secs_f64();
         println!("snapshot_save_seconds={save_seconds:.3}");
         println!("snapshot_load_seconds={load_seconds:.3}");
-        // Sanity surface (no assertions — measurement tool): the loaded
-        // graph must at least answer a query.
-        let check = loaded.search(&queries[0], k, Some(ef)).unwrap();
-        println!("snapshot_check_first_query_hits={}", check.len());
+        // Equivalence surface (2026-09-08, Stage E review round 1 P3-3;
+        // round 3 P3 finding 4): re-run ALL queries on the loaded graph and
+        // diff the FULL (NodeId, f64) sequences against the in-memory
+        // graph's — distances compared BITWISE (`to_bits`, +0.0/-0.0
+        // distinguishable, the same bit-exact contract
+        // snapshot_roundtrip.rs asserts). The round-1 version compared
+        // NodeIds only while its comment claimed (NodeId, f64) identity —
+        // a distance-only drift would have passed silently. Plus the loaded
+        // graph's own recall. No assertion per this tool's discipline, so a
+        // nonzero snapshot_query_diffs is THE alarm: the recall number
+        // above is only meaningful for a graph that round-trips intact.
+        let mut loaded_full: Vec<Vec<(pg_am_hnsw::NodeId, f64)>> =
+            Vec::with_capacity(queries.len());
+        for q in &queries {
+            loaded_full.push(loaded.search(q, k, Some(ef)).unwrap());
+        }
+        let diffs = loaded_full
+            .iter()
+            .zip(&retrieved_full)
+            .filter(|(a, b)| {
+                a.len() != b.len()
+                    || a.iter()
+                        .zip(b.iter())
+                        .any(|((ia, da), (ib, db))| ia != ib || da.to_bits() != db.to_bits())
+            })
+            .count();
+        let loaded_retrieved: Vec<Vec<pg_am_hnsw::NodeId>> = loaded_full
+            .iter()
+            .map(|r| r.iter().map(|(id, _)| *id).collect())
+            .collect();
+        let loaded_recall = recall_at_k(&gt, &loaded_retrieved, k, base_count).unwrap();
+        println!("snapshot_recall_at_{k}={loaded_recall:.4}");
+        println!("snapshot_query_diffs={diffs}");
         let _ = std::fs::remove_file(&snap_path);
     }
 }

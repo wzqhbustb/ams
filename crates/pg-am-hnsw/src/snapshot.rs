@@ -71,24 +71,29 @@ const MAX_TEMP_NAME_ATTEMPTS: u32 = 1024;
 /// Byte budgets for [`load_with_budget`] (2026-09-02 review rounds 5/6 P2).
 ///
 /// Two DIFFERENT quantities: a **file-byte** budget bounds what is read
-/// from disk, while a **memory** budget bounds the estimated in-memory
-/// footprint of the materialized graph. They diverge because the §6 SoA
+/// from disk, while a **memory** budget bounds the estimated peak in-memory
+/// footprint of the whole load. They diverge because the §6 SoA
 /// materialization amplifies the on-disk bytes on pathological (but
 /// format-legal) shapes — the per-level `Vec` headers cost 24 B against
 /// 2 B on disk, so a small file of many empty levels can decode to a much
 /// larger heap image; checklist item 12
 /// ([`crate::encoding::MAX_LEVEL_COUNT`]) caps the amplification factor,
-/// and [`crate::encoding::max_memory_estimate`] derives the resulting
-/// upper bound from the validated header alone.
+/// and [`crate::encoding::max_memory_estimate`] derives the heap-materialization
+/// upper bound from the validated header alone. The gate additionally
+/// charges the **file image** held during decode (the read-capped byte
+/// buffer — 2026-09-08 Stage E review round 1 P2-1: a legal
+/// large-dim/small-m snapshot otherwise peaks ~1.65× above the bare
+/// estimate, punching through a budget derived from it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadBudget {
     /// Maximum file size in bytes. Must be at least the fixed-width prefix
     /// (`CRC32_SIZE + SNAPSHOT_HEADER_SIZE` = 29) — a smaller budget is
     /// rejected before anything is read (2026-09-02 review round 6 P1).
     pub max_file_bytes: u64,
-    /// Maximum estimated in-memory footprint in bytes, compared against
-    /// [`crate::encoding::max_memory_estimate`] before any
-    /// decode/materialization.
+    /// Maximum estimated peak memory in bytes. The gate compares it against
+    /// [`crate::encoding::max_memory_estimate`] **plus the file image**
+    /// (the read-capped buffer held through decode, §7; Stage E round 1
+    /// P2-1) before any decode/materialization.
     pub max_memory_bytes: u64,
 }
 
@@ -284,10 +289,20 @@ pub fn load(path: impl AsRef<Path>, metric: Metric, ef_search_default: u32) -> R
 /// (`min(max_file_bytes, format ceiling) + 1` bytes), so a file grown
 /// between `metadata()` and the read cannot inflate the read (the over-cap
 /// bytes are cut and the CRC / decode trailing-byte check rejects the
-/// result). `budget.max_memory_bytes` bounds the **estimated in-memory
-/// footprint** ([`encoding::max_memory_estimate`], compared before any
-/// decode/materialization) — a distinct quantity, because the SoA
-/// materialization amplifies pathological shapes (see [`LoadBudget`]).
+/// result). `budget.max_memory_bytes` bounds the **estimated peak in-memory
+/// footprint**, compared before any decode/materialization as
+/// `max_memory_estimate(&header) + file_image` (2026-09-08, Stage E review
+/// round 1 P2-1): [`encoding::max_memory_estimate`] covers the heap
+/// materialization (SoA arenas + decode-time records) only, so the gate
+/// adds the file-image term itself — the read cap, known at gate time. A
+/// distinct quantity from the byte budget, because the SoA materialization
+/// amplifies pathological shapes (see [`LoadBudget`]). The image buffer is
+/// reserved exactly (`Vec::with_capacity`, round 1) and the read itself is
+/// bounded by that reserve (`read_body_capped`, 2026-09-08 round 3 P2 — a
+/// file concurrently grown mid-read fails loudly instead of double-growing
+/// the Vec past the charged term); the pre-round-1 path grew by Vec
+/// doubling from a 29-byte seed, wasting up to ~0.85× the file size on top
+/// of the image itself.
 ///
 /// **Validation order** (cheap checks first, the body is read last):
 ///
@@ -303,10 +318,11 @@ pub fn load(path: impl AsRef<Path>, metric: Metric, ef_search_default: u32) -> R
 ///    belongs to the `Io` variant (2026-09-02 review round 4 P3);
 /// 2. [`SnapshotHeader::decode`] on it — magic, format version, and the
 ///    construction-parameter re-run;
-/// 3. the budgets (rounds 5/6 P2): `file_len > budget.max_file_bytes`
-///    fails `InvalidArgument` before the body is read, and
-///    `max_memory_estimate(&header) > budget.max_memory_bytes` fails
-///    `InvalidArgument` before any decode/materialization;
+/// 3. the budgets (rounds 5/6 P2; file-image term added 2026-09-08 round
+///    1 P2-1): `file_len > budget.max_file_bytes` fails `InvalidArgument`
+///    before the body is read, and
+///    `max_memory_estimate(&header) + file_image > budget.max_memory_bytes`
+///    fails `InvalidArgument` before any decode/materialization;
 /// 4. `ef_search_default` re-validation against the header's `m` (§4.4, via
 ///    [`encoding::params_from_header`]) — **before the body is read**, so a
 ///    bad caller argument fails fast even on a truncated file;
@@ -434,10 +450,23 @@ pub fn load_with_budget(
             budget.max_file_bytes
         )));
     }
+    // The records-only ceiling is needed by BOTH the memory gate (the
+    // file-image term is derived from it via `read_cap`) and check 5's max
+    // side — compute it once (2026-09-08 Stage E review round 1 P2-1).
+    let max_records = encoding::max_records_size(&header);
     let memory_estimate = encoding::max_memory_estimate(&header);
-    if memory_estimate > budget.max_memory_bytes {
+    // Round 1 P2-1: the estimate covers the heap materialization only (its
+    // rustdoc states the口径); the gate must ALSO charge the file-image
+    // buffer, whose size is the read cap — computable here because
+    // `read_cap` depends only on the budget and the header-derived ceiling.
+    // Pre-fix the gate compared the estimate alone, and a legal
+    // dim=8192/m=2/N=4000 snapshot (estimate 279 MB) peaked at 460 MB RSS
+    // — 1.65× the budgeted figure.
+    let file_image = read_cap(budget.max_file_bytes, max_records);
+    let peak_estimate = memory_estimate.saturating_add(file_image);
+    if peak_estimate > budget.max_memory_bytes {
         return Err(HnswError::InvalidArgument(format!(
-            "estimated in-memory footprint of this snapshot is {memory_estimate} bytes, budget is {} (load_with_budget; §7 threat model: byte budget != memory budget — the SoA materialization amplifies pathological shapes)",
+            "estimated peak in-memory footprint of this snapshot is {peak_estimate} bytes (heap materialization {memory_estimate} + file image {file_image}), budget is {} (load_with_budget; §7 threat model: byte budget != memory budget — the SoA materialization amplifies pathological shapes)",
             budget.max_memory_bytes
         )));
     }
@@ -452,7 +481,7 @@ pub fn load_with_budget(
     // sub-prefix file_len; body_len then saturates to 0 and the min check
     // rejects any node_count > 0 (an empty-graph header proceeds to check
     // 6, which reads the real — now grown — bytes and validates normally).
-    let min_record_size = 2 + 4 * u64::from(header.dim) + 1 + 2;
+    let min_record_size = encoding::min_record_size(header.dim);
     let body_bytes = body_len(file_len);
     if u64::from(header.node_count) > body_bytes / min_record_size {
         return Err(HnswError::Corrupted(format!(
@@ -471,7 +500,8 @@ pub fn load_with_budget(
     // prefix), so the ceiling is `max_records_size`, not the
     // header-inclusive `max_body_size` (which left this gate 25 bytes
     // loose — safe direction, but not the exact ceiling).
-    let max_records = encoding::max_records_size(&header);
+    // max_records was computed at check 3 (the memory gate's file-image
+    // term derives from the same value — one computation, two checks).
     if body_bytes > max_records {
         return Err(HnswError::Corrupted(format!(
             "file is larger than the maximum legal size for its header — trailing garbage ({body_bytes} body bytes > max {max_records}; §3 checklist item 7 rejects trailing bytes, checked pre-read so a hostile/sparse file is never fully read)"
@@ -486,10 +516,29 @@ pub fn load_with_budget(
     // arithmetic goes through the saturating helpers (`read_cap`), so no
     // budget/stale-metadata combination can underflow. Round 7: `read_cap`
     // takes the records-only ceiling and adds the 29-byte prefix itself.
+    // 2026-09-08 Stage E review round 1 P2-1: the buffer is reserved
+    // EXACTLY — the pre-fix `prefix.to_vec()` seed (29 B) followed by
+    // read_to_end grew by Vec doubling, landing at up to ~1.85× the file
+    // size at the final realloc. The reserve is `file_len + 1`, not
+    // `read_cap_total`: for every file that passed checks 3/5,
+    // file_len + 1 <= read_cap_total holds (check 3 gives
+    // file_len <= budget; check 5 max gives file_len <= 29 + max_records),
+    // so this is exact for honest files — while a forged header can inflate
+    // read_cap_total to ~1e17 (u32::MAX nodes x max-capped records over a
+    // huge sparse file), and reserving THAT would abort on allocation
+    // failure instead of failing the CRC. file_len comes from the real
+    // filesystem; the take() cap still bounds the bytes actually read, and
+    // the memory gate charges the (larger) read_cap_total term, so the
+    // gate stays conservative either way.
     let read_cap_total = read_cap(budget.max_file_bytes, max_records);
     let remaining_cap = read_cap_total.saturating_sub((CRC32_SIZE + SNAPSHOT_HEADER_SIZE) as u64);
-    let mut bytes = prefix.to_vec();
-    file.take(remaining_cap).read_to_end(&mut bytes)?;
+    // 2026-09-08 Stage E review round 3 P2 (finding 2 — the round-2 nano is
+    // now FIXED, superseding its registration): the read itself is bounded
+    // by the reserve — a concurrently grown file fails loudly (Corrupted)
+    // instead of double-growing the Vec to a transient ~2x read_cap_total
+    // overshoot of what the check-3 memory gate charged. Memory can never
+    // exceed the reserve; growth is DETECTED, not silently truncated.
+    let bytes = read_body_capped(&file, &prefix, file_len, remaining_cap)?;
     let decoded = encoding::decode_snapshot_body(encoding::unwrap_crc32(&bytes)?)?;
     debug_assert_eq!(decoded.header, header, "same fd, same bytes");
     // 2026-09-02 review P2-1: free the file image before materializing the
@@ -567,9 +616,125 @@ fn read_cap(max_file_bytes: u64, max_records: u64) -> u64 {
         .saturating_add(1)
 }
 
+/// Read the post-prefix body into a Vec reserved at `file_len + 1` total
+/// bytes, NEVER growing past the reserve (2026-09-08, Stage E review round
+/// 3 P2 — finding 2; supersedes the round-2 nano registration, whose
+/// "documented corner" wording is retired): the pre-round-3
+/// `take().read_to_end()` let a file CONCURRENTLY GROWN after metadata()
+/// double the Vec beyond the reserve — a transient ~2x `read_cap_total`
+/// peak that overshot what the check-3 memory gate charged. This loop reads
+/// chunk-by-chunk bounded by the remaining reserve; when the reserve is
+/// exhausted, one more readable byte means the file grew past its metadata
+/// length and the load fails loudly as Corrupted instead of silently
+/// truncating. CRC-layout note (why loud is mandatory, not cosmetic):
+/// `unwrap_crc32` reads the FIRST 4 bytes as the checksum over the rest, so
+/// a silently truncated tail is CRC-rejected anyway — the pre-round-3 path
+/// did fail, but only after paying the doubling and reporting the wrong
+/// cause (bit-rot wording for a concurrency artifact).
+///
+/// Generic over `Read` so tests can inject a declared length that disagrees
+/// with the actual bytes (dataset.rs's `read_vecs_stream` injection
+/// pattern); production passes the still-open snapshot `&File` (same fd,
+/// no reopen race).
+fn read_body_capped<R: Read>(
+    reader: R,
+    prefix: &[u8; CRC32_SIZE + SNAPSHOT_HEADER_SIZE],
+    file_len: u64,
+    remaining_cap: u64,
+) -> Result<Vec<u8>> {
+    // Reserve = file_len + 1 (round 1 P2-1: exact for every file that
+    // passed checks 3/5, and immune to forged-header read_cap_total
+    // inflation since file_len comes from the real filesystem). All growth
+    // below stays within this reserve by construction.
+    let mut bytes = Vec::with_capacity(file_len.saturating_add(1) as usize);
+    bytes.extend_from_slice(prefix);
+    let mut capped = reader.take(remaining_cap);
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let room = bytes.capacity() - bytes.len();
+        if room == 0 {
+            // Reserve exhausted: any further readable byte means the file
+            // grew past its metadata length mid-read. Loud Corrupted — no
+            // realloc, no silent cut.
+            let mut probe = [0u8; 1];
+            return match capped.read(&mut probe) {
+                Ok(0) => Ok(bytes),
+                Ok(_) => Err(HnswError::Corrupted(format!(
+                    "snapshot grew beyond its metadata length {file_len} during read (reserve of {} bytes exhausted; concurrent writers are outside the §7 threat model but must fail loudly, not silently truncate)",
+                    bytes.capacity()
+                ))),
+                Err(e) => Err(HnswError::Io(e)),
+            };
+        }
+        let limit = room.min(chunk.len());
+        let n = match capped.read(&mut chunk[..limit]) {
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(HnswError::Io(e)),
+        };
+        if n == 0 {
+            return Ok(bytes);
+        }
+        // n <= room, so this never reallocates — the reserve is the hard
+        // memory bound the check-3 gate charged for.
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-09-08 Stage E review round 3 P2 (finding 2): the bounded read
+    /// never reallocs past the reserve and reports mid-read growth loudly.
+    /// Driven with injected readers whose content disagrees with the
+    /// declared metadata length (the read_vecs_stream pattern) — the
+    /// pre-round-3 read_to_end path would have double-grown the Vec.
+    #[test]
+    fn read_body_capped_bounds_memory_and_rejects_growth() {
+        const PREFIX_LEN: usize = CRC32_SIZE + SNAPSHOT_HEADER_SIZE; // 29
+        let prefix = [0xABu8; PREFIX_LEN];
+
+        // Honest case: declared length == content, read succeeds with the
+        // reserve never exceeded (capacity stays file_len + 1).
+        let body = vec![7u8; 100];
+        let file_len = (PREFIX_LEN + body.len()) as u64;
+        let got = read_body_capped(
+            std::io::Cursor::new(body.clone()),
+            &prefix,
+            file_len,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(got.len(), PREFIX_LEN + 100);
+        assert_eq!(&got[..PREFIX_LEN], &prefix[..]);
+        assert_eq!(&got[PREFIX_LEN..], &body[..]);
+        assert_eq!(got.capacity() as u64, file_len + 1);
+
+        // Shrink: fewer bytes than declared -> short image (CRC/decode
+        // rejects downstream — this helper's contract is memory bounding,
+        // not integrity), still within the reserve.
+        let got = read_body_capped(
+            std::io::Cursor::new(vec![7u8; 50]),
+            &prefix,
+            file_len,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(got.len(), PREFIX_LEN + 50);
+
+        // Growth: 64 KiB of extra bytes beyond the declared length, with a
+        // take() cap that would ALLOW them — the reserve fills, the probe
+        // sees one more byte, and the read fails Corrupted with the vec
+        // never exceeding file_len + 1 (no doubling, no silent cut).
+        let grown = vec![7u8; 100 + 64 * 1024];
+        let err =
+            read_body_capped(std::io::Cursor::new(grown), &prefix, file_len, u64::MAX).unwrap_err();
+        assert!(
+            matches!(&err, HnswError::Corrupted(m) if m.contains("grew beyond its metadata length")),
+            "unexpected error: {err}"
+        );
+    }
 
     /// Round-6 P1: the length arithmetic helpers must be total — no
     /// underflow/overflow at any boundary (the pre-fix code had a bare

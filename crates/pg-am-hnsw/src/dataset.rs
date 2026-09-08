@@ -107,18 +107,17 @@ fn read_vecs<T>(
     parse: fn([u8; 4]) -> T,
     max_file_bytes: u64,
 ) -> Result<Vec<Vec<T>>> {
-    let file = File::open(path)?;
-    let md = file.metadata()?;
-    // Regular-file gate (2026-09-07, Stage D review round 4 P2 — aligned
-    // with snapshot.rs's round-5 gate, same "regular file" wording): FIFOs,
-    // devices and sockets have no trustworthy length. Pre-fix, /dev/null
-    // and /dev/zero (metadata length 0) fell through to the file_len == 0
-    // branch and were silently accepted as an EMPTY dataset, and opening a
-    // FIFO blocked in File::open until a writer appeared; directories
-    // reach this gate on platforms where open(O_RDONLY) on a directory
-    // succeeds. The gate lives HERE, not in read_vecs_stream: the
-    // Cursor-injected test path has no file at all, so the stream core
-    // cannot check it.
+    // Regular-file gate, PRE-open (2026-09-08, Stage E review round 3 P2 —
+    // finding 1): `fs::metadata` (symlink-FOLLOWING — a symlink to a regular
+    // file is allowed, a symlink to a FIFO is rejected, same semantics as
+    // snapshot.rs's round-5 gate) runs BEFORE `File::open`, because opening
+    // a writerless FIFO blocks inside open itself and a post-open gate
+    // would never execute. Pre-fix, /dev/null and /dev/zero (metadata
+    // length 0) also fell through to the file_len == 0 branch and were
+    // silently accepted as an EMPTY dataset. The gate lives HERE, not in
+    // read_vecs_stream: the Cursor-injected test path has no file at all,
+    // so the stream core cannot check it.
+    let md = std::fs::metadata(path)?;
     if !md.is_file() {
         return Err(HnswError::InvalidArgument(format!(
             "{kind} path {} is not a regular file (FIFOs/devices/sockets have no trustworthy length)",
@@ -126,6 +125,11 @@ fn read_vecs<T>(
         )));
     }
     let file_len = md.len();
+    // Residual TOCTOU (registered, same class as snapshot.rs's gate): the
+    // path can be swapped for a FIFO between this metadata() and the open
+    // below, which would then block. Closing that needs O_NONBLOCK open,
+    // which std does not expose — the window is documented, not eliminated.
+    let file = File::open(path)?;
     read_vecs_stream(
         BufReader::new(file),
         file_len,
@@ -172,9 +176,17 @@ fn read_vecs_stream<T, R: Read>(
         )));
     }
     if file_len == 0 {
-        // Zero records is a legal (if useless) dataset; the modulo check
-        // above already holds vacuously.
-        return Ok(Vec::new());
+        // Zero records is a legal (if useless) dataset — but there is NO
+        // fast path back from here (2026-09-08, Stage E review round 1
+        // P3-1): pre-fix this returned Ok(vec![]) immediately, skipping the
+        // capped reader and the growth probe, so a file that was 0 bytes at
+        // metadata() and grew before the read was silently accepted as an
+        // empty dataset — contradicting round 4's "any change under read
+        // fails loudly" discipline. Fall through to the same gated path:
+        // cap = min(budget, 0) + 1 = 1 byte, so a grown file leaks exactly
+        // one byte into the first dim read and fails as a partial dim
+        // field, while a still-empty file reads a clean EOF and returns
+        // Ok(vec![]) as before.
     }
 
     let mut out: Vec<Vec<T>> = Vec::new();
@@ -656,6 +668,38 @@ mod tests {
         assert_eq!(got, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
     }
 
+    /// 2026-09-08 Stage E review round 1 P3-1: a declared-empty file whose
+    /// stream actually has bytes must fail loudly (the pre-fix zero-length
+    /// fast path accepted it as Ok(empty)); a genuinely empty stream still
+    /// returns Ok(vec![]) through the same gated path.
+    #[test]
+    fn zero_length_fast_path_still_probes_for_growth() {
+        let err = read_vecs_stream(
+            std::io::Cursor::new(vec![1u8, 0, 0, 0]), // 4 real bytes...
+            0,                                        // ...but metadata said empty
+            u64::MAX,
+            "fvecs",
+            "cursor",
+            f32::from_le_bytes,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, HnswError::Corrupted(m) if m.contains("partial dim field")),
+            "unexpected error: {err}"
+        );
+
+        let got = read_vecs_stream(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            0,
+            u64::MAX,
+            "fvecs",
+            "cursor",
+            f32::from_le_bytes,
+        )
+        .unwrap();
+        assert!(got.is_empty(), "honest empty file stays Ok(vec![])");
+    }
+
     /// 2026-09-07 Stage D review round 4 P1: the post-loop growth probe is
     /// pinned with a reader that reports a spurious clean EOF once and then
     /// "grows" by a byte — legal per Read's contract (Ok(0) is a hint, not
@@ -759,14 +803,18 @@ mod tests {
     }
 
     /// 2026-09-07 Stage D review round 4 P2: non-regular files are rejected
-    /// by the is_file gate (aligned with snapshot_roundtrip.rs's fifo test:
-    /// a writer thread completes the open handshake so File::open does not
-    /// block). Pre-fix, /dev/null and /dev/zero (metadata length 0) were
-    /// silently accepted as an EMPTY dataset via the file_len == 0 branch.
+    /// by the is_file gate. 2026-09-08 Stage E review round 3 P2 (finding
+    /// 1): the gate moved BEFORE File::open — a writerless FIFO blocked
+    /// inside open itself and the post-open gate never ran. The test
+    /// reflects that: no writer-thread handshake is needed anymore (open is
+    /// never attempted, so nothing can block; a leftover writer would now
+    /// hang forever and is deliberately gone), and a symlink-to-FIFO case
+    /// pins the symlink-following semantics (fs::metadata, aligned with
+    /// snapshot.rs's round-5 gate).
     #[cfg(unix)]
     #[test]
     fn non_regular_files_are_rejected() {
-        // FIFO.
+        // FIFO: immediate InvalidArgument, no open, no blocking.
         let fifo = std::env::temp_dir().join(format!(
             "pg_am_hnsw_dataset_test-{}-{}.fifo",
             std::process::id(),
@@ -777,20 +825,31 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "mkfifo failed");
-        let fifo_w = fifo.clone();
-        let writer = std::thread::spawn(move || {
-            // Opening a FIFO for writing blocks until a reader opens it —
-            // read_fvecs's File::open completes the pair; after the gate
-            // rejects and closes its end, the write fails with EPIPE (the
-            // Rust runtime ignores SIGPIPE).
-            let _ = File::create(&fifo_w).map(|mut f| f.write_all(&[0u8; 16]));
-        });
         let err = read_fvecs(&fifo).unwrap_err();
         assert!(
             matches!(&err, HnswError::InvalidArgument(m) if m.contains("regular file")),
             "unexpected error: {err}"
         );
-        writer.join().unwrap();
+
+        // Symlink semantics: symlink -> FIFO rejected, symlink -> regular
+        // file allowed.
+        let real = write_tmp(&fvecs_bytes(&[&[1.0, 2.0]]));
+        let link = std::env::temp_dir().join(format!(
+            "pg_am_hnsw_dataset_test-{}-{}.lnk",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        let err = read_fvecs(&link).unwrap_err();
+        assert!(
+            matches!(&err, HnswError::InvalidArgument(m) if m.contains("regular file")),
+            "symlink-to-FIFO: unexpected error: {err}"
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(read_fvecs(&link).unwrap(), vec![vec![1.0, 2.0]]);
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_file(&real).unwrap();
         std::fs::remove_file(&fifo).unwrap();
 
         // Character devices: /dev/null and /dev/zero must NOT come back as

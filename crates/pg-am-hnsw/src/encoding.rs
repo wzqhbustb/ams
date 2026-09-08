@@ -750,13 +750,15 @@ pub fn decode_snapshot_body(body: &[u8]) -> Result<SnapshotFileData> {
     let header = SnapshotHeader::decode(body)?;
     let mut cursor = &body[SNAPSHOT_HEADER_SIZE..];
     // Checklist item 6: bound the untrusted node_count against the remaining
-    // body BEFORE pre-allocating (see the checklist above).
-    let min_record_size = 2 + 4 * usize::from(header.dim) + 1 + 2;
-    if header.node_count as usize > cursor.len() / min_record_size {
+    // body BEFORE pre-allocating (see the checklist above). Round 1 (Stage E
+    // review, P3-2): the min-record-size formula is the shared
+    // `min_record_size`, not a hand copy.
+    let min_record = min_record_size(header.dim) as usize;
+    if header.node_count as usize > cursor.len() / min_record {
         return Err(HnswError::Corrupted(format!(
-            "node_count {} exceeds the {} records that fit in the {} remaining body bytes (min record size {min_record_size})",
+            "node_count {} exceeds the {} records that fit in the {} remaining body bytes (min record size {min_record})",
             header.node_count,
-            cursor.len() / min_record_size,
+            cursor.len() / min_record,
             cursor.len()
         )));
     }
@@ -782,6 +784,17 @@ pub fn decode_snapshot_body(body: &[u8]) -> Result<SnapshotFileData> {
     validate_graph_data(&header, &nodes)?;
 
     Ok(SnapshotFileData { header, nodes })
+}
+
+/// Minimum on-disk size of one node record with vector dimension `dim`
+/// (2026-09-08, Stage E review round 1 P3-2): flags + reserved (2 B) +
+/// vector (4·dim B) + level_count byte (1 B) + level 0's empty neighbor
+/// list (2 B count). ONE implementation shared by both node_count
+/// cross-checks — `decode_snapshot_body`'s usize division and
+/// `crate::snapshot::load`'s pre-read u64 check previously hand-copied the
+/// formula in two places (single-implementation discipline violation).
+pub(crate) fn min_record_size(dim: u16) -> u64 {
+    2 + 4 * u64::from(dim) + 1 + 2
 }
 
 /// Wrap a body in the CRC32 prefix (`crc32(4B LE) + body`, §7 — the same
@@ -852,12 +865,12 @@ pub fn max_records_size(header: &SnapshotHeader) -> u64 {
     max_body_size(header).saturating_sub(SNAPSHOT_HEADER_SIZE as u64)
 }
 
-/// Conservative upper bound on the **in-memory footprint** of loading a
-/// snapshot with this (already header-validated) header — 2026-09-02
-/// review round 6 P2. A file-size budget cannot express this: the §6 SoA
-/// materialization amplifies the on-disk bytes (a per-level `Vec` header
-/// is 24 B vs 2 B on disk), so the bound is derived from the header and
-/// the frozen caps alone. Per node:
+/// Conservative upper bound on the **in-memory footprint of the heap
+/// materialization** when loading a snapshot with this (already
+/// header-validated) header — 2026-09-02 review round 6 P2. A file-size
+/// budget cannot express this: the §6 SoA materialization amplifies the
+/// on-disk bytes (a per-level `Vec` header is 24 B vs 2 B on disk), so the
+/// bound is derived from the header and the frozen caps alone. Per node:
 ///
 /// - vector bytes `4·dim`, charged twice (the SoA arena + the decode-time
 ///   `NodeRecord` heap — both coexist transiently during load);
@@ -873,8 +886,19 @@ pub fn max_records_size(header: &SnapshotHeader) -> u64 {
 ///
 /// All arithmetic is u64 (`node_count` is u32; the product cannot
 /// overflow). This is deliberately an upper bound, not an estimate of the
-/// realistic shape — [`crate::snapshot::load_with_budget`] compares it
-/// against the caller's memory budget before any decode/materialization.
+/// realistic shape.
+///
+/// **口径 (2026-09-08, Stage E review round 1 P2-1): this function covers
+/// the HEAP MATERIALIZATION only — it deliberately excludes the file-image
+/// buffer.** The pre-round-1 read path grew that buffer by Vec doubling
+/// from a 29-byte seed (`prefix.to_vec()` + `take().read_to_end()`), so a
+/// legal dim=8192/m=2/N=4000 snapshot measured 279 MB here but peaked at
+/// 460 MB RSS (1.65×) — a legal snapshot broke through the memory budget.
+/// Post-fix the buffer is reserved exactly (`Vec::with_capacity(read_cap)`)
+/// and [`crate::snapshot::load_with_budget`]'s gate compares
+/// `max_memory_estimate(header) + file_image` against the budget, where the
+/// file-image term is the read cap known at the gate
+/// (min(file budget, 29 + format ceiling) + 1).
 pub fn max_memory_estimate(header: &SnapshotHeader) -> u64 {
     let dim = u64::from(header.dim);
     let (m, m_max0) = (u64::from(header.m), u64::from(header.m_max0));
@@ -942,6 +966,19 @@ mod tests {
 
     fn sample_body() -> Vec<u8> {
         encode_snapshot_body(&sample_header(), &sample_nodes()).unwrap()
+    }
+
+    /// Stage E review round 1 P3-2: the min-record-size formula lives in ONE
+    /// place; pin its value so a drift between the two former hand copies
+    /// (decode's usize division and load's u64 pre-read check) cannot
+    /// reappear silently.
+    #[test]
+    fn min_record_size_matches_the_format() {
+        // flags+reserved (2) + vector (4*dim) + level_count (1) + level-0
+        // neighbor count (2).
+        assert_eq!(min_record_size(2), 13);
+        assert_eq!(min_record_size(128), 517);
+        assert_eq!(min_record_size(0), 5);
     }
 
     /// Round 7: `max_records_size` is `max_body_size` minus exactly the

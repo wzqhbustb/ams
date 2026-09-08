@@ -41,7 +41,14 @@ fn lookup(engine: &Engine, key: i32) -> bool {
 /// on concurrent arming, so the pair must be serialized, and disarm must be
 /// panic-safe (2026-09-02: the pair raced under parallel test scheduling —
 /// latent since the Stage F F7 fix, surfaced by a Stage C workspace run).
-struct CommitFailHookGuard(std::sync::MutexGuard<'static, ()>);
+///
+/// The guard field is never read — holding the MutexGuard until Drop IS the
+/// semantics (2026-09-08: newer rustc's dead_code never-read analysis flags
+/// the tuple field; `expect` keeps it loud if that ever changes).
+struct CommitFailHookGuard(
+    #[expect(dead_code, reason = "held for Drop; the lock is the point")]
+    std::sync::MutexGuard<'static, ()>,
+);
 
 static COMMIT_FAIL_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

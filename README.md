@@ -159,7 +159,7 @@ The full plan (with rationale, time estimates, and risk register) is in
 | Phase | What it delivers | Status |
 |-------|------------------|--------|
 | **1 — Storage base + row store + tx + B+Tree** | Page / WAL / BufferPool (M1) · MVCC + crash recovery + locking (M2) · vacuum + observability + minimal PG Wire (M3) | ✅ done (tag `phase1-m3`) |
-| **2 — HNSW vector index** | in-memory graph (2a) → WAL + persistence (2b) → concurrency control (2c) | 🚧 M4 (= 2a) underway: Stages A–C done |
+| **2 — HNSW vector index** | in-memory graph (2a) → WAL + persistence (2b) → concurrency control (2c) | 🚧 M4 (= 2a) underway: Stages A–C done, D closing, E in flight |
 | **3 — Inverted index** | BM25 full-text, segment-based storage, merge | 📋 planned |
 | **4 — SQL + multi-path fusion** | DataFusion + PG Wire extended (4a) → fusion planner (4b) | 📋 planned |
 | **5a — Time-series + columnar** (parallel with 2/3/4a) | TTL partitions, columnar projection, distillation SDK stub | 📋 planned |
@@ -170,8 +170,13 @@ The full plan (with rationale, time estimates, and risk register) is in
 The current work is **Phase 2 M4**: the in-memory HNSW graph (insert /
 search / neighborhood-selection heuristics), distance functions, and a
 deterministic snapshot format — Stages A–C (crate foundations, the core
-algorithm, snapshot save/load) are done; Stage D (recall harness + 1M
-acceptance) is next.
+algorithm, snapshot save/load) are done. Stage D (siftsmall recall harness
++ A/B acceptance) is implemented and green locally but **not yet closed**:
+two acceptance items remain externally gated (the CI ftp-reachability
+probe verdict and the 1M sift/gist runs, both needing runner-side
+network/data — see `docs/phase2-m4-benchmarks.md`). Stage E (criterion
+benchmarks, coverage, M4 closeout) has started on local tasks and, per its
+declared precondition, closes only after D does.
 
 Per-stage design decisions and deviations from PostgreSQL are documented in
 [docs/](docs/), particularly `docs/stage_spec.md` (what was actually built).
@@ -191,7 +196,7 @@ From [ROADMAP.md](ROADMAP.md):
 
 Correctness is the priority, so the test surface is heavy:
 
-- **881 tests** across the workspace, run in CI on both Linux and macOS.
+- **884 tests** across the workspace, run in CI on both Linux and macOS.
 - **Crash recovery**: `kill -9`-style round-trip tests that replay real WAL
   streams (checkpoint + split + HOT + lock combinations) and re-verify state.
 - **`loom` model checking**: the B+Tree latch choreography is model-checked
