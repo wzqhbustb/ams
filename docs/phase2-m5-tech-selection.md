@@ -1,7 +1,8 @@
 # Phase 2 M5 技术选型（HNSW WAL + 持久化）
 
-> **状态：草案 v1.11(2026-09-09，第十轮审查 1 P1 + 2 P2 已修复，待复核；v1.10
-> 复核收敛判定：机制面已无未攻击角落，待用户终审）。** 本文档定义 Phase 2
+> **状态：草案 v1.12(2026-09-10，第十一轮审查 = 用户终审 P1(SetNeighbors
+> 无自环校验不可实现）已修复，待复核；v1.10 复核收敛判定：机制面已无未
+> 攻击角落）。** 本文档定义 Phase 2
 > 第二个 milestone(M5 = ROADMAP.md Phase 2b,**HNSW 变更进单一 WAL、崩溃后完整
 > 恢复**）落地前所有跨模块的技术选择，对应 ROADMAP.md:264-278。
 >
@@ -170,7 +171,7 @@ switch，注册表对"缺子操作 handler"失明。子操作码方案的唯一�
 | 判别值（建议段） | 记录 | payload(bincode standard,对齐先例） |
 |---|---|---|
 | 121 | HnswNodeInit | (meta_page_id, page, slot, node_id, level, dim, vector)——节点条目按 level **定长预留**创建，state=INITIALIZING(§7.2/§8.1,v1.5) |
-| 122 | HnswSetNeighbors | (meta_page_id, page, slot, level, count, 邻居内容）——**原位更新**（定长预留内改 count+内容，条目永不扩搬，v1.5;meta_page_id 供 redo 侧容量校验，v1.8) |
+| 122 | HnswSetNeighbors | (meta_page_id, page, slot, node_id, level, count, 邻居内容）——**原位更新**（定长预留内改 count+内容，条目永不扩搬，v1.5;meta_page_id 供 redo 侧容量校验，v1.8;**node_id = owner，供 redo 侧无自环校验**,v1.12——此前 payload/原语/条目布局均无 owner,"无自环"不可实现；owner 与 (page,slot) 的目录映射一致性归 §11.3 审计） |
 | 123 | HnswMetaUpdate | (meta_page_id, 字段后像：入口点/最大层） |
 | 124 | HnswNodeTombstone | (page, slot, node_id) —— 格式交付，语义 M6 生效（§1) |
 | 125 | HnswDirAppend | (目录尾页， node_id → (page u64, slot u16) 条目后像，条目宽 10B)——**真单页记录**(v1.2) |
@@ -197,7 +198,11 @@ SetNeighbors，但该记录 payload 没有 publish_live 标志，翻转实际上
 SetNeighbors 与 MetaUpdate 额外携带 `meta_page_id`(NodeInit 的 apply
 要按 meta 的 m 重算 L_max、SetNeighbors 的 apply 要按 meta 的 m/m_max0
 校验 count ≤ 该层容量——层容量分解需要 m 与 m_max0，条目自描述无法
-反解这个分裂，v1.7 第七轮 P3-2 修正；见 §10.1 纵深校验；对齐 btree
+反解这个分裂，v1.7 第七轮 P3-2 修正）;SetNeighbors 另携带 **owner
+node_id**(v1.12——redo 侧"无自环"校验的判定基准：节点条目布局不存
+NodeId(§7.2 公式无该字段）,payload 不带 owner 则自环检查不可实现；
+owner 与 (page,slot) 的目录映射一致性归 §11.3 审计，同可求值性约束）;
+见 §10.1 纵深校验；对齐 btree
 记录 payload 带 page_id 的先例
 record.rs:891-904)。redo 时 meta page 经 ctx.buffer_pool 可读（Stage I 起
 恒 Some),meta 创建于任何 insert 记录之前，redo 前缀序保证其时 meta
@@ -241,11 +246,13 @@ M5 单线程写入保证链前缀一致——无空洞）。备选 (a)（明文�
   slot u16 + bincode 开销，**只写尾页**——v1.2 后无头页热点；目录扩容
   摊销 ≈ 每 813 insert 一条 DirLink)+ level-0 的 ~16 个邻居页原位更新
   (16 × 130B ≈ 2.1KB)+ 自身列表（66B)+ 偶发上层与 meta 记录 ≈
-  **2.8KB/insert ≈ 向量本体的 5.4×**(v1.0 审查者估算 4–5KB/≈9× 偏高——
+  **2.9KB/insert ≈ 向量本体的 5.6×**(v1.0 审查者估算 4–5KB/≈9× 偏高——
   其把上层与双向 shrink 全量计入；本文以核算口径重算，系数随 m/m_max0
   线性增长。v1.10 nano:v1.8 给 SetNeighbors 加 meta_page_id 后
-  +16×8B ≈ 128B，从 2.7KB 升至此值）。
-  1M 全量建库 ≈ **2.8GB WAL**——接入 §9.2 的恢复预算讨论（checkpoint
+  +16×8B ≈ 128B，从 2.7KB 升起。v1.12:v1.12 给 SetNeighbors 补 owner
+  node_id(+4B/条，稳态 ≈17 条/insert = 16 邻居页 + 1 自身列表 → +68B,
+  从 2.8KB 升至此值）。
+  1M 全量建库 ≈ **2.9GB WAL**——接入 §9.2 的恢复预算讨论（checkpoint
   频率控制重放窗口；bulk load 后立即 checkpoint 是 §9.2 的硬要求）。
 - **幂等锚 = pd_lsn**(`page.pd_lsn >= record.lsn` 跳过，heap 先例
   record.rs:209)；页内内容 authoritative，无读时依赖。
@@ -628,12 +635,12 @@ CheckpointEnd v2 与 superblock redo 点（pg-storage/src/superblock.rs:79)。
 - **checkpoint 刷写放大与第二旋钮**(v1.1 审查 P3-1):1M 全量 bulk load
   后的首次 checkpoint 刷写 ≈ 全量脏页 ~0.9GB（与一次全量快照同量级，
   但走 buffer pool 刷写路径而非独立文件）；稳态增量窗口的刷写量 =
-  窗口内 WAL 触碰的脏页数，由 §4.2 核算的 ~2.8KB/insert 写放大推算。
+  窗口内 WAL 触碰的脏页数，由 §4.2 核算的 ~2.9KB/insert(v1.12）写放大推算。
   第二旋钮登记：**脏页上限/增量 checkpoint**（脏页超阈值即触发部分
   刷写，削平单点刷写尖峰）——Phase 1 的 checkpoint 协调器是否已有
   该钩子待开工时核实，无则列为 M5 内的小型 pg-storage 增量。
 - **bulk load 后必须立即 checkpoint——硬要求**(v1.4 P3，从暗示升为明文）:
-  1M 全量建库 ≈ 2.8GB WAL(§4.2)，在建库途中、首次 checkpoint 之前
+  1M 全量建库 ≈ 2.9GB WAL(§4.2,v1.12)，在建库途中、首次 checkpoint 之前
   崩溃，重放窗口 = 全量建库记录，恢复远超 30s——§13.2 的 <30s 验收
   **只对 checkpoint 之后的增量窗口成立**(§11.4 的测试方法"建库 →
   checkpoint → 注入增量 → SIGKILL"已正确如此构造）。因此：bulk load
@@ -670,15 +677,18 @@ CheckpointEnd v2 与 superblock redo 点（pg-storage/src/superblock.rs:79)。
   - **HnswNodeInit**:meta_page_id 指向合法 meta 页；dim == meta.dim;
     level ≤ L_max = ⌊53·ln2/ln m⌋（按 meta 的 m 重算）;vector 分量全有限;
     meta.metric == Cosine ⇒ vector 非零（对齐 M4 insert 漏斗的 ZeroVector
-    响亮拒绝——distance.rs:76 校验 funnel、graph.rs:385 insert 入口同口径；
+    响亮拒绝——distance.rs:76 校验 funnel、graph.rs:402 insert 入口同口径；
     L2/IP 零向量合法，M4 同）；目标 slot 为空闲或 INITIALIZING（幂等重放
     形态）;
   - **HnswSetNeighbors**:count == content.len();count ≤ 层容量（level 0 →
     m_max0，上层 → m，经 meta 分解——v1.8 P3-2：条目自描述反解不出，
     payload 必带 meta_page_id);level ≤ 目标条目 top_level；邻居列表升序、
-    无重复、无自环;("每个被引 id < 链导出 HWM"降级到 §11.3 审计——
+    无重复、无自环（判定基准 = payload 的 **owner node_id**,v1.12——此前
+    payload/原语/条目布局均无 owner，此项不可实现）;("每个被引 id < 链导出
+    HWM"降级到 §11.3 审计——
     redo 期 LSN 序已蕴含：同 insert 内步骤 4 在 5 前，旧节点更早；v1.10
-    可求值性约束）;
+    可求值性约束）;("owner node_id 与 (page,slot) 的目录映射一致"降级到
+    §11.3 审计，v1.12——v1.10 可求值性约束同型）;
   - **HnswDirAppend**：条目序位 == 尾页 count（追加位置精确）；目标
     (page, slot) 的条目存在且 state ∈ {INITIALIZING, LIVE}(NodeInit
     先行的协议前提；**不得要求 INITIALIZING 单值**——v1.11 审查 P1：
@@ -735,8 +745,8 @@ M4 深审（2026-09-09）已立卡，本文档正式收编：
    - `append_node(meta_page_id, node_page, slot, node_id, level, vector)` —
      指定 level(§5 裁决载体）；定长预留、INITIALIZING 态、节点页槽位
      分配在此发生（§8.1 步骤 3);
-   - `set_neighbors(page, slot, level, count, content)` — 原位更新（步骤
-     5/6);
+   - `set_neighbors(page, slot, node_id, level, count, content)` — 原位更新
+     （步骤 5/6);node_id = owner，无自环校验载体（v1.12);
    - `publish_live(page, slot, node_id)` — state 后像翻 LIVE（步骤 8);
    - `dir_append(dir_tail_page, node_id, node_page, slot)` — 尾页单页条目写
      （步骤 4);
@@ -842,7 +852,9 @@ HWM 的正确性依赖这组前提被钉住，对齐 M4 邻接良构清单纪律
 top_level ≥ L（层级归属，对齐 M4 快照校验 encoding.rs:423 的"目标
 拥有对应层"——v1.10 降级项"被引 id < HWM"只覆盖存在性，层级归属是
 独立一维，漏检即 Stage C 重建遍历越界类风险）;c) MetaUpdate 的
-entry_point < 链导出 HWM;d) PublishLive 的 node_id 与目录映射一致；②
+entry_point < 链导出 HWM;d) PublishLive 的 node_id 与目录映射一致；
+e) SetNeighbors 的 owner node_id 与 (page,slot) 目录映射一致（v1.12——
+同 d 的可求值性降级：redo 期 LSN 序已蕴含，审计期一次遍历求值）;②
 siftsmall recall@10 ≥ 0.98（恢复后对 M4 门槛数据集重跑 probe 口径）;③
 幽灵/孤儿统计输出（不阻断，只登记——8.3 不变量 5)。
 外加 ④（v1.1 审查 P2-1 配套）:**loser 窗口断言**——M5 的 WAL 流中
@@ -928,4 +940,5 @@ pg-am-hnsw（页布局/WAL 记录）与 pg-engine（崩溃 rounds）两侧。
 | v1.8 | 2026-09-09 | 第七轮复核回流（verdict **PASS 附条件** → 条件项本轮闭合；第六轮修复逐项实证成立，PublishLive 独立记录与 meta 重排方向正确，无新 P1)。闭合项：**P2-1(max_level 弱化立文）**——"隐藏高层节点残态良性、下次 MetaUpdate 自然覆盖"的论证两处不实（自然更新只升至下一个更高抽取值、永不追溯旧峰值；"上层边暂不可达"实为上层列表恒空，graph.rs:436 实证）;§8.3 不变量 1 立弱化声明（崩溃残态下 max_level 可滞后真实最高层，弱化后口径 = `max_level == 入口点 top_level`，不承诺 M4 快照清单第 9 条的"无节点高于 max_level"),§11.3① 验收断言按弱化口径收窄（否则 forget 窗口测试撞上自己的断言）,§8.2 窗口行与 §10.3 同步。**P3-1**:§10.3 步骤 3(pg_rust_relpages 登记）注明是引擎内最小登记（重开可定位性前提），与 §1 非目标的 SQL/DDL 用户面分层调和。**P3-2**:SetNeighbors 对称校验的"无需 meta"不成立（层容量分解需要 m/m_max0，条目自描述无法反解）——SetNeighbors payload 同规携带 meta_page_id,§4.2 表/自包含规则/§10.1 三处同步。**P3-3**:§8.2"6 后 7 前"行措辞修正（首 insert 在步骤 4–7 间任一位置崩溃产生同一检测态，"唯一残态"收窄性失实已改；"上层边暂不可达"→"上层列表为空")。七轮审查轨迹 FAIL→FAIL→PASS→FAIL→PASS→PASS→PASS，可提交用户终审 |
 | v1.9 | 2026-09-09 | 第八轮审查回流（verdict FAIL → 全量修复；1 P1 + 3 P2 逐条实证后全部属实）。**P1（节点页初始化协议不完整）**:§8.1 步骤 1 补全初始化链——new_page → 初始化 HNSW 页头（32B PageHeader + 页类型；目录页另写 ordinal/next=INVALID/count=0)→ log_page_init(post-image FPI + stamp pd_lsn)→ 首个 NodeInit/DirLink；回收页口径明文：post-image FPI 的内容 = 初始化后的合法 HNSW 页（非零页）,A1 契约（buffer_pool.rs:424-442）与 btree log_page_init(index.rs:3299-3310）语义核实；新分配全零页同样必须走此链（pd_lower=0 不是合法 slotted 页头），两情形无例外分支。**P2-1**:§10.2 原语清单补 `apply_tombstone(page, slot, node_id)`(HnswNodeTombstone=124 的 redo 承载；tombstone 语义 M6 生效但 §1 划的 M5 范围是"能写、能重放、能校验"，承载原语必须在清单内）。**P2-2**：校验层次明文——redo handler 先经 meta_page_id 读 meta 完成全部校验再调原语，原语不重复校验（单一实现纪律：校验在 funnel 层单点定义）,§10.1 总原则与 §10.2 同步。**P2-3**:§10.1 纵深校验扩为**冻结清单**（逐记录类型：NodeInit 的 meta 合法性/dim 一致/L_max/有限性/slot 态；SetNeighbors 的 count==content.len()/层容量/top_level/升序无重复无自环/被引 id < 链导出 HWM——LSN 序保证被引节点先发布；DirAppend 的追加位置精确/目标 INITIALIZING;DirLink 的未链接/ordinal+1;MetaUpdate 的 entry_point<HWM/max_level==入口点 top_level(v1.8 弱化口径）;PublishLive 的幂等态/目录一致；Tombstone 的目标 LIVE)，对齐 M4 encoding.rs:409-431 快照清单项别；pd_lsn 守卫先行（已应用即跳过不重验）；清单冻结——新增检查项 = 协议修订记录；图级深校验不进 redo 路径（恢复时长预算），归 §11.3 open 后审计 |
 | v1.10 | 2026-09-09 | 第九轮复核回流（verdict **PASS 附条件** → 条件项本轮闭合；复核给出**收敛判定：机制面已无未攻击角落**)。闭合项：**P2-1(redo 校验可求值性）**——冻结清单中三项依赖链导出 HWM/目录映射的校验（SetNeighbors 被引 id < HWM、MetaUpdate entry_point < HWM、PublishLive 目录一致性）与"handler 无状态化 + 30s 恢复预算"三方冲突（序位→物理页须沿链遍历，恢复窗口 10 万条 × 1231 页 = 亿次级页读）：按复核建议方向 (b) 全部降级到 §11.3 open 后审计（redo 期 LSN 序已蕴含其恒真，审计期有一次性遍历预算）,§10.1 立"可求值性约束"（redo 只留同页/同记录可判定项）。nano×4:① §8.1 步骤 1 "首个 NodeInit/DirLink"→"NodeInit(节点页)/DirAppend(目录页）"(DirLink 写旧尾页）;② 写放大核算补 v1.8 的 meta_page_id(+16×8B ≈ 128B):2.7→**2.8KB/insert ≈ 5.4×**,1M ≈ 2.8GB WAL(§4.2/§9.2 两处同步）;③ §8.2 表头 "v1.7 形态"→"v1.9 形态";④ pd_lsn 跳过不重验补 FPI 前提一句（镜像含全部先序同页记录内容,"pd_lsn ≥ lsn 而本记录未应用"不可达）。九轮轨迹 FAIL→FAIL→PASS→FAIL→PASS→PASS→PASS→PASS→PASS，可定稿提交用户终审 |
-| v1.11 | 2026-09-09 | 第十轮审查回流（1 P1 + 2 P2，逐条代码实证后全部属实并修复）。**P1(DirAppend 跨页单值断言误杀合法残态）**：冻结清单"目标条目存在且 INITIALIZING"改 state ∈ {INITIALIZING, LIVE}——节点页与目录页由 buffer pool 独立刷盘，节点页可携 LIVE 先于目录页落盘，崩溃后重放 DirAppend 时目标条目恰为 LIVE，单值校验会拒绝合法状态；由此立第二条跨页纪律：redo 校验对跨页可变状态只断言取值集合、不断言单值（pd_lsn 单页守卫只覆盖同页幂等）；同清单其余跨页读（MetaUpdate 读入口点 top_level）复核安全——top_level 不可变 + LSN 序保证条目已存在。**P2-1(NodeInit 缺 Cosine 零向量校验）**：补 meta.metric == Cosine ⇒ vector 非零，对齐 M4 insert 漏斗(distance.rs:76 的 ZeroVector 响亮拒绝、graph.rs:385 入口同口径；L2/IP 零向量合法，M4 同）——缺此校验则 Cosine 索引可经 WAL 写入搜索期 expect panic 的图（Stage C 已修过的同类边）。**P2-2(§11.3 邻接审计不自含）**:v1.10 把三类链导出校验降级到 §11.3，但 §11.3 正文未逐条枚举，降级近乎消失；补"邻接良构断言"四条——a) 端点存在（被引 id < 链导出 HWM 且目录条目占用）;b) 层级归属（level-L 边目标 top_level ≥ L，对齐 M4 快照校验 encoding.rs:423，与存在性是独立一维）;c) entry_point < HWM;d) PublishLive 的 node_id 与目录映射一致。十轮轨迹 FAIL→FAIL→PASS→FAIL→PASS→PASS→PASS→PASS→PASS→修复，待复核 |
+| v1.11 | 2026-09-09 | 第十轮审查回流（1 P1 + 2 P2，逐条代码实证后全部属实并修复）。**P1(DirAppend 跨页单值断言误杀合法残态）**：冻结清单"目标条目存在且 INITIALIZING"改 state ∈ {INITIALIZING, LIVE}——节点页与目录页由 buffer pool 独立刷盘，节点页可携 LIVE 先于目录页落盘，崩溃后重放 DirAppend 时目标条目恰为 LIVE，单值校验会拒绝合法状态；由此立第二条跨页纪律：redo 校验对跨页可变状态只断言取值集合、不断言单值（pd_lsn 单页守卫只覆盖同页幂等）；同清单其余跨页读（MetaUpdate 读入口点 top_level）复核安全——top_level 不可变 + LSN 序保证条目已存在。**P2-1(NodeInit 缺 Cosine 零向量校验）**：补 meta.metric == Cosine ⇒ vector 非零，对齐 M4 insert 漏斗(distance.rs:76 的 ZeroVector 响亮拒绝、graph.rs:402 入口同口径；L2/IP 零向量合法，M4 同）——缺此校验则 Cosine 索引可经 WAL 写入搜索期 expect panic 的图（Stage C 已修过的同类边）。**P2-2(§11.3 邻接审计不自含）**:v1.10 把三类链导出校验降级到 §11.3，但 §11.3 正文未逐条枚举，降级近乎消失；补"邻接良构断言"四条——a) 端点存在（被引 id < 链导出 HWM 且目录条目占用）;b) 层级归属（level-L 边目标 top_level ≥ L，对齐 M4 快照校验 encoding.rs:423，与存在性是独立一维）;c) entry_point < HWM;d) PublishLive 的 node_id 与目录映射一致。十轮轨迹 FAIL→FAIL→PASS→FAIL→PASS→PASS→PASS→PASS→PASS→修复，待复核 |
+| v1.12 | 2026-09-10 | 第十一轮审查回流（用户终审 P1，已核实属实并修复）。**P1(SetNeighbors "无自环"校验不可实现）**:payload/原语/节点条目布局均无 owner node_id，冻结清单的"无自环"无判定基准——按用户钦定修法：HnswSetNeighbors payload 补 owner node_id(§4.2 表与自包含规则段），原语签名改 `set_neighbors(page, slot, node_id, level, count, content)`(§10.2),§10.1 冻结清单注明判定基准 = payload owner;owner 与 (page,slot) 的目录映射一致性按可求值性约束同型降级到 §11.3（新增邻接良构断言 e)。写放大核算同步：+4B/条 × 稳态 ≈17 条/insert(16 邻居页 + 1 自身列表）= +68B,2.8KB → **≈2.9KB/insert ≈ 5.6×**,1M 全量 2.8GB → **≈2.9GB WAL**(§4.2/§9.2 两处同步，对齐 v1.10 nano 的笔法）。coding-plan 同步升 v1.3(Stage C 冻结清单行、Stage E benchmarks 数字、基线引用） |
