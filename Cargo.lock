@@ -732,6 +732,7 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "criterion",
+ "pg-storage",
  "thiserror",
 ]
 
@@ -757,6 +758,7 @@ dependencies = [
  "parking_lot",
  "pg-am-btree",
  "pg-am-heap",
+ "pg-am-hnsw",
  "pg-catalog",
  "pg-storage",
  "pg-txn",

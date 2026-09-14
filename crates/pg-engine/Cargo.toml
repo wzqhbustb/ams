@@ -13,6 +13,9 @@ pg-txn = { path = "../pg-txn" }
 pg-catalog = { path = "../pg-catalog" }
 pg-am-heap = { path = "../pg-am-heap" }
 pg-am-btree = { path = "../pg-am-btree" }
+# Phase 2 M5 Stage 0 (2026-09-11): HNSW redo handlers register into
+# Engine::open (tech-selection §2 — the second M5 dependency edge).
+pg-am-hnsw = { path = "../pg-am-hnsw" }
 
 # error types
 thiserror = "2"

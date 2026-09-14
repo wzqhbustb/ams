@@ -61,6 +61,21 @@ pub fn set_page_pd_lsn(page: &mut [u8], lsn: Lsn) {
     page[0..8].copy_from_slice(&lsn.0.to_le_bytes());
 }
 
+/// Read the page's `pd_flags` from `page[12..14]` (AM-specific usage; see
+/// the layout table above and the allocation registry on `PageHeader`).
+///
+/// 2026-09-14, M5 Stage 0 review round 5 P3-3: added so AMs (pg-am-hnsw's
+/// page type tags first) stop hardcoding the offset — one owner of the
+/// header layout, same discipline as [`page_pd_lsn`].
+pub fn page_pd_flags(page: &[u8]) -> u16 {
+    u16::from_le_bytes(page[12..14].try_into().expect("page is at least 14 bytes"))
+}
+
+/// Write the page's `pd_flags` into `page[12..14]`.
+pub fn set_page_pd_flags(page: &mut [u8], flags: u16) {
+    page[12..14].copy_from_slice(&flags.to_le_bytes());
+}
+
 /// The 32-byte slotted-page header (26 bytes of fields + 6 bytes padding).
 ///
 /// The 6-byte padding after `pd_prune_xid` keeps tuple payloads 8-byte
@@ -72,6 +87,12 @@ pub struct PageHeader {
     /// Page checksum (M2 writes 0; Phase 7b may enable real checksums).
     pub pd_checksum: u32,
     /// Page flags (AM-specific).
+    ///
+    /// Allocation register (2026-09-11, M5 Stage 0 review nano-2): bits
+    /// 8–15 are owned by pg-am-btree (`btpo_level` 8–11, `btpo_flags`
+    /// 12–15, pg-am-btree/src/page.rs); bits 0–7 are the HNSW page-type
+    /// tag (1=NODE, 2=DIR, 3=META, pg-am-hnsw/src/page.rs); heap does not
+    /// use this field. New AMs must register here before claiming a bit.
     pub pd_flags: u16,
     /// Offset to the end of the line pointer array (start of free space).
     pub pd_lower: u16,

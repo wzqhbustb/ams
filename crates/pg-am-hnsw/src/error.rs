@@ -52,6 +52,14 @@ pub enum HnswError {
     /// short write, failed rename) through this variant instead of panicking.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A pg-storage failure surfaced through the M5 dependency edge
+    /// (2026-09-11, Phase 2 M5 Stage 0): WAL appends, buffer-pool operations,
+    /// and page-allocator calls. Carried as a formatted message for now —
+    /// Stage C (the write path) may introduce structured classification if a
+    /// caller needs to discriminate.
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 /// A convenient type alias for HNSW AM results.

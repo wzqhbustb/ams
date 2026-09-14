@@ -1142,3 +1142,46 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **`.tmp-*` 崩溃残留**：进程在 create 与 rename 间崩溃留下临时文件，下次运行不自动清理（无害，rustdoc 已写明清理模式）
 - **跨进程并发 save 同目标不保证**（进程内已安全）：调用方串行化，rustdoc 已写明
 - **metric 不进快照 = 静默错配不可检出**（§3 冻结的固有代价，rustdoc 与交付项 1 已声明，此处补登记）：load 的 `metric` 入参与建图不一致时，快照没有任何 bit 可检出——距离语义静默改变，recall 数字静默作废。**Stage D 的 recall harness / benchmark 加载器必须在调用点钉死 metric**（每个数据集固定映射：sift/gist → L2)，与"先验连通性、后验 recall"同级的诊断纪律；M5 若把 metric 落入 catalog/reloptions，此残留自然消解（格式不动，metric 是运行时属性）
+
+## Stage 0（M5）:WAL 基建三件套 + 页初始化链 + 依赖边 + CI 核对
+
+**状态**:✅ 完成（2026-09-11 落码，多轮审查闭环（逐轮回流段见下）;pg-storage 全部套件绿（lib **205** + 各集成套件）,pg-am-hnsw **144** 全绿（92 lib + 3 bruteforce + 5 properties + 1 page_init + 3 recall_siftsmall + 40 snapshot_roundtrip),workspace 全量绿；clippy/fmt/doc 三档绿；未 commit——等用户确认，message 前缀 `PHASE2-M5-Stage0`)
+**工期**:预估 2–3 天
+**验收**:`cargo test -p pg-storage --test wal_record_type_discriminant` 3/3 绿（ALL_TYPES 25→32，三层测试自动生效；104 等未分配值拒绝不受影响）;`cargo test -p pg-storage` 全绿；`cargo run -p pg-storage --bin pg-waldump -- --help` 打印 usage 并 exit 0(2026-09-11 审查 P3-1 修复后实测;unknown option exit 1);`cargo test -p pg-storage --test waldump` 3/3 绿（2026-09-12 二轮 P3-2:HNSW 七解码臂进 `dump_covers_every_record_family` 执行验证，逐字段断言）;`cargo test --workspace` 全绿；`cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` 绿
+
+**审查回流（2026-09-12，二轮 verdict FAIL → 全量修复）**:P1 回收页整页清零（init_* 起手 `page.fill(0)`——FPI 是整页后像，旧租户字节不进 WAL/磁盘）;P2-1 七种 payload 共享**有界、完整消费**解码 API(`decode_hnsw_payload`，伪造长度前缀无巨量分配、尾随字节响亮拒绝，waldump 七臂全部改走）;P2-2 pd_lsn 契约断言（log_page_init 返回 lsn == 页 pd_lsn，恢复后与 FPI 一致）;P2-3 NodeId 合法性（u32::MAX 仅空图 MetaUpdate(entry_point=INVALID, max_level=0）合法，node/owner/neighbor/tombstone/dirappend/publishlive 全拒）;P3-1 coding-plan 基线 v1.12→v1.13;P3-2 waldump 执行验证补齐（原"解码臂随 crate 编译"口径升级为执行覆盖）
+
+**审查回流（2026-09-14，三轮 verdict FAIL → 全量修复）**:P2 有界解码机制重写——二轮版依赖 bincode serde"拒绝伪造长度即零分配"，实证不实（serde cautious size_hint 在输入耗尽前仍预分配至 1 MiB；旧测试只钉了"报错"没钉"零分配");改为**预解码闸门** `bounded_seq_gate`：先解标量前缀（定游标）→ 手读尾随 Vec 的 varint 长度 → `claimed > 剩余字节 / 元素最小编码宽` 在分配前拒绝（f32 定宽 4B、varint 整数最小 1B——首版取 u32=4B 误杀小值邻居的合法 payload，往返测试当场抓出）；顺带立解码侧契约校验（vector.len()==dim、neighbors.len()==count，构造器纪律的不可信输入镜像）。P3×3:coding-plan 两处旧口径（"已定稿 12 版"→13、waldump 验收注释"解码延至 Stage C"→执行验证已承接）;waldump.rs 补 MetaUpdate/Tombstone/DirLink/PublishLive 四臂的逐字段断言（归档"七臂逐字段"自此属实）;tech-selection 头部状态矛盾消除（"草案/待复核"→已经用户终审，与 coding-plan 前置口径对齐）
+
+**审查回流（2026-09-14，四轮 verdict FAIL（无 P1)→ 全量修复）**:P2-1 门禁自身工程化——三轮版手维护 wire layout（两个 Prefix 结构体）与 varint 规则（手写 reader)，与真实解码存在漂移面；改为**单一共享前缀结构体** `HnswSeqPrefix`（两 payload 标量布局相同，bincode 位置编码故一构两用；漂移由往返测试钉死——加字段不同步即红）+ **线长经共享 `bincode_config()` 解码为 u64**（手写 varint reader 删除，config 变更时门禁与真实解码同进退）。P2-2 SetNeighbors 伪造长度断言升级为必在闸门（消息含 "claims"，与 NodeInit 同级）。P3-1 语义不符 payload 预分配拒绝——门禁新增 wire 长度 == 声明 dim/count 的分配前比较（合法大小但语义造假不再先分配后拒绝），补字节翻转测试（篡改 dim/count 字节，断言在闸门失败）。P3×3:coding-plan Stage 0 CI 行"waldump 仅随 crate 编译"→ 执行验证承接口径；tech-selection 头部轮次表述统一（四轮闭环定稿）+ §13 去"草案";stage_spec 数字校准（lib 203→204、payload 测试 2→3 枚、pg-am-hnsw 总 144 分解）+ tarpaulin 口径读准（只插桩 pg-am-hnsw,Stage 0 的 pg-storage 侧代码无覆盖率数字背书，由既有 test matrix 承接）
+
+**审查回流（2026-09-14，五轮 verdict P3×3 → 全量修复）**:① coding-plan CI 清单 #3"waldump 编译 + 解码臂"→ 补执行验证表述（tests/waldump.rs 七分支逐字段断言）;② page_init.rs 测试注释机制纠错——2026-09-11 nano-3 注释虚构了"tenant A 的 pre-image FPI 把页清零"机制（该 FPI 不存在，junk 无 WAL)；缺 init FPI 时恢复的真实终态是**盘上 junk**(page_type 读 0xABAB)，承重断言是 page_type == PAGE_TYPE_DIR 的相等断言（junk 或零页皆红）,!= 0 检查只记述零页残态一种形状；③ pd_flags 偏移硬编码消除——pg-storage page.rs 新增 `page_pd_flags`/`set_page_pd_flags` 访问器（与 page_pd_lsn 同纪律，布局唯一属主）,pg-am-hnsw page.rs 的写/读全部改走访问器，不再出现 12..14 字面量
+
+**审查回流（2026-09-14，六轮 verdict 1 P2 + 3 P3 → 全量修复）**:P2 门禁漂移面根除——四轮的 `HnswSeqPrefix` 仍是独立维护的 wire 前缀，"漂移不可静默"宣称不成立（误读长度恰好与 tail 相等时可静默通过）；结构性解法：payload struct 改为**自身携带标量头**（新增 pub `HnswSeqHead`,NodeInit/SetNeighbors 记录 = head + 序列，wire 布局逐字节不变——bincode 位置编码），门禁解码的正是记录自身包含的类型，加字段则门禁与解码器结构性同进退，非测试钉。构造器/waldump 两臂/往返测试同步（`r.dim`→`r.dim()`、`r.meta_page_id`→`r.head.*`)。P3×3:① pg-am-hnsw page.rs 单测残留的 `page[12..14]` 字面量与"entry area 不属清零契约"注释（与二轮 P1 整页清零契约直接冲突）——断言改走访问器，注释对齐整页契约；② tech-selection 头部"四轮"与已登记五轮不一致——头部状态行改**非计数口径**("多轮审查闭环，逐轮回流见 stage_spec 归档"，消除每轮必改的 churn);stage_spec :1148 状态行同步
+
+**审查回流（2026-09-14，七轮 verdict 1 P2 + 3 P3 → 全量修复）**:P2 DPT 分析臂去布局重复——NodeInit/SetNeighbors 的 touched-page 解码原手解两个 PageId（跳过 meta 取次字段，重复假定 HnswSeqHead 布局，字段调整即追踪错页）;改 `decode_prefix::<HnswSeqHead>` 解记录自有头类型取 `head.page_id`，与六轮同一纪律（布局单源）。P3×3:① 补 **golden bytes 钉**(`hnsw_payload_golden_bytes`)——嵌套 head 记录与旧扁平布局逐字节相等的格式冻结（head varint 字节 + vec 长度 + f32 LE 逐字节断言）,lib 204→205;② coding-plan 两处"十轮"→ 十一轮（:27 硬约束速查、:88 工程规则，与选型 v1.13 一致）;③ tech-selection v1.13 修订记录 nano③ 保留已被五轮证伪的"tenant pre-image FPI 清零"机制解释——更正为真实机制（缺 init FPI 恢复盘上 junk）并交叉引用五轮回流段
+
+**审查回流（2026-09-14，八轮 verdict P3×3 → 全量修复）**:① 数字再校准——stage_spec 状态行 lib 204→**205**（七轮 golden 钉入库）、payload 编解码测试 3→**4 枚**（补登 `hnsw_payload_golden_bytes`);② DPT 穷举测试行号引用 :796→**:854**（代码位移）四处：coding-plan :112/:287、tech-selection :737、stage_spec 交付内容 ①（历史修订记录行保留当轮行号不改）;③ record.rs 两处手写 INVALID 检查（DirAppend.target_page、DirLink.next_page）改复用 `reject_invalid_page_id` 单一实现（错误消息口径随之统一为 "{record} {field} must be a real page")
+
+### 交付内容
+
+1. **判别值注册三件套（选型 §10.1 WAL 接入清单）**:① `wal/record.rs`:`WalRecordType` 新增 7 变体（121–127,HnswNodeInit/SetNeighbors/MetaUpdate/NodeTombstone/DirAppend/DirLink/PublishLive),`from_u8` 同步；7 个 payload struct(bincode standard）与 7 个构造器（对齐 `btree_insert` 先例，构造器做入参响亮校验：dim>0/vector 长度与 dim 一致/分量有限/level ≤ 63、count==len/严格升序/无自环（经 owner node_id 判定，v1.12 的校验载体自此真实存在）、max_level ≤ 63、非法目标页拒绝）;LogicalHnsw=100 保持无生产者/handler（选型 §4.1 既定）。② `analysis.rs`:`for_each_touched_page` 注册 7 类型（touched 口径：NodeInit/SetNeighbors → payload 的节点 page(meta_page_id 只读不算 touched);MetaUpdate → meta_page_id;Tombstone/PublishLive → 节点 page;DirAppend → 目录尾页；DirLink → 旧尾页）,PAGE_MODIFYING 穷举分类同步（:854 穷举测试自动把守）；行为测试用例 7 条（对齐既有 cases 模式）。③ `bin/pg-waldump.rs`:7 类型解码臂从 reserved-hex 移出，逐字段打印
+2. **payload 编解码测试**(`record.rs` 单测 4 枚）:`hnsw_payloads_roundtrip_field_by_field`(7 种 payload encode→bincode decode 逐字段断言；自包含规则钉死：NodeInit/SetNeighbors/MetaUpdate 必带 meta_page_id,SetNeighbors 必带 owner node_id,v1.12;Tombstone 只测格式，语义 M6)+ `hnsw_payload_golden_bytes`（嵌套 head 与扁平布局逐字节相等的 golden 钉，2026-09-14 七轮 P3-1)+ `hnsw_constructors_reject_bad_arguments`（非法入参逐条响亮拒绝：页字段 PageId::INVALID、NodeId::INVALID(node/owner/邻居，仅空图 MetaUpdate 例外）、level > 63、升序/重复/自环）+ `hnsw_bounded_decoders_reject_forged_lengths_and_trailing_bytes`（有界解码闸门：伪造长度必在预分配闸门失败、wire 长度与声明 dim/count 不符预分配拒绝、尾随字节拒绝——2026-09-14 四轮机制）
+3. **页初始化链（选型 §8.1 步骤 1 / §10.3,v1.9 P1)**:`pg-am-hnsw/src/page.rs`——三类页类型常量（NODE=1/DIR=2/META=3，挂 `pd_flags`,pg-storage 文档的 AM-specific 字段；0 = 未初始化非法页）、`init_node_page`/`init_meta_page`/`init_dir_page`(32B PageHeader 起手；目录页另写 §7.1 自描述头：version=1/flags/reserved/ordinal/count=0/next=INVALID,24B 格式常量）、`log_page_init`(post-image FPI + stamp pd_lsn——**post-image 内容 = 初始化后的合法 HNSW 页头，不是零页**;A1 契约 buffer_pool.rs:424-442，回收页与新分配页同链无例外）。**回收页断电恢复测试**(`tests/page_init.rs`):freelist 分配→写 junk→flush→释放→再分配（断言同 id 回收）→ init + log_page_init → `mem::forget` 模拟 kill -9 → `open_with_redo_handlers` 恢复 → 页头为 HNSW 目录页初始化态、零 junk 残留（红→绿语义：去掉 log_page_init 即红）
+4. **依赖边两条（选型 §2,coding-plan Stage 0 交付物行）**:pg-am-hnsw → pg-storage(Cargo.toml,M4 预留注释的消费点；page.rs/redo.rs 首用）;pg-engine → pg-am-hnsw + 空骨架 `hnsw_redo_handlers()`(redo.rs，返回空 Vec,Stage C 填本体）注册进 `Engine::open` 的 extend 链（engine.rs:687-690——接线从第一天可编译，注册动作只发生一次）
+5. **错误通道**:`HnswError` 新增 `Storage(String)` 变体（M5 依赖边的 pg-storage 失败映射基线；Stage C 写路径可按需细化分类）
+6. **CI 核对结论（零新增 job 预期，核对而非假设）**:pg-am-hnsw 已在 ci.yml clippy/test/doc 三 matrix(M4 注册）;pg-storage 新增测试（判别值钉表、analysis 行为用例）随既有 pg-storage test matrix 覆盖，无 per-test 注册点；pg-waldump 是 pg-storage 的 bin target，随 crate 构建编译，**HNSW 七解码臂的执行验证由 `tests/waldump.rs` 承接**(2026-09-12 二轮 P3-2——初稿此处仅"编译验证"即宣布无缺口，口径过强，已补执行覆盖）;coverage(tarpaulin)job 只对 pg-am-hnsw 插桩（`cargo tarpaulin -p pg-am-hnsw`,ci.yml:145-165)——**覆盖口径要读准**:Stage 0 的 pg-am-hnsw 侧代码（page.rs/redo.rs）纳入统计，pg-storage 侧 M5 新代码（record.rs/analysis.rs/waldump，本 stage 大头）**不在**该 job 插桩范围内，其质量承接 = pg-storage 既有 test matrix 的测试覆盖，无覆盖率数字背书。**预期零新增 job 成立**，无"绿但没跑"缺口
+
+### 与 pgvector·hnswlib 的 trade-off
+
+| 维度 | pgvector / hnswlib | 本实现 | 取舍 |
+|---|---|---|---|
+| 索引 WAL 形态 | pgvector 复用 PG 的生理 WAL（页级） | 生理记录 on 节点页（选型 §3，与全部现存 AM 同构） | 恢复走页不重跑算法，30s 上限路径清晰；pgvector 的 ivfflat/hnsw 各有页协议，我们统一一种 |
+| 页初始化 | PG 的 generic page init（无跨租户残留问题） | 显式 post-image FPI 初始化链（A1 契约） | freelist 复用页的旧租户映像是自建 freelist 的固有风险，初始化链是唯一防线，测试钉死 |
+
+### 已知残留与后续归队
+
+- **redo handler 本体 ×7**:Stage C 交付；Stage 0 注册空骨架，M5 数据不存在前重放遇 HNSW 记录硬失败（未知 handler,recovery.rs:303 既定行为）——响亮而非静默
+- **`HnswError::Storage` 为格式化消息基线**:Stage C 若需判别性分类（调用方分支处理）再细化
+- **meta 页字段布局**:Stage B 交付物；Stage 0 只定类型标签与初始化
+- **payload 预算核算**(§4.3,dim ≤ 1791 时最大单记录 < 8KB）未经真实大记录压测：归 Stage C 写入路径落地时的实测

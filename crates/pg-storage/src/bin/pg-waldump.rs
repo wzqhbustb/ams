@@ -40,7 +40,9 @@ use pg_storage::wal::record::{
     BTreeDeleteRecord, BTreeInsertRecord, BTreeSplitCLRRecord, BTreeSplitCommitRecord,
     BTreeSplitCopyRecord, BTreeSplitPrepareRecord, CheckpointEndRecord, FullPageImageRecord,
     HeapCleanupRecord, HeapDeleteRecord, HeapHotUpdateRecord, HeapInsertRecord, HeapUpdateRecord,
-    PageAllocRecord, PageFreeRecord, TxnAbortRecord, TxnCommitRecord, WalRecord, WalRecordType,
+    HnswDirAppendRecord, HnswDirLinkRecord, HnswMetaUpdateRecord, HnswNodeInitRecord,
+    HnswNodeTombstoneRecord, HnswPublishLiveRecord, HnswSetNeighborsRecord, PageAllocRecord,
+    PageFreeRecord, TxnAbortRecord, TxnCommitRecord, WalRecord, WalRecordType,
 };
 
 fn main() -> ExitCode {
@@ -63,6 +65,9 @@ struct Args {
     end_lsn: Option<u64>,
     /// The writer's segment size (needed to map LSN → segment file).
     segment_size: u64,
+    /// `-h`/`--help` was passed: usage was already printed, exit 0 without
+    /// touching the filesystem (2026-09-11, M5 Stage 0 review P3-1).
+    help: bool,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -83,7 +88,20 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--start-lsn" => start_lsn = Some(parse_u64(&take_value(arg)?)?),
             "--end-lsn" => end_lsn = Some(parse_u64(&take_value(arg)?)?),
             "--segment-size" => segment_size = parse_u64(&take_value(arg)?)?,
-            "-h" | "--help" => return Err(usage()),
+            "-h" | "--help" => {
+                // 2026-09-11, M5 Stage 0 review P3-1: POSIX convention —
+                // an explicit help request is a success, not an error.
+                // Usage goes to stdout with exit 0; unknown options still
+                // fail with exit 1 (the `_ if arg.starts_with('-')` arm).
+                println!("{}", usage());
+                return Ok(Args {
+                    dir: PathBuf::new(),
+                    start_lsn: None,
+                    end_lsn: None,
+                    segment_size,
+                    help: true,
+                });
+            }
             _ if arg.starts_with('-') => return Err(format!("unknown option {arg}\n{}", usage())),
             _ => {
                 if dir.is_some() {
@@ -105,6 +123,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         start_lsn,
         end_lsn,
         segment_size,
+        help: false,
     })
 }
 
@@ -138,6 +157,9 @@ fn resolve_wal_dir(dir: &Path) -> Result<PathBuf, String> {
 
 fn run() -> Result<(), String> {
     let args = parse_args(&std::env::args().skip(1).collect::<Vec<_>>())?;
+    if args.help {
+        return Ok(());
+    }
     let wal_dir = resolve_wal_dir(&args.dir)?;
     println!(
         "# pg-waldump dir={} segment_size={} start_lsn={} end_lsn={}",
@@ -339,6 +361,59 @@ fn payload_fields(record: &WalRecord) -> String {
         | WalRecordType::LogicalTimeSeries
         | WalRecordType::SegmentSeal
         | WalRecordType::SegmentMerge => format!("reserved payload={}", hex(p)),
+        // Phase 2 M5 Stage 0: the seven HNSW records, decoded field by field.
+        WalRecordType::HnswNodeInit => match HnswNodeInitRecord::decode(p) {
+            Ok(r) => format!(
+                "meta={} page={} slot={} node={} level={} dim={} vector={}B",
+                r.head.meta_page_id.0,
+                r.head.page_id.0,
+                r.head.slot_id,
+                r.head.node_id,
+                r.head.level,
+                r.dim(),
+                r.vector.len() * 4
+            ),
+            Err(e) => undecodable(p, &e),
+        },
+        WalRecordType::HnswSetNeighbors => match HnswSetNeighborsRecord::decode(p) {
+            Ok(r) => format!(
+                "meta={} page={} slot={} owner={} level={} count={} neighbors={:?}",
+                r.head.meta_page_id.0,
+                r.head.page_id.0,
+                r.head.slot_id,
+                r.head.node_id,
+                r.head.level,
+                r.count(),
+                r.neighbors
+            ),
+            Err(e) => undecodable(p, &e),
+        },
+        WalRecordType::HnswMetaUpdate => match HnswMetaUpdateRecord::decode(p) {
+            Ok(r) => format!(
+                "meta={} entry_point={} max_level={}",
+                r.meta_page_id.0, r.entry_point, r.max_level
+            ),
+            Err(e) => undecodable(p, &e),
+        },
+        WalRecordType::HnswNodeTombstone => match HnswNodeTombstoneRecord::decode(p) {
+            Ok(r) => format!("page={} slot={} node={}", r.page_id.0, r.slot_id, r.node_id),
+            Err(e) => undecodable(p, &e),
+        },
+        WalRecordType::HnswDirAppend => match HnswDirAppendRecord::decode(p) {
+            Ok(r) => format!(
+                "dir_tail={} node={} -> page={} slot={}",
+                r.dir_tail_page.0, r.node_id, r.target_page.0, r.target_slot
+            ),
+            Err(e) => undecodable(p, &e),
+        },
+        WalRecordType::HnswDirLink => match HnswDirLinkRecord::decode(p) {
+            Ok(r) => format!("old_tail={} next={}", r.old_tail_page.0, r.next_page.0),
+            Err(e) => undecodable(p, &e),
+        },
+        WalRecordType::HnswPublishLive => match HnswPublishLiveRecord::decode(p) {
+            Ok(r) => format!("page={} slot={} node={}", r.page_id.0, r.slot_id, r.node_id),
+            Err(e) => undecodable(p, &e),
+        },
     }
 }
 

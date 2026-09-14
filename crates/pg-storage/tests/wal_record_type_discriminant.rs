@@ -9,7 +9,7 @@ use pg_storage::wal::record::WalRecordType;
 
 /// Every declared variant and its on-disk value. Keep in sync with
 /// `WalRecordType` in `crates/pg-storage/src/wal/record.rs`.
-const ALL_TYPES: [(WalRecordType, u8); 25] = [
+const ALL_TYPES: [(WalRecordType, u8); 32] = [
     (WalRecordType::HeapInsert, 1),
     (WalRecordType::HeapUpdate, 2),
     (WalRecordType::HeapDelete, 3),
@@ -35,6 +35,14 @@ const ALL_TYPES: [(WalRecordType, u8); 25] = [
     (WalRecordType::LogicalTimeSeries, 103),
     (WalRecordType::SegmentSeal, 110),
     (WalRecordType::SegmentMerge, 111),
+    // Phase 2 M5 Stage 0 (tech-selection §4.1/§4.2): physiological HNSW WAL.
+    (WalRecordType::HnswNodeInit, 121),
+    (WalRecordType::HnswSetNeighbors, 122),
+    (WalRecordType::HnswMetaUpdate, 123),
+    (WalRecordType::HnswNodeTombstone, 124),
+    (WalRecordType::HnswDirAppend, 125),
+    (WalRecordType::HnswDirLink, 126),
+    (WalRecordType::HnswPublishLive, 127),
 ];
 
 #[test]

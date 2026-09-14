@@ -100,6 +100,16 @@ fn write_full_family_wal(tmp: &TempDir) -> Vec<Lsn> {
         WalRecord::btree_split_clr(&clr).unwrap(),
         WalRecord::txn_commit(TxnId(42)).unwrap(),
         WalRecord::txn_abort(TxnId(43)).unwrap(),
+        // Phase 2 M5 Stage 0 round 2 (P3-2): the seven HNSW records must be
+        // executed through their decode arms, not merely compiled — one of
+        // each, with spot-checkable field values.
+        WalRecord::hnsw_node_init(PageId(30), PageId(31), 2, 7, 1, 4, vec![1.0; 4]).unwrap(),
+        WalRecord::hnsw_set_neighbors(PageId(30), PageId(31), 2, 7, 1, vec![3, 5, 9]).unwrap(),
+        WalRecord::hnsw_meta_update(PageId(30), 7, 1).unwrap(),
+        WalRecord::hnsw_node_tombstone(PageId(31), 2, 7).unwrap(),
+        WalRecord::hnsw_dir_append(PageId(32), 7, PageId(31), 2).unwrap(),
+        WalRecord::hnsw_dir_link(PageId(32), PageId(33)).unwrap(),
+        WalRecord::hnsw_publish_live(PageId(31), 2, 7).unwrap(),
         reserved_record(WalRecordType::SegmentSeal, vec![0xDE, 0xAD, 0xBE, 0xEF]),
         reserved_record(WalRecordType::SegmentMerge, vec![0x01, 0x02]),
     ];
@@ -182,6 +192,13 @@ fn dump_covers_every_record_family() {
         "type=BTreeSplitCLR(50)",
         "type=TxnCommit(21)",
         "type=TxnAbort(22)",
+        "type=HnswNodeInit(121)",
+        "type=HnswSetNeighbors(122)",
+        "type=HnswMetaUpdate(123)",
+        "type=HnswNodeTombstone(124)",
+        "type=HnswDirAppend(125)",
+        "type=HnswDirLink(126)",
+        "type=HnswPublishLive(127)",
         "type=SegmentSeal(110)",
         "type=SegmentMerge(111)",
     ];
@@ -199,6 +216,45 @@ fn dump_covers_every_record_family() {
     assert!(commit.contains("commit_xid=42"), "{commit}");
     let fpi = lines.iter().find(|l| l.contains("FullPageImage")).unwrap();
     assert!(fpi.contains("page=5 image=8192B"), "{fpi}");
+
+    // HNSW arms (M5 Stage 0 round 2 P3-2): fields decoded, not reserved-hex.
+    let node_init = lines.iter().find(|l| l.contains("HnswNodeInit")).unwrap();
+    assert!(
+        node_init.contains("meta=30 page=31 slot=2 node=7 level=1 dim=4 vector=16B"),
+        "{node_init}"
+    );
+    let set_nb = lines
+        .iter()
+        .find(|l| l.contains("HnswSetNeighbors"))
+        .unwrap();
+    assert!(
+        set_nb.contains("owner=7 level=1 count=3 neighbors=[3, 5, 9]"),
+        "{set_nb}"
+    );
+    let dir_append = lines.iter().find(|l| l.contains("HnswDirAppend")).unwrap();
+    assert!(
+        dir_append.contains("dir_tail=32 node=7 -> page=31 slot=2"),
+        "{dir_append}"
+    );
+    // 2026-09-14 round 3 P3-b: the remaining four arms get the same
+    // field-level assertions — the archive claims all seven.
+    let meta_upd = lines.iter().find(|l| l.contains("HnswMetaUpdate")).unwrap();
+    assert!(
+        meta_upd.contains("meta=30 entry_point=7 max_level=1"),
+        "{meta_upd}"
+    );
+    let tombstone = lines
+        .iter()
+        .find(|l| l.contains("HnswNodeTombstone"))
+        .unwrap();
+    assert!(tombstone.contains("page=31 slot=2 node=7"), "{tombstone}");
+    let dir_link = lines.iter().find(|l| l.contains("HnswDirLink")).unwrap();
+    assert!(dir_link.contains("old_tail=32 next=33"), "{dir_link}");
+    let publish = lines
+        .iter()
+        .find(|l| l.contains("HnswPublishLive"))
+        .unwrap();
+    assert!(publish.contains("page=31 slot=2 node=7"), "{publish}");
 
     // Reserved types: raw payload bytes, no error (§6.1).
     let seal = lines.iter().find(|l| l.contains("SegmentSeal")).unwrap();
@@ -242,21 +298,23 @@ fn lsn_filter_boundaries_are_inclusive() {
     assert_eq!(lines.len(), 5, "{stdout}");
     assert_eq!(line_lsn(lines[0]), lsns[5].0);
     assert_eq!(line_lsn(lines[4]), lsns[9].0);
-    assert!(stdout.contains("dumped=5 filtered=15"));
+    assert!(stdout.contains(&format!("dumped=5 filtered={}", lsns.len() - 5)));
 
-    // Open-ended filters: start only, end only.
+    // Open-ended filters: start only (at the LAST record — exactly one
+    // line), end only.
+    let last = lsns.len() - 1;
     let stdout = dump(
         tmp.path(),
         &[
             "--segment-size".into(),
             seg.clone(),
             "--start-lsn".into(),
-            lsns[19].0.to_string(),
+            lsns[last].0.to_string(),
         ],
     );
     let lines = record_lines(&stdout);
     assert_eq!(lines.len(), 1, "{stdout}");
-    assert_eq!(line_lsn(lines[0]), lsns[19].0);
+    assert_eq!(line_lsn(lines[0]), lsns[last].0);
 
     let stdout = dump(
         tmp.path(),
@@ -278,7 +336,7 @@ fn lsn_filter_boundaries_are_inclusive() {
             "--segment-size".into(),
             cfg.wal_segment_size.to_string(),
             "--start-lsn".into(),
-            format!("{:#x}", lsns[19].0),
+            format!("{:#x}", lsns[last].0),
         ],
     );
     assert_eq!(record_lines(&stdout).len(), 1, "{stdout}");

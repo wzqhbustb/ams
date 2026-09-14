@@ -96,6 +96,28 @@ pub enum WalRecordType {
     /// the record must be sufficient to reconstruct that outcome
     /// idempotently.
     SegmentMerge = 111,
+
+    /// HNSW node initialization (Phase 2 M5 Stage 0; tech-selection §4.2):
+    /// creates a fixed-size node entry on a node page, state INITIALIZING.
+    HnswNodeInit = 121,
+    /// HNSW neighbor-list update (Phase 2 M5): in-place count+content rewrite
+    /// of one level of one node entry; carries the owner `node_id` (v1.12 —
+    /// the redo-side no-self-loop check's judgment basis).
+    HnswSetNeighbors = 122,
+    /// HNSW meta-page field post-image (Phase 2 M5): entry point / max level.
+    HnswMetaUpdate = 123,
+    /// HNSW node tombstone (Phase 2 M5): format only — the delete SEMANTICS
+    /// land in M6 (tech-selection §1 scope split).
+    HnswNodeTombstone = 124,
+    /// HNSW directory append (Phase 2 M5): publishes `node_id → (page, slot)`
+    /// at the directory tail page — the NodeId allocation point.
+    HnswDirAppend = 125,
+    /// HNSW directory chain link (Phase 2 M5): points the old tail page at
+    /// the freshly allocated next directory page.
+    HnswDirLink = 126,
+    /// HNSW publish-live (Phase 2 M5): flips a fully connected node from
+    /// INITIALIZING to LIVE (v1.7 — the LIVE flip gets its own record).
+    HnswPublishLive = 127,
 }
 
 impl WalRecordType {
@@ -132,6 +154,13 @@ impl WalRecordType {
             103 => Ok(WalRecordType::LogicalTimeSeries),
             110 => Ok(WalRecordType::SegmentSeal),
             111 => Ok(WalRecordType::SegmentMerge),
+            121 => Ok(WalRecordType::HnswNodeInit),
+            122 => Ok(WalRecordType::HnswSetNeighbors),
+            123 => Ok(WalRecordType::HnswMetaUpdate),
+            124 => Ok(WalRecordType::HnswNodeTombstone),
+            125 => Ok(WalRecordType::HnswDirAppend),
+            126 => Ok(WalRecordType::HnswDirLink),
+            127 => Ok(WalRecordType::HnswPublishLive),
             _ => Err(StorageError::WalReadFailed(format!(
                 "unknown WAL record type discriminant {v}"
             ))),
@@ -302,6 +331,280 @@ pub struct BTreeDeleteRecord {
     pub page_id: PageId,
     /// The slot being removed.
     pub slot_id: u16,
+}
+
+/// The scalar head carried BY the two sequence-carrying HNSW records
+/// ([`HnswNodeInitRecord`] / [`HnswSetNeighborsRecord`]). The pre-decode
+/// bound gate decodes this exact type — the same type the full record
+/// contains — so gate and decoder can never drift apart (2026-09-14,
+/// review round 6 P2: the independent prefix struct is gone; a field
+/// added to the head moves gate and record in lockstep, structurally).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HnswSeqHead {
+    /// The index's meta page (validation context for redo).
+    pub meta_page_id: PageId,
+    /// The node page the entry lives on.
+    pub page_id: PageId,
+    /// The slot of the node entry.
+    pub slot_id: u16,
+    /// The entry's NodeId (NodeInit: the id being allocated; SetNeighbors:
+    /// the owner — the no-self-loop check's judgment basis, v1.12).
+    pub node_id: u32,
+    /// NodeInit: the drawn top level (carried in the record — replay never
+    /// redraws, tech-selection §5). SetNeighbors: the level whose list is
+    /// rewritten (must be <= the entry's top level).
+    pub level: u8,
+    /// Declared sequence length: `dim` (NodeInit) / `count` (SetNeighbors).
+    pub tail: u16,
+}
+
+/// Payload for an `HnswNodeInit` record (Phase 2 M5 Stage 0, tech-selection
+/// §4.2): creates a node entry on a node page at `(page_id, slot_id)` —
+/// fixed-size reserved by `level`, state INITIALIZING (v1.5), all level
+/// lists empty. Self-contained per the §4.2 rule: `meta_page_id` lets redo
+/// re-derive `L_max` and the metric/dim checks from the meta page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HnswNodeInitRecord {
+    /// Scalar head: meta page / node page / slot / NodeId / top level /
+    /// declared dim — see [`HnswSeqHead`].
+    pub head: HnswSeqHead,
+    /// The node's vector, `dim` f32 components.
+    pub vector: Vec<f32>,
+}
+
+impl HnswNodeInitRecord {
+    /// Vector dimension (= `head.tail`; checked against the meta page at
+    /// redo).
+    pub fn dim(&self) -> u16 {
+        self.head.tail
+    }
+}
+
+/// Payload for an `HnswSetNeighbors` record (Phase 2 M5): in-place rewrite of
+/// one level's neighbor list of the node entry at `(page_id, slot_id)` —
+/// the entry never moves or grows (v1.5 fixed-size reservation). Carries the
+/// owner `node_id` (v1.12: the redo-side no-self-loop check's judgment
+/// basis; the owner ↔ `(page, slot)` directory-mapping consistency is an
+/// open-time audit item, §11.3, not a redo check).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HnswSetNeighborsRecord {
+    /// Scalar head: meta page / node page / slot / owner NodeId / level /
+    /// declared count — see [`HnswSeqHead`].
+    pub head: HnswSeqHead,
+    /// The full new neighbor list content (ascending, no duplicates).
+    pub neighbors: Vec<u32>,
+}
+
+impl HnswSetNeighborsRecord {
+    /// Neighbor count (= `head.tail`) — must equal `neighbors.len()`.
+    pub fn count(&self) -> u16 {
+        self.head.tail
+    }
+}
+
+/// Payload for an `HnswMetaUpdate` record (Phase 2 M5): field-level
+/// post-image of the index's meta page (entry point / max level).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HnswMetaUpdateRecord {
+    /// The meta page itself (also the touched page).
+    pub meta_page_id: PageId,
+    /// New entry-point NodeId; `u32::MAX` (NodeId::INVALID) for an empty
+    /// graph — the M4 encoding's empty-graph sentinel convention.
+    pub entry_point: u32,
+    /// New max level (== the entry-point node's top level).
+    pub max_level: u8,
+}
+
+/// Payload for an `HnswNodeTombstone` record (Phase 2 M5): format only —
+/// the tombstone SEMANTICS (search filtering, space reclamation) land in M6
+/// (tech-selection §1 scope split); M5 only writes/replays the bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HnswNodeTombstoneRecord {
+    /// The node page the entry lives on.
+    pub page_id: PageId,
+    /// The slot of the node entry.
+    pub slot_id: u16,
+    /// The NodeId being tombstoned.
+    pub node_id: u32,
+}
+
+/// Payload for an `HnswDirAppend` record (Phase 2 M5): publishes the
+/// `node_id → (target_page, target_slot)` mapping at the directory chain's
+/// tail page. This record IS the NodeId allocation (v1.2: allocation ==
+/// mapping publication; the high-water mark is derived from the chain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HnswDirAppendRecord {
+    /// The directory chain's current tail page.
+    pub dir_tail_page: PageId,
+    /// The NodeId being published (== the entry's ordinal in the chain).
+    pub node_id: u32,
+    /// The node page the entry lives on.
+    pub target_page: PageId,
+    /// The slot of the node entry on `target_page`.
+    pub target_slot: u16,
+}
+
+/// Payload for an `HnswDirLink` record (Phase 2 M5): directory-chain
+/// expansion — points the old tail page at the freshly allocated next
+/// directory page (single-page record, v1.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HnswDirLinkRecord {
+    /// The directory chain's old tail page.
+    pub old_tail_page: PageId,
+    /// The freshly allocated next directory page.
+    pub next_page: PageId,
+}
+
+/// Payload for an `HnswPublishLive` record (Phase 2 M5): flips the node
+/// entry at `(page_id, slot_id)` from INITIALIZING to LIVE — the state
+/// post-image (v1.7: the LIVE flip gets its own record, applied after all
+/// of the node's own level lists are written).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HnswPublishLiveRecord {
+    /// The node page the entry lives on.
+    pub page_id: PageId,
+    /// The slot of the node entry.
+    pub slot_id: u16,
+    /// The NodeId being published as live.
+    pub node_id: u32,
+}
+
+// ---------------------------------------------------------------------
+// Bounded, fully-consuming HNSW payload decoders (2026-09-11, M5 Stage 0
+// review round 2 P2-1; mechanism rewritten 2026-09-14 round 3 P2 and
+// round 4 P2-1/P3-1): pg-waldump decodes WAL payloads without the
+// recovery path's trust context. Two properties:
+//
+// - **bounded**: sequence-carrying payloads (NodeInit.vector,
+//   SetNeighbors.neighbors) pass a PRE-DECODE gate (`bounded_seq_gate`):
+//   the shared scalar prefix is decoded through `bincode_config()`, the
+//   wire's sequence length is decoded as a `u64` through the SAME config
+//   (no hand-rolled varint/layout rules that could drift from the real
+//   decoder), and the claim is checked against BOTH the remaining bytes
+//   (allocation capped by input size) and the record's declared
+//   dim/count (semantic mismatch rejected pre-allocation) BEFORE the
+//   real decode runs. (Round 2 relied on bincode's serde layer to reject
+//   forged lengths "without allocating" — false in substance: serde's
+//   cautious size_hint still pre-allocates up to 1 MiB before the input
+//   runs out, and the old test pinned only the error, not the
+//   allocation.)
+// - **fully-consuming**: `read != payload.len()` after a successful decode
+//   is a loud error (trailing bytes mean the record is not what its type
+//   claims).
+//
+// An earlier draft of this block hand-rolled a fixed-width decoder — wrong
+// on contact with reality: bincode's standard config is VARINT for all
+// integers (probed 2026-09-11), not little-endian fixed width. The
+// encoders stay bincode-only; the decoders stay bincode-only; the
+// roundtrip tests pin them together.
+
+/// Bincode decode + exact-consumption gate shared by all seven HNSW
+/// payload decoders (single implementation, P2-1).
+fn decode_hnsw_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T> {
+    let (rec, read) = bincode::serde::decode_from_slice::<T, _>(payload, bincode_config())
+        .map_err(|e| StorageError::Serialize(format!("HNSW payload undecodable: {e}")))?;
+    if read != payload.len() {
+        return Err(StorageError::Serialize(format!(
+            "HNSW payload has {} trailing bytes",
+            payload.len() - read
+        )));
+    }
+    Ok(rec)
+}
+
+/// Pre-decode bound gate (round 3 P2; round 4 P2-1/P3-1; round 6 P2
+/// revision — the prefix is now the records' OWN [`HnswSeqHead`], so the
+/// gate decodes the exact type the full record contains and drift between
+/// gate and decoder is structurally impossible, not merely test-pinned):
+///
+/// 1. decode the scalar head through the SHARED [`bincode_config`] — the
+///    record's declared sequence length (`tail` = dim / count) comes from
+///    this decode;
+/// 2. decode the wire's sequence length as a `u64` through the SAME
+///    config — no hand-rolled varint rules, a `bincode_config()` change
+///    moves both decoders together;
+/// 3. reject BEFORE any Vec allocation when (a) the wire length exceeds
+///    what the remaining bytes could hold (`elem_min` = each element's
+///    minimum encoded width: f32 = 4 fixed LE, varint ints = 1), or
+///    (b) the wire length disagrees with the declared dim/count — a
+///    legal-size but semantically false payload is now also rejected
+///    pre-allocation (round 4 P3-1), not after it.
+fn bounded_seq_gate(payload: &[u8], elem_min: usize, what: &str) -> Result<()> {
+    let (head, off) =
+        bincode::serde::decode_from_slice::<HnswSeqHead, _>(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(format!("HNSW payload head undecodable: {e}")))?;
+    let (wire_len, len_bytes) =
+        bincode::serde::decode_from_slice::<u64, _>(&payload[off..], bincode_config()).map_err(
+            |e| StorageError::Serialize(format!("HNSW payload {what} length undecodable: {e}")),
+        )?;
+    let remaining = payload.len() - off - len_bytes;
+    if wire_len > (remaining / elem_min) as u64 {
+        return Err(StorageError::Serialize(format!(
+            "HNSW payload {what} claims {wire_len} elements but only {remaining} bytes remain (bounded decode: allocation is capped by input size)"
+        )));
+    }
+    if wire_len != u64::from(head.tail) {
+        return Err(StorageError::Serialize(format!(
+            "HNSW payload {what} wire length {wire_len} != declared {} (payload contract, rejected pre-allocation)",
+            head.tail
+        )));
+    }
+    Ok(())
+}
+
+impl HnswNodeInitRecord {
+    /// Bounded (pre-decode length gate), fully-consuming decode — see the
+    /// section comment. The gate enforces the `vector.len() == dim`
+    /// payload contract pre-allocation.
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        bounded_seq_gate(payload, 4, "vector")?;
+        decode_hnsw_payload::<Self>(payload)
+    }
+}
+
+impl HnswSetNeighborsRecord {
+    /// Bounded, fully-consuming decode; the gate enforces
+    /// `neighbors.len() == count` pre-allocation (varint elements: minimum
+    /// encoded width 1 byte).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        bounded_seq_gate(payload, 1, "neighbors")?;
+        decode_hnsw_payload::<Self>(payload)
+    }
+}
+
+impl HnswMetaUpdateRecord {
+    /// Bounded, fully-consuming decode (P2-1 — see the section comment).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        decode_hnsw_payload(payload)
+    }
+}
+
+impl HnswNodeTombstoneRecord {
+    /// Bounded, fully-consuming decode (P2-1 — see the section comment).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        decode_hnsw_payload(payload)
+    }
+}
+
+impl HnswDirAppendRecord {
+    /// Bounded, fully-consuming decode (P2-1 — see the section comment).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        decode_hnsw_payload(payload)
+    }
+}
+
+impl HnswDirLinkRecord {
+    /// Bounded, fully-consuming decode (P2-1 — see the section comment).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        decode_hnsw_payload(payload)
+    }
+}
+
+impl HnswPublishLiveRecord {
+    /// Bounded, fully-consuming decode (P2-1 — see the section comment).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        decode_hnsw_payload(payload)
+    }
 }
 
 /// Payload for a `BTreeSplitPrepare` record (tech-selection §13.3 step 1).
@@ -717,6 +1020,35 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
+/// Reject `PageId::INVALID` for a payload page field (2026-09-11, M5 Stage 0
+/// review P3-3(b)): every page-id field in the HNSW payload layouts must
+/// name a real page at construction — the redo validation checklist rejects
+/// such records, and the constructors' self-imposed discipline is to never
+/// emit what redo would refuse. Shared by all seven HNSW constructors
+/// (single implementation).
+fn reject_invalid_page_id(record: &str, field: &str, page: PageId) -> Result<()> {
+    if page == PageId::INVALID {
+        return Err(StorageError::Serialize(format!(
+            "{record} {field} must be a real page (PageId::INVALID)"
+        )));
+    }
+    Ok(())
+}
+
+/// 2026-09-12, M5 Stage 0 round 2 P2-3: `u32::MAX` is `NodeId::INVALID`, the
+/// "no node" sentinel (M4's `NodeId::INVALID`, pg-am-hnsw/src/graph.rs) —
+/// legal **only** as an empty graph's `HnswMetaUpdate` entry point. A record
+/// carrying it as a real node identity (node/owner/neighbor) is as malformed
+/// as one carrying `PageId::INVALID`.
+fn reject_invalid_node_id(record: &str, field: &str, node: u32) -> Result<()> {
+    if node == u32::MAX {
+        return Err(StorageError::Serialize(format!(
+            "{record} {field} = u32::MAX (NodeId::INVALID is only legal as the empty-graph MetaUpdate entry point)"
+        )));
+    }
+    Ok(())
+}
+
 impl WalRecord {
     /// Create a `PageAlloc` record.
     pub fn page_alloc(page_id: PageId) -> Result<Self> {
@@ -915,6 +1247,233 @@ impl WalRecord {
             bincode::serde::encode_to_vec(BTreeDeleteRecord { page_id, slot_id }, bincode_config())
                 .map_err(|e| StorageError::Serialize(e.to_string()))?;
         Ok(Self::new(WalRecordType::BTreeDelete, payload))
+    }
+
+    /// Create an `HnswNodeInit` record (Phase 2 M5 Stage 0; tech-selection
+    /// §4.2). Loud argument validation: `dim > 0`, the vector length matches
+    /// `dim`, and every component is finite (the M4 §5 entry-validation
+    /// convention — a constructor must never emit a record the redo
+    /// validation checklist would reject).
+    pub fn hnsw_node_init(
+        meta_page_id: PageId,
+        page_id: PageId,
+        slot_id: u16,
+        node_id: u32,
+        level: u8,
+        dim: u16,
+        vector: Vec<f32>,
+    ) -> Result<Self> {
+        reject_invalid_page_id("HnswNodeInit", "meta_page_id", meta_page_id)?;
+        reject_invalid_page_id("HnswNodeInit", "page_id", page_id)?;
+        reject_invalid_node_id("HnswNodeInit", "node_id", node_id)?;
+        if dim == 0 {
+            return Err(StorageError::Serialize(
+                "HnswNodeInit dim = 0 (M4 §5: rejected at every entry point)".to_string(),
+            ));
+        }
+        if vector.len() != usize::from(dim) {
+            return Err(StorageError::Serialize(format!(
+                "HnswNodeInit vector has {} components, dim is {dim}",
+                vector.len()
+            )));
+        }
+        if let Some((i, _)) = vector.iter().enumerate().find(|(_, x)| !x.is_finite()) {
+            return Err(StorageError::Serialize(format!(
+                "HnswNodeInit non-finite vector component at index {i} (M4 §5/§7)"
+            )));
+        }
+        if level > 63 {
+            return Err(StorageError::Serialize(format!(
+                "HnswNodeInit level {level} > 63 (top_level is 6 bits in the node-entry state byte; M4's MAX_LEVEL_COUNT = 64 convention)"
+            )));
+        }
+        let payload = bincode::serde::encode_to_vec(
+            HnswNodeInitRecord {
+                head: HnswSeqHead {
+                    meta_page_id,
+                    page_id,
+                    slot_id,
+                    node_id,
+                    level,
+                    tail: dim,
+                },
+                vector,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HnswNodeInit, payload))
+    }
+
+    /// Create an `HnswSetNeighbors` record (Phase 2 M5). Loud argument
+    /// validation: `count == neighbors.len()`, strictly ascending neighbors,
+    /// no self-loop against the owner `node_id` (v1.12 — the owner is
+    /// carried precisely so this check is implementable), and
+    /// `level <= 63` (2026-09-11 Stage 0 review P3-3(a): NodeInit and
+    /// MetaUpdate already reject out-of-range levels; this constructor
+    /// missed the same gate).
+    pub fn hnsw_set_neighbors(
+        meta_page_id: PageId,
+        page_id: PageId,
+        slot_id: u16,
+        node_id: u32,
+        level: u8,
+        neighbors: Vec<u32>,
+    ) -> Result<Self> {
+        reject_invalid_page_id("HnswSetNeighbors", "meta_page_id", meta_page_id)?;
+        reject_invalid_page_id("HnswSetNeighbors", "page_id", page_id)?;
+        reject_invalid_node_id("HnswSetNeighbors", "node_id", node_id)?;
+        if neighbors.contains(&u32::MAX) {
+            return Err(StorageError::Serialize(
+                "HnswSetNeighbors neighbor = u32::MAX (NodeId::INVALID is not a real endpoint)"
+                    .to_string(),
+            ));
+        }
+        if level > 63 {
+            return Err(StorageError::Serialize(format!(
+                "HnswSetNeighbors level {level} > 63 (6-bit top_level convention)"
+            )));
+        }
+        if neighbors.len() > usize::from(u16::MAX) {
+            return Err(StorageError::Serialize(format!(
+                "HnswSetNeighbors {} neighbors exceeds the u16 count field",
+                neighbors.len()
+            )));
+        }
+        if neighbors.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(StorageError::Serialize(
+                "HnswSetNeighbors neighbors must be strictly ascending (duplicates included)"
+                    .to_string(),
+            ));
+        }
+        if neighbors.contains(&node_id) {
+            return Err(StorageError::Serialize(format!(
+                "HnswSetNeighbors self-loop: owner node_id {node_id} is its own neighbor (v1.12 owner check)"
+            )));
+        }
+        let payload = bincode::serde::encode_to_vec(
+            HnswSetNeighborsRecord {
+                head: HnswSeqHead {
+                    meta_page_id,
+                    page_id,
+                    slot_id,
+                    node_id,
+                    level,
+                    tail: neighbors.len() as u16,
+                },
+                neighbors,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HnswSetNeighbors, payload))
+    }
+
+    /// Create an `HnswMetaUpdate` record (Phase 2 M5).
+    pub fn hnsw_meta_update(meta_page_id: PageId, entry_point: u32, max_level: u8) -> Result<Self> {
+        reject_invalid_page_id("HnswMetaUpdate", "meta_page_id", meta_page_id)?;
+        if max_level > 63 {
+            return Err(StorageError::Serialize(format!(
+                "HnswMetaUpdate max_level {max_level} > 63 (6-bit top_level convention)"
+            )));
+        }
+        // 2026-09-12, round 2 P2-3: NodeId::INVALID is legal here ONLY for
+        // the empty graph — an entry point of "no node" with a nonzero
+        // max_level is a contradiction (no node can claim a top level).
+        if entry_point == u32::MAX && max_level != 0 {
+            return Err(StorageError::Serialize(format!(
+                "HnswMetaUpdate entry_point = NodeId::INVALID but max_level = {max_level} (INVALID is only legal for the empty graph, max_level = 0)"
+            )));
+        }
+        let payload = bincode::serde::encode_to_vec(
+            HnswMetaUpdateRecord {
+                meta_page_id,
+                entry_point,
+                max_level,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HnswMetaUpdate, payload))
+    }
+
+    /// Create an `HnswNodeTombstone` record (Phase 2 M5 — format only; the
+    /// semantics land in M6, tech-selection §1).
+    pub fn hnsw_node_tombstone(page_id: PageId, slot_id: u16, node_id: u32) -> Result<Self> {
+        reject_invalid_page_id("HnswNodeTombstone", "page_id", page_id)?;
+        reject_invalid_node_id("HnswNodeTombstone", "node_id", node_id)?;
+        let payload = bincode::serde::encode_to_vec(
+            HnswNodeTombstoneRecord {
+                page_id,
+                slot_id,
+                node_id,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HnswNodeTombstone, payload))
+    }
+
+    /// Create an `HnswDirAppend` record (Phase 2 M5): publish a
+    /// `node_id → (target_page, target_slot)` mapping at the directory tail.
+    pub fn hnsw_dir_append(
+        dir_tail_page: PageId,
+        node_id: u32,
+        target_page: PageId,
+        target_slot: u16,
+    ) -> Result<Self> {
+        reject_invalid_page_id("HnswDirAppend", "dir_tail_page", dir_tail_page)?;
+        reject_invalid_node_id("HnswDirAppend", "node_id", node_id)?;
+        reject_invalid_page_id("HnswDirAppend", "target_page", target_page)?;
+        let payload = bincode::serde::encode_to_vec(
+            HnswDirAppendRecord {
+                dir_tail_page,
+                node_id,
+                target_page,
+                target_slot,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HnswDirAppend, payload))
+    }
+
+    /// Create an `HnswDirLink` record (Phase 2 M5): point the old directory
+    /// tail at the freshly allocated next directory page.
+    pub fn hnsw_dir_link(old_tail_page: PageId, next_page: PageId) -> Result<Self> {
+        reject_invalid_page_id("HnswDirLink", "old_tail_page", old_tail_page)?;
+        reject_invalid_page_id("HnswDirLink", "next_page", next_page)?;
+        if next_page == old_tail_page {
+            return Err(StorageError::Serialize(
+                "HnswDirLink must not link a page to itself".to_string(),
+            ));
+        }
+        let payload = bincode::serde::encode_to_vec(
+            HnswDirLinkRecord {
+                old_tail_page,
+                next_page,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HnswDirLink, payload))
+    }
+
+    /// Create an `HnswPublishLive` record (Phase 2 M5): flip the node entry
+    /// from INITIALIZING to LIVE.
+    pub fn hnsw_publish_live(page_id: PageId, slot_id: u16, node_id: u32) -> Result<Self> {
+        reject_invalid_page_id("HnswPublishLive", "page_id", page_id)?;
+        reject_invalid_node_id("HnswPublishLive", "node_id", node_id)?;
+        let payload = bincode::serde::encode_to_vec(
+            HnswPublishLiveRecord {
+                page_id,
+                slot_id,
+                node_id,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HnswPublishLive, payload))
     }
 
     /// Create a `BTreeSplitPrepare` record (§13.3 step 1).
@@ -1309,6 +1868,275 @@ mod tests {
         let (decoded, _) = WalRecord::decode(&buf).unwrap();
         assert_eq!(decoded.record_type, WalRecordType::FullPageImage);
         assert_eq!(decoded.payload, record.payload);
+    }
+
+    /// Phase 2 M5 Stage 0: the seven HNSW payload layouts round-trip through
+    /// encode → bincode decode with every field asserted (tech-selection §4.2
+    /// self-containment: NodeInit/SetNeighbors/MetaUpdate carry
+    /// `meta_page_id`; SetNeighbors carries the owner `node_id`, v1.12).
+    /// Tombstone is format-only (§1 scope split — semantics land in M6).
+    #[test]
+    fn hnsw_payloads_roundtrip_field_by_field() {
+        // 121 NodeInit.
+        let rec =
+            WalRecord::hnsw_node_init(PageId(1), PageId(10), 3, 42, 2, 4, vec![1.0, 2.0, 3.0, 4.0])
+                .unwrap();
+        let r = HnswNodeInitRecord::decode(&rec.payload).unwrap();
+        assert_eq!(
+            (
+                r.head.meta_page_id,
+                r.head.page_id,
+                r.head.slot_id,
+                r.head.node_id,
+                r.head.level,
+                r.dim()
+            ),
+            (PageId(1), PageId(10), 3, 42, 2, 4)
+        );
+        assert_eq!(r.vector, vec![1.0, 2.0, 3.0, 4.0]);
+
+        // 122 SetNeighbors (owner node_id present, v1.12).
+        let rec =
+            WalRecord::hnsw_set_neighbors(PageId(1), PageId(11), 4, 42, 0, vec![1, 5, 9]).unwrap();
+        let r = HnswSetNeighborsRecord::decode(&rec.payload).unwrap();
+        assert_eq!(
+            (
+                r.head.meta_page_id,
+                r.head.page_id,
+                r.head.slot_id,
+                r.head.node_id,
+                r.head.level,
+                r.count()
+            ),
+            (PageId(1), PageId(11), 4, 42, 0, 3)
+        );
+        assert_eq!(r.neighbors, vec![1, 5, 9]);
+
+        // 123 MetaUpdate.
+        let rec = WalRecord::hnsw_meta_update(PageId(1), 42, 2).unwrap();
+        let r = HnswMetaUpdateRecord::decode(&rec.payload).unwrap();
+        assert_eq!(
+            (r.meta_page_id, r.entry_point, r.max_level),
+            (PageId(1), 42, 2)
+        );
+
+        // 124 NodeTombstone (format only).
+        let rec = WalRecord::hnsw_node_tombstone(PageId(11), 4, 42).unwrap();
+        let r = HnswNodeTombstoneRecord::decode(&rec.payload).unwrap();
+        assert_eq!((r.page_id, r.slot_id, r.node_id), (PageId(11), 4, 42));
+
+        // 125 DirAppend.
+        let rec = WalRecord::hnsw_dir_append(PageId(100), 42, PageId(11), 4).unwrap();
+        let r = HnswDirAppendRecord::decode(&rec.payload).unwrap();
+        assert_eq!(
+            (r.dir_tail_page, r.node_id, r.target_page, r.target_slot),
+            (PageId(100), 42, PageId(11), 4)
+        );
+
+        // 126 DirLink.
+        let rec = WalRecord::hnsw_dir_link(PageId(100), PageId(101)).unwrap();
+        let r = HnswDirLinkRecord::decode(&rec.payload).unwrap();
+        assert_eq!((r.old_tail_page, r.next_page), (PageId(100), PageId(101)));
+
+        // 127 PublishLive.
+        let rec = WalRecord::hnsw_publish_live(PageId(11), 4, 42).unwrap();
+        let r = HnswPublishLiveRecord::decode(&rec.payload).unwrap();
+        assert_eq!((r.page_id, r.slot_id, r.node_id), (PageId(11), 4, 42));
+    }
+
+    /// Golden bytes pin (2026-09-14, review round 7 P3-1): the nested
+    /// `HnswSeqHead` record layout must stay byte-identical to the flat
+    /// wire layout it replaced (bincode encodes fields positionally,
+    /// varint standard config — every small value below is a one-byte
+    /// varint; f32 is fixed 4B LE). If a future refactor changes the wire
+    /// bytes, this test — not memory — says so.
+    #[test]
+    fn hnsw_payload_golden_bytes() {
+        // 121 NodeInit: head (meta/page/slot/node/level/dim) + vec len + 4 f32.
+        let rec =
+            WalRecord::hnsw_node_init(PageId(1), PageId(10), 3, 42, 2, 4, vec![1.0, 2.0, 3.0, 4.0])
+                .unwrap();
+        let mut expect = vec![1u8, 10, 3, 42, 2, 4, 4];
+        for f in [1.0f32, 2.0, 3.0, 4.0] {
+            expect.extend_from_slice(&f.to_le_bytes());
+        }
+        assert_eq!(rec.payload, expect);
+
+        // 122 SetNeighbors: head (…/count) + vec len + 3 one-byte varint ids.
+        let rec =
+            WalRecord::hnsw_set_neighbors(PageId(1), PageId(11), 4, 42, 0, vec![1, 5, 9]).unwrap();
+        assert_eq!(rec.payload, vec![1u8, 11, 4, 42, 0, 3, 3, 1, 5, 9]);
+    }
+
+    /// Stage 0: constructor argument validation fails loudly (a constructor
+    /// must never emit a record the redo validation checklist would reject).
+    #[test]
+    fn hnsw_constructors_reject_bad_arguments() {
+        // dim = 0 / length mismatch / NaN / level > 63.
+        assert!(WalRecord::hnsw_node_init(PageId(1), PageId(2), 0, 0, 0, 0, vec![]).is_err());
+        assert!(WalRecord::hnsw_node_init(PageId(1), PageId(2), 0, 0, 0, 4, vec![1.0]).is_err());
+        assert!(
+            WalRecord::hnsw_node_init(PageId(1), PageId(2), 0, 0, 0, 1, vec![f32::NAN]).is_err()
+        );
+        assert!(WalRecord::hnsw_node_init(PageId(1), PageId(2), 0, 0, 64, 1, vec![1.0]).is_err());
+        // SetNeighbors: unsorted/duplicate/self-loop.
+        assert!(WalRecord::hnsw_set_neighbors(PageId(1), PageId(2), 0, 0, 0, vec![5, 3]).is_err());
+        assert!(WalRecord::hnsw_set_neighbors(PageId(1), PageId(2), 0, 0, 0, vec![3, 3]).is_err());
+        assert!(WalRecord::hnsw_set_neighbors(PageId(1), PageId(2), 0, 7, 0, vec![3, 7]).is_err());
+        // MetaUpdate: max_level > 63.
+        assert!(WalRecord::hnsw_meta_update(PageId(1), 0, 64).is_err());
+        // SetNeighbors: level > 63 (2026-09-11 Stage 0 review P3-3(a)).
+        assert!(WalRecord::hnsw_set_neighbors(PageId(1), PageId(2), 0, 0, 64, vec![3]).is_err());
+        // PageId::INVALID rejected on every page field (P3-3(b)): the two
+        // already-gated fields (DirAppend.target_page, DirLink.next_page)
+        // plus the nine that were silently accepted.
+        assert!(
+            WalRecord::hnsw_node_init(PageId::INVALID, PageId(2), 0, 0, 0, 1, vec![1.0]).is_err()
+        );
+        assert!(
+            WalRecord::hnsw_node_init(PageId(1), PageId::INVALID, 0, 0, 0, 1, vec![1.0]).is_err()
+        );
+        assert!(
+            WalRecord::hnsw_set_neighbors(PageId::INVALID, PageId(2), 0, 0, 0, vec![3]).is_err()
+        );
+        assert!(
+            WalRecord::hnsw_set_neighbors(PageId(1), PageId::INVALID, 0, 0, 0, vec![3]).is_err()
+        );
+        assert!(WalRecord::hnsw_meta_update(PageId::INVALID, 0, 0).is_err());
+        assert!(WalRecord::hnsw_node_tombstone(PageId::INVALID, 0, 0).is_err());
+        assert!(WalRecord::hnsw_dir_append(PageId::INVALID, 0, PageId(2), 0).is_err());
+        assert!(WalRecord::hnsw_dir_link(PageId::INVALID, PageId(2)).is_err());
+        assert!(WalRecord::hnsw_publish_live(PageId::INVALID, 0, 0).is_err());
+        // DirAppend: invalid target page. DirLink: invalid/self next page.
+        assert!(WalRecord::hnsw_dir_append(PageId(100), 0, PageId::INVALID, 0).is_err());
+        assert!(WalRecord::hnsw_dir_link(PageId(100), PageId::INVALID).is_err());
+        assert!(WalRecord::hnsw_dir_link(PageId(100), PageId(100)).is_err());
+        // NodeId::INVALID (u32::MAX) rejected as a real node identity
+        // (2026-09-12 round 2 P2-3): node / owner / neighbor / tombstone /
+        // dir-append / publish-live all gate it.
+        assert!(
+            WalRecord::hnsw_node_init(PageId(1), PageId(2), 0, u32::MAX, 0, 1, vec![1.0]).is_err()
+        );
+        assert!(
+            WalRecord::hnsw_set_neighbors(PageId(1), PageId(2), 0, u32::MAX, 0, vec![3]).is_err()
+        );
+        assert!(
+            WalRecord::hnsw_set_neighbors(PageId(1), PageId(2), 0, 0, 0, vec![3, u32::MAX])
+                .is_err()
+        );
+        assert!(WalRecord::hnsw_node_tombstone(PageId(2), 0, u32::MAX).is_err());
+        assert!(WalRecord::hnsw_dir_append(PageId(100), u32::MAX, PageId(2), 0).is_err());
+        assert!(WalRecord::hnsw_publish_live(PageId(2), 0, u32::MAX).is_err());
+        // MetaUpdate: NodeId::INVALID is legal ONLY for the empty graph
+        // (max_level = 0); any nonzero level contradicts "no node".
+        assert!(WalRecord::hnsw_meta_update(PageId(1), u32::MAX, 1).is_err());
+        assert!(WalRecord::hnsw_meta_update(PageId(1), u32::MAX, 0).is_ok());
+    }
+
+    /// Stage 0 round 3 P2: the bounded decoders reject forged length
+    /// prefixes at the PRE-DECODE gate (claimed length vs remaining bytes,
+    /// checked before any Vec allocation) and reject any trailing byte.
+    /// Round 2 pinned only "errors, eventually" — serde's cautious
+    /// size_hint would still pre-allocate up to 1 MiB first; the gate makes
+    /// the bound structural.
+    #[test]
+    fn hnsw_bounded_decoders_reject_forged_lengths_and_trailing_bytes() {
+        // Forged huge vector count in bincode VARINT layout (standard
+        // config: u64 counts > u32::MAX encode as marker 0xFD + 8B LE):
+        // tiny fixed prefix (one-byte varints) + count = 2^40 + no data.
+        let mut forged = vec![1u8, 10, 3, 42, 2, 4]; // meta/page/slot/node/level/dim
+        forged.push(0xFD);
+        forged.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        let err = HnswNodeInitRecord::decode(&forged).unwrap_err();
+        assert!(
+            err.to_string().contains("claims"),
+            "forged length must fail at the pre-decode gate: {err}"
+        );
+        // Round 4 P2-2: the SetNeighbors arm gets the same gate-point
+        // assertion — is_err() alone cannot prove the rejection happened
+        // pre-allocation.
+        let err = HnswSetNeighborsRecord::decode(&forged).unwrap_err();
+        assert!(
+            err.to_string().contains("claims"),
+            "forged length must fail at the pre-decode gate: {err}"
+        );
+
+        // Round 4 P3-1: a legal-size but semantically false payload (wire
+        // length disagrees with the declared dim/count) is rejected at the
+        // gate, pre-allocation. Flip the declared dim byte (prefix field
+        // #6, one-byte varint for small values) of an honest payload.
+        let mut mismatched =
+            WalRecord::hnsw_node_init(PageId(1), PageId(10), 3, 42, 2, 3, vec![1.0; 3])
+                .unwrap()
+                .payload;
+        mismatched[5] = 4; // declared dim 3 -> 4, wire length stays 3
+        let err = HnswNodeInitRecord::decode(&mismatched).unwrap_err();
+        assert!(
+            err.to_string().contains("!= declared"),
+            "dim/wire mismatch must fail at the pre-decode gate: {err}"
+        );
+        let mut mismatched =
+            WalRecord::hnsw_set_neighbors(PageId(1), PageId(11), 4, 42, 0, vec![1, 5, 9])
+                .unwrap()
+                .payload;
+        mismatched[5] = 4; // declared count 3 -> 4, wire length stays 3
+        let err = HnswSetNeighborsRecord::decode(&mismatched).unwrap_err();
+        assert!(
+            err.to_string().contains("!= declared"),
+            "count/wire mismatch must fail at the pre-decode gate: {err}"
+        );
+
+        // Trailing byte: each decoder rejects its own honest payload + 1B.
+        let with_tail = |mut p: Vec<u8>| {
+            p.push(0);
+            p
+        };
+        assert!(HnswNodeInitRecord::decode(&with_tail(
+            WalRecord::hnsw_node_init(PageId(1), PageId(10), 3, 42, 2, 4, vec![1.0; 4])
+                .unwrap()
+                .payload
+        ))
+        .is_err());
+        assert!(HnswSetNeighborsRecord::decode(&with_tail(
+            WalRecord::hnsw_set_neighbors(PageId(1), PageId(11), 4, 42, 0, vec![1, 5, 9])
+                .unwrap()
+                .payload
+        ))
+        .is_err());
+        assert!(HnswMetaUpdateRecord::decode(&with_tail(
+            WalRecord::hnsw_meta_update(PageId(1), 42, 2)
+                .unwrap()
+                .payload
+        ))
+        .is_err());
+        assert!(HnswNodeTombstoneRecord::decode(&with_tail(
+            WalRecord::hnsw_node_tombstone(PageId(11), 4, 42)
+                .unwrap()
+                .payload
+        ))
+        .is_err());
+        assert!(HnswDirAppendRecord::decode(&with_tail(
+            WalRecord::hnsw_dir_append(PageId(100), 42, PageId(11), 4)
+                .unwrap()
+                .payload
+        ))
+        .is_err());
+        assert!(HnswDirLinkRecord::decode(&with_tail(
+            WalRecord::hnsw_dir_link(PageId(100), PageId(101))
+                .unwrap()
+                .payload
+        ))
+        .is_err());
+        assert!(HnswPublishLiveRecord::decode(&with_tail(
+            WalRecord::hnsw_publish_live(PageId(11), 4, 42)
+                .unwrap()
+                .payload
+        ))
+        .is_err());
+
+        // Honest payloads still decode through the bounded API.
+        let good = WalRecord::hnsw_publish_live(PageId(11), 4, 42).unwrap();
+        assert!(HnswPublishLiveRecord::decode(&good.payload).is_ok());
     }
 
     #[test]

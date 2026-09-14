@@ -26,6 +26,11 @@
 //!   tech-selection v1.6).
 //! - [`dataset`]: fvecs/ivecs parsing and recall@k scoring (Stage D local
 //!   toolchain) — shared by the recall probe and the CI hard gate.
+//! - [`page`]: HNSW page types and the page-initialization chain (Phase 2
+//!   M5 Stage 0) — node/directory/meta page headers and the post-image FPI
+//!   durability anchor (`log_page_init`, tech-selection §8.1 step 1).
+//! - [`redo`]: the redo-handler registry skeleton (Phase 2 M5 Stage 0 —
+//!   empty; the seven handlers land in Stage C).
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
@@ -35,7 +40,9 @@ pub mod distance;
 pub mod encoding;
 pub mod error;
 pub mod graph;
+pub mod page;
 pub mod params;
+pub mod redo;
 pub mod rng;
 pub mod snapshot;
 

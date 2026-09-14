@@ -68,7 +68,9 @@ use tracing::{debug, info, warn};
 use crate::error::{Result, StorageError};
 use crate::types::{Lsn, PageId, Tid, TxnId};
 use crate::wal::reader::WalReader;
-use crate::wal::record::{bincode_config, CheckpointEndRecord, WalRecord, WalRecordType};
+use crate::wal::record::{
+    bincode_config, CheckpointEndRecord, HnswSeqHead, WalRecord, WalRecordType,
+};
 
 /// Outcome of the analysis phase: where redo must start, plus the ARIES
 /// tables rebuilt as of the crash (tech-selection §11.1).
@@ -361,6 +363,30 @@ fn for_each_touched_page(record: &WalRecord, f: &mut impl FnMut(PageId)) -> Resu
             if meta != PageId::INVALID {
                 f(meta);
             }
+        }
+        // Phase 2 M5 Stage 0 (tech-selection §4.2): the seven HNSW records.
+        // `meta_page_id` is read-only validation context, never modified —
+        // only the node page is tracked. Decode the records' OWN head type
+        // (2026-09-14, review round 7 P2) instead of hand-stepping two
+        // PageIds — a head-layout change moves this arm in lockstep.
+        HnswNodeInit | HnswSetNeighbors => {
+            let mut off = 0;
+            let head = decode_prefix::<HnswSeqHead>(payload, &mut off)?;
+            f(head.page_id);
+        }
+        HnswMetaUpdate => {
+            let mut off = 0;
+            f(decode_prefix::<PageId>(payload, &mut off)?);
+        }
+        HnswNodeTombstone | HnswPublishLive => {
+            let mut off = 0;
+            f(decode_prefix::<PageId>(payload, &mut off)?);
+        }
+        HnswDirAppend | HnswDirLink => {
+            // Directory chain pages; `target_page`/`next_page` are only
+            // referenced (allocated elsewhere), not modified by the record.
+            let mut off = 0;
+            f(decode_prefix::<PageId>(payload, &mut off)?);
         }
         _ => {}
     }
@@ -770,6 +796,38 @@ mod tests {
                 WalRecord::heap_cleanup(PageId(20), vec![0], PageId(19), PageId(21)).unwrap(),
                 vec![PageId(20), PageId(19)],
             ),
+            // Phase 2 M5 Stage 0: the seven HNSW records. meta_page_id (1) is
+            // validation context, never touched; only the node/meta/directory
+            // page is tracked per record.
+            (
+                WalRecord::hnsw_node_init(PageId(1), PageId(30), 0, 0, 0, 2, vec![1.0, 2.0])
+                    .unwrap(),
+                vec![PageId(30)],
+            ),
+            (
+                WalRecord::hnsw_set_neighbors(PageId(1), PageId(31), 0, 0, 0, vec![3, 4]).unwrap(),
+                vec![PageId(31)],
+            ),
+            (
+                WalRecord::hnsw_meta_update(PageId(32), 0, 0).unwrap(),
+                vec![PageId(32)],
+            ),
+            (
+                WalRecord::hnsw_node_tombstone(PageId(33), 0, 0).unwrap(),
+                vec![PageId(33)],
+            ),
+            (
+                WalRecord::hnsw_dir_append(PageId(34), 0, PageId(35), 0).unwrap(),
+                vec![PageId(34)],
+            ),
+            (
+                WalRecord::hnsw_dir_link(PageId(36), PageId(37)).unwrap(),
+                vec![PageId(36)],
+            ),
+            (
+                WalRecord::hnsw_publish_live(PageId(38), 0, 0).unwrap(),
+                vec![PageId(38)],
+            ),
             // Non-page records touch nothing.
             (WalRecord::checkpoint_begin(), vec![]),
             (WalRecord::txn_commit(TxnId(1)).unwrap(), vec![]),
@@ -811,6 +869,16 @@ mod tests {
             BTreeSplitCommit,
             HeapHotUpdate,
             BTreeSplitCLR,
+            // Phase 2 M5 Stage 0: all seven HNSW records are page-modifying
+            // (tech-selection §4.2 — physiological records on node/meta/
+            // directory pages).
+            HnswNodeInit,
+            HnswSetNeighbors,
+            HnswMetaUpdate,
+            HnswNodeTombstone,
+            HnswDirAppend,
+            HnswDirLink,
+            HnswPublishLive,
         ];
         // Transaction and checkpoint markers, and the Phase-2+ logical/
         // segment records: no pages are tracked for them. If any of these

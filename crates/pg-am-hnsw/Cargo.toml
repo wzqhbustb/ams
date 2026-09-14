@@ -20,6 +20,11 @@ crc32fast = "1.3"
 # §2 v1.5): the pg-storage edge is deferred to M5, when WAL/buffer-pool
 # integration creates a real consumer. Do not add dependencies before then.
 
+# Phase 2 M5 Stage 0 (2026-09-11): the deferred edge materializes — page
+# headers, WAL records, and the buffer pool are consumed by page.rs /
+# redo.rs now, and by the Stage B/C write path next.
+pg-storage = { path = "../pg-storage" }
+
 [dev-dependencies]
 # benchmarks (Stage E, coding plan "criterion bench" row). The §2 freeze
 # above covers RUNTIME dependencies; criterion is dev-only. Version 0.5

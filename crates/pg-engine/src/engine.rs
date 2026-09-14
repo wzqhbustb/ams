@@ -684,9 +684,13 @@ impl Engine {
         // 2. Storage recovery with the heap + txn + btree redo handlers and
         //    the CLOG (Stage M wave 2: btree records — index entries, the
         //    3-step split protocol, meta records — must replay too).
+        //    Phase 2 M5 Stage 0: the HNSW handler set registers as an empty
+        //    skeleton (pg_am_hnsw::redo::hnsw_redo_handlers — Stage C fills
+        //    the seven bodies; tech-selection §2).
         let mut redo_handlers = heap_redo_handlers();
         redo_handlers.extend(txn_redo_handlers());
         redo_handlers.extend(btree_redo_handlers());
+        redo_handlers.extend(pg_am_hnsw::redo::hnsw_redo_handlers());
         let undo_handlers: Vec<Box<dyn UndoHandler>> =
             vec![Box::new(HeapUndoHandler), Box::new(BTreeUndoHandler)];
         let storage = StorageEngine::open_with_redo_and_clog(
