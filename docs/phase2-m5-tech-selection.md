@@ -176,17 +176,18 @@ switch，注册表对"缺子操作 handler"失明。子操作码方案的唯一�
 | 121 | HnswNodeInit | (meta_page_id, page, slot, node_id, level, dim, vector)——节点条目按 level **定长预留**创建，state=INITIALIZING(§7.2/§8.1,v1.5) |
 | 122 | HnswSetNeighbors | (meta_page_id, page, slot, node_id, level, count, 邻居内容）——**原位更新**（定长预留内改 count+内容，条目永不扩搬，v1.5;meta_page_id 供 redo 侧容量校验，v1.8;**node_id = owner，供 redo 侧无自环校验**,v1.12——此前 payload/原语/条目布局均无 owner,"无自环"不可实现；owner 与 (page,slot) 的目录映射一致性归 §11.3 审计） |
 | 123 | HnswMetaUpdate | (meta_page_id, 字段后像：入口点/最大层） |
-| 124 | HnswNodeTombstone | (page, slot, node_id) —— 格式交付，语义 M6 生效（§1) |
+| 124 | HnswNodeTombstone | (page, slot, node_id, dim, meta_page_id) —— 格式交付，语义 M6 生效（§1);**dim 定位状态字节**（偏移 4·dim,v1.17——redo handler 无状态，payload 不含 dim 则位不可寻）;**meta_page_id 供 redo handler 自定位 meta，应用前核对 dim == meta.dim**(v1.18 入 payload;v1.19 起一致性核对从 §11.3 审计上移为 redo 前置门——审计拿不到历史 payload，错误 dim 留到审计才核对则 redo 早已改坏条目） |
 | 125 | HnswDirAppend | (目录尾页， node_id → (page u64, slot u16) 条目后像，条目宽 10B)——**真单页记录**(v1.2) |
 | 126 | HnswDirLink | (旧尾页， next_page_id 链指针后像）——目录扩容专用，单页 |
-| 127 | HnswPublishLive | (page, slot, node_id)——state 后像翻 LIVE(v1.7，见下） |
+| 127 | HnswPublishLive | (page, slot, node_id, dim, meta_page_id)——state 后像翻 LIVE(v1.7，见下）;dim 的定位作用同 124(v1.17),meta_page_id 的自定位作用与 redo 前置门同 124(v1.18/v1.19) |
 
 **LIVE 翻转的承载记录**(v1.7 审查 P1-2——v1.5/v1.6 把翻转"并入"步骤 6 的
 SetNeighbors，但该记录 payload 没有 publish_live 标志，翻转实际上无 WAL
 承载）。三案：① SetNeighbors 加标志位——翻转必须在**全部**自身层写完
 之后，逐层多条记录里"哪条承担翻转"把记录语义耦合到步骤序，层数变化
 即漂移，否；② 独立 HnswPublishLive 记录（选定）——语义最清晰，记录极小
-（页+槽+id)，幂等天然（state 后像覆写）,§8.2 窗口表只需新增一行；
+（页+槽+id;v1.17 起 +dim 定位状态字节，v1.18 起 +meta_page_id 供审计自定位）,
+幂等天然（state 后像覆写）,§8.2 窗口表只需新增一行；
 ③ 一条记录写全部自身层——payload 变长（≤ m_max0 + L×m 个 id，预算内），
 但把"写内容"与"翻状态"两个语义揉进一条记录，不如 ② 干净。
 **state 位的语义定位**(v1.6 P2-1 已立，此处钉死）:INITIALIZING/LIVE 是
@@ -205,6 +206,13 @@ SetNeighbors 与 MetaUpdate 额外携带 `meta_page_id`(NodeInit 的 apply
 node_id**(v1.12——redo 侧"无自环"校验的判定基准：节点条目布局不存
 NodeId(§7.2 公式无该字段）,payload 不带 owner 则自环检查不可实现；
 owner 与 (page,slot) 的目录映射一致性归 §11.3 审计，同可求值性约束）;
+Tombstone 与 PublishLive 另携带 **dim**(v1.17——状态字节偏移 4·dim
+的唯一无状态来源，缺它则 redo 对这两条记录物理不可施行）与
+**meta_page_id**(v1.18——redo handler 从 payload 自定位 meta 页；
+v1.19 起 dim == meta.dim 的核对随之上移为 **redo 前置门**：handler
+读 meta 核对后才应用，不再降级 §11.3——审计拿不到历史 payload，留
+到审计才核对的错误 dim 早已在 redo 期改坏条目；redo 可求值的前提 =
+meta 初始化记录在 LSN 序上先于一切节点记录且 dim 不可变）;
 见 §10.1 纵深校验；对齐 btree
 记录 payload 带 page_id 的先例
 record.rs:1223)。redo 时 meta page 经 ctx.buffer_pool 可读（Stage I 起
@@ -261,7 +269,11 @@ M5 单线程写入保证链前缀一致——无空洞）。备选 (a)（明文�
   record.rs:238)；页内内容 authoritative，无读时依赖。
 - **payload 版本**:payload 版本 nibble 在 **u8** flags 的高 4 位
   (`version = flags >> 4`,record.rs:941-946——注意 M1 冻结的 32B 记录头里
-  flags 是 u8，不是 u16)。HNSW 全部新记录从 v0 起步。
+  flags 是 u8，不是 u16)。HNSW 记录从 v0 起步；**124/127 自 v1.18 起
+  版本化为 v1**(`HNSW_STATE_VERSION_V1`/`HNSW_STATE_V1_FLAGS`——
+  payload 两次格式修订（+dim、+meta_page_id）后补打的版本通道；
+  flags=0 的预版本化开发格式与未知版本均响亮拒绝，不做兼容解码，
+  其余五类型格式未变、flags=0 即隐式原始版）。
 
 ### 4.3 payload 预算核算
 
@@ -719,12 +731,19 @@ CheckpointEnd v2 与 superblock redo 点（pg-storage/src/superblock.rs:79)。
     的 top_level（弱化口径，v1.8);("entry_point < 链导出 HWM"降级到
     §11.3 审计，v1.10 可求值性约束）;
   - **HnswPublishLive**：目标条目存在，state ∈ {INITIALIZING, LIVE}
-    (LIVE = 幂等重放形态）;("node_id 与目录映射一致"降级到 §11.3
-    审计，同上）;
+    (LIVE = 幂等重放形态）;**dim == meta.dim**(v1.19 **redo 前置
+    门**——handler 经 payload 自带的 meta_page_id 读 meta、核对
+    通过后才应用；meta 初始化记录在 LSN 序上先于一切节点记录且
+    dim 不可变，故 redo 可求值；open 审计拿不到历史 payload,
+    v1.17/v1.18 的"同型降级审计"口径作废——留到审计才核对的错误
+    dim 早已在 redo 期改写错误字节）;("node_id 与目录映射一致"
+    降级到 §11.3 审计，同上）;
   - **HnswNodeTombstone**：目标条目存在且 LIVE(M5 只重放不生效语义，
-    §1);M6 生效时再按那时口径收紧。
+    §1);M6 生效时再按那时口径收紧。dim == meta.dim 同为 redo 前置门
+    (v1.19，可求值前提与作废口径同 PublishLive)。
   此清单为 M5 redo 校验的**冻结边界**：新增检查项 = 协议修订记录；更深
-  的图级校验（连通性、目录一致性、HWM 导出核对——含上述三项降级项）
+  的图级校验（连通性、目录一致性、HWM 导出核对——含上述四项降级项：
+  被引 id < HWM、entry_point < HWM、PublishLive/owner 两条目录一致性）
   不进 redo 路径（恢复时长预算 + v1.10 可求值性约束），归 open 后审计
   (§11.3)。
 - `buffer_pool: Option` 的处置（v1.1 审查 P2-4 改写——v1.0 引用了"M1
@@ -768,6 +787,10 @@ M4 深审（2026-09-09）已立卡，本文档正式收编：
    **落地签名**(2026-09-14 Stage A 二轮复核 P3-1 按代码重写，取代 v1.7
    bullet——参数语义：页 = 页 buffer;`geo` = NodeGeometry(dim/m/m_max0);
    owner/count/无自环在 funnel 不在原语）:
+   - `select_slot(node_page, len) -> slot` — **非修改式选槽**(v1.17,
+     Stage A 三轮 P1-1——WAL-first 次序的载体：正常路径先选槽、把 slot
+     写进 WAL 记录、append+flush，然后才 `apply_node_at`;append_node
+     改为此两者的组合，单一实现）;
    - `append_node(node_page, node_id, top_level, geo, vector) -> slot` —
      指定 level(§5 裁决载体）；定长预留、INITIALIZING 态、节点页槽位
      分配在此发生（§8.1 步骤 3);redo 用 `apply_node_at(node_page, slot,
@@ -777,7 +800,10 @@ M4 深审（2026-09-09）已立卡，本文档正式收编：
      WAL payload 与 funnel，原语只写内容）;
    - `publish_live(node_page, slot, dim)` — state 后像翻 LIVE（步骤 8);
    - `dir_append(dir_tail_page, node_id, target_page, target_slot)` — 尾页
-     单页条目写（步骤 4);
+     单页条目写（步骤 4);**node_id 键控幂等**(v1.17, Stage A 三轮
+     P3——node_id == 链 HWM:`hwm == id` 追加、`hwm > id` 幂等跳过、
+     `hwm < id` 间隙响亮，原语自身即 N=3 字节全等，不只靠 handler 的
+     pd_lsn 守卫）;
    - `dir_link(old_tail_page, new_dir_page)` — 目录扩容（步骤 2);
    - `apply_meta(meta_page, entry_point, max_level)` — 步骤 7 与 §10.3
      的创建/修复共用；
@@ -785,6 +811,9 @@ M4 深审（2026-09-09）已立卡，本文档正式收编：
      redo 承载（v1.9 审查 P2-1 补登）;tombstone 语义 M6 才生效，但 §1
      划的 M5 范围是"能写、能重放、能校验"——重放承载的原语必须在
      清单内;
+   **读侧热路径**(v1.17, Stage A 三轮 P3):`neighbor_iter`/`vector_iter`
+   零分配借用迭代器为 Stage C 搜索形态，`entry_neighbors`/`entry_vector`
+   是其 `.collect()` 便利封装（每次调用分配 Vec，不进热路径）;
    **校验层次**(v1.9 审查 P2-2 明文）:redo handler 先经 meta_page_id 读
    meta 完成全部校验（§10.1 冻结清单），再调用原语；**原语本身不重复
    校验**——校验在 handler/正常路径的 funnel，原语是纯应用（单一实现
@@ -882,7 +911,11 @@ top_level ≥ L（层级归属，对齐 M4 快照校验 encoding.rs:423 的"目�
 独立一维，漏检即 Stage C 重建遍历越界类风险）;c) MetaUpdate 的
 entry_point < 链导出 HWM;d) PublishLive 的 node_id 与目录映射一致；
 e) SetNeighbors 的 owner node_id 与 (page,slot) 目录映射一致（v1.12——
-同 d 的可求值性降级：redo 期 LSN 序已蕴含，审计期一次遍历求值）;②
+同 d 的可求值性降级：redo 期 LSN 序已蕴含，审计期一次遍历求值）。
+(v1.19：原 f 条"Tombstone/PublishLive 的 payload dim ↔ meta.dim
+一致"**上移为 redo 前置门**，不再属审计枚举——审计拿不到历史
+payload,open 后无从逐条核对，留在这里等于错误 dim 在 redo 期改坏
+条目后无人能发现；见 §10.1 冻结清单的 v1.19 项。);②
 siftsmall recall@10 ≥ 0.98（恢复后对 M4 门槛数据集重跑 probe 口径）;③
 幽灵/孤儿统计输出（不阻断，只登记——8.3 不变量 5)。
 外加 ④（v1.1 审查 P2-1 配套）:**loser 窗口断言**——M5 的 WAL 流中
@@ -974,3 +1007,6 @@ pg-am-hnsw（页布局/WAL 记录）与 pg-engine（崩溃 rounds）两侧。
 | v1.14 | 2026-09-14 | M5 Stage A 落地回流 + 审查裁断回写（agent-23 verdict PASS 附条件，条件项已闭合，详见 coding-plan v1.13 与 stage_spec Stage A 回流段）。**裁断①（原语签名口径）**:§10.2 补——v1.7"物理页参数"落地为页 buffer（纯应用原语不做 I/O,PageId 由调用方 pin 解析）;append_node/apply_node_at 带几何参数（落地为 `NodeGeometry` 值对象）;redo 形态分化为 append_node（正常路径）与 apply_node_at(slot,…)（空闲创建/INITIALIZING 覆写幂等，§10.1 "目标 slot 空闲或 INITIALIZING"的实现载体）。**裁断②(LP 布局归属）**:§7.2 容量不变量补注——LP 布局由 pg-am-hnsw apply.rs 再导出（§2 禁依赖 pg-am-heap 的推论）,golden pin 测试冻结一致性，上移 pg-storage::page 登记为 Stage B 评估候选。**P3-2(meta page 形态收窄）**:§6 "slotted page"收窄为"32B PageHeader + raw 字段区，LP 永不使用";entry_point@32/max_level@36 为格式常量（Stage A 已冻结）。**P3-3(slot 态校验归属）**:funnel 的 slot 态 ∈ {INITIALIZING, LIVE} 项需页访问，归 Stage C handler 侧（validate.rs 注释立文） |
 | v1.15 | 2026-09-14 | M5 Stage A 二轮复核回流（agent-23 verdict PASS 附条件 → 条件项已闭合，详见 coding-plan v1.14)。**P2-1（页内容边界）**:pd_lower/pd_upper/LP off+len 无 PAGE_SIZE 钳制（页无 checksum,bit-rot 可致 redo 路径 slice panic，违反 no-panic 纪律）——read_lp 入口钳制（pd_lower ∈ [32, PAGE_SIZE] 且 4 对齐）+ 返回前 off/len 钳制，append_node/apply_node_at 增 pd_upper ≤ PAGE_SIZE 守卫。**P3-1**:§10.2 原语 bullet 列表按落地签名重写（v1.7 遗物与 2026-09-14 口径段双重矛盾：append_node 无 meta_page_id/slot、set_neighbors 无 owner/count、publish_live/apply_tombstone 以 dim 为参、apply_meta 以页 buffer 为参）。**P3-2(裁断）**:set_neighbors/entry_neighbors 统一为 `NodeGeometry` 签名（与 append_node/apply_node_at 一致，API 单约定）。**P3-3**:LP golden pin 的 encode 断言改字面量 0x00C0_9F40（公式化期望与实现同式自指，守卫失效）。**nano**:l_max 补 m=2 → 53 边界钉（rng.rs:93-96 上界语义） |
 | v1.16 | 2026-09-14 | M5 Stage A 三轮复核回流（用户终审 P3：源码行号漂移，逐项核实修复）。正文锚点更新：from_u8 record.rs:107-138→:130、btree_insert 构造器先例 :891-904→:1223、for_each_touched_page analysis.rs:267→:269、pg-waldump HNSW 解码臂 :336→:365、Engine::open extend 链 engine.rs:687-689→:692-693（两处）、pg-storage recovery 阶段序 engine.rs:236-243→:237-245、heap pd_lsn 幂等先例 record.rs:209→:238（三处）、WalRecord 头布局 :705-718→:1627-1636、version nibble :638-643→:941-946；pg-am-hnsw 两处源码注释同步（redo.rs:4、page.rs:105 的 PageHeader::write_to :118-128→:142-153)。核实不改：analysis.rs:854 穷举测试、engine.rs:646 的 RedoContext 构造、recovery.rs:210-229、record.rs:74/:81-88/:189 仍准确；修订记录表历史行号按 v1.12 起约定保留当轮值。coding-plan v1.15、stage_spec :1171 同步 |
+| v1.18 | 2026-09-15 | M5 Stage A 五轮复核回流（用户终审：1 P1 + 3 P2 + 2 P3 逐条核实属实）。**P1(124/127 payload 补 meta_page_id)**:§11.3 审计的 dim == meta.dim 核对须能从 payload 自定位 meta 页——两 payload 末尾补 meta_page_id(§4.2 表、自包含规则段、§10.1 清单、§11.3 f 条自定位化同步；构造器首参加参过 INVALID 拒绝；apply.rs 原语签名不变）。**P2(flags 版本半字节）**：照 CheckpointEnd 先例新增 HNSW_STATE_VERSION_V1/HNSW_STATE_V1_FLAGS 覆盖 124/127;flags=0 = 预版本化开发格式（从未随 release 落盘，响亮拒绝不做兼容解码），其余五类型格式未变 = flags 0 隐式原始版（常量注释立文）;decode 双分派。**P2(apply.rs 三条）**:pd_special 区界钳制、HWM checked_add、dir_append 幂等后像比对（字节同源）。**P3（文档）**:coding-plan v1.17 同步（原语签名、审计断言 a–f);stage_spec 五轮回流段。验证：pg-am-hnsw lib 116 绿、pg-storage lib 206 绿、waldump 3/3、clippy/fmt/doc 绿 |
+| v1.17 | 2026-09-15 | M5 Stage A 四轮复核回流（用户终审：2 P1 + 2 P2 + 4 P3 逐条代码实证后全部属实，主线修复；含两个前轮已判修复但未落入 c3f0ab1 的 P3 遗留）。**P1-1(append_node 违反 WAL-first)**：选槽与页面应用耦合（先改页后得 slot，正常路径无法满足"选槽 → WAL append → 应用")——新增非修改式 `select_slot(node_page, len)`,append_node 改为 select_slot + apply_node_at 组合（单一实现）;§10.2 落地签名同步。**P1-2(PublishLive/Tombstone payload 无状态字节定位参数）**:redo handler 无状态，payload 仅 page/slot/node,4·dim 偏移物理不可寻——**格式修订**：两 payload 补 `dim: u16`（构造器 dim=0 响亮拒绝；golden 钉补 124/127 位置钉；waldump 两臂打印；analysis.rs touched-page 零影响——dim 追加末尾、首字段 PageId 不动）;dim ↔ meta.dim 一致性同型降级 §11.3 审计（邻接良构断言新增 f 条，§4.2 表/自包含规则/§10.1 冻结清单三处同步）。**P2-1(read_lp 仅整页钳制）**：补元组区 [pd_upper, pd_special) 校验——伪造 LP 指向 LP 数组/空闲区/越 pd_special 皆响亮，publish/tombstone/邻接写的靶区限死元组区。**P2-2(pd_lower 未对齐检查）**:append 路径共享 `append_bounds`（含 4 字节对齐——撕裂 pd_lower 曾静默圆整槽位计数）。**P3-1(top_level 静默掩码遗留）**:write_entry 的 `& 0x3F` 改响亮 Corrupted(64 曾回绕为 0；先于任何字节写入，拒绝时页不染）。**P3-2(L_max 公式重复遗留）**:rng.rs 导出单一来源 `l_max(m)`,validate.rs `MetaView::l_max` 与 next_level 的 debug_assert 改委派。**P3-3(dir_append 忽略 node_id、非幂等）**:node_id 键控幂等——hwm == id 追加 / hwm > id 幂等跳过（返回条目位置）/ hwm < id 间隙响亮 / id 早于本页基址响亮；header count > 容量与 ordinal 溢出（checked_mul）响亮；coding-plan "每原语 N=3 字节全等"验收口径对 dir_append 自此真正成立。**P3-4（读侧每次调用分配 Vec)**:`neighbor_iter`/`vector_iter` 零分配借用迭代器（ExactSizeIterator）为 Stage C 搜索热路径形态，entry_neighbors/entry_vector 改 `.collect()` 便利封装；region/count 校验收拢 checked_region(_mut)/checked_count 单一实现。新增测试 +8;pg-am-hnsw lib 107→115、pg-storage lib 205 绿、waldump 3/3、clippy -D warnings/fmt 绿。coding-plan v1.16、stage_spec 四轮回流段同步 |
+| v1.19 | 2026-09-15 | M5 Stage A 六轮复核回流（用户终审：1 P1 + 1 P2 + 1 P3 逐条核实属实）。**P1(dim == meta.dim 上移 redo 前置门）**:v1.17/v1.18 把该核对降级 §11.3 审计的口径在实质上不成立——redo 先于审计运行，错误 dim 会在审计介入前就把状态位写进错误偏移，且审计拿不到历史 payload、事后无法归因；payload 自 v1.18 起自带 meta_page_id 使该项 redo 可求值（meta 初始化记录 LSN 序先于一切节点记录、dim 不可变）——§10.1 冻结清单 124/127 项改"handler 经 meta_page_id 读 meta、核对后应用",§11.3 审计枚举 f 条撤销（回 a–e)，降级项集合回四项；validate.rs 新增单点 `validate_state_dim`（正常路径与 Stage C handler 共用），两条 payload rustdoc 同步改写。**P2(DPT 未门控 124/127 版本 flags)**:analysis.rs  touched-page 臂原 `decode_prefix::<PageId>` 对版本化 payload 按未知布局静默读页——两臂改走记录自身的版本化 decode（flags=0 预版本化格式与未知版本均响亮），新增版本门负例测试。**P3（文档漂移）**:§4.2 表 124/127 payload 顺序改为实际 wire 序 (page, slot, node_id, dim, meta_page_id)（前版误按构造器参数序）;§4.2 payload 版本段"HNSW 全部新记录从 v0 起步"补 124/127 已 v1 化；"三项降级项"改四项；coding-plan v1.18、stage_spec 六轮回流段同步。验证：pg-am-hnsw lib 117 绿、pg-storage lib 207 绿、clippy/fmt/doc 绿 |

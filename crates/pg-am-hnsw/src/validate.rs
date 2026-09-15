@@ -18,6 +18,18 @@
 //! the redo path. They belong to the Stage D open-time audit (§11.3).
 //! Moving that line is a protocol revision, not an implementation detail.
 //!
+//! **State-record dim gate** (2026-09-15, review round 6 P1): the
+//! PublishLive/Tombstone `dim == meta.dim` check is NOT one of the demoted
+//! audit items — it is redo-evaluable and MUST run before apply. Redo-
+//! evaluable because the payload carries `meta_page_id` (round 5) and the
+//! meta page's init records precede every node record in LSN order while
+//! `dim` is immutable (metric/dim mismatch is a hard open failure); must
+//! run before apply because the open-time audit cannot recover historical
+//! payloads — a wrong `dim` caught only there would already have rewritten
+//! the wrong bytes during redo. [`validate_state_dim`] is the single
+//! point; the Stage C handler reads meta through the payload's
+//! `meta_page_id` and gates here before the flip.
+//!
 //! **Slot-state check ownership** (2026-09-14, Stage A review P3-3): the
 //! frozen checklist's "target slot free-or-INITIALIZING / state ∈
 //! {INITIALIZING, LIVE}" items need PAGE access, so they are NOT part of
@@ -45,13 +57,15 @@ pub(crate) struct MetaView {
 
 impl MetaView {
     /// Maximum legal top level for this meta: `⌊53·ln2 / ln M⌋` — the
-    /// redraw-bounded hard ceiling of the geometric level draw (rng.rs:93-96,
-    /// §10.1 frozen checklist). Precondition (2026-09-14, review nano):
-    /// `m >= 2`, guaranteed by meta creation (HnswParams' validation,
-    /// params.rs:77-82) — `m ∈ {0, 1}` makes the ln degenerate and is not
-    /// defended here because no legal meta can carry it.
+    /// redraw-bounded hard ceiling of the geometric level draw, delegated
+    /// to the single source [`crate::rng::l_max`] (2026-09-15, review
+    /// round 3 P3-2: the formula was duplicated here and at rng.rs).
+    /// Precondition (2026-09-14, review nano): `m >= 2`, guaranteed by
+    /// meta creation (HnswParams' validation, params.rs:77-82) — `m ∈
+    /// {0, 1}` makes the ln degenerate and is not defended here because no
+    /// legal meta can carry it.
     pub(crate) fn l_max(&self) -> u8 {
-        (53.0 * std::f64::consts::LN_2 / f64::from(self.m).ln()).floor() as u8
+        crate::rng::l_max(self.m)
     }
 
     /// Reserved neighbor capacity of `level` (level 0 → m_max0, upper → m).
@@ -152,6 +166,25 @@ pub(crate) fn validate_set_neighbors(
     Ok(())
 }
 
+/// §10.1 HnswPublishLive / HnswNodeTombstone checklist item: the payload
+/// `dim` — which locates the entry's state byte at offset `4·dim` — must
+/// equal `meta.dim`. This is a PRE-APPLY gate, not an audit item (see the
+/// module doc's "State-record dim gate": a mismatch caught only at the
+/// open-time audit would already have flipped a bit at the wrong offset
+/// during redo, and the audit cannot recover the historical payloads to
+/// attribute it). The Stage C redo handler reads meta through the
+/// payload's `meta_page_id` and gates here before calling the primitive;
+/// the normal path gates here against its in-memory meta.
+pub(crate) fn validate_state_dim(meta: &MetaView, dim: u16, what: &str) -> Result<()> {
+    if dim != meta.dim {
+        return Err(HnswError::InvalidArgument(format!(
+            "{what} dim {dim} != meta dim {} — the state-byte locator must match meta before apply",
+            meta.dim
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +251,19 @@ mod tests {
         assert!(validate_set_neighbors(&m, 7, 0, 2, &[5, 1], 0).is_err());
         assert!(validate_set_neighbors(&m, 7, 0, 2, &[5, 5], 0).is_err());
         assert!(validate_set_neighbors(&m, 7, 0, 2, &[1, 7], 0).is_err());
+    }
+
+    #[test]
+    fn state_dim_gate_accepts_and_rejects() {
+        let m = meta();
+        // The pre-apply gate (2026-09-15, review round 6 P1): equal dims
+        // pass; any mismatch is a loud InvalidArgument BEFORE the flip.
+        validate_state_dim(&m, DIM, "PublishLive").unwrap();
+        validate_state_dim(&m, DIM, "NodeTombstone").unwrap();
+        for what in ["PublishLive", "NodeTombstone"] {
+            let err = validate_state_dim(&m, DIM + 1, what).unwrap_err();
+            assert!(err.to_string().contains(what), "{err}");
+            assert!(err.to_string().contains("before apply"), "{err}");
+        }
     }
 }

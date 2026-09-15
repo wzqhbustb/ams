@@ -415,6 +415,23 @@ pub struct HnswMetaUpdateRecord {
     pub max_level: u8,
 }
 
+/// Payload version nibble for the two HNSW state-bit records
+/// (HnswNodeTombstone = 124, HnswPublishLive = 127), stamped in the record
+/// header's `flags` byte — same convention as
+/// [`CHECKPOINT_END_VERSION_V2`]/[`CHECKPOINT_END_V2_FLAGS`]
+/// (2026-09-15, M5 Stage A review round 5 P2). Version 0 means the
+/// pre-versioning DEVELOPMENT format (Stage 0 / early Stage A, before
+/// `dim`/`meta_page_id` entered the payloads); it never shipped in any
+/// release, so decode rejects it loudly instead of offering a compatibility
+/// path. The other five HNSW record types are format-unchanged since their
+/// introduction: their `flags` stays 0, read as "implicit original
+/// version" — no nibble needed (documented here as the umbrella note).
+pub const HNSW_STATE_VERSION_V1: u8 = 1;
+
+/// The `flags` byte stamped on emitted v1 state-bit records: version 1 in
+/// the high nibble, no record-specific flags in the low nibble.
+pub const HNSW_STATE_V1_FLAGS: u8 = HNSW_STATE_VERSION_V1 << 4;
+
 /// Payload for an `HnswNodeTombstone` record (Phase 2 M5): format only —
 /// the tombstone SEMANTICS (search filtering, space reclamation) land in M6
 /// (tech-selection §1 scope split); M5 only writes/replays the bit.
@@ -426,6 +443,25 @@ pub struct HnswNodeTombstoneRecord {
     pub slot_id: u16,
     /// The NodeId being tombstoned.
     pub node_id: u32,
+    /// The index's vector dimension — the entry's state byte sits at offset
+    /// `4·dim`, and the redo handler is stateless (tech-selection §10.1):
+    /// without `dim` in the payload the bit is physically unlocatable
+    /// (2026-09-15, M5 Stage A review round 3 P1-2). `dim == meta.dim` is
+    /// a REDO pre-apply gate, not an audit item (round 6 P1): the handler
+    /// reads meta through `meta_page_id` and rejects a mismatch BEFORE the
+    /// bit flip — the open-time audit cannot recover historical payloads,
+    /// so a wrong `dim` caught only there would already have rewritten the
+    /// wrong bytes during redo. Sound at redo time because the meta page's
+    /// init records precede every node record in LSN order and `dim` is
+    /// immutable (metric/dim mismatch is a hard open failure).
+    pub dim: u16,
+    /// The index's meta page — carried so the redo handler can locate meta
+    /// from the payload alone and gate `dim == meta.dim` before apply
+    /// (2026-09-15, M5 Stage A review round 5 P1 for localization; round 6
+    /// P1 moved the check itself from the open-time audit to the redo
+    /// pre-apply gate). The RedoContext has no index registry (§4.2
+    /// self-containment), so the payload must name the page.
+    pub meta_page_id: PageId,
 }
 
 /// Payload for an `HnswDirAppend` record (Phase 2 M5): publishes the
@@ -467,6 +503,15 @@ pub struct HnswPublishLiveRecord {
     pub slot_id: u16,
     /// The NodeId being published as live.
     pub node_id: u32,
+    /// The index's vector dimension — locates the state byte (`4·dim`)
+    /// without a meta read, keeping the redo handler stateless (2026-09-15,
+    /// M5 Stage A review round 3 P1-2; same contract and redo pre-apply
+    /// gate note as [`HnswNodeTombstoneRecord::dim`]).
+    pub dim: u16,
+    /// The index's meta page — same redo-gate localization contract as
+    /// [`HnswNodeTombstoneRecord::meta_page_id`] (2026-09-15, round 5 P1;
+    /// the check itself moved to the redo pre-apply gate in round 6 P1).
+    pub meta_page_id: PageId,
 }
 
 // ---------------------------------------------------------------------
@@ -580,9 +625,23 @@ impl HnswMetaUpdateRecord {
 }
 
 impl HnswNodeTombstoneRecord {
-    /// Bounded, fully-consuming decode (P2-1 — see the section comment).
-    pub fn decode(payload: &[u8]) -> Result<Self> {
-        decode_hnsw_payload(payload)
+    /// Bounded, fully-consuming decode, dispatched on the record's `flags`
+    /// version nibble (2026-09-15, round 5 P2 — see [`HNSW_STATE_VERSION_V1`]):
+    /// version 0 is the pre-versioning development format and is REJECTED
+    /// (it never shipped in any release — regenerate the data directory);
+    /// version 1 decodes the current layout; any other nibble is an unknown
+    /// version from a newer binary and must never be silently mis-decoded.
+    pub fn decode(payload: &[u8], flags: u8) -> Result<Self> {
+        match flags >> 4 {
+            0 => Err(StorageError::Serialize(
+                "HnswNodeTombstone payload version 0: superseded pre-versioning development format (never shipped in any release; regenerate the data directory)"
+                    .to_string(),
+            )),
+            HNSW_STATE_VERSION_V1 => decode_hnsw_payload(payload),
+            v => Err(StorageError::WalReadFailed(format!(
+                "unknown HnswNodeTombstone payload version {v}"
+            ))),
+        }
     }
 }
 
@@ -601,9 +660,20 @@ impl HnswDirLinkRecord {
 }
 
 impl HnswPublishLiveRecord {
-    /// Bounded, fully-consuming decode (P2-1 — see the section comment).
-    pub fn decode(payload: &[u8]) -> Result<Self> {
-        decode_hnsw_payload(payload)
+    /// Bounded, fully-consuming decode, dispatched on the record's `flags`
+    /// version nibble (2026-09-15, round 5 P2 — same contract as
+    /// [`HnswNodeTombstoneRecord::decode`]).
+    pub fn decode(payload: &[u8], flags: u8) -> Result<Self> {
+        match flags >> 4 {
+            0 => Err(StorageError::Serialize(
+                "HnswPublishLive payload version 0: superseded pre-versioning development format (never shipped in any release; regenerate the data directory)"
+                    .to_string(),
+            )),
+            HNSW_STATE_VERSION_V1 => decode_hnsw_payload(payload),
+            v => Err(StorageError::WalReadFailed(format!(
+                "unknown HnswPublishLive payload version {v}"
+            ))),
+        }
     }
 }
 
@@ -1398,20 +1468,40 @@ impl WalRecord {
     }
 
     /// Create an `HnswNodeTombstone` record (Phase 2 M5 — format only; the
-    /// semantics land in M6, tech-selection §1).
-    pub fn hnsw_node_tombstone(page_id: PageId, slot_id: u16, node_id: u32) -> Result<Self> {
+    /// semantics land in M6, tech-selection §1). `dim` locates the entry's
+    /// state byte at redo (2026-09-15 round 3 P1-2); `dim = 0` is rejected
+    /// like NodeInit's (M4 §5: rejected at every entry point).
+    pub fn hnsw_node_tombstone(
+        meta_page_id: PageId,
+        page_id: PageId,
+        slot_id: u16,
+        node_id: u32,
+        dim: u16,
+    ) -> Result<Self> {
+        reject_invalid_page_id("HnswNodeTombstone", "meta_page_id", meta_page_id)?;
         reject_invalid_page_id("HnswNodeTombstone", "page_id", page_id)?;
         reject_invalid_node_id("HnswNodeTombstone", "node_id", node_id)?;
+        if dim == 0 {
+            return Err(StorageError::Serialize(
+                "HnswNodeTombstone dim = 0 (M4 §5: rejected at every entry point)".to_string(),
+            ));
+        }
         let payload = bincode::serde::encode_to_vec(
             HnswNodeTombstoneRecord {
                 page_id,
                 slot_id,
                 node_id,
+                dim,
+                meta_page_id,
             },
             bincode_config(),
         )
         .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        Ok(Self::new(WalRecordType::HnswNodeTombstone, payload))
+        // 2026-09-15, round 5 P2: stamp the v1 payload-version nibble (see
+        // [`HNSW_STATE_VERSION_V1`]).
+        let mut rec = Self::new(WalRecordType::HnswNodeTombstone, payload);
+        rec.flags = HNSW_STATE_V1_FLAGS;
+        Ok(rec)
     }
 
     /// Create an `HnswDirAppend` record (Phase 2 M5): publish a
@@ -1460,20 +1550,40 @@ impl WalRecord {
     }
 
     /// Create an `HnswPublishLive` record (Phase 2 M5): flip the node entry
-    /// from INITIALIZING to LIVE.
-    pub fn hnsw_publish_live(page_id: PageId, slot_id: u16, node_id: u32) -> Result<Self> {
+    /// from INITIALIZING to LIVE. `dim` locates the entry's state byte at
+    /// redo (2026-09-15 round 3 P1-2); `dim = 0` is rejected like
+    /// NodeInit's (M4 §5: rejected at every entry point).
+    pub fn hnsw_publish_live(
+        meta_page_id: PageId,
+        page_id: PageId,
+        slot_id: u16,
+        node_id: u32,
+        dim: u16,
+    ) -> Result<Self> {
+        reject_invalid_page_id("HnswPublishLive", "meta_page_id", meta_page_id)?;
         reject_invalid_page_id("HnswPublishLive", "page_id", page_id)?;
         reject_invalid_node_id("HnswPublishLive", "node_id", node_id)?;
+        if dim == 0 {
+            return Err(StorageError::Serialize(
+                "HnswPublishLive dim = 0 (M4 §5: rejected at every entry point)".to_string(),
+            ));
+        }
         let payload = bincode::serde::encode_to_vec(
             HnswPublishLiveRecord {
                 page_id,
                 slot_id,
                 node_id,
+                dim,
+                meta_page_id,
             },
             bincode_config(),
         )
         .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        Ok(Self::new(WalRecordType::HnswPublishLive, payload))
+        // 2026-09-15, round 5 P2: stamp the v1 payload-version nibble (see
+        // [`HNSW_STATE_VERSION_V1`]).
+        let mut rec = Self::new(WalRecordType::HnswPublishLive, payload);
+        rec.flags = HNSW_STATE_V1_FLAGS;
+        Ok(rec)
     }
 
     /// Create a `BTreeSplitPrepare` record (§13.3 step 1).
@@ -1920,10 +2030,17 @@ mod tests {
             (PageId(1), 42, 2)
         );
 
-        // 124 NodeTombstone (format only).
-        let rec = WalRecord::hnsw_node_tombstone(PageId(11), 4, 42).unwrap();
-        let r = HnswNodeTombstoneRecord::decode(&rec.payload).unwrap();
-        assert_eq!((r.page_id, r.slot_id, r.node_id), (PageId(11), 4, 42));
+        // 124 NodeTombstone (format only; dim locates the state byte,
+        // 2026-09-15 round 3 P1-2).
+        let rec = WalRecord::hnsw_node_tombstone(PageId(1), PageId(11), 4, 42, 4).unwrap();
+        let r = HnswNodeTombstoneRecord::decode(&rec.payload, rec.flags).unwrap();
+        assert_eq!(
+            (r.page_id, r.slot_id, r.node_id, r.dim, r.meta_page_id),
+            (PageId(11), 4, 42, 4, PageId(1))
+        );
+        // 2026-09-15 round 5 P2: the state-bit records carry the v1
+        // payload-version nibble in the header flags byte.
+        assert_eq!(rec.flags, HNSW_STATE_V1_FLAGS);
 
         // 125 DirAppend.
         let rec = WalRecord::hnsw_dir_append(PageId(100), 42, PageId(11), 4).unwrap();
@@ -1939,9 +2056,13 @@ mod tests {
         assert_eq!((r.old_tail_page, r.next_page), (PageId(100), PageId(101)));
 
         // 127 PublishLive.
-        let rec = WalRecord::hnsw_publish_live(PageId(11), 4, 42).unwrap();
-        let r = HnswPublishLiveRecord::decode(&rec.payload).unwrap();
-        assert_eq!((r.page_id, r.slot_id, r.node_id), (PageId(11), 4, 42));
+        let rec = WalRecord::hnsw_publish_live(PageId(1), PageId(11), 4, 42, 4).unwrap();
+        let r = HnswPublishLiveRecord::decode(&rec.payload, rec.flags).unwrap();
+        assert_eq!(
+            (r.page_id, r.slot_id, r.node_id, r.dim, r.meta_page_id),
+            (PageId(11), 4, 42, 4, PageId(1))
+        );
+        assert_eq!(rec.flags, HNSW_STATE_V1_FLAGS);
     }
 
     /// Golden bytes pin (2026-09-14, review round 7 P3-1): the nested
@@ -1966,6 +2087,14 @@ mod tests {
         let rec =
             WalRecord::hnsw_set_neighbors(PageId(1), PageId(11), 4, 42, 0, vec![1, 5, 9]).unwrap();
         assert_eq!(rec.payload, vec![1u8, 11, 4, 42, 0, 3, 3, 1, 5, 9]);
+
+        // 124/127 (2026-09-15, round 3 P1-2 + round 5 P1): page/slot/node +
+        // dim + meta_page_id — trailing dim locates the state byte,
+        // meta_page_id localizes the §11.3 audit; both POSITIONS are format.
+        let rec = WalRecord::hnsw_node_tombstone(PageId(1), PageId(11), 4, 42, 4).unwrap();
+        assert_eq!(rec.payload, vec![11u8, 4, 42, 4, 1]);
+        let rec = WalRecord::hnsw_publish_live(PageId(1), PageId(11), 4, 42, 4).unwrap();
+        assert_eq!(rec.payload, vec![11u8, 4, 42, 4, 1]);
     }
 
     /// Stage 0: constructor argument validation fails loudly (a constructor
@@ -2003,10 +2132,19 @@ mod tests {
             WalRecord::hnsw_set_neighbors(PageId(1), PageId::INVALID, 0, 0, 0, vec![3]).is_err()
         );
         assert!(WalRecord::hnsw_meta_update(PageId::INVALID, 0, 0).is_err());
-        assert!(WalRecord::hnsw_node_tombstone(PageId::INVALID, 0, 0).is_err());
+        assert!(WalRecord::hnsw_node_tombstone(PageId(1), PageId::INVALID, 0, 0, 1).is_err());
         assert!(WalRecord::hnsw_dir_append(PageId::INVALID, 0, PageId(2), 0).is_err());
         assert!(WalRecord::hnsw_dir_link(PageId::INVALID, PageId(2)).is_err());
-        assert!(WalRecord::hnsw_publish_live(PageId::INVALID, 0, 0).is_err());
+        assert!(WalRecord::hnsw_publish_live(PageId(1), PageId::INVALID, 0, 0, 1).is_err());
+        // meta_page_id = INVALID rejected on both state-bit constructors
+        // (2026-09-15 round 5 P1).
+        assert!(WalRecord::hnsw_node_tombstone(PageId::INVALID, PageId(2), 0, 0, 1).is_err());
+        assert!(WalRecord::hnsw_publish_live(PageId::INVALID, PageId(2), 0, 0, 1).is_err());
+        // Tombstone/PublishLive: dim = 0 rejected like NodeInit's (2026-09-15
+        // round 3 P1-2 — the state byte sits at 4·dim, dim = 0 would target
+        // the vector's first byte).
+        assert!(WalRecord::hnsw_node_tombstone(PageId(1), PageId(2), 0, 0, 0).is_err());
+        assert!(WalRecord::hnsw_publish_live(PageId(1), PageId(2), 0, 0, 0).is_err());
         // DirAppend: invalid target page. DirLink: invalid/self next page.
         assert!(WalRecord::hnsw_dir_append(PageId(100), 0, PageId::INVALID, 0).is_err());
         assert!(WalRecord::hnsw_dir_link(PageId(100), PageId::INVALID).is_err());
@@ -2024,9 +2162,9 @@ mod tests {
             WalRecord::hnsw_set_neighbors(PageId(1), PageId(2), 0, 0, 0, vec![3, u32::MAX])
                 .is_err()
         );
-        assert!(WalRecord::hnsw_node_tombstone(PageId(2), 0, u32::MAX).is_err());
+        assert!(WalRecord::hnsw_node_tombstone(PageId(1), PageId(2), 0, u32::MAX, 1).is_err());
         assert!(WalRecord::hnsw_dir_append(PageId(100), u32::MAX, PageId(2), 0).is_err());
-        assert!(WalRecord::hnsw_publish_live(PageId(2), 0, u32::MAX).is_err());
+        assert!(WalRecord::hnsw_publish_live(PageId(1), PageId(2), 0, u32::MAX, 1).is_err());
         // MetaUpdate: NodeId::INVALID is legal ONLY for the empty graph
         // (max_level = 0); any nonzero level contradicts "no node".
         assert!(WalRecord::hnsw_meta_update(PageId(1), u32::MAX, 1).is_err());
@@ -2109,11 +2247,14 @@ mod tests {
                 .payload
         ))
         .is_err());
-        assert!(HnswNodeTombstoneRecord::decode(&with_tail(
-            WalRecord::hnsw_node_tombstone(PageId(11), 4, 42)
-                .unwrap()
-                .payload
-        ))
+        assert!(HnswNodeTombstoneRecord::decode(
+            &with_tail(
+                WalRecord::hnsw_node_tombstone(PageId(1), PageId(11), 4, 42, 4)
+                    .unwrap()
+                    .payload
+            ),
+            HNSW_STATE_V1_FLAGS
+        )
         .is_err());
         assert!(HnswDirAppendRecord::decode(&with_tail(
             WalRecord::hnsw_dir_append(PageId(100), 42, PageId(11), 4)
@@ -2127,16 +2268,47 @@ mod tests {
                 .payload
         ))
         .is_err());
-        assert!(HnswPublishLiveRecord::decode(&with_tail(
-            WalRecord::hnsw_publish_live(PageId(11), 4, 42)
-                .unwrap()
-                .payload
-        ))
+        assert!(HnswPublishLiveRecord::decode(
+            &with_tail(
+                WalRecord::hnsw_publish_live(PageId(1), PageId(11), 4, 42, 4)
+                    .unwrap()
+                    .payload
+            ),
+            HNSW_STATE_V1_FLAGS
+        )
         .is_err());
 
         // Honest payloads still decode through the bounded API.
-        let good = WalRecord::hnsw_publish_live(PageId(11), 4, 42).unwrap();
-        assert!(HnswPublishLiveRecord::decode(&good.payload).is_ok());
+        let good = WalRecord::hnsw_publish_live(PageId(1), PageId(11), 4, 42, 4).unwrap();
+        assert!(HnswPublishLiveRecord::decode(&good.payload, good.flags).is_ok());
+    }
+
+    /// Stage A review round 5 P2: the state-bit records' version nibble is
+    /// enforced at decode — version 0 (pre-versioning development format,
+    /// never shipped) and unknown future versions are both loud errors.
+    #[test]
+    fn hnsw_state_records_enforce_the_version_nibble() {
+        let rec = WalRecord::hnsw_node_tombstone(PageId(1), PageId(11), 4, 42, 4).unwrap();
+        // v1 decodes.
+        assert!(HnswNodeTombstoneRecord::decode(&rec.payload, HNSW_STATE_V1_FLAGS).is_ok());
+        // flags = 0: superseded development format — loud rejection.
+        let err = HnswNodeTombstoneRecord::decode(&rec.payload, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pre-versioning development format"),
+            "{err}"
+        );
+        // Unknown future nibble: loud, never silently mis-decoded.
+        assert!(HnswNodeTombstoneRecord::decode(&rec.payload, 2 << 4).is_err());
+
+        let rec = WalRecord::hnsw_publish_live(PageId(1), PageId(11), 4, 42, 4).unwrap();
+        assert!(HnswPublishLiveRecord::decode(&rec.payload, HNSW_STATE_V1_FLAGS).is_ok());
+        assert!(HnswPublishLiveRecord::decode(&rec.payload, 0).is_err());
+        assert!(HnswPublishLiveRecord::decode(&rec.payload, 2 << 4).is_err());
+        // The other five HNSW types keep flags = 0 (implicit original
+        // version, HNSW_STATE_VERSION_V1's umbrella note).
+        let rec = WalRecord::hnsw_dir_append(PageId(100), 42, PageId(11), 4).unwrap();
+        assert_eq!(rec.flags, 0);
     }
 
     #[test]

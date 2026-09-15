@@ -20,6 +20,19 @@ pub struct Xoshiro256StarStar {
 /// the 256-bit xoshiro state.
 struct SplitMix64(u64);
 
+/// Post-redraw hard ceiling of the geometric level draw for fan-out `m`:
+/// `⌊53·ln2 / ln m⌋` — after redraw `u >= 2⁻⁵³`, so `-ln(u) <= 53·ln2`
+/// (see [`Xoshiro256StarStar::next_level`]). Single source of the bound
+/// (2026-09-15, Stage A review round 3 P3-2: the formula was duplicated
+/// inline here and at `validate.rs`'s `MetaView::l_max`).
+///
+/// **Precondition: `m >= 2`** (HnswParams construction validation) — the
+/// ln degenerates below that and is not defended here because no legal
+/// caller can carry it.
+pub(crate) fn l_max(m: u16) -> u8 {
+    (53.0 * std::f64::consts::LN_2 / f64::from(m).ln()).floor() as u8
+}
+
 impl SplitMix64 {
     fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -91,7 +104,7 @@ impl Xoshiro256StarStar {
             }
             let level = (-u.ln() * m_l).floor();
             debug_assert!(
-                level <= 53.0 * std::f64::consts::LN_2 / f64::from(m).ln(),
+                level <= f64::from(l_max(m)),
                 "level {level} exceeds the post-redraw bound for M = {m} (§11 R2)"
             );
             return level as u8;

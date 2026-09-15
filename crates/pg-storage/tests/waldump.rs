@@ -106,10 +106,10 @@ fn write_full_family_wal(tmp: &TempDir) -> Vec<Lsn> {
         WalRecord::hnsw_node_init(PageId(30), PageId(31), 2, 7, 1, 4, vec![1.0; 4]).unwrap(),
         WalRecord::hnsw_set_neighbors(PageId(30), PageId(31), 2, 7, 1, vec![3, 5, 9]).unwrap(),
         WalRecord::hnsw_meta_update(PageId(30), 7, 1).unwrap(),
-        WalRecord::hnsw_node_tombstone(PageId(31), 2, 7).unwrap(),
+        WalRecord::hnsw_node_tombstone(PageId(30), PageId(31), 2, 7, 4).unwrap(),
         WalRecord::hnsw_dir_append(PageId(32), 7, PageId(31), 2).unwrap(),
         WalRecord::hnsw_dir_link(PageId(32), PageId(33)).unwrap(),
-        WalRecord::hnsw_publish_live(PageId(31), 2, 7).unwrap(),
+        WalRecord::hnsw_publish_live(PageId(30), PageId(31), 2, 7, 4).unwrap(),
         reserved_record(WalRecordType::SegmentSeal, vec![0xDE, 0xAD, 0xBE, 0xEF]),
         reserved_record(WalRecordType::SegmentMerge, vec![0x01, 0x02]),
     ];
@@ -247,14 +247,17 @@ fn dump_covers_every_record_family() {
         .iter()
         .find(|l| l.contains("HnswNodeTombstone"))
         .unwrap();
-    assert!(tombstone.contains("page=31 slot=2 node=7"), "{tombstone}");
+    assert!(
+        tombstone.contains("page=31 slot=2 node=7 dim=4"),
+        "{tombstone}"
+    );
     let dir_link = lines.iter().find(|l| l.contains("HnswDirLink")).unwrap();
     assert!(dir_link.contains("old_tail=32 next=33"), "{dir_link}");
     let publish = lines
         .iter()
         .find(|l| l.contains("HnswPublishLive"))
         .unwrap();
-    assert!(publish.contains("page=31 slot=2 node=7"), "{publish}");
+    assert!(publish.contains("page=31 slot=2 node=7 dim=4"), "{publish}");
 
     // Reserved types: raw payload bytes, no error (§6.1).
     let seal = lines.iter().find(|l| l.contains("SegmentSeal")).unwrap();

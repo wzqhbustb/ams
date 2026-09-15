@@ -395,10 +395,15 @@ fn payload_fields(record: &WalRecord) -> String {
             ),
             Err(e) => undecodable(p, &e),
         },
-        WalRecordType::HnswNodeTombstone => match HnswNodeTombstoneRecord::decode(p) {
-            Ok(r) => format!("page={} slot={} node={}", r.page_id.0, r.slot_id, r.node_id),
-            Err(e) => undecodable(p, &e),
-        },
+        WalRecordType::HnswNodeTombstone => {
+            match HnswNodeTombstoneRecord::decode(p, record.flags) {
+                Ok(r) => format!(
+                    "meta_page_id={} page={} slot={} node={} dim={}",
+                    r.meta_page_id.0, r.page_id.0, r.slot_id, r.node_id, r.dim
+                ),
+                Err(e) => undecodable(p, &e),
+            }
+        }
         WalRecordType::HnswDirAppend => match HnswDirAppendRecord::decode(p) {
             Ok(r) => format!(
                 "dir_tail={} node={} -> page={} slot={}",
@@ -410,8 +415,11 @@ fn payload_fields(record: &WalRecord) -> String {
             Ok(r) => format!("old_tail={} next={}", r.old_tail_page.0, r.next_page.0),
             Err(e) => undecodable(p, &e),
         },
-        WalRecordType::HnswPublishLive => match HnswPublishLiveRecord::decode(p) {
-            Ok(r) => format!("page={} slot={} node={}", r.page_id.0, r.slot_id, r.node_id),
+        WalRecordType::HnswPublishLive => match HnswPublishLiveRecord::decode(p, record.flags) {
+            Ok(r) => format!(
+                "meta_page_id={} page={} slot={} node={} dim={}",
+                r.meta_page_id.0, r.page_id.0, r.slot_id, r.node_id, r.dim
+            ),
             Err(e) => undecodable(p, &e),
         },
     }

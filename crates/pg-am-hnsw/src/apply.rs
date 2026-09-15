@@ -2,10 +2,13 @@
 //! §10.2 task 2, v1.7 signatures; coding plan Stage A).
 //!
 //! Seven `pub(crate)` primitives, one per WAL record type (121–127), shared
-//! by the redo handlers (Stage C) and the normal write path (Stage C):
+//! by the redo handlers (Stage C) and the normal write path (Stage C),
+//! plus the non-mutating [`select_slot`] (2026-09-15, round 3 P1-1) that
+//! lets the normal path pick the slot BEFORE the WAL append (WAL-first):
 //!
 //! - [`append_node`] — §8.1 step 3: create a node entry (fixed-size
-//!   reservation by drawn level, §7.2; state INITIALIZING);
+//!   reservation by drawn level, §7.2; state INITIALIZING); a convenience
+//!   composition of `select_slot` + `apply_node_at`;
 //! - [`dir_append`] — §8.1 step 4: publish `node_id → (page, slot)` at the
 //!   directory tail;
 //! - [`set_neighbors`] — §8.1 steps 5/6: in-place rewrite of one level's
@@ -35,7 +38,7 @@ use pg_storage::page::PAGE_HEADER_SIZE;
 use pg_storage::types::{PageId, PAGE_SIZE};
 
 use crate::error::{HnswError, Result};
-use crate::page::{dir_count, DIR_HEADER_SIZE, DIR_OFF_COUNT, DIR_OFF_NEXT};
+use crate::page::{dir_count, dir_ordinal, DIR_HEADER_SIZE, DIR_OFF_COUNT, DIR_OFF_NEXT};
 
 // ---------------------------------------------------------------------
 // Line-pointer access (re-derived from the slotted-page line-pointer
@@ -66,11 +69,22 @@ pub(crate) const DIR_ENTRIES_PER_PAGE: u32 =
 /// `pd_lower` itself and the LP's off/len are clamped to the page size
 /// before any slice is formed (redo-path no-panic discipline, error.rs:
 /// corrupted bytes must never panic).
+///
+/// Tuple-region bounds (2026-09-15, round 3 P2): page-size clamping alone
+/// let a forged LP point into the header / LP array / free space and have
+/// publish-live / tombstone / neighbor writes land there. The tuple region
+/// is `[pd_upper, pd_special)` — clamp both header values, then require the
+/// entry to lie inside it.
 fn read_lp(page: &[u8; PAGE_SIZE], slot: u16) -> Option<(u16, u16)> {
     let pd_lower = u16::from_le_bytes(page[14..16].try_into().unwrap()) as usize;
     if !(PAGE_HEADER_SIZE..=PAGE_SIZE).contains(&pd_lower)
         || (pd_lower - PAGE_HEADER_SIZE) % LINE_POINTER_SIZE != 0
     {
+        return None;
+    }
+    let pd_upper = u16::from_le_bytes(page[16..18].try_into().unwrap()) as usize;
+    let pd_special = u16::from_le_bytes(page[18..20].try_into().unwrap()) as usize;
+    if pd_upper < pd_lower || pd_upper > pd_special || pd_special > PAGE_SIZE {
         return None;
     }
     let idx = PAGE_HEADER_SIZE + usize::from(slot) * LINE_POINTER_SIZE;
@@ -82,7 +96,7 @@ fn read_lp(page: &[u8; PAGE_SIZE], slot: u16) -> Option<(u16, u16)> {
         return None;
     }
     let (off, len) = ((raw & 0x7FFF) as usize, ((raw >> 17) & 0x7FFF) as usize);
-    if off < PAGE_HEADER_SIZE || off + len > PAGE_SIZE {
+    if off < pd_upper || off + len > pd_special {
         return None;
     }
     Some((off as u16, len as u16))
@@ -100,6 +114,12 @@ fn pd_lower(page: &[u8; PAGE_SIZE]) -> u16 {
 
 fn pd_upper(page: &[u8; PAGE_SIZE]) -> u16 {
     u16::from_le_bytes(page[16..18].try_into().unwrap())
+}
+
+/// pd_special (bytes 18..20 of the 32-byte header) — the end of the tuple
+/// area; AM-private space starts there.
+fn pd_special(page: &[u8; PAGE_SIZE]) -> u16 {
+    u16::from_le_bytes(page[18..20].try_into().unwrap())
 }
 
 fn set_pd_lower(page: &mut [u8; PAGE_SIZE], v: u16) {
@@ -177,6 +197,70 @@ const fn level_base_offset(dim: u16) -> usize {
     4 * dim as usize + 1
 }
 
+/// `(region offset, capacity)` of `level`'s neighbor region inside an
+/// entry (2026-09-15, round 3 P3 — single source, shared by
+/// `set_neighbors` and the read side).
+fn level_region_pos(geo: NodeGeometry, level: u8) -> (usize, u16) {
+    if level == 0 {
+        (level_base_offset(geo.dim), geo.m_max0)
+    } else {
+        (level_offset(geo.dim, geo.m, geo.m_max0, level), geo.m)
+    }
+}
+
+/// The level's reserved region inside `entry`, geometry-checked
+/// (2026-09-14, review P2-2): the (dim, level) geometry must fit the
+/// entry's actual reserved length — a mismatched dim or a level above the
+/// entry's top_level would slice out of bounds (panic in debug AND
+/// release), so reject loudly first.
+fn checked_region<'a>(
+    entry: &'a [u8],
+    geo: NodeGeometry,
+    level: u8,
+    what: &str,
+) -> Result<&'a [u8]> {
+    let (region_off, cap) = level_region_pos(geo, level);
+    let region_end = region_off + level_region_size(cap);
+    if region_end > entry.len() {
+        return Err(HnswError::Corrupted(format!(
+            "{what}: level {level} region [{region_off}..{region_end}) exceeds the {}-byte entry (dim/level geometry mismatch)",
+            entry.len()
+        )));
+    }
+    Ok(&entry[region_off..region_end])
+}
+
+/// Mutable variant of [`checked_region`].
+fn checked_region_mut<'a>(
+    entry: &'a mut [u8],
+    geo: NodeGeometry,
+    level: u8,
+    what: &str,
+) -> Result<&'a mut [u8]> {
+    let (region_off, cap) = level_region_pos(geo, level);
+    let region_end = region_off + level_region_size(cap);
+    if region_end > entry.len() {
+        return Err(HnswError::Corrupted(format!(
+            "{what}: level {level} region [{region_off}..{region_end}) exceeds the {}-byte entry (dim/level geometry mismatch)",
+            entry.len()
+        )));
+    }
+    Ok(&mut entry[region_off..region_end])
+}
+
+/// The region's live-neighbor count, capacity-checked (a corrupt count
+/// above the reserved capacity is loud, never an out-of-region read).
+fn checked_count(region: &[u8], geo: NodeGeometry, level: u8, what: &str) -> Result<usize> {
+    let (_, cap) = level_region_pos(geo, level);
+    let count = u16::from_le_bytes(region[..2].try_into().unwrap()) as usize;
+    if count > usize::from(cap) {
+        return Err(HnswError::Corrupted(format!(
+            "{what}: stored count {count} exceeds reserved capacity {cap} of level {level}"
+        )));
+    }
+    Ok(count)
+}
+
 fn entry_at<'a>(page: &'a [u8; PAGE_SIZE], slot: u16, what: &str) -> Result<&'a [u8]> {
     let (off, len) = read_lp(page, slot).ok_or_else(|| {
         HnswError::Corrupted(format!(
@@ -227,6 +311,57 @@ fn state_byte_mut<'a>(entry: &'a mut [u8], dim: u16, what: &str) -> Result<&'a m
 // The seven primitives.
 // ---------------------------------------------------------------------
 
+/// Slotted-page bounds for the append path (2026-09-15, Stage A review
+/// round 3 P2): `pd_lower` must be header-sized AND 4-byte-aligned (LP
+/// array entries are 4 bytes — a torn `pd_lower` would silently round the
+/// slot count), with `pd_lower <= pd_upper <= PAGE_SIZE`. Shared by
+/// [`select_slot`] and [`apply_node_at`].
+fn append_bounds(page: &[u8; PAGE_SIZE], what: &str) -> Result<(usize, usize)> {
+    let lower = pd_lower(page) as usize;
+    let upper = pd_upper(page) as usize;
+    let special = pd_special(page) as usize;
+    if lower < PAGE_HEADER_SIZE
+        || (lower - PAGE_HEADER_SIZE) % LINE_POINTER_SIZE != 0
+        || upper < lower
+        || upper > PAGE_SIZE
+    {
+        return Err(HnswError::Corrupted(format!(
+            "{what}: page is not slotted-initialized (pd_lower={lower}, pd_upper={upper})"
+        )));
+    }
+    // 2026-09-15, Stage A review round 5 P2 item 1: the tuple area is
+    // [upper, special) — a corrupt pd_special outside that interval would
+    // make the append math trust phantom free space (same clamp discipline
+    // as read_lp's tuple-area check).
+    if special < upper || special > PAGE_SIZE {
+        return Err(HnswError::Corrupted(format!(
+            "{what}: pd_special {special} outside [pd_upper {upper}, {PAGE_SIZE}]"
+        )));
+    }
+    Ok((lower, upper))
+}
+
+/// §8.1 step 3, SELECTION form (2026-09-15, round 3 P1-1 — WAL-first):
+/// pick the slot a `len`-byte entry would occupy WITHOUT modifying the
+/// page. The normal path calls this first, carries the returned slot in
+/// the WAL record, appends + flushes the record, and only then applies
+/// [`apply_node_at`] — selection → WAL → application. Redo takes the
+/// record's slot as authoritative and calls `apply_node_at` directly.
+///
+/// Same failure contract as the old allocate-then-write form:
+/// `InvalidOperation` when the page has no room (the caller allocates a
+/// fresh page per §8.1 step 1).
+pub(crate) fn select_slot(node_page: &[u8; PAGE_SIZE], len: usize) -> Result<u16> {
+    let (lower, upper) = append_bounds(node_page, "select_slot")?;
+    if upper - lower < len + LINE_POINTER_SIZE {
+        return Err(HnswError::InvalidOperation(format!(
+            "node page has no room for a {len}-byte entry (free {} < {len} + 4 LP)",
+            upper - lower
+        )));
+    }
+    Ok(((lower - PAGE_HEADER_SIZE) / LINE_POINTER_SIZE) as u16)
+}
+
 /// §8.1 step 3: allocate a slot on `node_page` and create the node entry —
 /// fixed-size reservation by `top_level` (level 0 reserved at `m_max0`,
 /// upper levels at `m`, §7.2), state = INITIALIZING, every level's
@@ -235,64 +370,42 @@ fn state_byte_mut<'a>(entry: &'a mut [u8], dim: u16, what: &str) -> Result<&'a m
 ///
 /// Returns the allocated slot. Fails with `InvalidOperation` when the page
 /// has no room (the caller then allocates a fresh page per §8.1 step 1).
+///
+/// Composition (2026-09-15, round 3 P1-1): `select_slot` + `apply_node_at`
+/// — one implementation of the append, so the convenience wrapper can
+/// never drift from the WAL-first pair the real paths use.
 pub(crate) fn append_node(
     node_page: &mut [u8; PAGE_SIZE],
-    _node_id: u32,
+    node_id: u32,
     top_level: u8,
     geo: NodeGeometry,
     vector: &[f32],
 ) -> Result<u16> {
-    // Structural guards (2026-09-14, Stage A review P2-1/P2-2 — the
-    // buffer-overrun invariant, NOT business validation, same class as
-    // set_neighbors' capacity guard):
-    // - a vector whose length differs from `dim` would silently corrupt the
-    //   state byte / level-0 region (len > dim) or zero-pad a wrong vector
-    //   (len < dim); a large-enough len would panic on the slice;
-    // - an uninitialized page (pd_lower < header, or upper < lower) would
-    //   underflow the slot/free computation below.
-    if vector.len() != usize::from(geo.dim) {
-        return Err(HnswError::Corrupted(format!(
-            "append_node: vector has {} components, dim is {}",
-            vector.len(),
-            geo.dim
-        )));
-    }
-    let len = geo.entry_size(top_level);
-    let lower = pd_lower(node_page) as usize;
-    let upper = pd_upper(node_page) as usize;
-    // Page-content bounds (review round 2 P2-1): pd_lower/pd_upper are
-    // read from the (checks um-less) page — clamp before the free/slot
-    // math, never let a torn value slice out of the page.
-    if lower < PAGE_HEADER_SIZE || upper < lower || upper > PAGE_SIZE {
-        return Err(HnswError::Corrupted(format!(
-            "append_node: page is not slotted-initialized (pd_lower={lower}, pd_upper={upper})"
-        )));
-    }
-    if upper - lower < len + LINE_POINTER_SIZE {
-        return Err(HnswError::InvalidOperation(format!(
-            "node page has no room for a {len}-byte entry (free {} < {len} + 4 LP)",
-            upper - lower
-        )));
-    }
-    let slot = ((lower - PAGE_HEADER_SIZE) / LINE_POINTER_SIZE) as u16;
-    let off = (upper - len) as u16;
-    let entry = &mut node_page[usize::from(off)..usize::from(off) + len];
-    write_entry(entry, top_level, geo.dim, vector);
-    write_lp(node_page, slot, off, len as u16);
-    set_pd_lower(node_page, (lower + LINE_POINTER_SIZE) as u16);
-    set_pd_upper(node_page, off);
+    let slot = select_slot(node_page, geo.entry_size(top_level))?;
+    apply_node_at(node_page, slot, node_id, top_level, geo, vector)?;
     Ok(slot)
 }
 
 /// Write the INITIALIZING entry content shared by [`append_node`] and
 /// [`apply_node_at`]: zero-fill, vector, state byte (top_level in bits
 /// 0-5, INITIALIZING with bit 6 clear, no tombstone with bit 7 clear).
-fn write_entry(entry: &mut [u8], top_level: u8, dim: u16, vector: &[f32]) {
+///
+/// Structural guard (2026-09-15, round 3 P3-1): `top_level` is 6 bits
+/// (state byte bits 0-5) — reject loudly instead of the old silent
+/// `& 0x3F` mask (64 wrapped to 0, corrupting the entry's own level
+/// structure). Checked BEFORE any byte is written.
+fn write_entry(entry: &mut [u8], top_level: u8, dim: u16, vector: &[f32]) -> Result<()> {
+    if top_level > 63 {
+        return Err(HnswError::Corrupted(format!(
+            "top_level {top_level} exceeds the 6-bit state-byte field (max 63)"
+        )));
+    }
     entry.fill(0);
     for (i, &x) in vector.iter().enumerate() {
         entry[4 * i..4 * i + 4].copy_from_slice(&x.to_le_bytes());
     }
-    entry[state_offset(dim)] = top_level & 0x3F;
+    entry[state_offset(dim)] = top_level;
+    Ok(())
 }
 
 /// §8.1 step 3, REDO form (2026-09-14, Stage A review P3-1): write the
@@ -322,14 +435,10 @@ pub(crate) fn apply_node_at(
         )));
     }
     let len = geo.entry_size(top_level);
-    let lower = pd_lower(node_page) as usize;
-    let upper = pd_upper(node_page) as usize;
-    // Page-content bounds (review round 2 P2-1), same clamp as append_node.
-    if lower < PAGE_HEADER_SIZE || upper < lower || upper > PAGE_SIZE {
-        return Err(HnswError::Corrupted(format!(
-            "apply_node_at: page is not slotted-initialized (pd_lower={lower}, pd_upper={upper})"
-        )));
-    }
+    // Page-content bounds (review round 2 P2-1; round 3 P2 moved the clamp
+    // into the shared `append_bounds`, adding the 4-byte pd_lower alignment
+    // check).
+    let (lower, upper) = append_bounds(node_page, "apply_node_at")?;
     let next_free = ((lower - PAGE_HEADER_SIZE) / LINE_POINTER_SIZE) as u16;
     match read_lp(node_page, slot) {
         Some((off, lp_len)) => {
@@ -346,7 +455,7 @@ pub(crate) fn apply_node_at(
                     "apply_node_at: slot {slot} is already LIVE — replay must be skipped by the pd_lsn guard, not overwritten"
                 )));
             }
-            write_entry(entry, top_level, geo.dim, vector);
+            write_entry(entry, top_level, geo.dim, vector)?;
         }
         None => {
             if slot != next_free {
@@ -362,7 +471,7 @@ pub(crate) fn apply_node_at(
             }
             let off = (upper - len) as u16;
             let entry = &mut node_page[usize::from(off)..usize::from(off) + len];
-            write_entry(entry, top_level, geo.dim, vector);
+            write_entry(entry, top_level, geo.dim, vector)?;
             write_lp(node_page, slot, off, len as u16);
             set_pd_lower(node_page, (lower + LINE_POINTER_SIZE) as u16);
             set_pd_upper(node_page, off);
@@ -378,13 +487,82 @@ pub(crate) fn apply_node_at(
 /// Fails with `InvalidOperation` when the tail page already holds
 /// [`DIR_ENTRIES_PER_PAGE`] entries (the caller then DirLinks a fresh page,
 /// §8.1 step 2).
+///
+/// Idempotence (2026-09-15, Stage A review round 3 P3): `node_id` is the
+/// chain high-water mark this append publishes (v1.2: NodeId allocation ==
+/// mapping publication), so it keys idempotent replay — the primitive
+/// itself is N=3 byte-identical (coding-plan Stage A acceptance), not
+/// merely pd_lsn-guarded at the handler:
+/// - `hwm == node_id` → append (first application);
+/// - `hwm >  node_id` → already applied → no-op, returns the entry's
+///   position (replay is byte-identical);
+/// - `hwm <  node_id` → gap → loud `Corrupted` (the record does not match
+///   the chain state);
+/// - `node_id` below this page's base → the record belongs to an earlier
+///   chain page — loud `Corrupted`.
 pub(crate) fn dir_append(
     dir_tail_page: &mut [u8; PAGE_SIZE],
-    _node_id: u32,
+    node_id: u32,
     target_page: PageId,
     target_slot: u16,
 ) -> Result<u32> {
     let count = dir_count(dir_tail_page);
+    // Header sanity (round 3 P3): ordinal/count are read from the
+    // (checksum-less) page — a corrupt count above capacity would make the
+    // append math below slice out of the page, and the ordinal multiply
+    // must not wrap (debug builds panic on overflow).
+    if count > DIR_ENTRIES_PER_PAGE {
+        return Err(HnswError::Corrupted(format!(
+            "dir_append: directory header count {count} exceeds capacity {DIR_ENTRIES_PER_PAGE}"
+        )));
+    }
+    let ordinal = dir_ordinal(dir_tail_page);
+    let page_base = ordinal
+        .checked_mul(u64::from(DIR_ENTRIES_PER_PAGE))
+        .ok_or_else(|| {
+            HnswError::Corrupted(format!(
+                "dir_append: directory ordinal {ordinal} overflows the chain math"
+            ))
+        })?;
+    // 2026-09-15, Stage A review round 5 P2 item 2: same checked-arithmetic
+    // discipline as the ordinal multiply above — a wrapped high-water mark
+    // would flip every comparison below into nonsense, loudly.
+    let hwm = page_base.checked_add(u64::from(count)).ok_or_else(|| {
+        HnswError::Corrupted(format!(
+            "dir_append: high-water mark computation overflows (ordinal {ordinal}, count {count})"
+        ))
+    })?;
+    let id = u64::from(node_id);
+    if id < page_base {
+        return Err(HnswError::Corrupted(format!(
+            "dir_append: node_id {node_id} predates this directory page (ordinal {ordinal}, base {page_base})"
+        )));
+    }
+    if id < hwm {
+        // 2026-09-15, Stage A review round 5 P2 item 3: idempotent replay
+        // must be byte-identical, not merely position-present — compare the
+        // existing 10-byte entry with the record's (target_page,
+        // target_slot). The position is guaranteed in-page: id - page_base
+        // < count <= DIR_ENTRIES_PER_PAGE.
+        let idx = (id - page_base) as usize;
+        let off = PAGE_HEADER_SIZE + DIR_HEADER_SIZE + idx * 10;
+        let existing_page = u64::from_le_bytes(dir_tail_page[off..off + 8].try_into().unwrap());
+        let existing_slot =
+            u16::from_le_bytes(dir_tail_page[off + 8..off + 10].try_into().unwrap());
+        if existing_page != target_page.0 || existing_slot != target_slot {
+            return Err(HnswError::Corrupted(format!(
+                "dir_append: entry {node_id} already maps to ({existing_page}, {existing_slot}), record says ({}, {target_slot}) — the directory post-image disagrees with the record",
+                target_page.0
+            )));
+        }
+        // Idempotent replay: byte-identical re-application.
+        return Ok((id - page_base) as u32);
+    }
+    if id > hwm {
+        return Err(HnswError::Corrupted(format!(
+            "dir_append: node_id {node_id} leaves a gap at the chain high-water mark {hwm}"
+        )));
+    }
     if count >= DIR_ENTRIES_PER_PAGE {
         return Err(HnswError::InvalidOperation(format!(
             "directory page is full ({count} entries, capacity {DIR_ENTRIES_PER_PAGE})"
@@ -409,11 +587,7 @@ pub(crate) fn set_neighbors(
     level: u8,
     content: &[u32],
 ) -> Result<()> {
-    let (region_off, cap) = if level == 0 {
-        (level_base_offset(geo.dim), geo.m_max0)
-    } else {
-        (level_offset(geo.dim, geo.m, geo.m_max0, level), geo.m)
-    };
+    let (_, cap) = level_region_pos(geo, level);
     let entry = entry_at_mut(node_page, slot, "set_neighbors")?;
     if content.len() > usize::from(cap) {
         return Err(HnswError::Corrupted(format!(
@@ -421,18 +595,7 @@ pub(crate) fn set_neighbors(
             content.len()
         )));
     }
-    // Structural guard (2026-09-14, review P2-2): the (dim, level)
-    // geometry must fit the entry's actual reserved length — a mismatched
-    // dim or a level above the entry's top_level would slice out of bounds
-    // (panic in debug AND release), so reject loudly first.
-    let region_end = region_off + level_region_size(cap);
-    if region_end > entry.len() {
-        return Err(HnswError::Corrupted(format!(
-            "set_neighbors: level {level} region [{region_off}..{region_end}) exceeds the {}-byte entry (dim/level geometry mismatch)",
-            entry.len()
-        )));
-    }
-    let region = &mut entry[region_off..region_end];
+    let region = checked_region_mut(entry, geo, level, "set_neighbors")?;
     region[..2].copy_from_slice(&(content.len() as u16).to_le_bytes());
     region[2..].fill(0);
     for (i, &id) in content.iter().enumerate() {
@@ -508,61 +671,127 @@ pub(crate) fn entry_is_tombstoned(
     Ok(state_byte(entry, dim, "entry_is_tombstoned")? & STATE_TOMBSTONE_BIT != 0)
 }
 
-/// Read `level`'s live neighbor ids of the entry at `slot`.
+/// Zero-allocation iterator over a level's live neighbor ids (2026-09-15,
+/// Stage A review round 3 P3): the Vec-returning reader allocated one Vec
+/// per call — unfit for the Stage C search hot path, where neighbor lists
+/// are read per visited node per layer. This borrows the page; the Vec
+/// form ([`entry_neighbors`]) is now a thin `.collect()` wrapper for
+/// tests and cold callers.
+#[derive(Debug)]
+pub(crate) struct NeighborIter<'a> {
+    region: &'a [u8],
+    next: usize,
+    count: usize,
+}
+
+impl Iterator for NeighborIter<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        if self.next >= self.count {
+            return None;
+        }
+        let i = self.next;
+        self.next += 1;
+        Some(u32::from_le_bytes(
+            self.region[2 + 4 * i..2 + 4 * i + 4].try_into().unwrap(),
+        ))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.count - self.next;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for NeighborIter<'_> {}
+
+/// Borrow `level`'s live neighbor ids of the entry at `slot` as an
+/// iterator — the search hot-path form (see [`NeighborIter`]).
+pub(crate) fn neighbor_iter(
+    node_page: &[u8; PAGE_SIZE],
+    slot: u16,
+    geo: NodeGeometry,
+    level: u8,
+) -> Result<NeighborIter<'_>> {
+    let entry = entry_at(node_page, slot, "neighbor_iter")?;
+    let region = checked_region(entry, geo, level, "neighbor_iter")?;
+    let count = checked_count(region, geo, level, "neighbor_iter")?;
+    Ok(NeighborIter {
+        region,
+        next: 0,
+        count,
+    })
+}
+
+/// Read `level`'s live neighbor ids of the entry at `slot` (allocating
+/// convenience wrapper over [`neighbor_iter`]).
 pub(crate) fn entry_neighbors(
     node_page: &[u8; PAGE_SIZE],
     slot: u16,
     geo: NodeGeometry,
     level: u8,
 ) -> Result<Vec<u32>> {
-    let (region_off, cap) = if level == 0 {
-        (level_base_offset(geo.dim), geo.m_max0)
-    } else {
-        (level_offset(geo.dim, geo.m, geo.m_max0, level), geo.m)
-    };
-    let entry = entry_at(node_page, slot, "entry_neighbors")?;
-    // Structural guard (2026-09-14, review P2-2 — same class as
-    // set_neighbors'): the (dim, level) geometry must fit the entry.
-    let region_end = region_off + level_region_size(cap);
-    if region_end > entry.len() {
-        return Err(HnswError::Corrupted(format!(
-            "entry_neighbors: level {level} region [{region_off}..{region_end}) exceeds the {}-byte entry (dim/level geometry mismatch)",
-            entry.len()
-        )));
-    }
-    let region = &entry[region_off..region_end];
-    let count = u16::from_le_bytes(region[..2].try_into().unwrap()) as usize;
-    if count > usize::from(cap) {
-        return Err(HnswError::Corrupted(format!(
-            "entry_neighbors: stored count {count} exceeds reserved capacity {cap} of level {level}"
-        )));
-    }
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        out.push(u32::from_le_bytes(
-            region[2 + 4 * i..2 + 4 * i + 4].try_into().unwrap(),
-        ));
-    }
-    Ok(out)
+    Ok(neighbor_iter(node_page, slot, geo, level)?.collect())
 }
 
-/// Read the entry's vector (`dim` f32 components).
-pub(crate) fn entry_vector(node_page: &[u8; PAGE_SIZE], slot: u16, dim: u16) -> Result<Vec<f32>> {
-    let entry = entry_at(node_page, slot, "entry_vector")?;
+/// Zero-allocation iterator over the entry's vector components — same
+/// hot-path rationale as [`NeighborIter`] (2026-09-15, round 3 P3).
+#[derive(Debug)]
+pub(crate) struct VectorIter<'a> {
+    entry: &'a [u8],
+    next: usize,
+    dim: usize,
+}
+
+impl Iterator for VectorIter<'_> {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.next >= self.dim {
+            return None;
+        }
+        let i = self.next;
+        self.next += 1;
+        Some(f32::from_le_bytes(
+            self.entry[4 * i..4 * i + 4].try_into().unwrap(),
+        ))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.dim - self.next;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for VectorIter<'_> {}
+
+/// Borrow the entry's vector (`dim` f32 components) as an iterator — the
+/// search hot-path form (see [`VectorIter`]).
+pub(crate) fn vector_iter(
+    node_page: &[u8; PAGE_SIZE],
+    slot: u16,
+    dim: u16,
+) -> Result<VectorIter<'_>> {
+    let entry = entry_at(node_page, slot, "vector_iter")?;
     // Structural guard (2026-09-14, review P2-2): dim must fit the entry.
     if entry.len() < 4 * usize::from(dim) {
         return Err(HnswError::Corrupted(format!(
-            "entry_vector: dim {dim} exceeds the {}-byte entry (dim geometry mismatch)",
+            "vector_iter: dim {dim} exceeds the {}-byte entry (dim geometry mismatch)",
             entry.len()
         )));
     }
-    let mut out = Vec::with_capacity(usize::from(dim));
-    for i in 0..usize::from(dim) {
-        out.push(f32::from_le_bytes(
-            entry[4 * i..4 * i + 4].try_into().unwrap(),
-        ));
-    }
-    Ok(out)
+    Ok(VectorIter {
+        entry,
+        next: 0,
+        dim: usize::from(dim),
+    })
+}
+
+/// Read the entry's vector (`dim` f32 components; allocating convenience
+/// wrapper over [`vector_iter`]).
+pub(crate) fn entry_vector(node_page: &[u8; PAGE_SIZE], slot: u16, dim: u16) -> Result<Vec<f32>> {
+    Ok(vector_iter(node_page, slot, dim)?.collect())
 }
 
 #[cfg(test)]
@@ -639,6 +868,45 @@ mod tests {
         assert!(matches!(err, HnswError::InvalidOperation(_)));
         dir_link(&mut page, PageId(200));
         assert_eq!(dir_next(&page), PageId(200));
+    }
+
+    /// 2026-09-15, Stage A review round 5 P2 items 1-3: the new guards —
+    /// pd_special interval check, checked high-water arithmetic, and the
+    /// idempotent-replay post-image comparison.
+    #[test]
+    fn dir_append_round5_guards() {
+        // Item 1: corrupt pd_special (below pd_upper) fails append_bounds
+        // loudly even on a well-typed page.
+        let mut page = node_page();
+        page[18..20].copy_from_slice(&10u16.to_le_bytes()); // pd_special < pd_upper
+        assert!(matches!(
+            append_node(&mut page, 1, 0, GEO, &[1.0; 4]),
+            Err(HnswError::Corrupted(_))
+        ));
+
+        // Item 2: an ordinal at the overflow edge of the chain math is a
+        // loud Corrupted, never a wrapped high-water mark.
+        let mut page = dir_page(u64::MAX / u64::from(DIR_ENTRIES_PER_PAGE) + 1);
+        assert!(matches!(
+            dir_append(&mut page, 0, PageId(11), 0),
+            Err(HnswError::Corrupted(_))
+        ));
+
+        // Item 3a: idempotent replay with a MATCHING post-image passes
+        // (byte-identical re-application).
+        let mut page = dir_page(0);
+        dir_append(&mut page, 0, PageId(11), 3).unwrap();
+        dir_append(&mut page, 1, PageId(12), 4).unwrap();
+        let before = page;
+        // Re-apply the same two records (id < hwm): no-op, byte-identical.
+        dir_append(&mut page, 0, PageId(11), 3).unwrap();
+        dir_append(&mut page, 1, PageId(12), 4).unwrap();
+        assert_eq!(page, before);
+
+        // Item 3b: replay with a DISAGREEING post-image is a loud Corrupted.
+        let err = dir_append(&mut page, 1, PageId(99), 7).unwrap_err();
+        assert!(matches!(err, HnswError::Corrupted(_)));
+        assert!(err.to_string().contains("post-image disagrees"), "{err}");
     }
 
     #[test]
@@ -864,8 +1132,215 @@ mod tests {
         // computed once from pg-am-heap/src/line_pointer.rs:5-9.
         assert_eq!(raw, 0x00C0_9F40);
         // read_lp only sees LPs below pd_lower — bump it as a real
-        // allocation would before asserting the read-side roundtrip.
+        // allocation would before asserting the read-side roundtrip; the
+        // tuple-region check (2026-09-15 round 3 P2) also requires the
+        // entry to lie in [pd_upper, pd_special), so lower pd_upper too.
         set_pd_lower(&mut page, (PAGE_HEADER_SIZE + LINE_POINTER_SIZE) as u16);
+        set_pd_upper(&mut page, off);
         assert_eq!(read_lp(&page, 0), Some((off, len)));
+    }
+
+    // -----------------------------------------------------------------
+    // 2026-09-15, Stage A review round 3: top_level loud reject (P3-1),
+    // WAL-first select_slot (P1-1), tuple-region + pd_lower alignment
+    // guards (P2), dir_append node_id-keyed idempotence (P3),
+    // zero-allocation iterators (P3).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn write_entry_rejects_top_level_above_63_loudly() {
+        // P3-1: the old `& 0x3F` silently wrapped 64 → 0. Now a loud
+        // Corrupted BEFORE any byte is written (page untouched).
+        let mut page = node_page();
+        let pristine = page;
+        assert!(matches!(
+            append_node(&mut page, 7, 64, GEO, &[1.0; 4]).unwrap_err(),
+            HnswError::Corrupted(_)
+        ));
+        assert_eq!(page, pristine);
+        assert!(matches!(
+            apply_node_at(&mut page, 0, 7, 100, GEO, &[1.0; 4]).unwrap_err(),
+            HnswError::Corrupted(_)
+        ));
+        assert_eq!(page, pristine);
+        // 63 remains the legal maximum (the boundary test above pins it).
+        assert!(append_node(&mut page, 7, 63, GEO, &[1.0; 4]).is_ok());
+    }
+
+    #[test]
+    fn select_slot_is_pure_and_feeds_the_wal_first_flow() {
+        // P1-1: selection must not modify the page — the normal path is
+        // select → WAL append/flush → apply_node_at.
+        let mut page = node_page();
+        let pristine = page;
+        let len = GEO.entry_size(1);
+        assert_eq!(select_slot(&page, len).unwrap(), 0);
+        assert_eq!(select_slot(&page, len).unwrap(), 0); // pure: same answer
+        assert_eq!(page, pristine);
+        // The selected slot goes into the record; application lands there.
+        apply_node_at(&mut page, 0, 7, 1, GEO, &[1.0; 4]).unwrap();
+        assert_eq!(select_slot(&page, len).unwrap(), 1);
+        // append_node is exactly the composition (same end state).
+        let mut composed = pristine;
+        let slot = append_node(&mut composed, 7, 1, GEO, &[1.0; 4]).unwrap();
+        assert_eq!(slot, 0);
+        assert_eq!(composed, page);
+        // A len that cannot fit → InvalidOperation (the caller DirLinks a
+        // fresh page, §8.1 step 1).
+        assert!(matches!(
+            select_slot(&page, PAGE_SIZE).unwrap_err(),
+            HnswError::InvalidOperation(_)
+        ));
+    }
+
+    #[test]
+    fn append_paths_reject_misaligned_or_torn_headers_loudly() {
+        // P2: a pd_lower that is not 4-byte aligned would silently round
+        // the slot count — loud, never a panic.
+        let mut page = node_page();
+        page[14..16].copy_from_slice(&35u16.to_le_bytes()); // 32 + 3
+        assert!(matches!(
+            select_slot(&page, GEO.entry_size(0)).unwrap_err(),
+            HnswError::Corrupted(_)
+        ));
+        assert!(matches!(
+            append_node(&mut page, 7, 0, GEO, &[1.0; 4]).unwrap_err(),
+            HnswError::Corrupted(_)
+        ));
+        assert!(matches!(
+            apply_node_at(&mut page, 0, 7, 0, GEO, &[1.0; 4]).unwrap_err(),
+            HnswError::Corrupted(_)
+        ));
+    }
+
+    #[test]
+    fn read_lp_rejects_entries_outside_the_tuple_region() {
+        // P2: a forged LP pointing into the LP array / free space / past
+        // pd_special must not become a publish/tombstone/neighbor target.
+        let mut page = node_page();
+        let slot = append_node(&mut page, 7, 0, GEO, &[1.0; 4]).unwrap();
+        let (real_off, real_len) = read_lp(&page, slot).unwrap();
+        let forged = [
+            pd_lower(&page),        // inside the LP array
+            pd_upper(&page) - 4,    // inside the free space
+            (PAGE_SIZE - 4) as u16, // off+len overruns pd_special
+        ];
+        for off in forged {
+            write_lp(&mut page, slot, off, real_len);
+            assert!(matches!(
+                entry_top_level(&page, slot, DIM).unwrap_err(),
+                HnswError::Corrupted(_)
+            ));
+            assert!(matches!(
+                publish_live(&mut page, slot, DIM).unwrap_err(),
+                HnswError::Corrupted(_)
+            ));
+        }
+        // Restore: the real entry still reads fine.
+        write_lp(&mut page, slot, real_off, real_len);
+        assert_eq!(entry_top_level(&page, slot, DIM).unwrap(), 0);
+    }
+
+    #[test]
+    fn dir_append_is_node_id_keyed_idempotent() {
+        // P3: node_id IS the chain HWM — replay skips, gaps are loud.
+        let mut page = dir_page(0);
+        dir_append(&mut page, 0, PageId(11), 0).unwrap();
+        dir_append(&mut page, 1, PageId(11), 1).unwrap();
+        dir_append(&mut page, 2, PageId(12), 0).unwrap();
+        // N=3 replay of the node_id=1 record: byte-identical, and it
+        // returns the entry's position.
+        let before = page;
+        for _ in 0..3 {
+            assert_eq!(dir_append(&mut page, 1, PageId(11), 1).unwrap(), 1);
+        }
+        assert_eq!(page, before);
+        // Gap: a node_id ahead of the HWM is loud.
+        assert!(matches!(
+            dir_append(&mut page, 5, PageId(13), 0).unwrap_err(),
+            HnswError::Corrupted(_)
+        ));
+        // The next legal id still appends.
+        assert_eq!(dir_append(&mut page, 3, PageId(13), 0).unwrap(), 3);
+        // A record belonging to an EARLIER chain page is loud here...
+        let mut later = dir_page(1);
+        assert!(matches!(
+            dir_append(&mut later, 0, PageId(11), 0).unwrap_err(),
+            HnswError::Corrupted(_)
+        ));
+        // ...while the page's first legal id (ordinal 1 × 813) lands at 0.
+        assert_eq!(
+            dir_append(&mut later, DIR_ENTRIES_PER_PAGE, PageId(20), 0).unwrap(),
+            0
+        );
+        // A corrupt header count (> capacity) is loud, never an OOB write.
+        let mut corrupt = dir_page(0);
+        corrupt[DIR_OFF_COUNT..DIR_OFF_COUNT + 4].copy_from_slice(&5000u32.to_le_bytes());
+        assert!(matches!(
+            dir_append(&mut corrupt, 0, PageId(11), 0).unwrap_err(),
+            HnswError::Corrupted(_)
+        ));
+    }
+
+    #[test]
+    fn dir_append_replay_on_a_full_page_skips_without_error() {
+        let mut page = dir_page(0);
+        for i in 0..DIR_ENTRIES_PER_PAGE {
+            dir_append(&mut page, i, PageId(11), i as u16).unwrap();
+        }
+        let before = page;
+        // Replaying an already-applied record against the full page is a
+        // no-op — NOT InvalidOperation (the chain has since moved on).
+        assert_eq!(
+            dir_append(&mut page, DIR_ENTRIES_PER_PAGE - 1, PageId(11), 812).unwrap(),
+            DIR_ENTRIES_PER_PAGE - 1
+        );
+        assert_eq!(page, before);
+    }
+
+    #[test]
+    fn dir_link_is_byte_idempotent() {
+        let mut page = dir_page(0);
+        dir_link(&mut page, PageId(200));
+        let before = page;
+        for _ in 0..3 {
+            dir_link(&mut page, PageId(200));
+        }
+        assert_eq!(page, before);
+    }
+
+    #[test]
+    fn iterators_match_the_vec_readers() {
+        // P3: NeighborIter/VectorIter are the hot-path zero-allocation
+        // forms; they must yield exactly what the Vec wrappers collect.
+        let mut page = node_page();
+        let slot = append_node(&mut page, 7, 2, GEO, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        set_neighbors(&mut page, slot, GEO, 0, &[1, 5, 9]).unwrap();
+        set_neighbors(&mut page, slot, GEO, 2, &[3, 7]).unwrap();
+        let mut it = neighbor_iter(&page, slot, GEO, 0).unwrap();
+        assert_eq!(it.len(), 3);
+        assert_eq!(it.by_ref().collect::<Vec<_>>(), vec![1, 5, 9]);
+        assert_eq!(it.len(), 0);
+        assert_eq!(it.next(), None);
+        assert_eq!(
+            neighbor_iter(&page, slot, GEO, 2)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![3, 7]
+        );
+        assert_eq!(neighbor_iter(&page, slot, GEO, 1).unwrap().count(), 0);
+        let v: Vec<f32> = vector_iter(&page, slot, DIM).unwrap().collect();
+        assert_eq!(v, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(entry_neighbors(&page, slot, GEO, 0).unwrap(), vec![1, 5, 9]);
+        // Geometry mismatch is loud through the iterator constructors too
+        // (dim 30 → 120 bytes > the 87-byte top_level=2 entry).
+        assert!(matches!(
+            neighbor_iter(&page, slot, GEO, 3).unwrap_err(),
+            HnswError::Corrupted(_)
+        ));
+        assert!(matches!(
+            vector_iter(&page, slot, 30).unwrap_err(),
+            HnswError::Corrupted(_)
+        ));
     }
 }

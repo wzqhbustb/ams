@@ -69,7 +69,8 @@ use crate::error::{Result, StorageError};
 use crate::types::{Lsn, PageId, Tid, TxnId};
 use crate::wal::reader::WalReader;
 use crate::wal::record::{
-    bincode_config, CheckpointEndRecord, HnswSeqHead, WalRecord, WalRecordType,
+    bincode_config, CheckpointEndRecord, HnswNodeTombstoneRecord, HnswPublishLiveRecord,
+    HnswSeqHead, WalRecord, WalRecordType,
 };
 
 /// Outcome of the analysis phase: where redo must start, plus the ARIES
@@ -378,9 +379,19 @@ fn for_each_touched_page(record: &WalRecord, f: &mut impl FnMut(PageId)) -> Resu
             let mut off = 0;
             f(decode_prefix::<PageId>(payload, &mut off)?);
         }
-        HnswNodeTombstone | HnswPublishLive => {
-            let mut off = 0;
-            f(decode_prefix::<PageId>(payload, &mut off)?);
+        HnswNodeTombstone => {
+            // Versioned decode (2026-09-15, M5 Stage A review round 6 P2):
+            // this payload's layout is flags-versioned (HNSW_STATE_VERSION_*
+            // — v0 = pre-dim development format, v1 = dim + meta_page_id),
+            // so the record's OWN decode gates the version nibble before any
+            // field is read. The old `decode_prefix::<PageId>` happened to
+            // land on `page_id` for both known layouts, but would silently
+            // read a PageId by an unknown layout for any future version.
+            f(HnswNodeTombstoneRecord::decode(payload, record.flags)?.page_id);
+        }
+        HnswPublishLive => {
+            // Same versioned-decode discipline as HnswNodeTombstone above.
+            f(HnswPublishLiveRecord::decode(payload, record.flags)?.page_id);
         }
         HnswDirAppend | HnswDirLink => {
             // Directory chain pages; `target_page`/`next_page` are only
@@ -813,7 +824,7 @@ mod tests {
                 vec![PageId(32)],
             ),
             (
-                WalRecord::hnsw_node_tombstone(PageId(33), 0, 0).unwrap(),
+                WalRecord::hnsw_node_tombstone(PageId(30), PageId(33), 0, 0, 2).unwrap(),
                 vec![PageId(33)],
             ),
             (
@@ -825,7 +836,7 @@ mod tests {
                 vec![PageId(36)],
             ),
             (
-                WalRecord::hnsw_publish_live(PageId(38), 0, 0).unwrap(),
+                WalRecord::hnsw_publish_live(PageId(30), PageId(38), 0, 0, 2).unwrap(),
                 vec![PageId(38)],
             ),
             // Non-page records touch nothing.
@@ -839,6 +850,30 @@ mod tests {
             let mut pages = Vec::new();
             for_each_touched_page(&record, &mut |p| pages.push(p)).unwrap();
             assert_eq!(pages, expected, "record type {:?}", record.record_type);
+        }
+    }
+
+    /// 2026-09-15, M5 Stage A review round 6 P2: the DPT arms for the two
+    /// flags-versioned state records (124/127) must gate the version
+    /// nibble through the record's own decode — a pre-versioning
+    /// (`flags = 0`) or unknown-version record is a loud error, never a
+    /// PageId read by an unknown layout.
+    #[test]
+    fn dpt_state_records_reject_unversioned_or_unknown_flags() {
+        for mut rec in [
+            WalRecord::hnsw_node_tombstone(PageId(1), PageId(33), 0, 0, 2).unwrap(),
+            WalRecord::hnsw_publish_live(PageId(1), PageId(38), 0, 0, 2).unwrap(),
+        ] {
+            // Constructor-stamped v1 flags: decode + track the node page.
+            let mut pages = Vec::new();
+            for_each_touched_page(&rec, &mut |p| pages.push(p)).unwrap();
+            assert_eq!(pages.len(), 1, "record type {:?}", rec.record_type);
+            // flags = 0 — the pre-versioning development format: loud.
+            rec.flags = 0;
+            assert!(for_each_touched_page(&rec, &mut |_| {}).is_err());
+            // Unknown future version nibble: loud.
+            rec.flags = 2 << 4;
+            assert!(for_each_touched_page(&rec, &mut |_| {}).is_err());
         }
     }
 
