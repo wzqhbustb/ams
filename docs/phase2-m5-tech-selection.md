@@ -1,7 +1,7 @@
 # Phase 2 M5 技术选型（HNSW WAL + 持久化）
 
-> **状态:v1.13(2026-09-11，十一轮审查闭环 + Stage 0 落地回流；已经用户终审
-> ——Stage 0 已按本稿实现并经多轮审查闭环，逐轮回流见 stage_spec 归档）。** 本文档定义 Phase 2
+> **状态:v1.20(2026-09-15，多轮审查闭环 + Stage 0/Stage A 落地回流；已经用户终审
+> ——Stage 0 已按本稿实现，Stage A 落码并经六轮审查闭合，逐轮回流见 stage_spec 归档）。** 本文档定义 Phase 2
 > 第二个 milestone(M5 = ROADMAP.md Phase 2b,**HNSW 变更进单一 WAL、崩溃后完整
 > 恢复**）落地前所有跨模块的技术选择，对应 ROADMAP.md:264-278。
 >
@@ -186,7 +186,8 @@ SetNeighbors，但该记录 payload 没有 publish_live 标志，翻转实际上
 承载）。三案：① SetNeighbors 加标志位——翻转必须在**全部**自身层写完
 之后，逐层多条记录里"哪条承担翻转"把记录语义耦合到步骤序，层数变化
 即漂移，否；② 独立 HnswPublishLive 记录（选定）——语义最清晰，记录极小
-（页+槽+id;v1.17 起 +dim 定位状态字节，v1.18 起 +meta_page_id 供审计自定位）,
+（页+槽+id;v1.17 起 +dim 定位状态字节，v1.18 起 +meta_page_id——v1.19
+起供 redo handler 自定位 meta、应用前核对 dim == meta.dim，非审计项）,
 幂等天然（state 后像覆写）,§8.2 窗口表只需新增一行；
 ③ 一条记录写全部自身层——payload 变长（≤ m_max0 + L×m 个 id，预算内），
 但把"写内容"与"翻状态"两个语义揉进一条记录，不如 ② 干净。
@@ -1010,3 +1011,4 @@ pg-am-hnsw（页布局/WAL 记录）与 pg-engine（崩溃 rounds）两侧。
 | v1.18 | 2026-09-15 | M5 Stage A 五轮复核回流（用户终审：1 P1 + 3 P2 + 2 P3 逐条核实属实）。**P1(124/127 payload 补 meta_page_id)**:§11.3 审计的 dim == meta.dim 核对须能从 payload 自定位 meta 页——两 payload 末尾补 meta_page_id(§4.2 表、自包含规则段、§10.1 清单、§11.3 f 条自定位化同步；构造器首参加参过 INVALID 拒绝；apply.rs 原语签名不变）。**P2(flags 版本半字节）**：照 CheckpointEnd 先例新增 HNSW_STATE_VERSION_V1/HNSW_STATE_V1_FLAGS 覆盖 124/127;flags=0 = 预版本化开发格式（从未随 release 落盘，响亮拒绝不做兼容解码），其余五类型格式未变 = flags 0 隐式原始版（常量注释立文）;decode 双分派。**P2(apply.rs 三条）**:pd_special 区界钳制、HWM checked_add、dir_append 幂等后像比对（字节同源）。**P3（文档）**:coding-plan v1.17 同步（原语签名、审计断言 a–f);stage_spec 五轮回流段。验证：pg-am-hnsw lib 116 绿、pg-storage lib 206 绿、waldump 3/3、clippy/fmt/doc 绿 |
 | v1.17 | 2026-09-15 | M5 Stage A 四轮复核回流（用户终审：2 P1 + 2 P2 + 4 P3 逐条代码实证后全部属实，主线修复；含两个前轮已判修复但未落入 c3f0ab1 的 P3 遗留）。**P1-1(append_node 违反 WAL-first)**：选槽与页面应用耦合（先改页后得 slot，正常路径无法满足"选槽 → WAL append → 应用")——新增非修改式 `select_slot(node_page, len)`,append_node 改为 select_slot + apply_node_at 组合（单一实现）;§10.2 落地签名同步。**P1-2(PublishLive/Tombstone payload 无状态字节定位参数）**:redo handler 无状态，payload 仅 page/slot/node,4·dim 偏移物理不可寻——**格式修订**：两 payload 补 `dim: u16`（构造器 dim=0 响亮拒绝；golden 钉补 124/127 位置钉；waldump 两臂打印；analysis.rs touched-page 零影响——dim 追加末尾、首字段 PageId 不动）;dim ↔ meta.dim 一致性同型降级 §11.3 审计（邻接良构断言新增 f 条，§4.2 表/自包含规则/§10.1 冻结清单三处同步）。**P2-1(read_lp 仅整页钳制）**：补元组区 [pd_upper, pd_special) 校验——伪造 LP 指向 LP 数组/空闲区/越 pd_special 皆响亮，publish/tombstone/邻接写的靶区限死元组区。**P2-2(pd_lower 未对齐检查）**:append 路径共享 `append_bounds`（含 4 字节对齐——撕裂 pd_lower 曾静默圆整槽位计数）。**P3-1(top_level 静默掩码遗留）**:write_entry 的 `& 0x3F` 改响亮 Corrupted(64 曾回绕为 0；先于任何字节写入，拒绝时页不染）。**P3-2(L_max 公式重复遗留）**:rng.rs 导出单一来源 `l_max(m)`,validate.rs `MetaView::l_max` 与 next_level 的 debug_assert 改委派。**P3-3(dir_append 忽略 node_id、非幂等）**:node_id 键控幂等——hwm == id 追加 / hwm > id 幂等跳过（返回条目位置）/ hwm < id 间隙响亮 / id 早于本页基址响亮；header count > 容量与 ordinal 溢出（checked_mul）响亮；coding-plan "每原语 N=3 字节全等"验收口径对 dir_append 自此真正成立。**P3-4（读侧每次调用分配 Vec)**:`neighbor_iter`/`vector_iter` 零分配借用迭代器（ExactSizeIterator）为 Stage C 搜索热路径形态，entry_neighbors/entry_vector 改 `.collect()` 便利封装；region/count 校验收拢 checked_region(_mut)/checked_count 单一实现。新增测试 +8;pg-am-hnsw lib 107→115、pg-storage lib 205 绿、waldump 3/3、clippy -D warnings/fmt 绿。coding-plan v1.16、stage_spec 四轮回流段同步 |
 | v1.19 | 2026-09-15 | M5 Stage A 六轮复核回流（用户终审：1 P1 + 1 P2 + 1 P3 逐条核实属实）。**P1(dim == meta.dim 上移 redo 前置门）**:v1.17/v1.18 把该核对降级 §11.3 审计的口径在实质上不成立——redo 先于审计运行，错误 dim 会在审计介入前就把状态位写进错误偏移，且审计拿不到历史 payload、事后无法归因；payload 自 v1.18 起自带 meta_page_id 使该项 redo 可求值（meta 初始化记录 LSN 序先于一切节点记录、dim 不可变）——§10.1 冻结清单 124/127 项改"handler 经 meta_page_id 读 meta、核对后应用",§11.3 审计枚举 f 条撤销（回 a–e)，降级项集合回四项；validate.rs 新增单点 `validate_state_dim`（正常路径与 Stage C handler 共用），两条 payload rustdoc 同步改写。**P2(DPT 未门控 124/127 版本 flags)**:analysis.rs  touched-page 臂原 `decode_prefix::<PageId>` 对版本化 payload 按未知布局静默读页——两臂改走记录自身的版本化 decode（flags=0 预版本化格式与未知版本均响亮），新增版本门负例测试。**P3（文档漂移）**:§4.2 表 124/127 payload 顺序改为实际 wire 序 (page, slot, node_id, dim, meta_page_id)（前版误按构造器参数序）;§4.2 payload 版本段"HNSW 全部新记录从 v0 起步"补 124/127 已 v1 化；"三项降级项"改四项；coding-plan v1.18、stage_spec 六轮回流段同步。验证：pg-am-hnsw lib 117 绿、pg-storage lib 207 绿、clippy/fmt/doc 绿 |
+| v1.20 | 2026-09-15 | M5 Stage A 七轮复核回流（用户终审 P3×5 文档漂移，逐条核实属实）。① 文首状态行仍 v1.13 → v1.20（Stage A 六轮闭合口径）;② §4.2 LIVE 承载段仍称 meta_page_id "供审计自定位" → v1.19 redo 前置门口径；③ coding-plan Stage A 原语签名行仍 v1.7 版（append_node 的 meta_page_id/slot 参数、set_neighbors 的 node_id/count、缺 select_slot/apply_node_at)→ 按落地签名重写（geo: NodeGeometry、dir_append 返回条目位置与幂等三态、无自环校验归 funnel);④ coding-plan "每原语 N=3 字节全等"对分配型 append_node 不适用（每次占新槽）→ 注明 N=3 适用 redo 形态与后像型原语，append_node 的幂等由 apply_node_at + pd_lsn 承担；⑤ stage_spec 交付项 2 测试计数 21→22（五轮 dir_append_round5_guards 未计入）。纯文档轮，代码零改动；coding-plan v1.19、stage_spec 七轮回流段同步 |
