@@ -50,12 +50,19 @@ pub const DIR_HEADER_SIZE: usize = 24;
 /// revision).
 pub const DIR_FORMAT_VERSION: u8 = 1;
 
-const DIR_OFF_VERSION: usize = PAGE_HEADER_SIZE;
-const DIR_OFF_FLAGS: usize = PAGE_HEADER_SIZE + 1;
-const DIR_OFF_RESERVED: usize = PAGE_HEADER_SIZE + 2;
-const DIR_OFF_ORDINAL: usize = PAGE_HEADER_SIZE + 4;
-const DIR_OFF_COUNT: usize = PAGE_HEADER_SIZE + 12;
-const DIR_OFF_NEXT: usize = PAGE_HEADER_SIZE + 16;
+/// Directory header field offsets (§7.1 format constants; pub for the
+/// apply.rs primitives — 2026-09-14 M5 Stage A, single implementation).
+pub const DIR_OFF_VERSION: usize = PAGE_HEADER_SIZE;
+/// See [`DIR_OFF_VERSION`].
+pub const DIR_OFF_FLAGS: usize = PAGE_HEADER_SIZE + 1;
+/// See [`DIR_OFF_VERSION`].
+pub const DIR_OFF_RESERVED: usize = PAGE_HEADER_SIZE + 2;
+/// See [`DIR_OFF_VERSION`].
+pub const DIR_OFF_ORDINAL: usize = PAGE_HEADER_SIZE + 4;
+/// See [`DIR_OFF_VERSION`].
+pub const DIR_OFF_COUNT: usize = PAGE_HEADER_SIZE + 12;
+/// See [`DIR_OFF_VERSION`].
+pub const DIR_OFF_NEXT: usize = PAGE_HEADER_SIZE + 16;
 
 /// Map a pg-storage failure to the crate error type (2026-09-11, M5 Stage
 /// 0): the dependency edge's error channel is the new
@@ -95,7 +102,7 @@ pub fn init_dir_page(page: &mut [u8; PAGE_SIZE], ordinal: u64) {
 
 fn write_header(page: &mut [u8; PAGE_SIZE], page_type: u16) {
     // 2026-09-11, M5 Stage 0 review nano-1: use pg-storage's own writer
-    // (PageHeader::write_to, page.rs:118-128) instead of a hand-copied
+    // (PageHeader::write_to, page.rs:142-153) instead of a hand-copied
     // field-by-field encoding — one implementation of the header layout.
     //
     // Callers must zero-fill the page FIRST (all three init_* entry points

@@ -1168,7 +1168,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 1. **判别值注册三件套（选型 §10.1 WAL 接入清单）**:① `wal/record.rs`:`WalRecordType` 新增 7 变体（121–127,HnswNodeInit/SetNeighbors/MetaUpdate/NodeTombstone/DirAppend/DirLink/PublishLive),`from_u8` 同步；7 个 payload struct(bincode standard）与 7 个构造器（对齐 `btree_insert` 先例，构造器做入参响亮校验：dim>0/vector 长度与 dim 一致/分量有限/level ≤ 63、count==len/严格升序/无自环（经 owner node_id 判定，v1.12 的校验载体自此真实存在）、max_level ≤ 63、非法目标页拒绝）;LogicalHnsw=100 保持无生产者/handler（选型 §4.1 既定）。② `analysis.rs`:`for_each_touched_page` 注册 7 类型（touched 口径：NodeInit/SetNeighbors → payload 的节点 page(meta_page_id 只读不算 touched);MetaUpdate → meta_page_id;Tombstone/PublishLive → 节点 page;DirAppend → 目录尾页；DirLink → 旧尾页）,PAGE_MODIFYING 穷举分类同步（:854 穷举测试自动把守）；行为测试用例 7 条（对齐既有 cases 模式）。③ `bin/pg-waldump.rs`:7 类型解码臂从 reserved-hex 移出，逐字段打印
 2. **payload 编解码测试**(`record.rs` 单测 4 枚）:`hnsw_payloads_roundtrip_field_by_field`(7 种 payload encode→bincode decode 逐字段断言；自包含规则钉死：NodeInit/SetNeighbors/MetaUpdate 必带 meta_page_id,SetNeighbors 必带 owner node_id,v1.12;Tombstone 只测格式，语义 M6)+ `hnsw_payload_golden_bytes`（嵌套 head 与扁平布局逐字节相等的 golden 钉，2026-09-14 七轮 P3-1)+ `hnsw_constructors_reject_bad_arguments`（非法入参逐条响亮拒绝：页字段 PageId::INVALID、NodeId::INVALID(node/owner/邻居，仅空图 MetaUpdate 例外）、level > 63、升序/重复/自环）+ `hnsw_bounded_decoders_reject_forged_lengths_and_trailing_bytes`（有界解码闸门：伪造长度必在预分配闸门失败、wire 长度与声明 dim/count 不符预分配拒绝、尾随字节拒绝——2026-09-14 四轮机制）
 3. **页初始化链（选型 §8.1 步骤 1 / §10.3,v1.9 P1)**:`pg-am-hnsw/src/page.rs`——三类页类型常量（NODE=1/DIR=2/META=3，挂 `pd_flags`,pg-storage 文档的 AM-specific 字段；0 = 未初始化非法页）、`init_node_page`/`init_meta_page`/`init_dir_page`(32B PageHeader 起手；目录页另写 §7.1 自描述头：version=1/flags/reserved/ordinal/count=0/next=INVALID,24B 格式常量）、`log_page_init`(post-image FPI + stamp pd_lsn——**post-image 内容 = 初始化后的合法 HNSW 页头，不是零页**;A1 契约 buffer_pool.rs:424-442，回收页与新分配页同链无例外）。**回收页断电恢复测试**(`tests/page_init.rs`):freelist 分配→写 junk→flush→释放→再分配（断言同 id 回收）→ init + log_page_init → `mem::forget` 模拟 kill -9 → `open_with_redo_handlers` 恢复 → 页头为 HNSW 目录页初始化态、零 junk 残留（红→绿语义：去掉 log_page_init 即红）
-4. **依赖边两条（选型 §2,coding-plan Stage 0 交付物行）**:pg-am-hnsw → pg-storage(Cargo.toml,M4 预留注释的消费点；page.rs/redo.rs 首用）;pg-engine → pg-am-hnsw + 空骨架 `hnsw_redo_handlers()`(redo.rs，返回空 Vec,Stage C 填本体）注册进 `Engine::open` 的 extend 链（engine.rs:687-690——接线从第一天可编译，注册动作只发生一次）
+4. **依赖边两条（选型 §2,coding-plan Stage 0 交付物行）**:pg-am-hnsw → pg-storage(Cargo.toml,M4 预留注释的消费点；page.rs/redo.rs 首用）;pg-engine → pg-am-hnsw + 空骨架 `hnsw_redo_handlers()`(redo.rs，返回空 Vec,Stage C 填本体）注册进 `Engine::open` 的 extend 链（engine.rs:692-693——接线从第一天可编译，注册动作只发生一次）
 5. **错误通道**:`HnswError` 新增 `Storage(String)` 变体（M5 依赖边的 pg-storage 失败映射基线；Stage C 写路径可按需细化分类）
 6. **CI 核对结论（零新增 job 预期，核对而非假设）**:pg-am-hnsw 已在 ci.yml clippy/test/doc 三 matrix(M4 注册）;pg-storage 新增测试（判别值钉表、analysis 行为用例）随既有 pg-storage test matrix 覆盖，无 per-test 注册点；pg-waldump 是 pg-storage 的 bin target，随 crate 构建编译，**HNSW 七解码臂的执行验证由 `tests/waldump.rs` 承接**(2026-09-12 二轮 P3-2——初稿此处仅"编译验证"即宣布无缺口，口径过强，已补执行覆盖）;coverage(tarpaulin)job 只对 pg-am-hnsw 插桩（`cargo tarpaulin -p pg-am-hnsw`,ci.yml:145-165)——**覆盖口径要读准**:Stage 0 的 pg-am-hnsw 侧代码（page.rs/redo.rs）纳入统计，pg-storage 侧 M5 新代码（record.rs/analysis.rs/waldump，本 stage 大头）**不在**该 job 插桩范围内，其质量承接 = pg-storage 既有 test matrix 的测试覆盖，无覆盖率数字背书。**预期零新增 job 成立**，无"绿但没跑"缺口
 
@@ -1185,3 +1185,36 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **`HnswError::Storage` 为格式化消息基线**:Stage C 若需判别性分类（调用方分支处理）再细化
 - **meta 页字段布局**:Stage B 交付物；Stage 0 只定类型标签与初始化
 - **payload 预算核算**(§4.3,dim ≤ 1791 时最大单记录 < 8KB）未经真实大记录压测：归 Stage C 写入路径落地时的实测
+
+## Stage A(M5)：访问器收口 + 物理应用原语 ×7 + 校验 funnel
+
+**状态**:✅ 完成（2026-09-14 落码 + 一轮审查闭合;pg-am-hnsw 全套件 159 绿（lib 107 = M4 的 92 + 本阶段 15 新增 + bruteforce 3 / properties 5 / snapshot_roundtrip 40 / page_init 1 / recall_siftsmall 3),release lib 107 绿；pg-storage lib 205 绿无回归；clippy -D warnings / fmt --check / doc -D warnings 三档绿；cargo check --workspace 零错误；未 commit——等用户确认，message 前缀 `PHASE2-M5-StageA`)
+**工期**:预估 3–4 天
+**验收**:`cargo test -p pg-am-hnsw` 159 绿 / 0 失败；`cargo test -p pg-am-hnsw --release --lib` 107 绿；`cargo clippy -p pg-am-hnsw --all-targets -- -D warnings` 绿；`RUSTDOCFLAGS="-D warnings" cargo doc -p pg-am-hnsw --no-deps` 绿；`cargo test -p pg-storage --lib` 205 绿（依赖面无回归）
+
+**审查回流（2026-09-14,verdict PASS 附条件 → 条件项全部闭合）**:P2-1 append_node 缺 vector 长度守卫（dim+1 静默写坏 state/level-0 区、更大长度 panic、dim−1 静默补零）→ 入口 `vector.len() != dim → Corrupted`（结构守卫，与 set_neighbors 容量守卫同级）;P2-2 条目切片边界守卫补全（set_neighbors/entry_neighbors region 切片、state 字节索引五个消费点经 `state_byte`/`state_byte_mut` 助手、entry_vector、append_node 的 pd_lower 下溢，全部一行级 Corrupted;in-bounds 错误 dim 结构性不可检——条目不存 dim,§7.2——归 funnel 的 meta.dim 校验，注释立文）;P3-1 新增 redo 形态 `apply_node_at(slot, …)`（空闲创建/INITIALIZING 覆写幂等字节全等；LIVE 覆写与 gap slot 响亮拒绝）,append 形态留正常路径；P3-2 meta page 形态收窄（32B 头 + raw 字段区，LP 永不使用；选型 §6 已回写）;P3-3 slot 态校验归属 Stage C handler 侧（validate.rs 注释立文）;P3-4 DIR_ENTRIES_PER_PAGE 813 → 公式导出；nano×2(LP 引用 :262-269→:298;l_max 补 m≥2 前提）;裁断①选型 §10.2 补原语签名口径（页 buffer + NodeGeometry 值对象——clippy arity 的结构性解法，非 allow);裁断② LP 布局 golden pin 防线（上移 pg-storage 登记 Stage B 候选）。新增测试 +5,lib 102→107
+
+**审查回流（2026-09-14，二轮 verdict PASS 附条件 → 条件项全部闭合）**:P2-1 页内容边界钳制（一轮 P2-2 同类漏网——pd_lower/pd_upper/LP off+len 来自无 checksum 的页内容，bit-rot 页可致 redo 路径 slice panic，探针实证）:read_lp 入口钳制（pd_lower ∈ [32, PAGE_SIZE] 且 LP 对齐）+ off/len 返回前钳制，append_node/apply_node_at 增 pd_upper ≤ PAGE_SIZE 守卫——页内容来源的三处边界自此全部响亮；P3-1 tech-selection §10.2 原语 bullet 列表按落地签名重写（v1.7 遗物与口径段双重矛盾，handler 作者照写会全错）;P3-2 裁断 set_neighbors/entry_neighbors 统一 `NodeGeometry` 签名（API 单约定，arity 反降）;P3-3 LP golden pin encode 断言改字面量 0x00C0_9F40（公式化期望与实现同式自指，M4 "oracle 局限"同型）;nano l_max 补 m=2 → 53 边界钉。攻击未遂登记：entry_size 碰撞自洽（write_entry 按记录几何整写 + funnel dim 校验上游拦截）、INITIALIZING 覆写清 tombstone 合法（tombstone 只落 LIVE 条目）、dir_append 腐坏 count ≥813 响亮 InvalidOperation
+
+### 交付内容
+
+1. **访问器收口（graph.rs，纯重构零行为变更，§10.2 任务 1)**:`insert` 的邻接长度读（:442 区域）与 `search_layer` 的邻接遍历（:578 区域）改走 `neighbors()`；新增私有 `neighbors_mut(node, level)` 作为 adjacency arena 的**唯一写入 funnel**,`insert` 自身列表发布、`push_edge`、`shrink` 三处写入全部收口；收口后全文件直接 arena 索引只剩三个访问器自身（:369/:378/:391)。M4 既有 92 lib + 40 snapshot + 5 properties + 3 bruteforce + 3 recall 全绿为行为钉。**未做** select_neighbors/search_layer 的自由函数泛型化（那是 Stage C 页驻查询行的明确落点，coding-plan 任务分工）
+2. **物理应用原语 ×7(`apply.rs`,pub(crate))**:`append_node`（步骤 3：按抽取 level 定长分档预留——level 0 按 m_max0、上层按 m,§7.2 容量公式 `4·dim+1+(2+4·m_max0)+L·(2+4·m)`;state 位布局 top_level:6+state:1(bit6)+tombstone:1(bit7);各层 count=0；页内槽位分配（自研最小 line-pointer 读写——**布局从 pg-am-heap/src/line_pointer.rs:16 再导出**,pg-am-hnsw 禁依赖 pg-am-heap（选型 §2)，与 pg-storage 的 MAX_HEAP_CLEANUP_SLOTS 再导出同纪律）)、`dir_append`（步骤 4:10B 条目（PageId u64+SlotId u16)+ count+1;813 满页响亮 InvalidOperation)、`set_neighbors`（步骤 5/6：**原位**改写，count+内容覆写 + 预留尾部清零（幂等字节级成立的机制）;越预留 = Corrupted 结构守卫）、`apply_meta`（步骤 7:entry_point/max_level 字段覆写；两个字段位置冻结为 META_OFF_ENTRY_POINT=32 / META_OFF_MAX_LEVEL=36,Stage B 在其周围扩展完整 meta 布局）、`publish_live`（步骤 8,bit6 置位）、`dir_link`（步骤 2,next 指针）、`apply_tombstone`(124 承载，bit7 置位，语义 M6)。**原语零校验**(§10.2 v1.9 层次明文），仅保留 buffer-overrun 结构守卫（页满/缺槽/越预留/vector 长度/state 与 region 边界——审查回流后守卫面补全）;redo 形态 `apply_node_at` 与正常路径 `append_node` 分化（审查 P3-1);读取侧访问器（entry_top_level/entry_is_live/entry_is_tombstoned/entry_neighbors/entry_vector）供测试与 Stage C/D 消费。测试 13 枚（正常应用 + 幂等 N=3 页字节全等 + 813 满页边界 + 63 层上限 + 满容量写满 + 溢出/缺槽负例 + 审查回流 5 枚：守卫钉/geometry 误配/apply_node_at 三形态/813 公式/LP golden)
+3. **校验 funnel(`validate.rs`)**:`MetaView` 内存 meta 结构（dim/m/m_max0/metric;Stage B 的 meta.rs 换页化实现，同型替换）;`validate_node_init`(dim 一致 / L_max=⌊53·ln2/ln m⌋ 边界钉（m=4 → 26，双侧）/ 有限性 / Cosine 零向量（M4 distance.rs:76 同 funnel,ZeroVector 变体原样上抛；L2/IP 零向量合法）)、`validate_set_neighbors`(count==len / 层容量 / level ≤ top_level / 升序 / 无重复 / 无自环（owner,v1.12))。**可求值性约束注释钉死**(§10.1 v1.10)：依赖链导出 HWM/目录映射的校验不进 redo 路径，归 Stage D 审计——改线 = 协议修订。测试 2 枚（全负例矩阵）
+4. **lib.rs 挂出**:apply/validate 以 `#[allow(dead_code)] pub(crate)` 挂出——非测试消费方（redo handler/正常写入路径）归 Stage C，当前唯一调用者是单测（tests/common/mod.rs 同型先例）
+5. **签名落地说明（如实登记，非文档改动）**:§10.2 v1.7 签名中的 PageId 参数（meta_page_id/node_page/dir_tail_page）在原语层落实为**页 buffer 参数**——纯应用原语不做 I/O，页定位 → buffer 的解析由调用方（Stage C 的 redo handler pin 页后）完成；append_node 的定长分档需要 dim/m/m_max0 三个几何参数（从 meta 传入），比 v1.7 签名多带但语义同源
+
+### 与 pgvector·hnswlib 的 trade-off
+
+| 维度 | pgvector / hnswlib | 本实现 | 取舍 |
+|---|---|---|---|
+| 写路径形态 | PG AM 的"页内直接改写 + 记录即副作用" | 应用原语与校验 funnel 分层（原语零校验） | redo/正常路径共享同一应用层，校验单点——预防"两侧两份实现"漂移（M4 Stage B 教训的制度化） |
+| 节点页内分配 | heap slotted page 通用 tuple 语义 | 自研最小 line-pointer 读写 + 定长分档条目 | 禁依赖 pg-am-heap（选型 §2）的代价 = 再导出 4B LP 布局；换得层级满载预留 → 条目永不扩搬（M6 稳定槽位前提） |
+
+### 已知残留与后续归队
+
+- **redo handler ×7 本体与正常写入路径**:Stage C 交付——届时 apply/validate 的 dead_code allow 应随真实调用点落地而移除（登记为 Stage C 开工检查项）
+- **meta 页完整字段布局**:Stage B 交付物；本阶段只冻结 entry_point/max_level 两位（:32/:36),Stage B 扩展时不得移动（格式常量纪律）
+- **MetaView → 页化 meta 的同型替换**:Stage B 的 meta.rs 落地时 funnel 换实现，负例矩阵原样保留
+- **目录满页 → DirLink 的调用方编排**(813 边界后的换页时机）归 Stage C 写入路径；原语只保证边界响亮
+- **slot 复用/压缩**:定长分档下无变长碎裂来源（§7.3 已论证），回收槽策略归 M6

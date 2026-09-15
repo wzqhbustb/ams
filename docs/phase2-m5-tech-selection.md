@@ -68,7 +68,7 @@
   pg-storage/src/page.rs:1-36，不重发明。
 - redo handler 接线点对齐 btree 先例：pg-am-hnsw 导出
   `hnsw_redo_handlers()`(crate 内新增 `redo.rs`),pg-engine 在
-  `Engine::open` 注册（pg-engine/src/engine.rs:687-689 现有
+  `Engine::open` 注册（pg-engine/src/engine.rs:692-693 现有
   heap+txn+btree 的 extend 链上追加一行）。由此 pg-engine 新增对
   pg-am-hnsw 的依赖——这是 M5 才出现的第二条依赖边，与 Phase 1
   "依赖逐 milestone 扩大"原则一致。
@@ -88,7 +88,7 @@
 
 **选项**：
 (a) **生理记录 on 节点页**——与全部现存 AM 同构：页+槽位寻址、pd_lsn
-    权威幂等（pg-storage/src/wal/record.rs:209 的 heap 先例）、FPI/checkpoint/
+    权威幂等（pg-storage/src/wal/record.rs:238 的 heap 先例）、FPI/checkpoint/
     崩溃测试基建全部白拿；
 (b) **纯逻辑重放**——重放 insert 操作流，确定性重跑建图算法；
 (c) **混合**——页驻图 + 生理 WAL 为主线，M4 快照文件保留为逻辑归档/迁移/
@@ -195,7 +195,7 @@ SetNeighbors，但该记录 payload 没有 publish_live 标志，翻转实际上
 （崩溃轮次统计、M6 vacuum 的清理对象判定）。
 
 **记录自包含规则**(v1.5 审查 P1-6):WalRecord 头无 page 字段
-(record.rs:705-718),RedoContext 无索引定位能力（recovery.rs:210-229
+(record.rs:1627-1636),RedoContext 无索引定位能力（recovery.rs:210-229
 字段集核实：buffer_pool/page_allocator/clog/att/dpt/incomplete_splits,
 无索引注册表）——每条 HNSW 记录的 payload 自包含全部目标页；NodeInit、
 SetNeighbors 与 MetaUpdate 额外携带 `meta_page_id`(NodeInit 的 apply
@@ -207,7 +207,7 @@ NodeId(§7.2 公式无该字段）,payload 不带 owner 则自环检查不可实
 owner 与 (page,slot) 的目录映射一致性归 §11.3 审计，同可求值性约束）;
 见 §10.1 纵深校验；对齐 btree
 记录 payload 带 page_id 的先例
-record.rs:891-904)。redo 时 meta page 经 ctx.buffer_pool 可读（Stage I 起
+record.rs:1223)。redo 时 meta page 经 ctx.buffer_pool 可读（Stage I 起
 恒 Some),meta 创建于任何 insert 记录之前，redo 前缀序保证其时 meta
 状态已合法。
 
@@ -258,9 +258,9 @@ M5 单线程写入保证链前缀一致——无空洞）。备选 (a)（明文�
   1M 全量建库 ≈ **2.9GB WAL**——接入 §9.2 的恢复预算讨论（checkpoint
   频率控制重放窗口；bulk load 后立即 checkpoint 是 §9.2 的硬要求）。
 - **幂等锚 = pd_lsn**(`page.pd_lsn >= record.lsn` 跳过，heap 先例
-  record.rs:209)；页内内容 authoritative，无读时依赖。
+  record.rs:238)；页内内容 authoritative，无读时依赖。
 - **payload 版本**:payload 版本 nibble 在 **u8** flags 的高 4 位
-  (`version = flags >> 4`,record.rs:638-643——注意 M1 冻结的 32B 记录头里
+  (`version = flags >> 4`,record.rs:941-946——注意 M1 冻结的 32B 记录头里
   flags 是 u8，不是 u16)。HNSW 全部新记录从 v0 起步。
 
 ### 4.3 payload 预算核算
@@ -332,8 +332,12 @@ P1-1 修正后）:vector 7164B + level(1B)+ 元组开销 < 8KB。§12 O1 的
 **与 btree meta 先例的差异声明**(v1.1 审查 P3-5，不隐含同构）:btree 的
 meta 更新是 **append 新 slot 记录、最新者权威**(index.rs:565-575 的
 `write_meta_record`);HNSW 的 HnswMetaUpdate 是**字段级覆写后像**（入口点/
-最大层是单值字段，append 式历史对它们无意义）。meta page 物理形态同为
-slotted page，更新语义不同，redo handler 不复用 btree 的。
+最大层是单值字段，append 式历史对它们无意义）。**meta page 物理形态 =
+32B PageHeader + raw 字段区**(2026-09-14 Stage A 审查 P3-2 收窄：上文
+"slotted page"仅指共享页头——**line-pointer 数组在 meta page 上永不
+使用**，否则 LP[0] 与字段区首字段（entry_point@32）直接混叠；
+entry_point@32 / max_level@36 为格式常量，Stage A 已冻结）,redo handler
+不复用 btree 的。
 
 **存放**（创建时钉死，加载/重放校验，错配硬失败）:
 
@@ -432,7 +436,11 @@ FPI（自描述头随之落盘）+ 旧尾页写链指针（HnswDirLink，单页�
   紧邻，M4 tech-selection :150 的探路兑现）。
 - **容量不变量**(v1.1 审查 P1-1 重写；v1.5 P1-2 后公式由"最坏情况"变为
   **精确值**——每个条目都按满载预留）。页可用面 = PAGE_SIZE − 32
-  (PageHeader)− 4(LinePointer,pg-am-heap/src/line_pointer.rs:16);
+  (PageHeader)− 4(LinePointer——**LP 布局归属**(2026-09-14 Stage A
+  裁断②):pg-am-hnsw 禁依赖 pg-am-heap（§2),LP 布局（off:15|flags:2|
+  len:15,LP_NORMAL=1,pg-am-heap/src/line_pointer.rs:16）由 pg-am-hnsw
+  apply.rs 再导出，跨 crate 一致性由 golden pin 测试冻结；上移
+  pg-storage::page 做单一真源登记为候选，Stage B 评估）;
   8KB 页下 = **8156B**。节点条目字节数 =
   `4·dim + 1(level_count/state)+ (2 + 4·m_max0)+ L·(2 + 4·m)`
   (L = 抽取的上层数，全按满载预留计)。**1B 状态的位布局**
@@ -662,7 +670,7 @@ CheckpointEnd v2 与 superblock redo 点（pg-storage/src/superblock.rs:79)。
 ### 10.1 redo 注册与 RedoContext 处置
 
 - `hnsw_redo_handlers()` 导出 7 个 handler(§4.2 的 121–127),Engine::open 注册
-  (engine.rs:687-689 链）。
+  (engine.rs:692-693 链）。
 - **RedoContext 封闭集合**(recovery.rs:210-229:buffer_pool Option /
   page_allocator / clog / att / dpt / incomplete_splits)——HNSW handler
   **无状态化**，只用 buffer_pool + page_allocator，不请求扩展 RedoContext
@@ -721,7 +729,7 @@ CheckpointEnd v2 与 superblock redo 点（pg-storage/src/superblock.rs:79)。
   (§11.3)。
 - `buffer_pool: Option` 的处置（v1.1 审查 P2-4 改写——v1.0 引用了"M1
   早期重放阶段 pool 不存在"的生产路径，该阶段已不存在）:**Stage I 起
-  recovery 恒在 buffer pool 打开后进行**（pg-storage/src/engine.rs:236-243
+  recovery 恒在 buffer pool 打开后进行**（pg-storage/src/engine.rs:237-245
   的阶段序注释；RedoContext 构造处 :646 恒传 `Some(buffer_pool)`),
   `None` 仅三处测试构造可达。HNSW handler 遇 None 直接硬失败因此是
   **纵深防御**而非真实分支；recovery 阶段序的测试保留（钉住 Stage I
@@ -729,15 +737,15 @@ CheckpointEnd v2 与 superblock redo 点（pg-storage/src/superblock.rs:79)。
 
 **WAL 接入清单**(v1.5 审查 P2-1——落码时逐项打勾，缺一即破坏对应护栏）:
 
-1. **from_u8 判别值注册**:record.rs:107-138 的 `from_u8` 加 121–127 分支
+1. **from_u8 判别值注册**:record.rs:130 的 `from_u8` 加 121–127 分支
    （未知判别值现有行为 = WalReadFailed 硬失败，保持）;
    tests/wal_record_type_discriminant.rs 钉表同步新增；
-2. **DPT touched-page 分类**:analysis.rs:267 的 `for_each_touched_page`
+2. **DPT touched-page 分类**:analysis.rs:269 的 `for_each_touched_page`
    为 7 个新类型注册分类（每条记录的 payload 目标页即 touched page,
    §4.2 自包含规则使它可以直接解出）;analysis.rs:854 的穷举测试
    (`every_record_type_is_classified_for_the_dpt`）机制自带——新类型
    未注册时该测试变红，无需另写护栏；
-3. **pg-waldump 解码**:pg-waldump.rs:336 现状把 LogicalHnsw 列在
+3. **pg-waldump 解码**:pg-waldump.rs:365 现状把 LogicalHnsw 列在
    reserved-hex 分支；新增 7 个类型的 payload 解码器并从 reserved 分支
    移出（对齐现有 heap/btree 解码臂的形态）。
 
@@ -749,19 +757,31 @@ M4 深审（2026-09-09）已立卡，本文档正式收编：
    (graph.rs:578 的 `self.adjacency[...]` 等）全部改走 `neighbors()`/
    `vector()` funnel——页驻后这些 funnel 背后是页缓存查找；
 2. **物理应用原语**(pub(crate) 起步，v1.7 形态——v1.7 审查 P2-1：签名
-   补齐全部物理页定位参数，与"redo 与正常路径共用同一实现"的承诺对齐）:
-   - `append_node(meta_page_id, node_page, slot, node_id, level, vector)` —
+   补齐全部物理页定位参数，与"redo 与正常路径共用同一实现"的承诺对齐；
+   **签名口径**(2026-09-14 Stage A 落地裁断①):v1.7 的"物理页参数"落地
+   为**页 buffer**——纯应用原语不做 I/O,payload 携带的 PageId 由调用方
+   （redo handler pin / 正常路径）解析为 buffer;append_node/apply_node_at
+   因定长分档另带几何参数（dim/m/m_max0，落地为 `NodeGeometry` 值对象）;
+   redo 形态分化为 `append_node`（正常路径追加分配）与
+   `apply_node_at(slot, …)`(redo：空闲创建 / INITIALIZING 覆写幂等，即
+   §10.1 "目标 slot 为空闲或 INITIALIZING"的实现载体，Stage A 审查 P3-1)。
+   **落地签名**(2026-09-14 Stage A 二轮复核 P3-1 按代码重写，取代 v1.7
+   bullet——参数语义：页 = 页 buffer;`geo` = NodeGeometry(dim/m/m_max0);
+   owner/count/无自环在 funnel 不在原语）:
+   - `append_node(node_page, node_id, top_level, geo, vector) -> slot` —
      指定 level(§5 裁决载体）；定长预留、INITIALIZING 态、节点页槽位
-     分配在此发生（§8.1 步骤 3);
-   - `set_neighbors(page, slot, node_id, level, count, content)` — 原位更新
-     （步骤 5/6);node_id = owner，无自环校验载体（v1.12);
-   - `publish_live(page, slot, node_id)` — state 后像翻 LIVE（步骤 8);
-   - `dir_append(dir_tail_page, node_id, node_page, slot)` — 尾页单页条目写
-     （步骤 4);
+     分配在此发生（§8.1 步骤 3);redo 用 `apply_node_at(node_page, slot,
+     node_id, top_level, geo, vector)`（空闲创建/INITIALIZING 覆写幂等）;
+   - `set_neighbors(node_page, slot, geo, level, content)` — 原位更新
+     （步骤 5/6);owner node_id 与 count 不进原语（v1.12 的无自环载体在
+     WAL payload 与 funnel，原语只写内容）;
+   - `publish_live(node_page, slot, dim)` — state 后像翻 LIVE（步骤 8);
+   - `dir_append(dir_tail_page, node_id, target_page, target_slot)` — 尾页
+     单页条目写（步骤 4);
    - `dir_link(old_tail_page, new_dir_page)` — 目录扩容（步骤 2);
-   - `apply_meta(meta_page_id, entry_point, max_level)` — 步骤 7 与 §10.3
-     的创建/修复共用;
-   - `apply_tombstone(page, slot, node_id)` — HnswNodeTombstone(124)的
+   - `apply_meta(meta_page, entry_point, max_level)` — 步骤 7 与 §10.3
+     的创建/修复共用；
+   - `apply_tombstone(node_page, slot, dim)` — HnswNodeTombstone(124)的
      redo 承载（v1.9 审查 P2-1 补登）;tombstone 语义 M6 才生效，但 §1
      划的 M5 范围是"能写、能重放、能校验"——重放承载的原语必须在
      清单内;
@@ -839,7 +859,7 @@ pd_lsn)、确定性（目录序位即依据）、WAL 记录（正常记录，非
 ### 11.2 幂等测试
 
 每条新记录类型：同一记录对同一页 redo N 次（N=3)，断言页字节全等——
-pd_lsn 守卫（record.rs:209 模式）+ 后像覆写使这天然成立，测试是钉不是证。
+pd_lsn 守卫（record.rs:238 模式）+ 后像覆写使这天然成立，测试是钉不是证。
 
 ### 11.3 图语义一致性断言（恢复后）
 
@@ -951,3 +971,6 @@ pg-am-hnsw（页布局/WAL 记录）与 pg-engine（崩溃 rounds）两侧。
 | v1.11 | 2026-09-09 | 第十轮审查回流（1 P1 + 2 P2，逐条代码实证后全部属实并修复）。**P1(DirAppend 跨页单值断言误杀合法残态）**：冻结清单"目标条目存在且 INITIALIZING"改 state ∈ {INITIALIZING, LIVE}——节点页与目录页由 buffer pool 独立刷盘，节点页可携 LIVE 先于目录页落盘，崩溃后重放 DirAppend 时目标条目恰为 LIVE，单值校验会拒绝合法状态；由此立第二条跨页纪律：redo 校验对跨页可变状态只断言取值集合、不断言单值（pd_lsn 单页守卫只覆盖同页幂等）；同清单其余跨页读（MetaUpdate 读入口点 top_level）复核安全——top_level 不可变 + LSN 序保证条目已存在。**P2-1(NodeInit 缺 Cosine 零向量校验）**：补 meta.metric == Cosine ⇒ vector 非零，对齐 M4 insert 漏斗(distance.rs:76 的 ZeroVector 响亮拒绝、graph.rs:402 入口同口径；L2/IP 零向量合法，M4 同）——缺此校验则 Cosine 索引可经 WAL 写入搜索期 expect panic 的图（Stage C 已修过的同类边）。**P2-2(§11.3 邻接审计不自含）**:v1.10 把三类链导出校验降级到 §11.3，但 §11.3 正文未逐条枚举，降级近乎消失；补"邻接良构断言"四条——a) 端点存在（被引 id < 链导出 HWM 且目录条目占用）;b) 层级归属（level-L 边目标 top_level ≥ L，对齐 M4 快照校验 encoding.rs:423，与存在性是独立一维）;c) entry_point < HWM;d) PublishLive 的 node_id 与目录映射一致。十轮轨迹 FAIL→FAIL→PASS→FAIL→PASS→PASS→PASS→PASS→PASS→修复，待复核 |
 | v1.12 | 2026-09-10 | 第十一轮审查回流（用户终审 P1，已核实属实并修复）。**P1(SetNeighbors "无自环"校验不可实现）**:payload/原语/节点条目布局均无 owner node_id，冻结清单的"无自环"无判定基准——按用户钦定修法：HnswSetNeighbors payload 补 owner node_id(§4.2 表与自包含规则段），原语签名改 `set_neighbors(page, slot, node_id, level, count, content)`(§10.2),§10.1 冻结清单注明判定基准 = payload owner;owner 与 (page,slot) 的目录映射一致性按可求值性约束同型降级到 §11.3（新增邻接良构断言 e)。写放大核算同步：+4B/条 × 稳态 ≈17 条/insert(16 邻居页 + 1 自身列表）= +68B,2.8KB → **≈2.9KB/insert ≈ 5.6×**,1M 全量 2.8GB → **≈2.9GB WAL**(§4.2/§9.2 两处同步，对齐 v1.10 nano 的笔法）。coding-plan 同步升 v1.3(Stage C 冻结清单行、Stage E benchmarks 数字、基线引用） |
 | v1.13 | 2026-09-11 | M5 Stage 0 落地回流 + 审查附条件项闭合（agent-23 verdict PASS 附条件）。Stage 0 交付（判别值 121–127 三件套、页初始化链、payload 往返、依赖边、CI 核对）经审查成立；闭合项：**P3-1** pg-waldump `-h/--help` 从"usage 走 stderr + exit 1"改 POSIX 惯例（stdout + exit 0,unknown option 维持 exit 1;coding-plan Stage 0 验收命令 `-- --help` 自此真实 exit 0)。**P3-2（裁断）**:`HnswError::Storage(String)` 错误映射基线接受——§2 补错误通道行（Stage C 有真实判别需求时细化并回写）。**P3-3**:HNSW 七构造器校验对齐——hnsw_set_neighbors 补 level ≤ 63;**全部 9 个此前照收的页字段**(NodeInit 的 meta_page_id/page、SetNeighbors 的 meta_page_id/page、MetaUpdate 的 meta_page_id、Tombstone/PublishLive 的 page、DirAppend 的 dir_tail_page、DirLink 的 old_tail_page）补 PageId::INVALID 响亮拒绝（共享 `reject_invalid_page_id` 单一实现）+ 负例矩阵扩展。nano×3:① pg-am-hnsw page.rs 的手写 header 编码改用 pg-storage `PageHeader::write_to`（单一实现纪律）;② pd_flags 位分配登记入 pg-storage page.rs rustdoc（bits 8–15 = btree btpo_level/btpo_flags,bits 0–7 = HNSW 页类型 1/2/3,heap 不用；新 AM 先登记）,§7.1 同步一行（页类型挂低字节）;③ page_init.rs 的 0xAB 断言语义改写——**此处初稿的机制解释（"junk 会被 tenant 自身 pre-image FPI 重放清零"）后在 Stage 0 五轮复核被证伪并更正**：该 FPI 不存在（junk 直写无 WAL)，缺 init FPI 时恢复的真实终态是盘上 junk(page_type 读 0xABAB)；承重断言 = page_type == PAGE_TYPE_DIR 的相等断言，更正见 stage_spec 五轮回流段 |
+| v1.14 | 2026-09-14 | M5 Stage A 落地回流 + 审查裁断回写（agent-23 verdict PASS 附条件，条件项已闭合，详见 coding-plan v1.13 与 stage_spec Stage A 回流段）。**裁断①（原语签名口径）**:§10.2 补——v1.7"物理页参数"落地为页 buffer（纯应用原语不做 I/O,PageId 由调用方 pin 解析）;append_node/apply_node_at 带几何参数（落地为 `NodeGeometry` 值对象）;redo 形态分化为 append_node（正常路径）与 apply_node_at(slot,…)（空闲创建/INITIALIZING 覆写幂等，§10.1 "目标 slot 空闲或 INITIALIZING"的实现载体）。**裁断②(LP 布局归属）**:§7.2 容量不变量补注——LP 布局由 pg-am-hnsw apply.rs 再导出（§2 禁依赖 pg-am-heap 的推论）,golden pin 测试冻结一致性，上移 pg-storage::page 登记为 Stage B 评估候选。**P3-2(meta page 形态收窄）**:§6 "slotted page"收窄为"32B PageHeader + raw 字段区，LP 永不使用";entry_point@32/max_level@36 为格式常量（Stage A 已冻结）。**P3-3(slot 态校验归属）**:funnel 的 slot 态 ∈ {INITIALIZING, LIVE} 项需页访问，归 Stage C handler 侧（validate.rs 注释立文） |
+| v1.15 | 2026-09-14 | M5 Stage A 二轮复核回流（agent-23 verdict PASS 附条件 → 条件项已闭合，详见 coding-plan v1.14)。**P2-1（页内容边界）**:pd_lower/pd_upper/LP off+len 无 PAGE_SIZE 钳制（页无 checksum,bit-rot 可致 redo 路径 slice panic，违反 no-panic 纪律）——read_lp 入口钳制（pd_lower ∈ [32, PAGE_SIZE] 且 4 对齐）+ 返回前 off/len 钳制，append_node/apply_node_at 增 pd_upper ≤ PAGE_SIZE 守卫。**P3-1**:§10.2 原语 bullet 列表按落地签名重写（v1.7 遗物与 2026-09-14 口径段双重矛盾：append_node 无 meta_page_id/slot、set_neighbors 无 owner/count、publish_live/apply_tombstone 以 dim 为参、apply_meta 以页 buffer 为参）。**P3-2(裁断）**:set_neighbors/entry_neighbors 统一为 `NodeGeometry` 签名（与 append_node/apply_node_at 一致，API 单约定）。**P3-3**:LP golden pin 的 encode 断言改字面量 0x00C0_9F40（公式化期望与实现同式自指，守卫失效）。**nano**:l_max 补 m=2 → 53 边界钉（rng.rs:93-96 上界语义） |
+| v1.16 | 2026-09-14 | M5 Stage A 三轮复核回流（用户终审 P3：源码行号漂移，逐项核实修复）。正文锚点更新：from_u8 record.rs:107-138→:130、btree_insert 构造器先例 :891-904→:1223、for_each_touched_page analysis.rs:267→:269、pg-waldump HNSW 解码臂 :336→:365、Engine::open extend 链 engine.rs:687-689→:692-693（两处）、pg-storage recovery 阶段序 engine.rs:236-243→:237-245、heap pd_lsn 幂等先例 record.rs:209→:238（三处）、WalRecord 头布局 :705-718→:1627-1636、version nibble :638-643→:941-946；pg-am-hnsw 两处源码注释同步（redo.rs:4、page.rs:105 的 PageHeader::write_to :118-128→:142-153)。核实不改：analysis.rs:854 穷举测试、engine.rs:646 的 RedoContext 构造、recovery.rs:210-229、record.rs:74/:81-88/:189 仍准确；修订记录表历史行号按 v1.12 起约定保留当轮值。coding-plan v1.15、stage_spec :1171 同步 |

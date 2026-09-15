@@ -378,6 +378,19 @@ impl Hnsw {
         &self.adjacency[node.index()]
     }
 
+    /// Mutable counterpart of [`Hnsw::neighbors`] (2026-09-14, M5 Stage A
+    /// accessor-funnel task, tech-selection §10.2 task 1): the ONLY
+    /// mutation funnel into the adjacency arena. All write paths
+    /// (`insert`'s own-list publication, `push_edge`, `shrink`) go through
+    /// here so a future page-backed representation has one place to
+    /// redirect; read paths use `neighbors()`.
+    ///
+    /// Panics if `node` is out of range or `level` exceeds the node's top
+    /// level (same indexing contract as `neighbors`).
+    fn neighbors_mut(&mut self, node: NodeId, level: u8) -> &mut Vec<NodeId> {
+        &mut self.adjacency[node.index()][usize::from(level)]
+    }
+
     /// Insert a vector (paper Algorithm 1); returns the freshly allocated
     /// [`NodeId`] (dense, never reused — §3).
     ///
@@ -439,14 +452,17 @@ impl Hnsw {
             let neighbors = self.select_neighbors(&w, m);
             for &nb in &neighbors {
                 self.push_edge(nb, l, id);
-                let list_len = self.adjacency[nb.index()][usize::from(l)].len();
+                // 2026-09-14, M5 Stage A accessor funnel (§10.2 task 1):
+                // adjacency reads go through the accessors, never direct
+                // arena indexing.
+                let list_len = self.neighbors(nb, l).len();
                 if list_len > self.m_max(l) {
                     self.shrink(nb, l);
                 }
             }
             // The new node's own list is published only after the backward
             // edges are in place — nothing in the loop above reads it.
-            self.adjacency[id.index()][usize::from(l)] = neighbors;
+            *self.neighbors_mut(id, l) = neighbors;
             ep = w[0].id; // nearest result carries the descent (Algorithm 1)
         }
 
@@ -575,7 +591,7 @@ impl Hnsw {
             if c.dist > worst.dist {
                 break; // nearest candidate is beyond the worst kept result
             }
-            for &e in &self.adjacency[c.id.index()][usize::from(level)] {
+            for &e in self.neighbors(c.id, level) {
                 let (word, bit) = (e.index() / 64, 1u64 << (e.index() % 64));
                 if visited[word] & bit != 0 {
                     continue;
@@ -677,7 +693,7 @@ impl Hnsw {
     /// canonical `NodeId`-ascending order. `to` must not already be present
     /// (a fresh node cannot be reachable from its own insertion search).
     fn push_edge(&mut self, node: NodeId, level: u8, to: NodeId) {
-        let list = &mut self.adjacency[node.index()][usize::from(level)];
+        let list = self.neighbors_mut(node, level);
         match list.binary_search(&to) {
             Ok(_) => debug_assert!(false, "duplicate edge {node:?} -> {to:?} on level {level}"),
             Err(pos) => list.insert(pos, to),
@@ -689,7 +705,7 @@ impl Hnsw {
     /// the list's owner plays the reference-vector role, so candidate
     /// distances are recomputed against the owner before the call.
     fn shrink(&mut self, owner: NodeId, level: u8) {
-        let list = &self.adjacency[owner.index()][usize::from(level)];
+        let list = self.neighbors(owner, level);
         let cands: Vec<Cand> = list
             .iter()
             .map(|&c| Cand {
@@ -698,7 +714,7 @@ impl Hnsw {
             })
             .collect();
         let kept = self.select_neighbors(&cands, self.m_max(level));
-        self.adjacency[owner.index()][usize::from(level)] = kept;
+        *self.neighbors_mut(owner, level) = kept;
     }
 }
 

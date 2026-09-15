@@ -1,7 +1,7 @@
 //! HNSW redo-handler registry — Phase 2 M5 Stage 0 skeleton.
 //!
 //! `Engine::open` registers these handlers alongside heap/txn/btree
-//! (pg-engine/src/engine.rs:687-689 extension point, tech-selection §2).
+//! (pg-engine/src/engine.rs:692-693 extension point, tech-selection §2).
 //! Stage 0 returns an EMPTY vector: the seven handler bodies (one per
 //! discriminant 121–127) land in Stage C. Registering an empty skeleton now
 //! keeps the wiring — dependency edge, registration call site, and CI
