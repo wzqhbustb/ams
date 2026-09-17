@@ -158,6 +158,39 @@ impl PageHeader {
     }
 }
 
+// ---------------------------------------------------------------------
+// Line-pointer layout — single source of truth (2026-09-15, Phase 2 M5
+// Stage B adjudication): the layout's historical owner is
+// pg-am-heap/src/line_pointer.rs:16 (4 bytes, off:15 | flags:2 | len:15;
+// `LP_NORMAL = 1`, the PostgreSQL `LP_NORMAL` value). pg-am-hnsw's M5
+// node pages reuse the same slotted-page discipline but must not depend
+// on pg-am-heap (tech-selection §2), so the layout now lives here for all
+// new consumers. Migrating pg-am-heap itself onto this module is a
+// registered FUTURE refactor — not done in this stage (minimal change).
+// ---------------------------------------------------------------------
+
+/// Line-pointer size in bytes (layout contract).
+pub const LINE_POINTER_SIZE: usize = 4;
+
+/// `LP_NORMAL` — the slot points at a live tuple (PostgreSQL's value).
+pub const LP_NORMAL: u32 = 1;
+
+/// Encode a line pointer: `off:15 | flags(LP_NORMAL):2 | len:15`
+/// (little-endian), i.e.
+/// `(off & 0x7FFF) | (LP_NORMAL << 15) | ((len & 0x7FFF) << 17)`.
+pub fn encode_line_pointer(off: u16, len: u16) -> [u8; 4] {
+    let raw = (u32::from(off) & 0x7FFF) | (LP_NORMAL << 15) | ((u32::from(len) & 0x7FFF) << 17);
+    raw.to_le_bytes()
+}
+
+/// Decode a line pointer, returning `(off, len, is_normal)`.
+pub fn decode_line_pointer(raw: [u8; 4]) -> (u16, u16, bool) {
+    let raw = u32::from_le_bytes(raw);
+    let off = (raw & 0x7FFF) as u16;
+    let len = ((raw >> 17) & 0x7FFF) as u16;
+    (off, len, (raw >> 15) & 0x3 == LP_NORMAL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +222,28 @@ mod tests {
 
         let decoded = PageHeader::read_from(&page);
         assert_eq!(decoded, header);
+    }
+
+    /// Golden pin for the line-pointer layout (2026-09-15 Stage B):
+    /// `encode(8000, 96)` must produce the LE bytes of `0x00C0_9F40` —
+    /// off=8000(0x1F40) | LP_NORMAL<<15 | len=96<<17, the same frozen value
+    /// pg-am-hnsw's apply.rs pins on its side (the pin's purpose is
+    /// cross-crate NON-drift; the formulaic derivation is intentionally NOT
+    /// used as the expectation).
+    #[test]
+    fn line_pointer_layout_golden_pin_and_roundtrip() {
+        let enc = encode_line_pointer(8000, 96);
+        assert_eq!(u32::from_le_bytes(enc), 0x00C0_9F40);
+        assert_eq!(decode_line_pointer(enc), (8000, 96, true));
+        // Non-normal flags decode as is_normal = false.
+        let mut raw = u32::from_le_bytes(enc);
+        raw = (raw & !(0x3 << 15)) | (3 << 15);
+        assert!(!decode_line_pointer(raw.to_le_bytes()).2);
+        // Roundtrip across the full 15-bit ranges.
+        for (off, len) in [(0u16, 0u16), (0x7FFF, 0x7FFF), (32, 8192), (1, 1)] {
+            let (d_off, d_len, normal) = decode_line_pointer(encode_line_pointer(off, len));
+            assert_eq!((d_off, d_len, normal), (off, len, true));
+        }
     }
 
     #[test]

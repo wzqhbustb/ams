@@ -78,6 +78,23 @@ impl MetaView {
     }
 }
 
+/// Page-backed meta → funnel view (2026-09-16, Stage B slice 2 wiring; the
+/// slice-2 archive entry predated the code, adversarial review P3-1 caught
+/// it — this impl is what makes the archive true). The Stage C redo handler
+/// reads [`crate::meta::MetaParams`] off the meta page and enters the funnel
+/// through this conversion — the in-memory shape is unchanged, so the
+/// negative-example matrix is unaffected.
+impl From<&crate::meta::MetaParams> for MetaView {
+    fn from(p: &crate::meta::MetaParams) -> Self {
+        MetaView {
+            dim: p.dim,
+            m: p.m,
+            m_max0: p.m_max0,
+            metric: p.metric,
+        }
+    }
+}
+
 /// §10.1 HnswNodeInit checklist subset: `dim == meta.dim`,
 /// `level <= L_max(meta.m)`, every vector component finite, and — for
 /// Cosine — no zero vector (same funnel as M4's insert entry validation,

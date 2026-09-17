@@ -193,11 +193,33 @@ impl Catalog {
         // value would let the checkpoint inside `force_rebootstrap` persist
         // it into the superblock — poisoning `next_oid` permanently, since
         // this same max() can never go back down.
+        // 2026-09-17, review round 4 P3-2 + round 5 P3-1: relpages OIDs
+        // feed `max_in_use` (round-3 P1 fix) but bypass `validate_content`,
+        // and `oid_of` only rejects negatives. Garbage-huge values are
+        // rejected against the sane ceiling (see `MAX_SANE_OID`) instead of
+        // poisoning `next_oid`: the next checkpoint would persist the
+        // garbage start permanently (the original threat of :190-195), a
+        // start past i64::MAX would brick the next restart's catalog open
+        // (`Oid.0 as i64` goes negative, engine.rs:1370), and
+        // `OidCounter::alloc` wraps silently at u64::MAX
+        // (pg-storage/src/oid.rs:32).
+        check_relpages_oid_bounds(&relpages)?;
         let max_in_use = relations
             .iter()
             .map(|r| r.oid.raw())
             .chain(types.iter().map(|t| t.oid.raw()))
             .chain(access_methods.iter().map(|a| a.oid))
+            // 2026-09-17, Stage B review round 3 P1: the HNSW minimal
+            // registration (engine.rs create_hnsw_index) writes ONLY a
+            // pg_rust_relpages row — the first "OID on a catalog page but
+            // not in pg_class" path in the system. Without this chain the
+            // startup correction is blind to such OIDs: after any restart
+            // without a checkpoint (clean drops included — nothing
+            // auto-checkpoints), next_oid rolls back and re-issues the
+            // same OID to the next HNSW index, making the second index
+            // unreachable by OID (reproduced live: two creates across a
+            // reopen both got Oid(16384)).
+            .chain(relpages.iter().map(|r| r.rel_oid.raw()))
             .max()
             .map(|m| Oid(m.0.saturating_add(1)));
         let start = [Some(engine.next_oid()), max_in_use, Some(Oid::FIRST_USER)]
@@ -559,10 +581,78 @@ fn oid_of(v: i64, table: &str, col: &str) -> Result<Oid> {
         .map_err(|_| CatalogError::Corrupted(format!("{table}.{col}: negative OID value {v}")))
 }
 
+/// Sane upper bound for a catalog OID (2026-09-17, review round 5 P3-1 —
+/// replaces the round-4 Int8-bound guard, which was DEAD on the production
+/// path and let the worst reachable value through). OIDs start at
+/// `Oid::FIRST_USER` = 16384 and every allocation consumes exactly one —
+/// even u32::MAX (~4.3e9, PostgreSQL's own OID width) is unreachable in
+/// practice, so 2^48 ≈ 2.8e14 is beyond any legal value by a wide margin.
+/// The bound must NOT be i64::MAX: `read_relpages` decodes through
+/// `int8_col` (i64) → `oid_of`, so every reachable value is already
+/// ≤ i64::MAX — a guard there rejects only unproducible values while
+/// `i64::MAX` itself (the worst REACHABLE poison) passes: `max_in_use =
+/// i64::MAX` → start = 2^63 → first `alloc` returns Oid(2^63) → the
+/// engine writes `Oid.0 as i64` = i64::MIN (engine.rs:1370) → the next
+/// restart's `oid_of` rejects it and the catalog cannot open.
+const MAX_SANE_OID: u64 = 1 << 48;
+
+/// Reject garbage-huge `pg_rust_relpages.rel_oid` values before they enter
+/// the `next_oid` startup correction (round-3 P1 chained relpages into
+/// `max_in_use`; without this bound the correction itself is a poisoning
+/// channel — the next checkpoint persists whatever start it computes, and
+/// `OidCounter::alloc` wraps silently at u64::MAX). Factored for direct
+/// unit testing. The same exposure on pg_class user rows (extra rows carry
+/// no OID upper bound either) is a pre-existing class, registered but out
+/// of this fix's scope.
+fn check_relpages_oid_bounds(relpages: &[RelpagesRow]) -> Result<()> {
+    for r in relpages {
+        if r.rel_oid.raw().0 > MAX_SANE_OID {
+            return Err(CatalogError::Corrupted(format!(
+                "pg_rust_relpages.rel_oid {} exceeds the sane OID ceiling {MAX_SANE_OID} — corrupt catalog row",
+                r.rel_oid.raw().0
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Widen an `Int8` `pg_rust_relpages` value to a [`PageId`]. Negative values
 /// are corruption — page ids are unsigned.
 fn page_id_of(v: i64, col: &str) -> Result<PageId> {
     u64::try_from(v).map(PageId).map_err(|_| {
         CatalogError::Corrupted(format!("pg_rust_relpages.{col}: negative page id {v}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TableOid;
+    use pg_storage::types::PageId;
+
+    /// 2026-09-17, review round 5 P3-1: the sane-OID ceiling — values above
+    /// 2^48 are definitionally garbage (OIDs start at 16384, one per alloc;
+    /// even u32::MAX is unreachable). i64::MAX MUST be rejected: it is the
+    /// worst REACHABLE poison (Int8 decode caps at i64::MAX) — accepting it
+    /// pushes `next_oid` to 2^63, whose `as i64` write-back is negative and
+    /// bricks the next restart's catalog open. (The round-4 Int8-bound
+    /// guard pinned i64::MAX as Ok — exactly the value that must fail.)
+    #[test]
+    fn relpages_oid_bound_rejects_garbage_huge_values() {
+        let row = |oid: u64| RelpagesRow {
+            rel_oid: TableOid::new(Oid(oid)),
+            first_page: PageId(1),
+            last_page: PageId(1),
+            page_count: 1,
+        };
+        check_relpages_oid_bounds(&[row(16_384)]).unwrap();
+        check_relpages_oid_bounds(&[row(MAX_SANE_OID)]).unwrap();
+        assert!(check_relpages_oid_bounds(&[row(MAX_SANE_OID + 1)]).is_err());
+        // The worst reachable poison must fail (round-4's dead guard
+        // accepted exactly this).
+        let err = check_relpages_oid_bounds(&[row(i64::MAX as u64)]).unwrap_err();
+        assert!(err.to_string().contains("sane OID ceiling"), "{err}");
+        // A garbage row must not hide behind a legal predecessor.
+        assert!(check_relpages_oid_bounds(&[row(16_384), row(u64::MAX)]).is_err());
+    }
 }

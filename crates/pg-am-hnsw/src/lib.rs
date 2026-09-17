@@ -48,18 +48,40 @@
 #[allow(dead_code)]
 pub(crate) mod apply;
 pub mod dataset;
+// Stage B slice 1 (2026-09-15): node-entry and directory-chain format
+// owners. Their consumers (index.rs / open-time chain walk) land in
+// slice 3; today's callers are the primitives and the unit tests — same
+// dead_code discipline as `apply`.
+#[allow(dead_code)]
+pub(crate) mod dir;
+
+/// Stage B slice 3a (2026-09-15): the index lifecycle — creation and open
+/// (tech-selection §10.3). See [`index`].
+pub mod index;
+
+// Stage B slice 2 (2026-09-15): meta-page layout owner. Its consumer
+// (index.rs creation/open protocol) lands in slice 3 — same dead_code
+// discipline as `dir`.
 pub mod distance;
 pub mod encoding;
 pub mod error;
 pub mod graph;
+#[allow(dead_code)]
+pub(crate) mod meta;
+
+// See `dir` above for the Stage B dead_code rationale.
+#[allow(dead_code)]
+pub(crate) mod node;
 pub mod page;
 pub mod params;
 pub mod redo;
 pub mod rng;
 pub mod snapshot;
+
 #[allow(dead_code)]
 pub(crate) mod validate;
 
 pub use error::{HnswError, Result};
-pub use graph::{Hnsw, Metric};
+pub use graph::{Hnsw, Metric, NeighborSelection};
+pub use index::{ExpectedParams, HnswIndex, OpenOutcome};
 pub use params::{HnswParams, NodeId};

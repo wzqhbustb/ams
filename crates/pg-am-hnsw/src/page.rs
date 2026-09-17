@@ -68,7 +68,7 @@ pub const DIR_OFF_NEXT: usize = PAGE_HEADER_SIZE + 16;
 /// 0): the dependency edge's error channel is the new
 /// [`HnswError::Storage`] variant; Stage C (write path) may refine the
 /// mapping, this is the loud baseline.
-fn storage_err(context: &str, e: pg_storage::error::StorageError) -> HnswError {
+pub(crate) fn storage_err(context: &str, e: pg_storage::error::StorageError) -> HnswError {
     HnswError::Storage(format!("{context}: {e}"))
 }
 

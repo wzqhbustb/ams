@@ -34,32 +34,27 @@
 //! buffers by the caller (the redo handler pins the page — 2026-09-14
 //! clarification of the v1.7 "physical page parameter" wording).
 
-use pg_storage::page::PAGE_HEADER_SIZE;
+use pg_storage::page::{
+    decode_line_pointer, encode_line_pointer, LINE_POINTER_SIZE, PAGE_HEADER_SIZE,
+};
 use pg_storage::types::{PageId, PAGE_SIZE};
 
+use crate::dir::DIR_ENTRIES_PER_PAGE;
 use crate::error::{HnswError, Result};
+use crate::meta::{META_OFF_ENTRY_POINT, META_OFF_MAX_LEVEL};
+use crate::node::{
+    level_region_pos, level_region_size, state_offset, NodeGeometry, STATE_LIVE_BIT,
+    STATE_TOMBSTONE_BIT,
+};
 use crate::page::{dir_count, dir_ordinal, DIR_HEADER_SIZE, DIR_OFF_COUNT, DIR_OFF_NEXT};
 
 // ---------------------------------------------------------------------
-// Line-pointer access (re-derived from the slotted-page line-pointer
-// layout, pg-am-heap/src/line_pointer.rs:16 — 4 bytes, off:15 | flags:2 |
-// len:15; `LP_NORMAL = 1`, PostgreSQL's LP_NORMAL value). pg-am-hnsw must
-// NOT depend on pg-am-heap (tech-selection §2), so the layout is
-// re-derived here — same discipline as pg-storage's
-// `MAX_HEAP_CLEANUP_SLOTS` re-derivation (wal/record.rs:298; 2026-09-14
-// review nano: an earlier draft cited record.rs:262-269, stale).
+// Line-pointer access — consumed from pg_storage::page since 2026-09-15
+// (Stage B slice 1 adjudication: the layout moved up to pg-storage as the
+// single source of truth for new consumers; pg-am-hnsw must not depend on
+// pg-am-heap, tech-selection §2). The golden pin in this file's tests
+// keeps freezing the shared byte layout across the crates.
 // ---------------------------------------------------------------------
-
-/// Line-pointer size in bytes (layout contract).
-const LINE_POINTER_SIZE: usize = 4;
-/// `LP_NORMAL` — the slot points at a live tuple.
-const LP_NORMAL: u32 = 1;
-
-/// Directory entries per directory page (§7.1 format constant, derived —
-/// 2026-09-14 review P3-4: not a bare literal, one source with the header
-/// layout constants): `⌊(PAGE_SIZE − 32 PageHeader − 24 dir header) / 10⌋`.
-pub(crate) const DIR_ENTRIES_PER_PAGE: u32 =
-    ((PAGE_SIZE - PAGE_HEADER_SIZE - DIR_HEADER_SIZE) / 10) as u32;
 
 /// Read the line pointer at `slot`; returns `(offset, length)` of the
 /// entry, or `None` when the slot does not exist or is not `LP_NORMAL`.
@@ -91,11 +86,11 @@ fn read_lp(page: &[u8; PAGE_SIZE], slot: u16) -> Option<(u16, u16)> {
     if idx + LINE_POINTER_SIZE > pd_lower {
         return None;
     }
-    let raw = u32::from_le_bytes(page[idx..idx + 4].try_into().unwrap());
-    if (raw >> 15) & 0x3 != LP_NORMAL {
+    let (off, len, is_normal) = decode_line_pointer(page[idx..idx + 4].try_into().unwrap());
+    if !is_normal {
         return None;
     }
-    let (off, len) = ((raw & 0x7FFF) as usize, ((raw >> 17) & 0x7FFF) as usize);
+    let (off, len) = (usize::from(off), usize::from(len));
     if off < pd_upper || off + len > pd_special {
         return None;
     }
@@ -104,8 +99,7 @@ fn read_lp(page: &[u8; PAGE_SIZE], slot: u16) -> Option<(u16, u16)> {
 
 fn write_lp(page: &mut [u8; PAGE_SIZE], slot: u16, off: u16, len: u16) {
     let idx = PAGE_HEADER_SIZE + usize::from(slot) * LINE_POINTER_SIZE;
-    let raw = (u32::from(off) & 0x7FFF) | (LP_NORMAL << 15) | ((u32::from(len) & 0x7FFF) << 17);
-    page[idx..idx + 4].copy_from_slice(&raw.to_le_bytes());
+    page[idx..idx + 4].copy_from_slice(&encode_line_pointer(off, len));
 }
 
 fn pd_lower(page: &[u8; PAGE_SIZE]) -> u16 {
@@ -141,72 +135,6 @@ fn set_pd_upper(page: &mut [u8; PAGE_SIZE], v: u16) {
 // only the first `count` ids are live, the rest stay zero.
 // ```
 // ---------------------------------------------------------------------
-
-const STATE_LIVE_BIT: u8 = 1 << 6;
-const STATE_TOMBSTONE_BIT: u8 = 1 << 7;
-
-/// The fixed-size geometry of a node entry (§7.2): vector dimension plus
-/// the two capacity parameters — grouped because the entry-creating
-/// primitives need all three and the flat triple pushed their arity past
-/// clippy's limit (2026-09-14, Stage A review fix).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NodeGeometry {
-    /// Vector dimension.
-    pub dim: u16,
-    /// Upper-level neighbor capacity.
-    pub m: u16,
-    /// Level-0 neighbor capacity.
-    pub m_max0: u16,
-}
-
-impl NodeGeometry {
-    /// Fixed size of a node entry with `top_level` upper levels (§7.2
-    /// capacity formula).
-    pub(crate) fn entry_size(&self, top_level: u8) -> usize {
-        entry_size(self.dim, self.m, self.m_max0, top_level)
-    }
-}
-
-/// Fixed size of a node entry with `top_level` upper levels (§7.2 capacity
-/// formula): `4·dim + 1 + (2 + 4·m_max0) + top_level·(2 + 4·m)`.
-pub(crate) fn entry_size(dim: u16, m: u16, m_max0: u16, top_level: u8) -> usize {
-    4 * usize::from(dim)
-        + 1
-        + level_region_size(m_max0)
-        + usize::from(top_level) * level_region_size(m)
-}
-
-/// Reserved byte size of one level's neighbor region (`2 + 4·cap`).
-fn level_region_size(cap: u16) -> usize {
-    2 + 4 * usize::from(cap)
-}
-
-/// Byte offset of `level`'s neighbor region inside an entry.
-fn level_offset(dim: u16, m: u16, m_max0: u16, level: u8) -> usize {
-    debug_assert!(
-        level >= 1,
-        "level_offset is for upper levels; level 0 uses the base"
-    );
-    4 * usize::from(dim)
-        + 1
-        + level_region_size(m_max0)
-        + usize::from(level - 1) * level_region_size(m)
-}
-
-const fn level_base_offset(dim: u16) -> usize {
-    4 * dim as usize + 1
-}
-
-/// `(region offset, capacity)` of `level`'s neighbor region inside an
-/// entry (2026-09-15, round 3 P3 — single source, shared by
-/// `set_neighbors` and the read side).
-fn level_region_pos(geo: NodeGeometry, level: u8) -> (usize, u16) {
-    if level == 0 {
-        (level_base_offset(geo.dim), geo.m_max0)
-    } else {
-        (level_offset(geo.dim, geo.m, geo.m_max0, level), geo.m)
-    }
-}
 
 /// The level's reserved region inside `entry`, geometry-checked
 /// (2026-09-14, review P2-2): the (dim, level) geometry must fit the
@@ -277,10 +205,6 @@ fn entry_at_mut<'a>(page: &'a mut [u8; PAGE_SIZE], slot: u16, what: &str) -> Res
         ))
     })?;
     Ok(&mut page[usize::from(off)..usize::from(off) + usize::from(len)])
-}
-
-fn state_offset(dim: u16) -> usize {
-    4 * usize::from(dim)
 }
 
 /// The entry's state byte, bounds-checked (2026-09-14, Stage A review
@@ -603,17 +527,6 @@ pub(crate) fn set_neighbors(
     }
     Ok(())
 }
-
-/// Meta-page field offsets (2026-09-14, Stage A — the FULL meta layout is
-/// Stage B's deliverable; these two positions are frozen now and Stage B
-/// extends the layout around them, format-constant discipline of §7.1).
-/// Layout contract (review P3-2): the meta page is the 32-byte PageHeader
-/// plus a RAW field area — the line-pointer array is NEVER used on it
-/// (offset 32 would otherwise alias LP[0]; tech-selection §6's "slotted
-/// page" wording refers to the shared header only).
-pub(crate) const META_OFF_ENTRY_POINT: usize = PAGE_HEADER_SIZE;
-/// See [`META_OFF_ENTRY_POINT`].
-pub(crate) const META_OFF_MAX_LEVEL: usize = PAGE_HEADER_SIZE + 4;
 
 /// §8.1 step 7: write the meta page's entry-point / max-level post-image.
 pub(crate) fn apply_meta(meta_page: &mut [u8; PAGE_SIZE], entry_point: u32, max_level: u8) {
@@ -1111,11 +1024,16 @@ mod tests {
 
     #[test]
     fn line_pointer_layout_golden_pin() {
-        // Adjudication ②: pg-am-hnsw must not depend on pg-am-heap (§2),
-        // so the LP layout is re-derived — this golden pin freezes the
-        // shared bit layout (off:15 | flags:2 | len:15, LP_NORMAL = 1)
-        // without a cross-crate dependency. Computed from
-        // pg-am-heap/src/line_pointer.rs:5-9.
+        // 2026-09-15 Stage B slice 1: the LP layout's single source of
+        // truth is now pg-storage's `page` module — this pin freezes the
+        // shared byte layout ACROSS the crates (off:15 | flags:2 |
+        // len:15, LP_NORMAL = 1); a drift on either side turns red here.
+        // The formulaic derivation is intentionally NOT used as the
+        // expectation (a broken implementation would drift in lockstep).
+        assert_eq!(
+            u32::from_le_bytes(encode_line_pointer(8000, 96)),
+            0x00C0_9F40
+        );
         let mut page = node_page();
         let off = 8000u16;
         let len = 96u16;

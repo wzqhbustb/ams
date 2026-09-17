@@ -12,8 +12,16 @@ use pg_storage::recovery::RedoHandler;
 
 /// All HNSW redo handlers (Stage 0: none yet — Stage C fills the seven
 /// bodies). An HNSW record replayed before Stage C therefore fails as
-/// unknown/unhandled, which is the intended loud behavior: no M5 data
-/// exists yet.
+/// unknown/unhandled, which is loud BY DESIGN — but the original premise
+/// "no M5 data exists yet" no longer holds (2026-09-16, mainline Stage B
+/// review round 2 P2-1): Stage B's open-time meta repair CAN write an
+/// `HnswMetaUpdate` (123) into a live directory's WAL. Consequence,
+/// registered as the Stage B interim limitation: once a repair has fired,
+/// an engine reopen WITHOUT an intervening checkpoint hard-fails redo on
+/// the handlerless 123 record (`UnknownRecord`) — fail-loud, never data
+/// loss (the directory opens again as soon as Stage C's handlers land,
+/// and a checkpoint after the repair moves the record out of the replay
+/// window). Stage C's first task closes this.
 pub fn hnsw_redo_handlers() -> Vec<Box<dyn RedoHandler>> {
     Vec::new()
 }

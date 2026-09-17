@@ -66,6 +66,34 @@ impl Metric {
             Metric::InnerProduct => distance::negative_inner_product(a, b),
         }
     }
+
+    /// On-disk discriminant (0=L2, 1=Cosine, 2=InnerProduct) — the metric's
+    /// FIRST persistence (2026-09-15, M5 Stage B slice 2): the M4 snapshot
+    /// deliberately carries no metric (§3; a snapshot stores geometry only),
+    /// but the page-resident graph must be self-describing — tech-selection
+    /// §6 stores it on the meta page so a load/replay mismatch fails loudly
+    /// instead of silently changing distance semantics.
+    pub fn discriminant(self) -> u8 {
+        match self {
+            Metric::L2 => 0,
+            Metric::Cosine => 1,
+            Metric::InnerProduct => 2,
+        }
+    }
+
+    /// Inverse of [`Metric::discriminant`]; unknown values are loud
+    /// `Corrupted` (on-disk discriminants are a format, never silently
+    /// defaulted).
+    pub fn from_discriminant(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(Metric::L2),
+            1 => Ok(Metric::Cosine),
+            2 => Ok(Metric::InnerProduct),
+            _ => Err(crate::error::HnswError::Corrupted(format!(
+                "unknown metric discriminant {v} in the meta page"
+            ))),
+        }
+    }
 }
 
 /// Neighbor-selection mode (§4.3 A/B control). `Heuristic` is the frozen
@@ -90,6 +118,34 @@ pub enum NeighborSelection {
     /// Paper Algorithm 3: take the `limit` nearest candidates by
     /// `(distance, NodeId ascending)`. Control group only.
     Simple,
+}
+
+#[doc(hidden)]
+impl NeighborSelection {
+    /// On-disk discriminant (0=Heuristic, 1=Simple) — first persistence
+    /// (2026-09-15, M5 Stage B slice 2, same rationale as
+    /// [`Metric::discriminant`]: the §3 snapshot never carries the selection
+    /// mode, but the page-resident graph must be self-describing or a
+    /// Simple-built graph would silently continue with Heuristic on
+    /// continuation-insert (tech-selection §6 residual).
+    pub fn discriminant(self) -> u8 {
+        match self {
+            NeighborSelection::Heuristic => 0,
+            NeighborSelection::Simple => 1,
+        }
+    }
+
+    /// Inverse of [`NeighborSelection::discriminant`]; unknown values are
+    /// loud `Corrupted`.
+    pub fn from_discriminant(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(NeighborSelection::Heuristic),
+            1 => Ok(NeighborSelection::Simple),
+            _ => Err(crate::error::HnswError::Corrupted(format!(
+                "unknown neighbor-selection discriminant {v} in the meta page"
+            ))),
+        }
+    }
 }
 
 /// Heap element: a candidate or kept result keyed by `(distance, NodeId

@@ -1316,6 +1316,121 @@ impl Engine {
         Ok(index_oid)
     }
 
+    /// Create an HNSW vector index and register its meta page in
+    /// `pg_rust_relpages` (Phase 2 M5 Stage B slice 3b, tech-selection
+    /// §10.3 step 3 — the engine-side MINIMAL registration).
+    ///
+    /// Sequence (creation is a utility operation, §8.1 — no transactional
+    /// DML): `pg_am_hnsw`'s create protocol allocates the directory-chain
+    /// head and the meta page (each made durable by its own post-image FPI,
+    /// the A1 contract), then ONE `pg_rust_relpages` row `(oid, meta_page,
+    /// meta_page, 1)` is written through the heap AM inside an auto-commit
+    /// — the exact same write path as the B+Tree index registration
+    /// (`create_index_catalog_rows`), WAL-logged and redo-recoverable.
+    ///
+    /// **Minimal-registration scope** (§10.3's range reconciliation): only
+    /// the `pg_rust_relpages` row. No `pg_class` / `pg_attribute` /
+    /// `pg_index` rows — M5 has no SQL surface, and the lone row is
+    /// harmless: the registry rebuild iterates `pg_class` / `pg_index`
+    /// rows and joins OUT to `pg_rust_relpages`, so it never encounters a
+    /// relpages row that has no catalog companion (2026-09-16 review nano
+    /// — result equivalent to "skipped", mechanism stated precisely). The
+    /// SQL/DDL user surface is Phase 4's deliverable.
+    ///
+    /// **Crash windows** (§10.3): a crash between the pg-am-hnsw create and
+    /// the catalog row leaves orphan directory/meta pages (accounted, M6
+    /// cleanup; creation is a utility operation — fail and recreate). A
+    /// crash after the row is durable has the full registration: redo
+    /// replays the heap-AM catalog write and `hnsw_index_first_page`
+    /// locates the index again.
+    ///
+    /// Returns `(index_oid, meta_page_id)`.
+    pub fn create_hnsw_index(
+        &self,
+        params: pg_am_hnsw::HnswParams,
+        dim: u16,
+        metric: pg_am_hnsw::Metric,
+        selection: pg_am_hnsw::NeighborSelection,
+        rng_seed: u64,
+    ) -> Result<(Oid, PageId)> {
+        let _ddl = self.ddl_lock.lock();
+        let index = pg_am_hnsw::index::create(
+            self.storage.buffer_pool(),
+            self.storage.wal_writer(),
+            params,
+            dim,
+            metric,
+            selection,
+            rng_seed,
+        )?;
+        let meta_page_id = index.meta_page_id();
+        let index_oid = self.catalog.oid_allocator().alloc();
+        self.auto_commit(|snap| {
+            let relpages_row = vec![
+                Some(Datum::Int8(index_oid.0 as i64)),
+                Some(Datum::Int8(meta_page_id.0 as i64)),
+                Some(Datum::Int8(meta_page_id.0 as i64)),
+                Some(Datum::Int8(1)),
+            ];
+            self.insert_catalog_row(snap, &PG_RELPAGES, &relpages_row)
+        })?;
+        Ok((index_oid, meta_page_id))
+    }
+
+    /// Look up an HNSW index's meta page by its catalog OID (the
+    /// `pg_rust_relpages.first_page` of the minimal registration). Returns
+    /// `Ok(None)` when no such row exists. The lookup SCANS `pg_rust_relpages`
+    /// through the heap AM (same read path the registry rebuild uses at
+    /// :910) — the in-memory `Catalog` is loaded once at open and does not
+    /// observe rows written since (2026-09-16: the first cut of this
+    /// function used the cache and returned `None` right after
+    /// `create_hnsw_index`; the heap scan is always fresh).
+    pub fn hnsw_index_first_page(&self, oid: Oid) -> Result<Option<PageId>> {
+        let columns = PG_RELPAGES.column_types();
+        let rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_RELPAGES.oid.raw(),
+                first_page: PG_RELPAGES.first_page,
+                columns: &columns,
+            },
+            snapshot: &Snapshot::everything(),
+            clog: self.clog.as_ref(),
+        })?;
+        for (_tid, values) in rows {
+            let Some(Datum::Int8(rel_oid)) = &values[0] else {
+                continue;
+            };
+            if *rel_oid as u64 == oid.0 {
+                let Some(Datum::Int8(first_page)) = &values[1] else {
+                    return Err(EngineError::Corrupted(
+                        "pg_rust_relpages row with non-int8 first_page".to_string(),
+                    ));
+                };
+                return Ok(Some(PageId(*first_page as u64)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Open an HNSW index by its meta page (thin wrapper over the
+    /// pg-am-hnsw open protocol, tech-selection §10.3): structural meta
+    /// validation, expectation check, directory-chain walk with open-time
+    /// repair, and rng skip-ahead. Warnings (currently the
+    /// ef_search_default performance-knob mismatch, v1.4 nano) are passed
+    /// through in [`pg_am_hnsw::OpenOutcome::warnings`].
+    pub fn open_hnsw_index(
+        &self,
+        first_page: PageId,
+        expected: &pg_am_hnsw::ExpectedParams,
+    ) -> Result<pg_am_hnsw::OpenOutcome> {
+        Ok(pg_am_hnsw::index::open(
+            self.storage.buffer_pool(),
+            self.storage.wal_writer(),
+            first_page,
+            expected,
+        )?)
+    }
+
     /// The catalog-writing half of `create_index`, inside transaction `snap`.
     fn create_index_catalog_rows(
         &self,
