@@ -143,7 +143,8 @@ pub(crate) fn validate_node_init(
 /// (caller supplies both, mirroring the payload), `count <= level capacity`,
 /// `level <= entry top level`, strictly ascending, no duplicates, no
 /// self-loop against the owner (v1.12 — the owner node_id is the judgment
-/// basis).
+/// basis), no INVALID (u32::MAX) endpoint (2026-09-18 round 3 P3-1 —
+/// mirrors the constructor; redo decodes raw WAL bytes).
 pub(crate) fn validate_set_neighbors(
     meta: &MetaView,
     owner_node_id: u32,
@@ -179,6 +180,15 @@ pub(crate) fn validate_set_neighbors(
         return Err(HnswError::InvalidArgument(format!(
             "SetNeighbors self-loop: owner node_id {owner_node_id} is its own neighbor"
         )));
+    }
+    // 2026-09-18, review round 3 P3-1: mirror the constructor's INVALID
+    // endpoint rejection (record.rs hnsw_set_neighbors) — redo decodes raw
+    // WAL bytes, so without this a corrupt record would write
+    // NodeId::INVALID into a neighbor list verbatim.
+    if content.contains(&u32::MAX) {
+        return Err(HnswError::InvalidArgument(
+            "SetNeighbors neighbor = u32::MAX (NodeId::INVALID is not a real endpoint)".to_string(),
+        ));
     }
     Ok(())
 }
@@ -268,6 +278,12 @@ mod tests {
         assert!(validate_set_neighbors(&m, 7, 0, 2, &[5, 1], 0).is_err());
         assert!(validate_set_neighbors(&m, 7, 0, 2, &[5, 5], 0).is_err());
         assert!(validate_set_neighbors(&m, 7, 0, 2, &[1, 7], 0).is_err());
+        // 2026-09-18, review round 3 P3-1: INVALID endpoint (mirrors the
+        // constructor; redo decodes raw bytes). [1, u32::MAX] is otherwise
+        // legal: ascending, in capacity, no self-loop — only the INVALID
+        // check can fire.
+        let err = validate_set_neighbors(&m, 7, 0, 2, &[1, u32::MAX], 0).unwrap_err();
+        assert!(err.to_string().contains("u32::MAX"), "{err}");
     }
 
     #[test]

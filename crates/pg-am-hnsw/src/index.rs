@@ -455,9 +455,9 @@ mod tests {
             // plus a pd_lsn stamp at that record's LSN. Without the stamp,
             // the pin_mut pre-image FPI would replay over the unlogged
             // content and wipe the residue (pd_lsn is only advanced by WAL
-            // records). Logical-record replay of 121–127 needs the Stage C
-            // handlers, which this slice deliberately does not implement —
-            // the image form is the honest checkpoint-level surrogate.
+            // records). Logical-record replay of 121–127 now exists (Stage
+            // C slice 1, redo.rs); the image form keeps this Stage B test
+            // independent of the handler wiring it predates.
             let slot = {
                 let mut guard = engine.buffer_pool().pin_mut(node_page_id).unwrap();
                 let page = page_mut(&mut guard);
@@ -535,13 +535,10 @@ mod tests {
         assert_eq!(meta_bytes_before, meta_bytes_after);
 
         // The repair is WAL-RECORDED: scan the WAL for the HnswMetaUpdate
-        // record carrying entry_point = 0 / max_level = 3. (An engine
-        // reopen would be the stronger durability proof, but replaying
-        // discriminant 123 needs the Stage C redo handlers, which this
-        // slice deliberately does not implement — the WAL fsync above plus
-        // this record's presence is the Stage B-level durability claim;
-        // engine-reopen replay of 121–127 is registered as a Stage C test
-        // dependency in stage_spec.)
+        // record carrying entry_point = 0 / max_level = 3. The WAL fsync
+        // above plus this record's presence is the durability claim;
+        // engine-reopen replay of 121–127 (the stronger end-to-end proof)
+        // is pinned by Stage C slice 1's `redo::tests::reopen_replays_hnsw_records`.
         engine.wal_writer().flush().unwrap();
         let wal_dir = dir.join("wal");
         let mut reader =

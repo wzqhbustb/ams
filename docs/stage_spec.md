@@ -1321,11 +1321,58 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 
 ### 已知残留
 
-- **重开限制（二轮 P2-1,Stage C 第一个任务闭合）**:open 修复触发（写入 HnswMetaUpdate 123)后、Stage C handler 落地前，**无 checkpoint 的引擎重开以 `UnknownRecord` 硬失败**(redo.rs 空骨架 + RedoRegistry 无 handler 硬错误）——fail-loud 非数据损坏：checkpoint 后记录移出重放窗口、Stage C handler 落地后同一记录正常重放，两条路都自愈。我们自己的测试均不踩此窗（repair 测试刻意不重开、引擎级测试图空不触发修复）;redo.rs 注释前提已从"no M5 data exists yet"更正为本条口径
-- **121–127 逻辑记录的引擎重开重放验证**:归 Stage C(redo handler 落地后)——Stage B 的残态测试以 FPI 镜像形式构造,durability 声明为 WAL 记录存在性级(stage_spec slice 3a 交付项 6 立文)
+- **重开限制（二轮 P2-1,Stage C 第一个任务闭合）**:open 修复触发（写入 HnswMetaUpdate 123)后、Stage C handler 落地前，**无 checkpoint 的引擎重开以 `UnknownRecord` 硬失败**(redo.rs 空骨架 + RedoRegistry 无 handler 硬错误）——fail-loud 非数据损坏：checkpoint 后记录移出重放窗口、Stage C handler 落地后同一记录正常重放，两条路都自愈。我们自己的测试均不踩此窗（repair 测试刻意不重开、引擎级测试图空不触发修复）;redo.rs 注释前提已从"no M5 data exists yet"更正为本条口径。**已闭合（2026-09-18,Stage C slice 1)**:七 handler 落地，`redo::tests::reopen_replays_hnsw_records` 引擎重开重放 121–127 转正（五记录 insert 序列、无 checkpoint crash-重开、三页语义状态逐字段断言）。**层口径（2026-09-18 四轮 nano 3 精度修订）**：该测试为 **StorageEngine 层**(pg-storage crate)——其 handler 集与 Engine::open 注册链同为 `hnsw_redo_handlers()`，闭合成立；**pg-engine 层**经公共 API 的 reopen-with-HNSW-records 测试归 slice 3 顺手补（Stage C 四轮回流段登记）
+- **121–127 逻辑记录的引擎重开重放验证**:**已闭合（2026-09-18,Stage C slice 1)**——`reopen_replays_hnsw_records` + `replay_prefix_is_deterministic` 转正；Stage B 残态测试的 FPI 镜像构造法保留（与 handler 接线解耦，index.rs 测试注释同步）
 - **pg-am-heap 的 line_pointer.rs 统一迁移**:单一真源已立(pg-storage::page),heap 侧属主角色未动——登记为未来重构,非本阶段范围
 - **`set_hwm`/`set_entry_point` 的 #[expect(dead_code)]**:Stage C 写入路径接入时移除
 - **check_dir_chain 的 sanity 上限 2^32 页**:任意值护栏,真实库远低于此;更大规模的链尾定位优化(checkpoint 后从页分配器高水位反推)登记为开工期实测点(§7.1 v1.2,不硬编);**hwm > u32::MAX 的 NodeId 空间护栏已立**(二轮 P3-1,check_hwm_node_id_space)
 - **lib.rs 的 node/dir/meta 的 #[allow(dead_code)] 挂出**:随 Stage C 真实调用点逐个移除(apply/validate 同纪律)
 - **open 修复路径的 dir_head 二次 fetch**(index.rs:261 区域,check_dir_chain 已取过一次):buffer pool 命中成本可忽略——Stage C 顺手消除,无需单独动作(二轮 nano,用户终审确认)
 
+
+## Stage C(M5):WAL 记录 + redo handler ×7 + 正常写入路径 + 页驻查询
+
+**状态**:🚧 进行中——slice 1(redo handler ×7)✅ 完成（2026-09-18 落码 + 主线验收 + agent-23 对抗审查 + 主线二轮 + 用户终审四轮，全部清零）;slice 2–4（算法核心泛型化 / insert 写入路径 / 页驻 search）未开工。pg-am-hnsw lib **137 绿**、全套件 **191 绿**、pg-storage lib **209 绿**、pg-engine 全量绿、workspace check 绿、clippy -D warnings / fmt / doc 全绿；未 commit——等用户终审确认，message 前缀 `PHASE2-M5-StageC`
+
+### slice 1 交付内容（redo handler ×7,2026-09-18)
+
+1. **七 handler 本体**(redo.rs,Stage 0 空骨架填入）:三段式——bounded decode(124/127 走 flags 版本半字节）→ pin_mut + 页型检查 + pd_lsn 守卫（已应用即跳过不重验，FPI 前提立文）→ funnel 校验 → 原语应用 → stamp `max(current, record.lsn)`。无状态化（仅 RedoContext.buffer_pool + page_allocator,None 硬失败为纵深防御，Stage I 阶段序前提）;Engine::open 注册链 Stage 0 已接线（engine.rs:693),handler 本体落地即自动生效
+2. **重开限制闭合**(Stage B 已知残留首条）:`reopen_replays_hnsw_records`——五记录 insert 序列（NodeInit/DirAppend/SetNeighbors/MetaUpdate/PublishLive)WAL-only 落盘、无 checkpoint crash-重开，目录/节点/meta 三页语义状态逐字段断言；此前同场景以 UnknownRecord 硬失败
+3. **幂等与确定性**:`handlers_replay_idempotently_n3`（七类型各 N=3 应用，页字节逐轮全等）、`replay_prefix_is_deterministic`(3/5 记录前缀两独立目录字节全等，§4.2 前缀确定性）
+4. **handler 级负例矩阵** `handlers_reject_bad_records_without_mutating`（主线验收补，7 枚）：每 handler 一条构造器可达的坏记录（121 dim 错配 / 122 count 33 超 m_max0=32 容量 / 123 max_level 14 > l_max(16)=13 / 124 dim 前置门 / 125 目标空槽 / 126 重复链接 / 127 dim 前置门）,**页面字节不变**钉死"拒绝先于变更"；构造器已拒类（乱序/重复/自环/越 63 层/INVALID id）由 pg-storage 记录测试承接不重复
+5. **可求值性界线注释钉死**(redo.rs 模块级）：链导出 HWM / entry_point < HWM / PublishLive 目录一致性 / SetNeighbors owner 目录一致性四项不进 redo 路径，归 Stage D §11.3 审计——改线 = 协议修订
+
+### slice 1 主线验收回流（2026-09-18，三项补码 + 一项口径明确）
+
+- **MetaUpdate redo 侧补 l_max(m) 语义界**：六轮 P3 只修了 read_meta 与 open-repair 两个写入方，redo 是第三写入方——坏 WAL 的 MetaUpdate(max_level ∈ (l_max, 63]，构造器合法）会经 handler 写坏 meta 页。m 冻结在记录自指的 meta 页上，检查可求值（handler 内 read_meta 复跑结构校验 + l_max 比较）；选型 §10.1 MetaUpdate 项同步：max_level == 入口点 top_level(v1.8 弱化口径）明确**归审计**（目录解析依赖，v1.10 约束）,l_max(m) 界 redo 强制——v1.32
+- **DirLink ordinal+1 改 checked_add**:dir_ordinal 是 u64,bit-rot 头携 u64::MAX 时 `+1` 在 debug panic（违反损坏输入不 panic 纪律）——改 checked_add 响亮 MetadataCorrupted
+- **slot_is_occupied 文档精度**(apply.rs)：占用证明实际覆盖 tombstoned 条目（LP_NORMAL 不含状态位）——注释更正为"{INITIALIZING, LIVE} 集合断言的最强可求值形态，合法流 LSN 序使 DirAppend 不会晚于同条目 Tombstone 重放，两口径等价"
+- **agent-21 第六次超时处置**：代码+测试完整且全绿，文档缺口（本节与两份 changelog）由主线补齐——教训沿用：派活已写防超时纪律，超时仍发生在文档阶段，主线验收必须包含文档面复核
+
+### slice 1 对抗审查一轮回流（2026-09-18,agent-23 verdict **PASS 附条件** → 条件项修复清零）
+
+- **P2-1(DirAppend/DirLink 同页双 pin 死锁，实证）**:handler 持 pin_mut 写守卫时再 pin 目标页，腐坏记录 `target_page == dir_tail_page`（或 `next_page == old_tail_page`）使非重入 RwLock 同线程读-pin 永不返回（探针 5s 挂起确认）——恢复路径"挂起且零诊断"的最坏失败形态，负例矩阵抓不到（测试进程会挂死）。且 redo 读原始字节、构造器校验不覆盖该路径。修复：两 handler 在第二次 pin 前各加一行不等判断（→ MetadataCorrupted;DirAppend 的同页等式定义性腐坏——一页不可能同为 DIR 与 NODE)，负例矩阵补两枚（DirLink 自链因构造器已拒，测试用合法记录换 payload 字节构造，两枚单字节 varint 前提注释立文、漂移则 fragment 断言响亮失败）。**commit 前条件就此闭合**
+- **P3-1(DirAppend node_id ↔（页 ordinal, count）一致性）**:**核实为已覆盖**——apply::dir_append 五轮起即有 node_id 键控机制：page_base = ordinal × 813(checked_mul)、hwm = page_base + count(checked_add)、id < page_base 响亮 / id < hwm 幂等逐字节比对 / id > hwm 间隙响亮（apply.rs:443-489)。清单条目"追加位置精确"的真实语义由原语承载，无需 handler 重复（层次明文：校验不双写）
+- **P3-2(MetaUpdate 缺同记录自洽 INVALID ⟺ max_level==0)**：构造器拒（record.rs:1453）但 redo 走 decode 原始字节——修复落在 **decode 侧**(`HnswMetaUpdateRecord::decode` 补同记录域规则，codec 对称纪律：decode 必须拒绝构造器拒绝的，M4 快照 codec 同型）,pg-storage 测试双钉（构造非法 payload 经 bincode 编码 → decode 拒；合法空图对仍过）。handler 零改动继承防护
+- **外溢登记（非本 stage 范围）**:pg-am-btree SplitCopy(redo.rs:218/224,left/right 双 pin_mut 同持）有同型潜在死锁面（腐坏记录 left==right)——建议归 Phase 7a 加固清单或另立小修，本 stage 不动
+- **探查为净登记（下轮勿重复）**:FPI 交错收敛正确（镜像含先序内容 + pd_lsn max 戳，recovery.rs:385-388);冻结清单逐类型在码且无越线（grep 级无链遍历）；异页 pin 顺序无锁序问题；apply_node_at 的 FPI/NodeInit 交错幂等收敛正确；负例矩阵均为承重断言；文档（stage_spec/coding-plan v1.31/lib.rs/engine.rs 注释）与代码逐条相符
+
+### slice 1 主线复核二轮回流（2026-09-18,1 P2 属实修复；以 agent-23 P2-1 为模板外推同类面）
+
+- **P2(meta_view 同页死锁——P2-1 的同类面，四个 handler)**:agent-23 修掉了 DirAppend/DirLink 的第二 pin，但**四个读 meta 的 handler(121/122/124/127）有同型面**:pin_mut（目标页）持写守卫 → `meta_view` 对 meta_page_id 读-pin——腐坏记录令 meta_page_id == page_id（构造器只拒 INVALID，不管相等）即同形态死锁。修复：新增 `require_distinct_meta` 守卫立于四 handler 的 meta_view 调用前（meta 页永不为节点页，相等即定义性腐坏）；负例矩阵补 4 枚（构造器合法路径直达，fragment "both meta and node" 钉死走新守卫）。教训登记：**死锁类修复必须外推全部二次 pin 点**（grep `pool.pin(` 全清单核对）——点修会漏同型面；本轮同时确认六个 pin 点全部有守卫或不构成二次 pin(MetaUpdate 复用已持页、无二次 pin)
+- **探查为净（本轮新增，下轮勿重复）**:require_type 逆方向（记录指向异类页）在首个 pin_mut 后即响亮；pin/pin_mut(PageId::INVALID) 由 buffer_pool 拒；未分配页 pin 读零页、页型 0 响亮；124/127 flags 版本门在 decode 先于一切；already_applied 跳过语义对腐坏记录一致（pd_lsn 更高的页状态蕴含后序记录存在）
+- 验证：pg-am-hnsw lib **137 绿**（矩阵内 13 case)、pg-storage lib 209 绿、clippy/fmt/doc 绿；coding-plan v1.33、tech-selection v1.34 同步
+
+### slice 1 用户终审三轮回流（2026-09-18,2 P3 + 1 连带，逐条核实属实并修复）
+
+- **P3-1(validate_set_neighbors 缺 u32::MAX 邻居拒绝）**：构造器拒（record.rs:1396）但 funnel 未镜像——redo 读原始字节不经构造器，脏记录会把 INVALID 端点原样写进邻接表。修复：funnel 自环检查旁补一行拒绝；测试补 `[1, u32::MAX]` 负例（其余维度全合法，仅该项可触发，fragment "u32::MAX" 钉死）。选型 §10.1 SetNeighbors 项同步登记（v1.35)
+- **P3-2(DirLinkRedo 缺"旧尾页已满"检查）**：脏的"未满尾页链接"会被 redo 应用，造出过不了 check_dir_chain 断言 2（中间页恰满）的非法链。同页可求值（count 在已钉住的页上），修复立于 redo(handler 内自链检查后、pin 新页前）;**§10.1 DirLink 冻结清单第四项新增——协议修订登记（v1.35)**；负例矩阵补第 14 枚（未满尾页链接，fragment "tail is full")
+- **连带测试重构（方案 b，用户裁定）**：两条在未满尾页上构造 DirLink 的测试（idempotency 的 dir_head count=1、负例矩阵的 count=0）改手工钉满页头（`DIR_OFF_COUNT = 813`，头部字段脚手架，被测逻辑不触）;idempotency 测试的填充点立于 DirAppend 记录应用之后、DirLink 之前（顺序敏感，注释立文）
+- 验证：pg-am-hnsw lib **137 绿**（负例矩阵 14 case、validate +1 断言）、fmt/clippy/doc 绿
+
+### slice 1 用户终审四轮回流（2026-09-18,nano ×3,无 P1/P2/P3——逐条核实属实并处置）
+
+- **nano 1（负例矩阵两条分支无独立覆盖，已补钉）**:124 的 LIVE 要求与 127 的存在性证明此前被 dim 前置门掩码——矩阵中 124/127 仅各一枚 dim 错配负例，正确 dim 下两条分支永不触发。补两枚"正确 dim"负例：124 对 INITIALIZING 条目（slot 0,good NodeInit 在本测试中从未发布）→ fragment "not LIVE";127 对空 slot 7(125 负例被拒后保持空）→ fragment "not a live entry"(entry_top_level 的响亮读）。两枚均钉死"拒绝先于变更"（页面字节不变）。矩阵 14 → 16 case，测试数不变（同一测试函数内子例）
+- **nano 2(Tombstone→LIVE 协议冻结的 M6 含义，M6 规划登记一行）**：选型 §10.1 冻结清单要求 HnswNodeTombstone 目标条目**存在且 LIVE**——redo 层拒绝对 INITIALIZING 条目盖墓碑。**交接登记（M6 开工前裁决）**：若 M6 需回收崩溃遗留的 INITIALIZING 孤条目（insert 崩在 NodeInit 与 PublishLive 之间的残态），现行协议下 redo 会拒绝该 Tombstone——届时须走**协议修订**（冻结清单改线，changelog 登记）或**新记录类型**，勿撞线后补票。**同条并案登记（2026-09-20 五轮 nano)**:PublishLive 的存在性证明（redo.rs `entry_top_level`，物理占用）同样接受 tombstoned 条目，`publish_live` 为纯位 OR 无状态前置——严格读冻结清单"state ∈ {INITIALIZING, LIVE}"（选型 §10.1)则 tombstoned 不在集合内；但合法 WAL 流不可达（Tombstone redo 前置要求 LIVE、写路径 127 于 §8.1 步骤 8 一次性发出且先于任何 124)、`apply_tombstone` 只 OR bit 7 不清 bit 6(LIVE+tombstoned 条目 `entry_is_live` 恒真，"已 LIVE"幂等判定本就覆盖）、M5 明文"只重放不生效语义"（选型 §10.1 Tombstone 项）——**不改代码**（加检查 = 新增冻结清单项 = 协议修订，越过冻结边界）,M6 收紧 Tombstone/PublishLive 口径时并案裁决
+- **nano 3("引擎重开"措辞精度 + slice 3 测试登记）**:v1.31 闭合的 `reopen_replays_hnsw_records` 是 **StorageEngine 层**(pg-storage crate)——测试用 handler 集与 Engine::open 注册链同为 `hnsw_redo_handlers()`，闭合成立（Stage B 残留条已加层口径注）。**pg-engine 层**（公共 API create/insert → 重开）的 reopen-with-HNSW-records 测试须等 slice 3 的 insert 写入路径落地才能经公共 API 构造——**slice 3 顺手补一枚，此条即登记**
+- 验证：pg-am-hnsw lib **137 绿**（负例矩阵 16 case)、fmt/clippy/doc 绿；coding-plan v1.35 同步

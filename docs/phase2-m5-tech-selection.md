@@ -714,7 +714,9 @@ CheckpointEnd v2 与 superblock redo 点（pg-storage/src/superblock.rs:79)。
     m_max0，上层 → m，经 meta 分解——v1.8 P3-2：条目自描述反解不出，
     payload 必带 meta_page_id);level ≤ 目标条目 top_level；邻居列表升序、
     无重复、无自环（判定基准 = payload 的 **owner node_id**,v1.12——此前
-    payload/原语/条目布局均无 owner，此项不可实现）;("每个被引 id < 链导出
+    payload/原语/条目布局均无 owner，此项不可实现）;**无 INVALID
+    (u32::MAX）端点**(v1.35 审查三轮 P3-1——镜像构造器拒绝，redo 读原始
+    字节不经构造器，funnel 必须同拒）;("每个被引 id < 链导出
     HWM"降级到 §11.3 审计——
     redo 期 LSN 序已蕴含：同 insert 内步骤 4 在 5 前，旧节点更早；v1.10
     可求值性约束）;("owner node_id 与 (page,slot) 的目录映射一致"降级到
@@ -728,10 +730,16 @@ CheckpointEnd v2 与 superblock redo 点（pg-storage/src/superblock.rs:79)。
     断言取值集合，不可断言单值——这是 pd_lsn 单页守卫之外的第二
     条跨页纪律）;
   - **HnswDirLink**：旧尾页 next == INVALID（未链接）;next 指向已分配页；
-    新页 ordinal == 旧页 ordinal + 1;
-  - **HnswMetaUpdate**:max_level == 入口点节点
-    的 top_level（弱化口径，v1.8);("entry_point < 链导出 HWM"降级到
-    §11.3 审计，v1.10 可求值性约束）;
+    新页 ordinal == 旧页 ordinal + 1;**旧尾页 count == DIR_ENTRIES_PER_PAGE
+    (满页才链接，v1.35 Stage C 审查三轮 P3-2**——同页可求值；未满链接会
+    造出过不了链断言 2（中间页恰满）的非法链）;
+  - **HnswMetaUpdate**:max_level ≤ l_max(m)(redo **可求值**——m 冻结在
+    该记录自指的 meta 页上，无需目录解析；v1.32 Stage C slice 1 落地，
+    与 read_meta/open-repair 同一语义界）;max_level == 入口点节点
+    的 top_level（弱化口径，v1.8)**归审计**(v1.32 明确：求值需目录
+    解析 entry_point → (page,slot)，目录映射依赖按 v1.10 约束不进
+    redo);("entry_point < 链导出 HWM"降级到 §11.3 审计，v1.10 可求值
+    性约束）;
   - **HnswPublishLive**：目标条目存在，state ∈ {INITIALIZING, LIVE}
     (LIVE = 幂等重放形态）;**dim == meta.dim**(v1.19 **redo 前置
     门**——handler 经 payload 自带的 meta_page_id 读 meta、核对
@@ -1033,4 +1041,8 @@ pg-am-hnsw（页布局/WAL 记录）与 pg-engine（崩溃 rounds）两侧。
 | v1.28 | 2026-09-17 | M5 Stage B 用户终审三轮回流:**P1** §10.3 最小登记的连锁后果——"只写 pg_rust_relpages 一行"使 HNSW OID 不在 pg_class,catalog 启动校正(next_oid 回滚窗防御,oid.rs:10-17 的自愈前提)必须扩扫 relpages,否则跨重启 OID 碰撞、第二索引不可达;已修(pg-catalog 一行 + 回归转正)。**P3-1**:§11.3 审计 c 条(entry_point < HWM)的 open 侧实例落地——open 时 HWM 已由链遍历算出,校验免费;redo 路径按可求值性约束保持豁免(降级线不动)。**P3-2**:§6 snapshot_format_version 字段与 M4 FORMAT_VERSION 单一真值对齐。coding-plan v1.27、stage_spec 三轮回流段同步。无格式/协议变更 |
 | v1.29 | 2026-09-17 | M5 Stage B 用户终审四轮回流:**P3-1** §10.3 open 修复的读取入口补页型检查(PAGE_TYPE_NODE)——与 check_dir_chain(PAGE_TYPE_DIR)/read_meta(PAGE_TYPE_META)同班,修复路径曾是唯一例外;**P3-2** §10.3 最小登记副作用:relpages OID 进 next_oid 启动校正必须先过 Int8 往返界校验(> i64::MAX 定义性腐坏),否则腐坏行毒化分配器起点并被 checkpoint 永久化;pg_class 用户行同类暴露登记为先已存在类。coding-plan v1.28、stage_spec 四轮回流段同步。无格式/协议变更 |
 | v1.30 | 2026-09-17 | M5 Stage B 用户终审五轮回流:**P3-1** v1.29 的 Int8 往返界守卫证伪并改界——生产路径 rel_oid 经解码链恒 ≤ i64::MAX,该界是死代码;最坏可达毒值恰为 i64::MAX(推高 start 至 2^63,as i64 变负,下次重启不可开)。改界 `MAX_SANE_OID = 1 << 48`(远超任何合法 OID——自 16384 逐个分配,连 u32::MAX 都不可达),§10.3 最小登记的 OID 防护自此真实生效。coding-plan v1.29、stage_spec 五轮回流段同步 |
+| v1.32 | 2026-09-18 | M5 Stage C slice 1(redo handler ×7)落码 + 主线验收回流:§10.1/§10.2 的三段式 handler 形态原样落成(pd_lsn 守卫先行、已应用跳过不重验;funnel 校验;原语应用;无状态化只用 buffer_pool + page_allocator)。**§10.1 MetaUpdate 项口径细化**:max_level == 入口点 top_level(v1.8 弱化口径)明确**归审计**——求值需目录解析 entry_point,属 v1.10 可求值性约束的目录映射依赖类;同时 **max_level ≤ l_max(m) 语义界在 redo 侧强制**(m 冻结在记录自指的 meta 页上,可求值——六轮 P3 的第三写入方闭合,read_meta/open-repair/redo 三方同界)。无格式/协议变更。DirAppend 的目标存在性证明以物理占用形态落地(slot_is_occupied——记录无 meta_page_id 拿不到 dim,占用即 {INITIALIZING, LIVE} 集合的最强可求值形态);DirLink ordinal+1 用 checked_add(no-panic 纪律)。**重开限制残留闭合**(Stage B 已知残留首条):无 checkpoint 重放 121–127 经 reopen 测试转正。coding-plan v1.31、stage_spec Stage C 节同步 |
+| v1.33 | 2026-09-18 | M5 Stage C slice 1 对抗审查一轮回流(agent-23 PASS 附条件 → 清零):**P2-1** 同页双 pin 死锁(DirAppend/DirLink 持写守卫再读-pin 同页;腐坏记录构造器管不到的 redo 字节面)——pin 前不等判断 ×2;同型面外溢登记(pg-am-btree SplitCopy 双 pin_mut,Phase 7a)。**P3-2** codec 对称:HnswMetaUpdateRecord::decode 补 INVALID⟺max_level==0 域规则(§10.1 层次不变——同记录自洽项归 decode/构造器对称层,跨记录语义项归 handler/funnel)。**P3-1 不补码**(已由原语承载,复核属实)。§10.1 冻结清单逐类型对账无缺口、可求值性界线无越线(审查报告登记)。coding-plan v1.32、stage_spec 审查一轮回流段同步 |
+| v1.34 | 2026-09-18 | M5 Stage C slice 1 主线复核二轮回流:**P2** §10.1 handler 形态的二次 pin 面外推——meta_view 的 meta 页读-pin 与 P2-1 同型(121/122/124/127 四 handler;meta_page_id==page_id 即死锁,构造器不拒),补 `require_distinct_meta` 守卫 ×4 + 负例 ×4。handler 层次不变(守卫在 funnel 前的 pin 层)。coding-plan v1.33、stage_spec 二轮回流段同步 |
+| v1.35 | 2026-09-18 | M5 Stage C slice 1 用户终审三轮回流(2 P3 属实):**§10.1 冻结清单两项修订登记**——① SetNeighbors 补"无 INVALID(u32::MAX)端点"(镜像构造器;redo 字节面不经构造器,funnel 必须同拒);② DirLink 补第四项"旧尾页 count == 813(满页才链接)"(同页可求值;未满链接造出过不了链断言 2 的非法链)。连带:两条测试在未满尾页上构造 DirLink,按手工钉满页头方案重构。coding-plan v1.34、stage_spec 三轮回流段同步 |
 | v1.31 | 2026-09-17 | M5 Stage B 用户终审六轮回流:**P1** §10.3 open 修复的 WAL 写序立文并修复——实现原为先 append MetaUpdate 后 pin_mut,与 ensure_fpi 的"FPI 必须先于本修改记录"契约相反(修复被 redo 的 FPI 映像冲掉、pd_lsn 权威违约;Stage C handler 落地即炸);§10.3 补写序明文(pin_mut(FPI)→ append → apply → stamp,btree write_meta_record 同款),代码重排 + checkpoint 前置的 WAL 序数值回归。**P3** max_level 校验从 6-bit 格式上界收紧到语义上界 l_max(m)(read_meta 与 open-repair 发布前各一处;构造器拿不到 m 保持 ≤63),§10.3 同步。**无格式/协议变更**(写序是对既有 A1/FPI 契约的对齐,非新协议)。coding-plan v1.30、stage_spec 六轮回流段同步 |

@@ -562,6 +562,19 @@ pub(crate) fn apply_tombstone(node_page: &mut [u8; PAGE_SIZE], slot: u16, dim: u
 // Read-side accessors (tests + the Stage C/D consumers).
 // ---------------------------------------------------------------------
 
+/// Whether `slot` holds ANY entry (its line pointer is `LP_NORMAL` with
+/// in-bounds off/len) — the dim-free physical existence proof for the
+/// Stage C DirAppend redo handler, whose record carries no `meta_page_id`
+/// and therefore cannot locate the state byte. Occupancy is the strongest
+/// evaluable form of the v1.11 {INITIALIZING, LIVE} set membership: a
+/// tombstoned entry is occupied too, but a DirAppend replayed after that
+/// entry's Tombstone cannot occur in a legal stream (LSN order), so the
+/// physical proof and the set assertion coincide. Never asserts a single
+/// state value.
+pub(crate) fn slot_is_occupied(node_page: &[u8; PAGE_SIZE], slot: u16) -> bool {
+    read_lp(node_page, slot).is_some()
+}
+
 /// The entry's top level (state byte bits 0-5).
 pub(crate) fn entry_top_level(node_page: &[u8; PAGE_SIZE], slot: u16, dim: u16) -> Result<u8> {
     let entry = entry_at(node_page, slot, "entry_top_level")?;

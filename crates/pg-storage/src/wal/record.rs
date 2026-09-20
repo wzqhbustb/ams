@@ -618,9 +618,24 @@ impl HnswSetNeighborsRecord {
 }
 
 impl HnswMetaUpdateRecord {
-    /// Bounded, fully-consuming decode (P2-1 — see the section comment).
+    /// Bounded, fully-consuming decode (P2-1 — see the section comment),
+    /// plus the same-record domain rule the constructor enforces
+    /// (2026-09-18, M5 Stage C slice-1 adversarial review P3-2 — codec
+    /// symmetry: decode must refuse what the constructor refuses, the
+    /// M4 snapshot-codec discipline): `entry_point = NodeId::INVALID` is
+    /// only legal with `max_level == 0` (the empty graph). The redo
+    /// handler decodes raw WAL bytes — the constructor never runs on that
+    /// path, so without this gate a corrupt INVALID + nonzero-max_level
+    /// record would be applied as-is.
     pub fn decode(payload: &[u8]) -> Result<Self> {
-        decode_hnsw_payload(payload)
+        let rec: Self = decode_hnsw_payload(payload)?;
+        if rec.entry_point == u32::MAX && rec.max_level != 0 {
+            return Err(StorageError::Serialize(format!(
+                "HnswMetaUpdate entry_point = NodeId::INVALID but max_level = {} (INVALID is only legal for the empty graph, max_level = 0)",
+                rec.max_level
+            )));
+        }
+        Ok(rec)
     }
 }
 
@@ -2169,6 +2184,31 @@ mod tests {
         // (max_level = 0); any nonzero level contradicts "no node".
         assert!(WalRecord::hnsw_meta_update(PageId(1), u32::MAX, 1).is_err());
         assert!(WalRecord::hnsw_meta_update(PageId(1), u32::MAX, 0).is_ok());
+    }
+
+    /// 2026-09-18, M5 Stage C slice-1 adversarial review P3-2: decode-side
+    /// codec symmetry — a raw payload the constructor would refuse
+    /// (entry_point = NodeId::INVALID with a nonzero max_level) must be
+    /// rejected by `HnswMetaUpdateRecord::decode` too (the redo handler
+    /// decodes raw WAL bytes; the constructor never runs on that path).
+    #[test]
+    fn hnsw_meta_update_decode_enforces_empty_graph_domain_rule() {
+        let bad = bincode::serde::encode_to_vec(
+            HnswMetaUpdateRecord {
+                meta_page_id: PageId(1),
+                entry_point: u32::MAX,
+                max_level: 1,
+            },
+            bincode_config(),
+        )
+        .unwrap();
+        let err = HnswMetaUpdateRecord::decode(&bad).unwrap_err();
+        assert!(err.to_string().contains("INVALID"), "{err}");
+        // The legal empty-graph pair still decodes.
+        let good = WalRecord::hnsw_meta_update(PageId(1), u32::MAX, 0).unwrap();
+        let decoded = HnswMetaUpdateRecord::decode(&good.payload).unwrap();
+        assert_eq!(decoded.entry_point, u32::MAX);
+        assert_eq!(decoded.max_level, 0);
     }
 
     /// Stage 0 round 3 P2: the bounded decoders reject forged length
