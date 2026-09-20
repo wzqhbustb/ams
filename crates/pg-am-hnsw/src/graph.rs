@@ -160,10 +160,15 @@ impl NeighborSelection {
 /// even at the u16 dimension ceiling of 65535 the worst-case accumulation
 /// (~3e82) stays orders of magnitude inside f64 range). The `expect` in
 /// `cmp` is therefore unreachable.
+///
+/// `pub(crate)` (2026-09-20, M5 Stage C slice 2, tech-selection §10.2 task
+/// 3): the generic free-function cores ([`search_layer`] /
+/// [`select_neighbors`]) return and consume `Cand`, and the slice-4
+/// page-resident search reads the fields of the returned values.
 #[derive(Debug, Clone, Copy)]
-struct Cand {
-    dist: f64,
-    id: NodeId,
+pub(crate) struct Cand {
+    pub(crate) dist: f64,
+    pub(crate) id: NodeId,
 }
 
 impl PartialEq for Cand {
@@ -610,17 +615,9 @@ impl Hnsw {
         }
     }
 
-    /// Paper Algorithm 2 (SEARCH-LAYER): beam search on one level.
-    ///
-    /// `entry_points` must be nodes present on `level`; `ef >= 1`. Returns
-    /// up to `ef` nearest visited elements sorted ascending by `(distance,
-    /// NodeId)`. The visited set is a bitset indexed by `NodeId` (§4.1
-    /// prerequisite ②: no hash-iteration order may enter the algorithm).
-    ///
-    /// The break condition compares **distances only** (paper semantics:
-    /// stop when the nearest unprocessed candidate is farther than the
-    /// worst retained element); every ordering that influences the *output*
-    /// goes through [`Cand`]'s total order, so ties are deterministic.
+    /// Paper Algorithm 2 (SEARCH-LAYER): beam search on one level — thin
+    /// wrapper over the generic free-function core [`search_layer`] (M5
+    /// Stage C slice 2, §10.2 task 3); the full contract lives there.
     fn search_layer(
         &self,
         query: &[f32],
@@ -628,121 +625,16 @@ impl Hnsw {
         ef: usize,
         level: u8,
     ) -> Vec<Cand> {
-        debug_assert!(ef >= 1, "beam width must be at least 1");
-        let n = self.node_count();
-        let mut visited = vec![0u64; n / 64 + 1];
-        let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
-        let mut results: BinaryHeap<Cand> = BinaryHeap::new();
-        for &ep in entry_points {
-            visited[ep.index() / 64] |= 1u64 << (ep.index() % 64);
-            let c = Cand {
-                dist: self.dist_to_query(query, ep),
-                id: ep,
-            };
-            candidates.push(Reverse(c));
-            results.push(c);
-        }
-        while let Some(Reverse(c)) = candidates.pop() {
-            let worst = results.peek().copied().expect("results never empties");
-            if c.dist > worst.dist {
-                break; // nearest candidate is beyond the worst kept result
-            }
-            for &e in self.neighbors(c.id, level) {
-                let (word, bit) = (e.index() / 64, 1u64 << (e.index() % 64));
-                if visited[word] & bit != 0 {
-                    continue;
-                }
-                visited[word] |= bit;
-                let cand = Cand {
-                    dist: self.dist_to_query(query, e),
-                    id: e,
-                };
-                // Admission compares the FULL frozen order (distance, NodeId
-                // ascending): at a full beam an equidistant candidate with a
-                // smaller NodeId displaces the larger-id worst, so the
-                // result set is the ef-best under the total order — not
-                // whatever the discovery order happened to seat first
-                // (2026-08-31 review P1). The distance-only *break*
-                // condition above is the paper's early termination and
-                // stays distance-only.
-                if results.len() < ef || cand < *results.peek().expect("non-empty") {
-                    candidates.push(Reverse(cand));
-                    results.push(cand);
-                    if results.len() > ef {
-                        results.pop(); // evict the worst
-                    }
-                }
-            }
-        }
-        // into_sorted_vec yields ascending (distance, NodeId) — the frozen
-        // output order.
-        results.into_sorted_vec()
+        search_layer(self, query, entry_points, ef, level)
     }
 
-    /// Neighbor selection — **the single function behind both sides of §4.3**
-    /// (hard constraint "select and shrink share one heuristic"):
-    ///
-    /// - select side (Algorithm 1): `candidates` are the beam-search results
-    ///   for the inserted vector, `limit` is `M`;
-    /// - shrink side: `candidates` are the over-capacity list of an existing
-    ///   node *with distances recomputed against that node's own vector*,
-    ///   `limit` is `M_max(level)`.
-    ///
-    /// The input role is carried entirely by `Cand::dist` = "distance to the
-    /// reference vector of this call" — the function itself never asks which
-    /// side it is serving. `candidates` is sorted internally, so callers
-    /// cannot supply a non-canonical order.
-    ///
-    /// Heuristic mode = paper Algorithm 4 with `extend_candidates = false`
-    /// (all levels, §4.3 v1.3) and `keep_pruned = true`: a candidate is
-    /// occluded (discarded) iff some already-kept element is strictly closer
-    /// to it than the reference vector is; occluded candidates then refill
-    /// the result in ascending-distance order up to `limit` (connectivity
-    /// first — full `M` edges per node). Simple mode = Algorithm 3 (nearest
-    /// `limit`), the §4.3 A/B control group. Both return the chosen ids
-    /// sorted by `NodeId` ascending (canonical adjacency order).
+    /// Neighbor selection — **the single function behind both sides of
+    /// §4.3**; thin wrapper over the generic free-function core
+    /// [`select_neighbors`] (M5 Stage C slice 2, §10.2 task 3), passing the
+    /// graph's construction-time selection mode. The full contract lives
+    /// there.
     fn select_neighbors(&self, candidates: &[Cand], limit: usize) -> Vec<NodeId> {
-        let mut sorted: Vec<Cand> = candidates.to_vec();
-        sorted.sort();
-        if sorted.len() <= limit {
-            let mut ids: Vec<NodeId> = sorted.iter().map(|c| c.id).collect();
-            ids.sort();
-            return ids;
-        }
-        let chosen: Vec<Cand> = match self.selection {
-            NeighborSelection::Simple => sorted[..limit].to_vec(),
-            NeighborSelection::Heuristic => {
-                let mut kept: Vec<Cand> = Vec::with_capacity(limit);
-                let mut occluded: Vec<Cand> = Vec::new();
-                for &c in &sorted {
-                    if kept.len() == limit {
-                        break; // Algorithm 4's main loop stops at |R| = M
-                    }
-                    // "closer to q than to any element of R": occlusion uses
-                    // a strict comparison — a tie keeps the candidate
-                    // (deterministic either way; R is scanned exhaustively).
-                    let shadowed = kept.iter().any(|&r| self.dist_between(c.id, r.id) < c.dist);
-                    if shadowed {
-                        occluded.push(c); // ascending order is preserved
-                    } else {
-                        kept.push(c);
-                    }
-                }
-                // keep_pruned = true: refill from the occluded candidates in
-                // ascending-distance order up to the limit (§4.3).
-                let mut out = kept;
-                for &c in &occluded {
-                    if out.len() == limit {
-                        break;
-                    }
-                    out.push(c);
-                }
-                out
-            }
-        };
-        let mut ids: Vec<NodeId> = chosen.iter().map(|c| c.id).collect();
-        ids.sort();
-        ids
+        select_neighbors(self, self.selection, candidates, limit)
     }
 
     /// Insert `to` into `node`'s level-`level` adjacency list, keeping the
@@ -772,6 +664,216 @@ impl Hnsw {
         let kept = self.select_neighbors(&cands, self.m_max(level));
         *self.neighbors_mut(owner, level) = kept;
     }
+}
+
+// ---------------------------------------------------------------------
+// Generic algorithm cores (2026-09-20, M5 Stage C slice 2 — tech-selection
+// §10.2 task 3): the graph-access abstraction the in-memory `Hnsw` and the
+// future page-resident graph share. Pure refactoring, zero behavior change:
+// the free-function bodies are byte-moved from the former `Hnsw` methods,
+// with `self.<funnel>` calls rerouted through the trait.
+// ---------------------------------------------------------------------
+
+/// Graph access abstraction for the algorithm cores (§10.2 task 3): the
+/// four read funnels [`search_layer`] and [`select_neighbors`] need.
+///
+/// Distances go through trait methods rather than closure parameters
+/// because the page-resident implementation must decode vectors off pages
+/// with the graph's own metric internally. [`GraphAccess::for_each_neighbor`]
+/// takes `impl FnMut` (no object safety needed — the generic cores inline
+/// it completely) because a page-resident implementation walks page bytes
+/// and cannot hand out a borrowed slice.
+pub(crate) trait GraphAccess {
+    /// Number of nodes ever inserted (dense `NodeId` space, §3).
+    fn node_count(&self) -> usize;
+    /// Distance between the query slice and a stored node.
+    ///
+    /// The return value must be finite — `Cand::cmp` panics on NaN
+    /// (2026-09-20, slice-2 review round 2): the query is entry-validated
+    /// (§5) and stored-vector finiteness is guaranteed by the write path /
+    /// redo funnel (and the §11.3 open-time audit); implementations —
+    /// including the slice-4 page-resident one — inherit this premise.
+    fn dist_to_query(&self, query: &[f32], node: NodeId) -> f64;
+    /// Distance between two stored nodes; the same finiteness premise as
+    /// [`GraphAccess::dist_to_query`] applies.
+    fn dist_between(&self, a: NodeId, b: NodeId) -> f64;
+    /// Invoke `f` on each of `node`'s neighbors on `level`, in the
+    /// canonical `NodeId`-ascending order.
+    ///
+    /// The order **is** part of the contract (2026-09-20, slice-2 review
+    /// round 2 — reversing the same-day "order-agnostic" wording, which
+    /// was wrong): `search_layer` pushes every admitted candidate into the
+    /// frontier heap and eviction only removes it from the result heap, so
+    /// an admitted-then-evicted candidate is still expanded — the expansion
+    /// set, and thus the result, is enumeration-order sensitive. Ascending
+    /// `NodeId` is the canonical adjacency order of both storage forms
+    /// (in-memory lists are kept sorted; page-resident lists are written
+    /// sorted under SetNeighbors funnel validation), so pinning it costs
+    /// nothing and makes cross-form result identity provable.
+    fn for_each_neighbor(&self, node: NodeId, level: u8, f: impl FnMut(NodeId));
+}
+
+impl GraphAccess for Hnsw {
+    fn node_count(&self) -> usize {
+        self.node_count()
+    }
+
+    fn dist_to_query(&self, query: &[f32], node: NodeId) -> f64 {
+        self.dist_to_query(query, node)
+    }
+
+    fn dist_between(&self, a: NodeId, b: NodeId) -> f64 {
+        self.dist_between(a, b)
+    }
+
+    fn for_each_neighbor(&self, node: NodeId, level: u8, mut f: impl FnMut(NodeId)) {
+        for &e in self.neighbors(node, level) {
+            f(e);
+        }
+    }
+}
+
+/// Paper Algorithm 2 (SEARCH-LAYER): beam search on one level.
+///
+/// `entry_points` must be nodes present on `level`; `ef >= 1`. Returns
+/// up to `ef` nearest visited elements sorted ascending by `(distance,
+/// NodeId)`. The visited set is a bitset indexed by `NodeId` (§4.1
+/// prerequisite ②: no hash-iteration order may enter the algorithm).
+///
+/// The break condition compares **distances only** (paper semantics:
+/// stop when the nearest unprocessed candidate is farther than the
+/// worst retained element); every ordering that influences the *output*
+/// goes through [`Cand`]'s total order, so ties are deterministic.
+pub(crate) fn search_layer<G: GraphAccess>(
+    g: &G,
+    query: &[f32],
+    entry_points: &[NodeId],
+    ef: usize,
+    level: u8,
+) -> Vec<Cand> {
+    debug_assert!(ef >= 1, "beam width must be at least 1");
+    let n = g.node_count();
+    let mut visited = vec![0u64; n / 64 + 1];
+    let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
+    let mut results: BinaryHeap<Cand> = BinaryHeap::new();
+    for &ep in entry_points {
+        visited[ep.index() / 64] |= 1u64 << (ep.index() % 64);
+        let c = Cand {
+            dist: g.dist_to_query(query, ep),
+            id: ep,
+        };
+        candidates.push(Reverse(c));
+        results.push(c);
+    }
+    while let Some(Reverse(c)) = candidates.pop() {
+        let worst = results.peek().copied().expect("results never empties");
+        if c.dist > worst.dist {
+            break; // nearest candidate is beyond the worst kept result
+        }
+        g.for_each_neighbor(c.id, level, |e| {
+            let (word, bit) = (e.index() / 64, 1u64 << (e.index() % 64));
+            if visited[word] & bit != 0 {
+                return;
+            }
+            visited[word] |= bit;
+            let cand = Cand {
+                dist: g.dist_to_query(query, e),
+                id: e,
+            };
+            // Admission compares the FULL frozen order (distance, NodeId
+            // ascending): at a full beam an equidistant candidate with a
+            // smaller NodeId displaces the larger-id worst, so the
+            // result set is the ef-best under the total order — not
+            // whatever the discovery order happened to seat first
+            // (2026-08-31 review P1). The distance-only *break*
+            // condition above is the paper's early termination and
+            // stays distance-only.
+            if results.len() < ef || cand < *results.peek().expect("non-empty") {
+                candidates.push(Reverse(cand));
+                results.push(cand);
+                if results.len() > ef {
+                    results.pop(); // evict the worst
+                }
+            }
+        });
+    }
+    // into_sorted_vec yields ascending (distance, NodeId) — the frozen
+    // output order.
+    results.into_sorted_vec()
+}
+
+/// Neighbor selection — **the single function behind both sides of §4.3**
+/// (hard constraint "select and shrink share one heuristic"):
+///
+/// - select side (Algorithm 1): `candidates` are the beam-search results
+///   for the inserted vector, `limit` is `M`;
+/// - shrink side: `candidates` are the over-capacity list of an existing
+///   node *with distances recomputed against that node's own vector*,
+///   `limit` is `M_max(level)`.
+///
+/// The input role is carried entirely by `Cand::dist` = "distance to the
+/// reference vector of this call" — the function itself never asks which
+/// side it is serving. `candidates` is sorted internally, so callers
+/// cannot supply a non-canonical order.
+///
+/// Heuristic mode = paper Algorithm 4 with `extend_candidates = false`
+/// (all levels, §4.3 v1.3) and `keep_pruned = true`: a candidate is
+/// occluded (discarded) iff some already-kept element is strictly closer
+/// to it than the reference vector is; occluded candidates then refill
+/// the result in ascending-distance order up to `limit` (connectivity
+/// first — full `M` edges per node). Simple mode = Algorithm 3 (nearest
+/// `limit`), the §4.3 A/B control group. Both return the chosen ids
+/// sorted by `NodeId` ascending (canonical adjacency order).
+///
+/// The selection mode is a parameter (not read off the graph) so the
+/// page-resident graph can supply its own construction-pinned mode.
+pub(crate) fn select_neighbors<G: GraphAccess>(
+    g: &G,
+    selection: NeighborSelection,
+    candidates: &[Cand],
+    limit: usize,
+) -> Vec<NodeId> {
+    let mut sorted: Vec<Cand> = candidates.to_vec();
+    sorted.sort();
+    if sorted.len() <= limit {
+        let mut ids: Vec<NodeId> = sorted.iter().map(|c| c.id).collect();
+        ids.sort();
+        return ids;
+    }
+    let chosen: Vec<Cand> = match selection {
+        NeighborSelection::Simple => sorted[..limit].to_vec(),
+        NeighborSelection::Heuristic => {
+            let mut kept: Vec<Cand> = Vec::with_capacity(limit);
+            let mut occluded: Vec<Cand> = Vec::new();
+            for &c in &sorted {
+                if kept.len() == limit {
+                    break; // Algorithm 4's main loop stops at |R| = M
+                }
+                // "closer to q than to any element of R": occlusion uses
+                // a strict comparison — a tie keeps the candidate
+                // (deterministic either way; R is scanned exhaustively).
+                let shadowed = kept.iter().any(|&r| g.dist_between(c.id, r.id) < c.dist);
+                if shadowed {
+                    occluded.push(c); // ascending order is preserved
+                } else {
+                    kept.push(c);
+                }
+            }
+            // keep_pruned = true: refill from the occluded candidates in
+            // ascending-distance order up to the limit (§4.3).
+            let mut out = kept;
+            for &c in &occluded {
+                if out.len() == limit {
+                    break;
+                }
+                out.push(c);
+            }
+            out
+        }
+    };
+    let mut ids: Vec<NodeId> = chosen.iter().map(|c| c.id).collect();
+    ids.sort();
+    ids
 }
 
 #[cfg(test)]

@@ -1332,7 +1332,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 
 ## Stage C(M5):WAL 记录 + redo handler ×7 + 正常写入路径 + 页驻查询
 
-**状态**:🚧 进行中——slice 1(redo handler ×7)✅ 完成（2026-09-18 落码 + 主线验收 + agent-23 对抗审查 + 主线二轮 + 用户终审四轮，全部清零）;slice 2–4（算法核心泛型化 / insert 写入路径 / 页驻 search）未开工。pg-am-hnsw lib **137 绿**、全套件 **191 绿**、pg-storage lib **209 绿**、pg-engine 全量绿、workspace check 绿、clippy -D warnings / fmt / doc 全绿；未 commit——等用户终审确认，message 前缀 `PHASE2-M5-StageC`
+**状态**:🚧 进行中——slice 1(redo handler ×7)✅ 完成并 commit(0341d66);slice 2（算法核心泛型化）✅ 完成（2026-09-20 落码 + 主线验收，零行为变更 191 枚全绿）;slice 3–4(insert 写入路径 / 页驻 search）未开工。pg-am-hnsw lib **137 绿**、全套件 **191 绿**、pg-storage lib **209 绿**、pg-engine 全量绿、workspace check 绿、clippy -D warnings / fmt / doc 全绿；slice 2 未 commit——等用户终审确认，message 前缀 `PHASE2-M5-StageC`
 
 ### slice 1 交付内容（redo handler ×7,2026-09-18)
 
@@ -1376,3 +1376,15 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **nano 2(Tombstone→LIVE 协议冻结的 M6 含义，M6 规划登记一行）**：选型 §10.1 冻结清单要求 HnswNodeTombstone 目标条目**存在且 LIVE**——redo 层拒绝对 INITIALIZING 条目盖墓碑。**交接登记（M6 开工前裁决）**：若 M6 需回收崩溃遗留的 INITIALIZING 孤条目（insert 崩在 NodeInit 与 PublishLive 之间的残态），现行协议下 redo 会拒绝该 Tombstone——届时须走**协议修订**（冻结清单改线，changelog 登记）或**新记录类型**，勿撞线后补票。**同条并案登记（2026-09-20 五轮 nano)**:PublishLive 的存在性证明（redo.rs `entry_top_level`，物理占用）同样接受 tombstoned 条目，`publish_live` 为纯位 OR 无状态前置——严格读冻结清单"state ∈ {INITIALIZING, LIVE}"（选型 §10.1)则 tombstoned 不在集合内；但合法 WAL 流不可达（Tombstone redo 前置要求 LIVE、写路径 127 于 §8.1 步骤 8 一次性发出且先于任何 124)、`apply_tombstone` 只 OR bit 7 不清 bit 6(LIVE+tombstoned 条目 `entry_is_live` 恒真，"已 LIVE"幂等判定本就覆盖）、M5 明文"只重放不生效语义"（选型 §10.1 Tombstone 项）——**不改代码**（加检查 = 新增冻结清单项 = 协议修订，越过冻结边界）,M6 收紧 Tombstone/PublishLive 口径时并案裁决
 - **nano 3("引擎重开"措辞精度 + slice 3 测试登记）**:v1.31 闭合的 `reopen_replays_hnsw_records` 是 **StorageEngine 层**(pg-storage crate)——测试用 handler 集与 Engine::open 注册链同为 `hnsw_redo_handlers()`，闭合成立（Stage B 残留条已加层口径注）。**pg-engine 层**（公共 API create/insert → 重开）的 reopen-with-HNSW-records 测试须等 slice 3 的 insert 写入路径落地才能经公共 API 构造——**slice 3 顺手补一枚，此条即登记**
 - 验证：pg-am-hnsw lib **137 绿**（负例矩阵 16 case)、fmt/clippy/doc 绿；coding-plan v1.35 同步
+
+### slice 2 交付内容（算法核心泛型化，§10.2 任务 3,2026-09-20)
+
+1. **`GraphAccess` trait**(graph.rs,pub(crate))：算法核心所需的四个读漏斗——node_count / dist_to_query / dist_between / for_each_neighbor(impl FnMut(NodeId))。两个形态决策：距离走 trait 方法而非闭包参数（页驻实现需以图自带 metric 内部解码页内向量）；邻居遍历回调化（页驻实现遍历页字节给不出借用切片；`impl FnMut` 不需对象安全，泛型核完全内联）
+2. **泛型自由函数 ×2**:`search_layer<G: GraphAccess>`(Algorithm 2 beam search）与 `select_neighbors<G: GraphAccess>`(§4.3 单一启发式）——函数体自 Hnsw 方法**逐字节搬运**(doc 与评审历史注释逐字随迁；`self.`→`g.`、邻居遍历闭包化、selection 改参数化——页驻图供自建图钉死模式）;`Cand` 升 pub(crate)（字段同，slice 4 页驻 search 读返回值）
+3. **Hnsw 两方法改一行薄封装**（签名不变）+ `impl GraphAccess for Hnsw` 委派既有 funnel；零公共 API 变更（全 pub(crate),lib.rs 再导出面不动）
+4. **§10.2 任务 1（访问器收口）核实现状：Stage A 已闭合**——graph.rs 直接字段索引只剩五个 funnel 本体（level/vector/neighbors/node_adjacency/neighbors_mut),insert 的 arena 增长（vectors/levels/adjacency push）是结构性分配，归 slice 3 写入路径
+5. **零行为变更验收**：既有 **191 枚测试一枚未改全绿**(137 lib + 3 对拍 + 5 属性 + 2+1+3+40 集成，主线亲跑）,clippy -D warnings / fmt / doc 绿；agent-21 落码、主线 diff 逐行验收（唯一语义等价改写：邻居循环的 `continue` → 闭包内 `return`)。未 commit——等用户终审确认
+
+**slice 2 对抗审查回流（2026-09-20,agent-23 verdict PASS,1 nano 当轮已修）**:nano——`for_each_neighbor` 的 trait doc"按 NodeId 升序"被当轮判为"强于算法所需"而弱化为"枚举序非契约；内存实现恰好升序";**该判断同日被终审二轮证伪推翻**(search_layer 的 admit-then-evict 使被逐出者留在候选堆继续扩展，扩展集对枚举序敏感——见下段），结论以终审二轮为准。**探查为净登记（下轮勿重复）**：闭包化等价（原循环无 break,return ≡ continue)、inherent 方法优先无虚递归、泛型界恰为四方法、Cand/trait/自由函数全 pub(crate) 零 API 变更、遗留直接字段索引仅剩五 funnel 本体、191 枚行为钉充分（逐步 trace 钉 select_neighbors、flood==brute-force 钉 search_layer、快照 golden 钉跨形态）。**顺带闭合**:agent-23 Stage B 轮 P3-1(`From<&MetaParams> for MetaView` 虚报）核实现已落地（validate.rs:87)
+
+**slice 2 终审二轮回流（2026-09-20,1 修正 + 2 nano，逐条核实属实）**:**修正（推翻同日对抗审查 nano 与主线修法）**——"两核 order-agnostic"断言为假：`search_layer` 的 admission 把候选同时推进 candidates 堆、eviction 只出 results 堆，被逐出者仍会被扩展——**扩展集乃至结果对枚举序敏感**;`for_each_neighbor` 契约改回"枚举序是契约的一部分：NodeId 升序（两形态存储的规范邻接序——in-memory 邻接恒排序、页驻邻接经 SetNeighbors funnel 校验升序写入），零成本满足、跨形态结果恒等可证";coding-plan v1.38 与本节上段的假断言登记已同步更正（留存轮次事实，结论以本段为准）。**nano-1**:trait 距离方法补有限性前置条件（`Cand::cmp` 对 NaN panic；查询经 §5 入口校验、存储向量有限性由写路径/redo funnel/§11.3 审计保证——slice 4 页驻实现以 trait 契约为准）。**nano-2（二次标记）**:tech-selection 版本表 v1.31 错位行已移回 v1.30/v1.32 之间。验证：lib 137 绿、fmt/doc 绿；coding-plan v1.39、tech-selection v1.37 同步
