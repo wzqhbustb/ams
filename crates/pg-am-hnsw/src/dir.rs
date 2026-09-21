@@ -28,12 +28,18 @@ pub(crate) const DIR_ENTRIES_PER_PAGE: u32 =
 const MAX_DIR_PAGES: u64 = 1 << 32;
 
 /// Outcome of a verified directory-chain walk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirChainInfo {
     /// Number of pages in the chain (>= 1).
     pub page_count: u64,
     /// Chain-derived high-water mark: the next unallocated NodeId.
     pub hwm: u64,
+    /// Every chain page in ordinal order (`pages[i]` has `ordinal == i`,
+    /// tail last) — 2026-09-20, M5 Stage C slice 3: the insert/search
+    /// resolution cache (NodeId → `pages[id / DIR_ENTRIES_PER_PAGE]` +
+    /// `dir_entry(page, id % DIR_ENTRIES_PER_PAGE)`), so resolving never
+    /// re-walks the chain. `Copy` was dropped with this field.
+    pub pages: Vec<PageId>,
 }
 
 /// Walk the directory chain from `head`, verifying the §11.3 chain-structure
@@ -54,7 +60,9 @@ pub(crate) struct DirChainInfo {
 ///
 /// `hwm = tail.ordinal × DIR_ENTRIES_PER_PAGE + tail.count`, computed with
 /// checked arithmetic (overflow is loud, same discipline as apply.rs's
-/// round-5 guards).
+/// round-5 guards). The returned [`DirChainInfo::pages`] is the visited
+/// set with the tail appended — ordinal order, Stage C slice 3's
+/// resolution cache.
 pub(crate) fn check_dir_chain<F>(head: PageId, mut fetch: F) -> Result<DirChainInfo>
 where
     F: FnMut(PageId) -> Result<[u8; PAGE_SIZE]>,
@@ -118,9 +126,14 @@ where
             // and hand two nodes the same id. Reject at the open/audit
             // boundary: loud, never truncated.
             check_hwm_node_id_space(hwm)?;
+            // The visited set doubles as the ordered page list (Stage C
+            // slice 3): it holds ordinals 0..tail.ordinal already, the tail
+            // joins last.
+            visited.push(current);
             return Ok(DirChainInfo {
                 page_count: expected_ordinal + 1,
                 hwm,
+                pages: visited,
             });
         }
         // Middle page: must be exactly full, and `next` must be a real
@@ -226,6 +239,8 @@ mod tests {
         assert_eq!(info.page_count, 2);
         assert_eq!(info.hwm, u64::from(CAP) + 5); // 818 at 8 KB
         assert_eq!(info.hwm, 813 + 5);
+        // Stage C slice 3: the resolution cache is ordinal-ordered, tail last.
+        assert_eq!(info.pages, vec![PageId(1), PageId(2)]);
     }
 
     #[test]

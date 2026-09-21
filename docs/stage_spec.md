@@ -1332,7 +1332,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 
 ## Stage C(M5):WAL 记录 + redo handler ×7 + 正常写入路径 + 页驻查询
 
-**状态**:🚧 进行中——slice 1(redo handler ×7)✅ 完成并 commit(0341d66);slice 2（算法核心泛型化）✅ 完成（2026-09-20 落码 + 主线验收，零行为变更 191 枚全绿）;slice 3–4(insert 写入路径 / 页驻 search）未开工。pg-am-hnsw lib **137 绿**、全套件 **191 绿**、pg-storage lib **209 绿**、pg-engine 全量绿、workspace check 绿、clippy -D warnings / fmt / doc 全绿；slice 2 未 commit——等用户终审确认，message 前缀 `PHASE2-M5-StageC`
+**状态**:🚧 进行中——slice 1(redo handler ×7)✅ commit(0341d66);slice 2（算法核心泛型化）✅ commit(d068a5d);slice 3(insert 写入路径）✅ 完成（2026-09-20 落码 + 主线验收 + agent-23 对抗审查 PASS + 2 P3 口径入 §10.2);slice 4（页驻 search）未开工。pg-am-hnsw lib **142 绿**、全套件 **196 绿**、pg-engine m5_hnsw_create_open **4/4**、workspace check 绿、clippy -D warnings / fmt / doc 全绿；slice 3 未 commit——等用户终审确认，message 前缀 `PHASE2-M5-StageC`
 
 ### slice 1 交付内容（redo handler ×7,2026-09-18)
 
@@ -1388,3 +1388,24 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 **slice 2 对抗审查回流（2026-09-20,agent-23 verdict PASS,1 nano 当轮已修）**:nano——`for_each_neighbor` 的 trait doc"按 NodeId 升序"被当轮判为"强于算法所需"而弱化为"枚举序非契约；内存实现恰好升序";**该判断同日被终审二轮证伪推翻**(search_layer 的 admit-then-evict 使被逐出者留在候选堆继续扩展，扩展集对枚举序敏感——见下段），结论以终审二轮为准。**探查为净登记（下轮勿重复）**：闭包化等价（原循环无 break,return ≡ continue)、inherent 方法优先无虚递归、泛型界恰为四方法、Cand/trait/自由函数全 pub(crate) 零 API 变更、遗留直接字段索引仅剩五 funnel 本体、191 枚行为钉充分（逐步 trace 钉 select_neighbors、flood==brute-force 钉 search_layer、快照 golden 钉跨形态）。**顺带闭合**:agent-23 Stage B 轮 P3-1(`From<&MetaParams> for MetaView` 虚报）核实现已落地（validate.rs:87)
 
 **slice 2 终审二轮回流（2026-09-20,1 修正 + 2 nano，逐条核实属实）**:**修正（推翻同日对抗审查 nano 与主线修法）**——"两核 order-agnostic"断言为假：`search_layer` 的 admission 把候选同时推进 candidates 堆、eviction 只出 results 堆，被逐出者仍会被扩展——**扩展集乃至结果对枚举序敏感**;`for_each_neighbor` 契约改回"枚举序是契约的一部分：NodeId 升序（两形态存储的规范邻接序——in-memory 邻接恒排序、页驻邻接经 SetNeighbors funnel 校验升序写入），零成本满足、跨形态结果恒等可证";coding-plan v1.38 与本节上段的假断言登记已同步更正（留存轮次事实，结论以本段为准）。**nano-1**:trait 距离方法补有限性前置条件（`Cand::cmp` 对 NaN panic；查询经 §5 入口校验、存储向量有限性由写路径/redo funnel/§11.3 审计保证——slice 4 页驻实现以 trait 契约为准）。**nano-2（二次标记）**:tech-selection 版本表 v1.31 错位行已移回 v1.30/v1.32 之间。验证：lib 137 绿、fmt/doc 绿；coding-plan v1.39、tech-selection v1.37 同步
+
+### slice 3 交付内容（insert 写入路径，§8.1 八步序，2026-09-20)
+
+1. **`PagedGraph`**(paged.rs 新建，pub(crate))：页驻只读视图 impl `GraphAccess`——resolve = `dir_pages[id / 813]` + `dir_entry`（解析缓存，不走链）；短共享 pin 死锁纪律（读 guard 不跨 pin/pin_mut);trait 有限性前提落地（expect 消息写明"open 已校验的链 + §5 入口校验"前提）
+2. **`HnswIndex::insert`**(§8.1 八步序全落）：校验（§5 漏斗 + NodeId 空间）→ 抽层（rng 流位置 = hwm)→ 节点页容量（select_slot / alloc_node_page 初始化链）→ 目录扩容（alloc_dir_page + DirLink)→ NodeInit(pin_mut → append → apply_node_at → stamp)→ DirAppend(→ set_hwm)→ 搜索连边（PagedGraph 跑泛型核；每邻居 collect → pin_mut → **一条** SetNeighbors 原位覆写，含同启发式 shrink)→ 自身各层列表（§8.1 字面序，空列表 = NodeInit 零内容不写记录）→ MetaUpdate(was_empty || level > max_level)→ PublishLive → **flush_to（末条 LSN）成功边界**。**每页触碰 = pin_mut（可能触发 FPI)→ append → apply → stamp**（六轮 P1 定序贯穿全程）
+3. **DirChainInfo 增 `pages: Vec<PageId>`**（尾页入列，去 Copy)——insert/search 的 NodeId 解析缓存
+4. **open 收口三顺手项**:head_cache 消除 open-repair 的 dir_head 二次 pin;open 时解析末条目定 `current_node_page`;`set_hwm`/`set_entry_point` 的 #[expect(dead_code)] 摘除（insert 即消费）
+5. **pg-engine `hnsw_insert` 薄封装**(utility/auto-commit 形态，flush_to 已在 crate 内）
+6. **测试 +6**：跨形态拓扑对拍（N=200 dim=4 M=4 + N=900 dim=1 M=2 节点页目录页双溢出，与内存孪生**逐字节等价**——承重钉）、首发 WAL 序（NodeInit→DirAppend→MetaUpdate→PublishLive 四记录 LSN 严格升序）、崩溃续插 level 流与未崩溃参照逐值一致（编码计划 Stage C 行 4 转正）、坏向量负例状态零变更、**pg-engine 层 reopen 经公共 API**(slice 1 四轮 nano-3 登记兑现：create→insert×5→forget 崩溃→Engine::open 重开→first_page→open→hwm=5→续插得 NodeId 5/6;entry_point 用参照 level 流计算非硬编码）
+
+### slice 3 对抗审查回流（2026-09-20,agent-23 verdict **PASS**,2 P3 口径 + 2 nano)
+
+- **P3-1（正常路径不走记录级 funnel，口径缺口非缺陷）**:insert 只做 §5 入口校验 + 构造器值域检查，validate.rs funnel 是 redo 专用防线——自产记录对其恒真（level 来自 rng、列表来自 select_neighbors)，重跑无收益。口径立文入 §10.2（三层承担：入口校验/构造器/八步序不变量；改线 = 协议修订）,tech-selection v1.38
+- **P3-2（形态分化口径漂移）**：正常路径实际用 `apply_node_at` 而非 `append_node`——WAL-first 要求 slot 先进 payload(v1.17 select_slot 条的字面推论）,append_node 保留为组合便利形态与测试件。§10.2 落地实录补登
+- **nano×2**:first_insert WAL 序测试补注释（FPI 过滤有意、四记录基数是有意硬钉——未来合法变更碰红是特性）;"恰好四记录"硬钉登记
+- **探查为净登记（下轮勿重复）**：八步序逐字对应 §8.1;WAL-first 定序每页成立；跨形态一致性逐项推演（下降区间/ep 携带/select limit=m/shrink limit=m_max(l)/shrink 参照=owner 向量）;PagedGraph resolve 边界（813 翻页/末条目/越界响亮）;dist expect 前提在所有调用点成立（DirAppend 先于搜索、shrink 候选的新节点向量已落页）;current_node_page 在孤儿残态下正确
+- **登记（slice 4 评估项，2026-09-21 终审锐化）**:`dist_to_query`/`dist_between` 每调用经 `entry_vector` 分配 Vec——正确性无影响；评估点 = **slice 4**（页驻搜索热路径真正成形处），候选方向：vector_iter + 迭代式 distance（保持安全 Rust）或受控切片重解释（unsafe，需单独论证）;Stage E benchmark 期兜底裁决
+
+**slice 3 主线二审（2026-09-21，与 agent-23 攻击面不重复）**:**多 seed × 多度量对拍探针**（临时 in-crate 测试，跑完即删）——4 seed × {L2 dim=4、Cosine dim=6、InnerProduct dim=5、极端参数 m=2} × N=300（每形态 4800 次 insert)，页驻与内存**全拓扑逐字节等价，零分歧**（钉住的两枚固定 seed 之外无侥幸）。**新登记 nano**:open 不重跑 `check_creation_geometry`——腐坏但貌似合法的 meta（如 dim 超页容量）能过 open，在首次 insert 的 select_slot 处**响亮 Err**(fail-loud，非静默非 panic)；列为 Stage D 审计期的 open 边界检查候选，不阻塞。**教训登记**：探针回滚对含未提交变更的文件禁用 git checkout（误抹了 lib.rs 的 slice-3 mod 行，已当场复原并复核 diff 逐字节一致）——探针行用 Edit 摘除。
+
+**slice 3 终审回流（2026-09-21,2 P3 观察项，逐条核实属实并处置）**:**P3-A（搜索路径目录损坏 panic)——接受并三处收口**:PagedGraph 的 GraphAccess 实现对解析失败 .expect(slice 2 trait 裸值设计），而 open 只校验链结构与 DIR/META 页类型、不校验目录条目目标页类型——前提陈述过宽。处置：① paged.rs 模块头改为精确口径（open 校验什么/不校验什么、fail-stop ≠ 错答案、M5 utility 范围接受）;② 缺口在正确边界闭合——**§11.3 审计新增 f 条**（每个目录条目目标页 = PAGE_TYPE_NODE 且槽位在界内，与 a 条同趟遍历）,Stage D 落地（tech-selection v1.39);③ GraphAccess→Result 的服务化改造（slice 2 设计回退，动两算法核与内存参照）登记为 **Phase 4 加固选项**,M5 不做。**P3-B（热路径每距离分配）**：维持不改码，登记锐化——评估点 = slice 4（页驻搜索热路径成形处），候选 vector_iter+迭代式 distance（安全）或受控切片重解释（unsafe 需论证）,Stage E benchmark 兜底。验证：fmt/doc 绿、lib 142 无回归

@@ -805,6 +805,12 @@ M4 深审（2026-09-09）已立卡，本文档正式收编：
      指定 level(§5 裁决载体）；定长预留、INITIALIZING 态、节点页槽位
      分配在此发生（§8.1 步骤 3);redo 用 `apply_node_at(node_page, slot,
      node_id, top_level, geo, vector)`（空闲创建/INITIALIZING 覆写幂等）;
+     **落地实录**(2026-09-20,Stage C slice 3 审查 P3-2):正常路径实际
+     同用 `apply_node_at`——WAL-first 要求 slot 先进 WAL payload(v1.17
+     select_slot 条的字面推论:先选槽 → slot 进记录 → append →
+     apply_node_at),`append_node` 保留为 select_slot+apply_node_at 的
+     组合便利形态与测试件;slot == next_free 时两形态功能等价,且
+     apply_node_at 更严(位置自证);
    - `set_neighbors(node_page, slot, geo, level, content)` — 原位更新
      （步骤 5/6);owner node_id 与 count 不进原语（v1.12 的无自环载体在
      WAL payload 与 funnel，原语只写内容）;
@@ -830,6 +836,11 @@ M4 深审（2026-09-09）已立卡，本文档正式收编：
    纪律：正常路径与 redo 共用原语，校验规则单点定义在 funnel 层）;
    redo handler 与正常路径共用（M4 Stage B 教训）;insert
    成功边界 = `flush_to`（全部记录的最后 LSN,§8.1 成功边界①);
+   **正常路径的 funnel 口径**(2026-09-20,Stage C slice 3 审查 P3-1 立文):insert 不对自产记录
+   重跑记录级 funnel(validate.rs)——其校验项对自产值构造恒真(level 来自 rng、邻接列表来自
+   select_neighbors、count 由 len 派生);正常路径的校验由三层承担:§5 入口校验(向量 dim/有限性/
+   cosine 零向量)+ 记录构造器值域检查(pg-storage 层)+ 八步序算法不变量。记录级 funnel 是
+   redo 专用防线(坏 WAL/腐坏页的对抗面);此分工改线 = 协议修订记录;
 3. M4 纯内存 `Hnsw` struct 保留：snapshot 往返矩阵与 recall 门槛不动，
    页驻图作为新类型与其共享算法函数（select_neighbors/search_layer 的
    算法核心抽成对 funnel 泛型化的自由函数——这是 §7 落地的前置重构，
@@ -931,6 +942,12 @@ top_level ≥ L（层级归属，对齐 M4 快照校验 encoding.rs:423 的"目�
 entry_point < 链导出 HWM;d) PublishLive 的 node_id 与目录映射一致；
 e) SetNeighbors 的 owner node_id 与 (page,slot) 目录映射一致（v1.12——
 同 d 的可求值性降级：redo 期 LSN 序已蕴含，审计期一次遍历求值）。
+f)(新增,2026-09-21,Stage C slice 3 终审 P3-A 闭合)**每个目录条目的目标页是
+    PAGE_TYPE_NODE 且槽位在界内**——open 只校验链结构与 DIR/META 页类型,
+    不逐条校验条目目标;缺此断言则 PagedGraph 的"open 已校验"前提不实(腐坏
+    目录把入口点映射到 META/DIR 页时,搜索路径的 with_node 类型检查只能以
+    panic 兜底——fail-stop 非错答案,但审计应把该面在恢复后钉死)。与 a 条同趟
+    遍历求值。(接替 v1.19 上移后空出的 f 条位号。)
 (v1.19：原 f 条"Tombstone/PublishLive 的 payload dim ↔ meta.dim
 一致"**上移为 redo 前置门**，不再属审计枚举——审计拿不到历史
 payload,open 后无从逐条核对，留在这里等于错误 dim 在 redo 期改坏
@@ -1048,3 +1065,5 @@ pg-am-hnsw（页布局/WAL 记录）与 pg-engine（崩溃 rounds）两侧。
 | v1.35 | 2026-09-18 | M5 Stage C slice 1 用户终审三轮回流(2 P3 属实):**§10.1 冻结清单两项修订登记**——① SetNeighbors 补"无 INVALID(u32::MAX)端点"(镜像构造器;redo 字节面不经构造器,funnel 必须同拒);② DirLink 补第四项"旧尾页 count == 813(满页才链接)"(同页可求值;未满链接造出过不了链断言 2 的非法链)。连带:两条测试在未满尾页上构造 DirLink,按手工钉满页头方案重构。coding-plan v1.34、stage_spec 三轮回流段同步 |
 | v1.36 | 2026-09-20 | M5 Stage C slice 2(算法核心泛型化)落码回流:§10.2 任务 3 落成——**`GraphAccess` trait**(node_count/dist_to_query/dist_between/for_each_neighbor(impl FnMut);两个形态决策:距离走 trait 方法而非闭包参数——页驻实现需以图自带 metric 内部解码页内向量;邻居遍历回调化——页驻实现遍历页字节给不出借用切片,impl FnMut 不需对象安全、泛型核完全内联)+ **`search_layer`/`select_neighbors` 泛型自由函数**(函数体自 Hnsw 方法逐字节搬运,doc 与评审历史注释随迁;select_neighbors 的 selection 改参数化——页驻图供自建图钉死模式)+ `Cand` 升 pub(crate)(字段同,slice 4 页驻 search 读返回值);Hnsw 两方法改一行薄封装,签名不变。零行为变更(191 枚测试一枚未改全绿)、零公共 API 变更(全部 pub(crate),lib.rs 再导出面不动)。**§10.2 任务 1(访问器收口)核实现状:Stage A 已闭合**——graph.rs 直接字段索引只剩五个 funnel 本体,insert 的 arena 增长(vectors/levels/adjacency push)为结构性分配,归 slice 3 写入路径。无格式/协议变更。coding-plan v1.37、stage_spec Stage C 节同步 |
 | v1.37 | 2026-09-20 | M5 Stage C slice 2 终审二轮回流(1 修正 + 1 nano):**修正(推翻同日对抗审查 nano 的弱化)**——GraphAccess::for_each_neighbor 的 doc 一度改述为"枚举序非契约"(依据"两核 order-agnostic"判断);终审证伪该断言:search_layer 的 admission 把候选同时推进 candidates 堆而 evict 只出 results 堆,被逐出者仍会被扩展——扩展集乃至结果对枚举序敏感。契约改回"枚举序是契约:NodeId 升序"——两形态天然满足(in-memory 邻接恒排序;页驻邻接经 SetNeighbors funnel 校验升序写入),零成本且跨形态结果恒等可证。**nano**:trait 距离方法补有限性前置条件(Cand::cmp 对 NaN panic;查询经 §5 入口校验、存储向量有限性由写路径/redo funnel/§11.3 审计保证——页驻实现以 trait 契约为准)。无格式/协议/行为变更。coding-plan v1.39、stage_spec slice 2 段同步 |
+| v1.38 | 2026-09-20 | M5 Stage C slice 3(insert 写入路径)对抗审查回流(agent-23 verdict **PASS**,2 P3 口径登记 + 2 nano):**P3-1** §10.2 补"正常路径的 funnel 口径"——insert 不对自产记录重跑记录级 funnel(校验项对自产值构造恒真),正常路径校验 = §5 入口 + 构造器值域 + 八步序不变量三层,记录级 funnel 是 redo 专用防线,改线 = 协议修订。**P3-2** §10.2 append_node 条补落地实录——正常路径同用 apply_node_at(WAL-first 要求 slot 先进 payload,v1.17 的字面推论),append_node 保留为组合便利形态与测试件。**nano①** first_insert WAL 序测试补注释(FPI 过滤是有意的,四记录基数是有意硬钉)。无格式/协议/行为变更。coding-plan v1.40、stage_spec slice 3 段同步 |
+| v1.39 | 2026-09-21 | M5 Stage C slice 3 终审回流(2 P3 观察项,逐条核实属实):**P3-A(搜索路径目录损坏 panic)接受 + 边界闭合**——PagedGraph 的 GraphAccess 实现对解析失败 fail-stop(trait 裸值设计,slice 2);open 只校验链结构与 DIR/META 页类型、不逐条校验目录条目目标页类型,前提有缺口——**§11.3 审计新增 f 条**(每个目录条目目标页 = PAGE_TYPE_NODE 且槽位在界内,接替 v1.19 上移后空出的位号,与 a 条同趟遍历),Stage D 落地;paged.rs 模块头改精确口径(fail-stop 非错答案,M5 utility 范围接受);GraphAccess→Result 服务化改造登记为 Phase 4 加固选项,M5 不做。**P3-B** 维持不改码:dist_* 每调用 Vec 分配的评估点锐化为 slice 4(vector_iter+迭代式 distance / 受控切片重解释两候选),Stage E benchmark 兜底。coding-plan v1.41、stage_spec slice 3 段同步 |

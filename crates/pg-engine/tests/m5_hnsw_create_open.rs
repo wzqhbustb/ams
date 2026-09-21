@@ -177,3 +177,82 @@ fn hnsw_oids_do_not_collide_across_a_checkpointless_restart() {
     assert_eq!(engine.hnsw_index_first_page(oid_b).unwrap(), Some(meta_b));
     assert_ne!(meta_a, meta_b);
 }
+
+/// 2026-09-20, Stage C slice 3 (the registered nano-3 acceptance): the
+/// engine-side insert path — create → open → hnsw_insert ×5 → crash WITHOUT
+/// a checkpoint (`mem::forget`) → engine reopen (slice-1 redo replays
+/// 121–127) → first_page hit → open → hwm = 5 with the reference entry
+/// point → continuation inserts allocate NodeIds 5 and 6.
+///
+/// The expected entry point is not hard-coded: it is derived from the
+/// reference level stream (same seed — Algorithm 1 promotes the entry
+/// point iff a node's drawn level exceeds every previous one).
+#[test]
+fn hnsw_insert_survives_a_checkpointless_crash() {
+    /// Entry point after `n` inserts under the reference level stream.
+    fn reference_entry_point(n: u32) -> u32 {
+        let mut rng = pg_am_hnsw::rng::Xoshiro256StarStar::new(SEED);
+        let mut ep = 0;
+        let mut max_level = 0u8;
+        for i in 0..n {
+            let l = rng.next_level(16);
+            if i == 0 || l > max_level {
+                ep = i;
+                max_level = l;
+            }
+        }
+        ep
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+
+    let (oid, meta_page) = {
+        let engine = Engine::open(dir, EngineConfig::new(dir)).unwrap();
+        let (oid, meta_page) = engine
+            .create_hnsw_index(
+                HnswParams::default(),
+                DIM,
+                Metric::L2,
+                NeighborSelection::Heuristic,
+                SEED,
+            )
+            .unwrap();
+        let mut index = engine
+            .open_hnsw_index(meta_page, &expected())
+            .unwrap()
+            .index;
+        for i in 0..5u32 {
+            let id = engine
+                .hnsw_insert(&mut index, &vec![i as f32; DIM as usize])
+                .unwrap();
+            assert_eq!(id, pg_am_hnsw::NodeId(i));
+        }
+        assert_eq!(index.hwm(), 5);
+        assert_eq!(index.entry_point(), reference_entry_point(5));
+        std::mem::forget(engine); // crash: no checkpoint
+        (oid, meta_page)
+    };
+
+    // Reopen: storage recovery replays the five inserts (slice-1 redo
+    // handlers), the catalog row is WAL-durable, and open re-derives the
+    // runtime state.
+    let engine = Engine::open(dir, EngineConfig::new(dir)).unwrap();
+    assert_eq!(engine.hnsw_index_first_page(oid).unwrap(), Some(meta_page));
+    let mut index = engine
+        .open_hnsw_index(meta_page, &expected())
+        .unwrap()
+        .index;
+    assert_eq!(index.hwm(), 5);
+    assert_eq!(index.entry_point(), reference_entry_point(5));
+
+    // Continuation inserts pick up the exact NodeId stream.
+    for i in 5..7u32 {
+        let id = engine
+            .hnsw_insert(&mut index, &vec![i as f32; DIM as usize])
+            .unwrap();
+        assert_eq!(id, pg_am_hnsw::NodeId(i));
+    }
+    assert_eq!(index.hwm(), 7);
+    assert_eq!(index.entry_point(), reference_entry_point(7));
+}

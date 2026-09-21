@@ -73,6 +73,9 @@ pub(crate) mod meta;
 #[allow(dead_code)]
 pub(crate) mod node;
 pub mod page;
+// Stage C slice 3 (2026-09-20): the page-resident read-only graph view —
+// the GraphAccess impl the insert/search algorithm cores run against.
+pub(crate) mod paged;
 pub mod params;
 pub mod redo;
 pub mod rng;

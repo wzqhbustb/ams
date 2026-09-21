@@ -1,12 +1,14 @@
-//! HNSW index lifecycle: creation and open — Phase 2 M5 Stage B slice 3a
-//! (tech-selection §10.3 creation/open protocol, §7.2 creation geometry,
-//! §5 rng skip-ahead).
+//! HNSW index lifecycle: creation, open, and the insert write path —
+//! Phase 2 M5 Stage B slice 3a (tech-selection §10.3 creation/open
+//! protocol, §7.2 creation geometry, §5 rng skip-ahead) and Stage C slice 3
+//! (§8.1 eight-step insert, §10.2 write path).
 //!
 //! [`HnswIndex`] is the handle pg-engine (slice 3b) and the Stage C write
 //! path consume: it carries the meta-page locator, the directory chain
 //! head, the validated [`crate::meta::MetaParams`], the chain-derived
-//! high-water mark, and the graph's level-draw PRNG (with its lineage
-//! preserved across restarts — see the `open` function below).
+//! high-water mark, the graph's level-draw PRNG (with its lineage
+//! preserved across restarts — see the `open` function below), and the
+//! slice-3 insert-resolution caches (`dir_pages`, `current_node_page`).
 //!
 //! Creation is a UTILITY operation (§8.1: no transactional DML; index
 //! records carry `txn_id = INVALID` and there is no abort window).
@@ -16,9 +18,11 @@ use pg_storage::types::{Lsn, PageId, PAGE_SIZE};
 use pg_storage::wal::record::WalRecord;
 use pg_storage::wal::writer::WalWriter;
 
-use crate::error::Result;
-use crate::graph::{Metric, NeighborSelection};
+use crate::error::{HnswError, Result};
+use crate::graph::{GraphAccess, Metric, NeighborSelection};
 pub use crate::meta::{ExpectedParams, MetaParams};
+use crate::node::NodeGeometry;
+use crate::paged::PagedGraph;
 use crate::params::{HnswParams, NodeId};
 use crate::rng::Xoshiro256StarStar;
 
@@ -30,6 +34,16 @@ pub struct HnswIndex {
     params: MetaParams,
     hwm: u64,
     rng: Xoshiro256StarStar,
+    /// The directory chain's pages in ordinal order (2026-09-20, Stage C
+    /// slice 3 — from `DirChainInfo::pages` at open, `vec![dir_head]` at
+    /// create): the NodeId → `(page, slot)` resolution cache; insert/search
+    /// never re-walk the chain.
+    dir_pages: Vec<PageId>,
+    /// The node page insert appends to (2026-09-20, Stage C slice 3): the
+    /// page holding the most recent node entry at open/create (`None` on an
+    /// empty graph); insert re-selects when it has no room for the next
+    /// entry.
+    current_node_page: Option<PageId>,
 }
 
 impl HnswIndex {
@@ -74,7 +88,6 @@ impl HnswIndex {
     /// Controlled high-water-mark write (Stage C's insert advances it
     /// after each DirAppend; not exposed to pg-engine directly — the write
     /// path inside this crate drives it).
-    #[expect(dead_code, reason = "consumed by the Stage C write path (insert)")]
     pub(crate) fn set_hwm(&mut self, hwm: u64) {
         self.hwm = hwm;
     }
@@ -82,13 +95,403 @@ impl HnswIndex {
     /// Controlled runtime meta update (open-repair and Stage C's
     /// entry-point promotion share this; mirrors an applied
     /// `HnswMetaUpdate`).
-    #[expect(
-        dead_code,
-        reason = "consumed by the Stage C write path (entry-point promotion)"
-    )]
     pub(crate) fn set_entry_point(&mut self, entry_point: u32, max_level: u8) {
         self.params.entry_point = entry_point;
         self.params.max_level = max_level;
+    }
+
+    /// Insert a vector into the page-resident graph (tech-selection §8.1
+    /// eight-step sequence; Stage C slice 3). Returns the freshly allocated
+    /// [`NodeId`] (dense, never reused — §3).
+    ///
+    /// **WAL-first discipline** (the open-repair round-6 P1 ordering): every
+    /// page mutation is `pin_mut` (which may emit the due pre-image FPI) →
+    /// WAL append → apply → `set_page_pd_lsn`, one guard per page touch.
+    ///
+    /// **Entry validation** (§5 funnel, same shape as graph.rs's
+    /// `validate_entry_vector`): exact dimension match, no non-finite
+    /// components, and (cosine) no zero vector — a failure changes NOTHING
+    /// (no level drawn, no page touched, hwm unmoved).
+    ///
+    /// **Crash windows** (§8.2): an `Err` return or a crash mid-sequence
+    /// leaves a residue of the §8.2 window shapes (INITIALIZING node,
+    /// published directory mapping without MetaUpdate, …) — all of them
+    /// replayable (slice-1 redo) and open-repairable; the graph is
+    /// observably consistent only after the success boundary.
+    ///
+    /// **Success boundary** (§8.1 boundary ①): `flush_to` the last record's
+    /// LSN (the PublishLive) before returning `Ok` — every record of the
+    /// sequence precedes it in WAL order.
+    ///
+    /// **Single-threaded premise**: one writer per index handle; the buffer
+    /// pool's latches make the page touches safe, but the eight steps are
+    /// not isolated against a concurrent inserter.
+    pub fn insert(
+        &mut self,
+        buffer_pool: &BufferPool,
+        wal_writer: &WalWriter,
+        vector: &[f32],
+    ) -> Result<NodeId> {
+        // Step 0: entry validation (§5) + NodeId space (mirrors
+        // graph.rs:472 — the INVALID sentinel stays unallocated).
+        if vector.len() != usize::from(self.params.dim) {
+            return Err(HnswError::InvalidArgument(format!(
+                "insert: vector has {} components, index dim is {} (§3: same index never mixes dimensions)",
+                vector.len(),
+                self.params.dim
+            )));
+        }
+        self.params.metric.distance(vector, vector)?;
+        if self.hwm == u64::from(u32::MAX) {
+            return Err(HnswError::InvalidOperation(
+                "NodeId space (u32) exhausted; NodeId::INVALID must stay unallocated (§3)"
+                    .to_string(),
+            ));
+        }
+
+        // Step 1 (level draw) — the rng's stream position is the hwm, so
+        // the draw must happen exactly once per successful validation.
+        let level = self.next_level();
+        let node_id = NodeId(self.hwm as u32);
+        let geometry = NodeGeometry {
+            dim: self.params.dim,
+            m: self.params.m,
+            m_max0: self.params.m_max0,
+        };
+        let entry_len = geometry.entry_size(level);
+
+        // Step 2 (§8.1 step 1): the current node page must have room for
+        // this entry — otherwise allocate a fresh one through the init
+        // chain (new_page → init → log_page_init; no exceptions, page.rs).
+        let node_page_id = match self.current_node_page {
+            Some(p) => {
+                let fits = {
+                    let guard = buffer_pool
+                        .pin(p)
+                        .map_err(|e| crate::page::storage_err("insert: pin node page", e))?;
+                    let page: &[u8; PAGE_SIZE] = guard
+                        .page()
+                        .try_into()
+                        .expect("a buffer frame is exactly PAGE_SIZE");
+                    crate::apply::select_slot(page, entry_len).is_ok()
+                };
+                if fits {
+                    p
+                } else {
+                    let fresh = alloc_node_page(buffer_pool, wal_writer)?;
+                    self.current_node_page = Some(fresh);
+                    fresh
+                }
+            }
+            None => {
+                let fresh = alloc_node_page(buffer_pool, wal_writer)?;
+                self.current_node_page = Some(fresh);
+                fresh
+            }
+        };
+
+        // Step 3 (§8.1 step 2): the directory tail must have room for the
+        // mapping — otherwise link a fresh chain page (its init FPI lands
+        // BEFORE the DirLink record, so redo's ordinal/type checks see a
+        // real directory page).
+        let mut dir_tail = *self
+            .dir_pages
+            .last()
+            .expect("the chain always has a head page");
+        {
+            let tail_full = {
+                let guard = buffer_pool
+                    .pin(dir_tail)
+                    .map_err(|e| crate::page::storage_err("insert: pin directory tail", e))?;
+                let page: &[u8; PAGE_SIZE] = guard
+                    .page()
+                    .try_into()
+                    .expect("a buffer frame is exactly PAGE_SIZE");
+                crate::page::dir_count(page) == crate::dir::DIR_ENTRIES_PER_PAGE
+            };
+            if tail_full {
+                let new_dir = alloc_dir_page(buffer_pool, wal_writer, self.dir_pages.len() as u64)?;
+                let mut guard = buffer_pool
+                    .pin_mut(dir_tail)
+                    .map_err(|e| crate::page::storage_err("insert: pin_mut directory tail", e))?;
+                let record = WalRecord::hnsw_dir_link(dir_tail, new_dir)
+                    .map_err(|e| crate::page::storage_err("insert: encode DirLink", e))?;
+                let lsn = wal_writer
+                    .append(record)
+                    .map_err(|e| crate::page::storage_err("insert: WAL append DirLink", e))?;
+                let page: &mut [u8; PAGE_SIZE] = guard
+                    .page_mut()
+                    .try_into()
+                    .expect("a buffer frame is exactly PAGE_SIZE");
+                crate::apply::dir_link(page, new_dir);
+                pg_storage::page::set_page_pd_lsn(page, lsn);
+                drop(guard);
+                self.dir_pages.push(new_dir);
+                dir_tail = new_dir;
+            }
+        }
+
+        // Step 4 (§8.1 step 3): NodeInit — the slot is selected on the same
+        // guard that applies the entry (single-threaded premise: the
+        // selection cannot go stale between the two).
+        let slot = {
+            let mut guard = buffer_pool
+                .pin_mut(node_page_id)
+                .map_err(|e| crate::page::storage_err("insert: pin_mut node page", e))?;
+            let page: &mut [u8; PAGE_SIZE] = guard
+                .page_mut()
+                .try_into()
+                .expect("a buffer frame is exactly PAGE_SIZE");
+            let slot = crate::apply::select_slot(page, entry_len)?;
+            let record = WalRecord::hnsw_node_init(
+                self.meta_page_id,
+                node_page_id,
+                slot,
+                node_id.0,
+                level,
+                self.params.dim,
+                vector.to_vec(),
+            )
+            .map_err(|e| crate::page::storage_err("insert: encode NodeInit", e))?;
+            let lsn = wal_writer
+                .append(record)
+                .map_err(|e| crate::page::storage_err("insert: WAL append NodeInit", e))?;
+            crate::apply::apply_node_at(page, slot, node_id.0, level, geometry, vector)?;
+            pg_storage::page::set_page_pd_lsn(page, lsn);
+            slot
+        };
+
+        // Step 5 (§8.1 step 4): DirAppend — this record IS the NodeId
+        // allocation (v1.2: allocation == mapping publication).
+        {
+            let mut guard = buffer_pool
+                .pin_mut(dir_tail)
+                .map_err(|e| crate::page::storage_err("insert: pin_mut directory tail", e))?;
+            let record = WalRecord::hnsw_dir_append(dir_tail, node_id.0, node_page_id, slot)
+                .map_err(|e| crate::page::storage_err("insert: encode DirAppend", e))?;
+            let lsn = wal_writer
+                .append(record)
+                .map_err(|e| crate::page::storage_err("insert: WAL append DirAppend", e))?;
+            let page: &mut [u8; PAGE_SIZE] = guard
+                .page_mut()
+                .try_into()
+                .expect("a buffer frame is exactly PAGE_SIZE");
+            crate::apply::dir_append(page, node_id.0, node_page_id, slot)?;
+            pg_storage::page::set_page_pd_lsn(page, lsn);
+        }
+        self.set_hwm(self.hwm + 1);
+
+        // Step 6 (§8.1 step 5): search + connect, only when the graph was
+        // non-empty BEFORE this insert (an empty graph has nothing to
+        // connect to — the first node skips the whole phase, like
+        // graph.rs's early return).
+        let was_empty = self.params.entry_point == NodeId::INVALID.0;
+        let old_max_level = self.params.max_level;
+        // The new node's own per-level selections, kept for step 7. Levels
+        // above the searched range stay empty and need NO record — NodeInit
+        // already reserved them with count = 0, so an empty list is the
+        // zero content (2026-09-20, slice 3 note: no record for empties).
+        let mut own_lists: Vec<Vec<u32>> = vec![Vec::new(); usize::from(level) + 1];
+        if !was_empty {
+            let searched_top = level.min(old_max_level);
+            {
+                let g = PagedGraph::new(
+                    buffer_pool,
+                    &self.dir_pages,
+                    self.hwm,
+                    self.params.dim,
+                    self.params.m,
+                    self.params.m_max0,
+                    self.params.metric,
+                );
+                let selection = self.params.selection;
+                let ef_construction = self.params.ef_construction as usize;
+                let m = usize::from(self.params.m);
+                let m_max = |l: u8| {
+                    if l == 0 {
+                        usize::from(self.params.m_max0)
+                    } else {
+                        m
+                    }
+                };
+
+                // Phase 1: greedy descent (ef = 1) from the entry point
+                // down to the new node's own top level (Algorithm 1).
+                let mut ep = NodeId(self.params.entry_point);
+                for l in ((level + 1)..=old_max_level).rev() {
+                    ep = crate::graph::search_layer(&g, vector, &[ep], 1, l)[0].id;
+                }
+
+                // Phase 2: beam-search, select, connect both sides, shrink
+                // over-capacity lists through the same heuristic (§4.3).
+                for l in (0..=searched_top).rev() {
+                    let w = crate::graph::search_layer(&g, vector, &[ep], ef_construction, l);
+                    let neighbors = crate::graph::select_neighbors(&g, selection, &w, m);
+                    for &nb in &neighbors {
+                        let (nb_page, nb_slot) = g.resolve(nb)?;
+                        // Collect-then-pin_mut (paged.rs deadlock
+                        // discipline): the read guard is dropped before the
+                        // write guard exists.
+                        let mut list: Vec<u32> = {
+                            let guard = buffer_pool.pin(nb_page).map_err(|e| {
+                                crate::page::storage_err("insert: pin neighbor page", e)
+                            })?;
+                            let page: &[u8; PAGE_SIZE] = guard
+                                .page()
+                                .try_into()
+                                .expect("a buffer frame is exactly PAGE_SIZE");
+                            crate::apply::neighbor_iter(page, nb_slot, geometry, l)?.collect()
+                        };
+                        // push_edge semantics: sorted insertion, a duplicate
+                        // would mean algorithm divergence — loud, never
+                        // silently absorbed (graph.rs debug_asserts the
+                        // same invariant on the in-memory side).
+                        match list.binary_search(&node_id.0) {
+                            Ok(_) => {
+                                return Err(HnswError::Corrupted(format!(
+                                    "insert: duplicate edge {} -> {} on level {l}",
+                                    nb.0, node_id.0
+                                )))
+                            }
+                            Err(pos) => list.insert(pos, node_id.0),
+                        }
+                        // Shrink through the SAME heuristic (§4.3 "both
+                        // sides"): the neighbor's own vector is the
+                        // reference, distances recomputed against it.
+                        let final_list = if list.len() > m_max(l) {
+                            let cands: Vec<crate::graph::Cand> = list
+                                .iter()
+                                .map(|&c| crate::graph::Cand {
+                                    dist: g.dist_between(nb, NodeId(c)),
+                                    id: NodeId(c),
+                                })
+                                .collect();
+                            crate::graph::select_neighbors(&g, selection, &cands, m_max(l))
+                                .iter()
+                                .map(|n| n.0)
+                                .collect()
+                        } else {
+                            list
+                        };
+                        // ONE SetNeighbors record settles the layer's
+                        // post-image (collect → pin_mut → append → apply →
+                        // stamp).
+                        let mut guard = buffer_pool.pin_mut(nb_page).map_err(|e| {
+                            crate::page::storage_err("insert: pin_mut neighbor page", e)
+                        })?;
+                        let record = WalRecord::hnsw_set_neighbors(
+                            self.meta_page_id,
+                            nb_page,
+                            nb_slot,
+                            nb.0,
+                            l,
+                            final_list.clone(),
+                        )
+                        .map_err(|e| crate::page::storage_err("insert: encode SetNeighbors", e))?;
+                        let lsn = wal_writer.append(record).map_err(|e| {
+                            crate::page::storage_err("insert: WAL append SetNeighbors", e)
+                        })?;
+                        let page: &mut [u8; PAGE_SIZE] = guard
+                            .page_mut()
+                            .try_into()
+                            .expect("a buffer frame is exactly PAGE_SIZE");
+                        crate::apply::set_neighbors(page, nb_slot, geometry, l, &final_list)?;
+                        pg_storage::page::set_page_pd_lsn(page, lsn);
+                    }
+                    own_lists[usize::from(l)] = neighbors.iter().map(|n| n.0).collect();
+                    ep = w[0].id; // nearest result carries the descent
+                }
+            }
+
+            // Step 7 (§8.1 step 6): the new node's own lists, AFTER every
+            // backward edge is in place (the §8.1 literal order — nothing
+            // in the loop above reads them).
+            for (l, list) in own_lists
+                .iter()
+                .enumerate()
+                .take(usize::from(searched_top) + 1)
+            {
+                if list.is_empty() {
+                    continue; // empty list == the NodeInit zero content
+                }
+                let mut guard = buffer_pool
+                    .pin_mut(node_page_id)
+                    .map_err(|e| crate::page::storage_err("insert: pin_mut own node page", e))?;
+                let record = WalRecord::hnsw_set_neighbors(
+                    self.meta_page_id,
+                    node_page_id,
+                    slot,
+                    node_id.0,
+                    l as u8,
+                    list.clone(),
+                )
+                .map_err(|e| crate::page::storage_err("insert: encode own SetNeighbors", e))?;
+                let lsn = wal_writer.append(record).map_err(|e| {
+                    crate::page::storage_err("insert: WAL append own SetNeighbors", e)
+                })?;
+                let page: &mut [u8; PAGE_SIZE] = guard
+                    .page_mut()
+                    .try_into()
+                    .expect("a buffer frame is exactly PAGE_SIZE");
+                crate::apply::set_neighbors(page, slot, geometry, l as u8, list)?;
+                pg_storage::page::set_page_pd_lsn(page, lsn);
+            }
+        }
+
+        // Step 8 (§8.1 step 7): MetaUpdate — a new top-level node becomes
+        // the entry point; the first node of an empty graph always does.
+        // (Non-empty graph with level <= max_level: no record at all.)
+        if was_empty || level > old_max_level {
+            let mut guard = buffer_pool
+                .pin_mut(self.meta_page_id)
+                .map_err(|e| crate::page::storage_err("insert: pin_mut meta page", e))?;
+            let record = WalRecord::hnsw_meta_update(self.meta_page_id, node_id.0, level)
+                .map_err(|e| crate::page::storage_err("insert: encode MetaUpdate", e))?;
+            let lsn = wal_writer
+                .append(record)
+                .map_err(|e| crate::page::storage_err("insert: WAL append MetaUpdate", e))?;
+            let page: &mut [u8; PAGE_SIZE] = guard
+                .page_mut()
+                .try_into()
+                .expect("a buffer frame is exactly PAGE_SIZE");
+            crate::apply::apply_meta(page, node_id.0, level);
+            pg_storage::page::set_page_pd_lsn(page, lsn);
+            drop(guard);
+            self.set_entry_point(node_id.0, level);
+        }
+
+        // Step 9 (§8.1 step 8): PublishLive — the state post-image lands
+        // only after all of the node's own level lists are written (v1.7).
+        let last_lsn = {
+            let mut guard = buffer_pool
+                .pin_mut(node_page_id)
+                .map_err(|e| crate::page::storage_err("insert: pin_mut node page", e))?;
+            let record = WalRecord::hnsw_publish_live(
+                self.meta_page_id,
+                node_page_id,
+                slot,
+                node_id.0,
+                self.params.dim,
+            )
+            .map_err(|e| crate::page::storage_err("insert: encode PublishLive", e))?;
+            let lsn = wal_writer
+                .append(record)
+                .map_err(|e| crate::page::storage_err("insert: WAL append PublishLive", e))?;
+            let page: &mut [u8; PAGE_SIZE] = guard
+                .page_mut()
+                .try_into()
+                .expect("a buffer frame is exactly PAGE_SIZE");
+            crate::apply::publish_live(page, slot, self.params.dim)?;
+            pg_storage::page::set_page_pd_lsn(page, lsn);
+            lsn
+        };
+
+        // Step 10 (§8.1 boundary ①): the success boundary — every record
+        // of the sequence is durable before Ok escapes.
+        wal_writer
+            .flush_to(last_lsn)
+            .map_err(|e| crate::page::storage_err("insert: success-boundary flush", e))?;
+        Ok(node_id)
     }
 }
 
@@ -179,7 +582,46 @@ pub fn create(
         params,
         hwm: 0,
         rng: Xoshiro256StarStar::new(rng_seed),
+        dir_pages: vec![dir_head],
+        current_node_page: None,
     })
+}
+
+/// Allocate + initialise a fresh node page through the §8.1 step-1 chain
+/// (`new_page` → `init_node_page` → `log_page_init` post-image FPI — no
+/// exceptions, page.rs's A1 contract).
+fn alloc_node_page(buffer_pool: &BufferPool, wal_writer: &WalWriter) -> Result<PageId> {
+    let mut guard = buffer_pool
+        .new_page()
+        .map_err(|e| crate::page::storage_err("alloc_node_page: allocate", e))?;
+    let page_id = guard.page_id();
+    let page: &mut [u8; PAGE_SIZE] = guard
+        .page_mut()
+        .try_into()
+        .expect("a buffer frame is exactly PAGE_SIZE");
+    crate::page::init_node_page(page);
+    crate::page::log_page_init(wal_writer, page_id, page)?;
+    Ok(page_id)
+}
+
+/// Allocate + initialise a fresh directory page with chain ordinal
+/// `ordinal` through the same init chain (§8.1 step 2).
+fn alloc_dir_page(
+    buffer_pool: &BufferPool,
+    wal_writer: &WalWriter,
+    ordinal: u64,
+) -> Result<PageId> {
+    let mut guard = buffer_pool
+        .new_page()
+        .map_err(|e| crate::page::storage_err("alloc_dir_page: allocate", e))?;
+    let page_id = guard.page_id();
+    let page: &mut [u8; PAGE_SIZE] = guard
+        .page_mut()
+        .try_into()
+        .expect("a buffer frame is exactly PAGE_SIZE");
+    crate::page::init_dir_page(page, ordinal);
+    crate::page::log_page_init(wal_writer, page_id, page)?;
+    Ok(page_id)
 }
 
 /// The outcome of opening an index: the handle plus non-fatal warnings
@@ -246,9 +688,13 @@ pub fn open(
 
     // 2. Directory chain walk (fetch through the read-only pin — the
     // closure pins per page and copies the frame out; no mutation, so the
-    // read guard is the right tool, buffer_pool.rs:272).
+    // read guard is the right tool, buffer_pool.rs:272). The head page's
+    // bytes are cached for the open-repair below (2026-09-20, Stage C
+    // slice 3: the walk already fetched them — a second pin would be a
+    // redundant round-trip).
     let dir_head = params.dir_head;
-    let fetch = |page_id: PageId| -> Result<[u8; PAGE_SIZE]> {
+    let mut head_cache: Option<[u8; PAGE_SIZE]> = None;
+    let mut fetch = |page_id: PageId| -> Result<[u8; PAGE_SIZE]> {
         let guard = buffer_pool
             .pin(page_id)
             .map_err(|e| crate::page::storage_err("open: pin directory page", e))?;
@@ -256,9 +702,12 @@ pub fn open(
             .page()
             .try_into()
             .expect("a buffer frame is PAGE_SIZE");
+        if page_id == dir_head {
+            head_cache = Some(*page);
+        }
         Ok(*page)
     };
-    let chain = crate::dir::check_dir_chain(dir_head, fetch)?;
+    let chain = crate::dir::check_dir_chain(dir_head, &mut fetch)?;
 
     // 3a. Published entry point must name an allocated node (2026-09-17,
     // review round 3 P3-1): INVALID is the empty graph (hwm == 0); anything
@@ -277,7 +726,7 @@ pub fn open(
 
     // 3b. Open-time meta repair (see the fn-level contract above).
     if chain.hwm > 0 && params.entry_point == NodeId::INVALID.0 {
-        let head_page = fetch(dir_head)?;
+        let head_page = head_cache.expect("the chain walk fetches the head page first");
         let (node_page_id, slot) = crate::dir::dir_entry(&head_page, 0)?;
         let top_level = {
             let guard = buffer_pool
@@ -352,6 +801,25 @@ pub fn open(
         let _ = rng.next_level(params.m);
     }
 
+    // 5. Insert-resolution caches (2026-09-20, Stage C slice 3): the
+    // ordinal-ordered chain pages come from the walk; the current node page
+    // is the page of the most recent directory entry (`None` when the graph
+    // is empty).
+    let current_node_page = if chain.hwm > 0 {
+        let tail_page_id = *chain.pages.last().expect("the chain is non-empty");
+        let idx = ((chain.hwm - 1) % u64::from(crate::dir::DIR_ENTRIES_PER_PAGE)) as u32;
+        let guard = buffer_pool
+            .pin(tail_page_id)
+            .map_err(|e| crate::page::storage_err("open: pin directory tail", e))?;
+        let page: &[u8; PAGE_SIZE] = guard
+            .page()
+            .try_into()
+            .expect("a buffer frame is PAGE_SIZE");
+        Some(crate::dir::dir_entry(page, idx)?.0)
+    } else {
+        None
+    };
+
     Ok(OpenOutcome {
         index: HnswIndex {
             meta_page_id,
@@ -359,6 +827,8 @@ pub fn open(
             params,
             hwm: chain.hwm,
             rng,
+            dir_pages: chain.pages,
+            current_node_page,
         },
         warnings,
     })
@@ -915,6 +1385,391 @@ mod tests {
             panic!("open-repair must reject a top_level beyond l_max(m)");
         };
         assert!(err.to_string().contains("l_max"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // 2026-09-20, Stage C slice 3: the insert write path (§8.1 eight-step
+    // sequence). The load-bearing pin is the topology parity test against
+    // the in-memory `Hnsw` — same seed, same vectors, byte-identical graph
+    // semantics — plus the WAL ordering, page-overflow, crash-continuation,
+    // and negative-validation pins.
+    // -----------------------------------------------------------------
+
+    /// Deterministic pseudo-random vectors from the crate's own PRNG (the
+    /// M4 dependency freeze bans `rand`).
+    fn det_vectors(seed: u64, n: usize, dim: usize) -> Vec<Vec<f32>> {
+        let mut rng = Xoshiro256StarStar::new(seed);
+        (0..n)
+            .map(|_| {
+                (0..dim)
+                    .map(|_| (rng.next_u64() % 4096) as f32 / 64.0)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Full page-resident topology (per node: top_level + per-level
+    /// neighbor ids) read through the slice-3 resolution cache.
+    fn paged_topology(pool: &BufferPool, index: &HnswIndex) -> Vec<(u8, Vec<Vec<u32>>)> {
+        let geo = NodeGeometry {
+            dim: index.params.dim,
+            m: index.params.m,
+            m_max0: index.params.m_max0,
+        };
+        let g = PagedGraph::new(
+            pool,
+            &index.dir_pages,
+            index.hwm,
+            index.params.dim,
+            index.params.m,
+            index.params.m_max0,
+            index.params.metric,
+        );
+        (0..index.hwm)
+            .map(|i| {
+                let (page_id, slot) = g.resolve(NodeId(i as u32)).unwrap();
+                let guard = pool.pin(page_id).unwrap();
+                let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+                let top = apply::entry_top_level(page, slot, geo.dim).unwrap();
+                let lists = (0..=top)
+                    .map(|l| {
+                        apply::neighbor_iter(page, slot, geo, l)
+                            .unwrap()
+                            .collect::<Vec<u32>>()
+                    })
+                    .collect();
+                (top, lists)
+            })
+            .collect()
+    }
+
+    /// The in-memory twin's topology in the same shape.
+    fn memory_topology(g: &crate::graph::Hnsw) -> Vec<(u8, Vec<Vec<u32>>)> {
+        (0..g.node_count())
+            .map(|i| {
+                let id = NodeId(i as u32);
+                let top = g.level(id);
+                let lists = (0..=top)
+                    .map(|l| g.neighbors(id, l).iter().map(|n| n.0).collect::<Vec<u32>>())
+                    .collect();
+                (top, lists)
+            })
+            .collect()
+    }
+
+    /// The slice-3 load-bearing pin: the page-resident insert path must
+    /// produce the graph the in-memory reference produces — same seed (the
+    /// level draws align), same vectors, byte-identical topology.
+    #[test]
+    fn paged_insert_matches_in_memory_topology() {
+        let dir = fresh_dir("paged-parity");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let params = HnswParams::new(4, 8, 16, 4).unwrap();
+        let mut index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            params,
+            4,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            0xC0FFEE,
+        )
+        .unwrap();
+        let mut mem = crate::graph::Hnsw::new(4, Metric::L2, params, 0xC0FFEE).unwrap();
+        for v in det_vectors(0xDEC0DE, 200, 4) {
+            let m_id = mem.insert(&v).unwrap();
+            let p_id = index
+                .insert(engine.buffer_pool(), engine.wal_writer(), &v)
+                .unwrap();
+            assert_eq!(m_id, p_id, "NodeId streams must align");
+        }
+        assert_eq!(index.hwm(), 200);
+        assert_eq!(index.entry_point(), mem.entry_point().unwrap().0);
+        assert_eq!(index.max_level(), mem.max_level());
+        assert_eq!(
+            paged_topology(engine.buffer_pool(), &index),
+            memory_topology(&mem),
+            "page-resident and in-memory topologies must be identical"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// First insert into an empty graph: hwm = 1, entry_point = 0, the
+    /// entry is LIVE with top_level == max_level, and the WAL carries the
+    /// §8.1 prefix NodeInit → DirAppend → MetaUpdate → PublishLive in
+    /// strictly ascending LSN order.
+    #[test]
+    fn first_insert_state_and_wal_order() {
+        let dir = fresh_dir("first-insert");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let mut index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            HnswParams::default(),
+            DIM,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            SEED,
+        )
+        .unwrap();
+        let id = index
+            .insert(
+                engine.buffer_pool(),
+                engine.wal_writer(),
+                &vec![1.0; DIM as usize],
+            )
+            .unwrap();
+        assert_eq!(id, NodeId(0));
+        assert_eq!(index.hwm(), 1);
+        assert_eq!(index.entry_point(), 0);
+
+        let g = PagedGraph::new(
+            engine.buffer_pool(),
+            &index.dir_pages,
+            index.hwm,
+            DIM,
+            16,
+            32,
+            Metric::L2,
+        );
+        let (node_page, slot) = g.resolve(NodeId(0)).unwrap();
+        let guard = engine.buffer_pool().pin(node_page).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        assert!(apply::entry_is_live(page, slot, DIM).unwrap());
+        assert_eq!(
+            apply::entry_top_level(page, slot, DIM).unwrap(),
+            index.max_level()
+        );
+        drop(guard);
+
+        // WAL scan: exactly the four records, LSN-ordered. The FullPageImage
+        // records interleaved between them (page-init chain + pin_mut
+        // pre-images) are intentionally filtered out — FPI-before-record
+        // ordering is structurally guaranteed by the pin_mut → append
+        // sequence, not something this assertion needs to see (2026-09-20,
+        // slice-3 adversarial review nano ①). The exact-four cardinality
+        // is a deliberate hard pin on the first-insert path: any future
+        // LEGAL change to the record sequence turns this test red on
+        // purpose (same nano ② — registered, not accidental).
+        use pg_storage::wal::record::WalRecordType::*;
+        let wal_dir = dir.join("wal");
+        let mut reader =
+            pg_storage::wal::reader::WalReader::open(&wal_dir, config.wal_segment_size).unwrap();
+        let mut seq: Vec<(Lsn, pg_storage::wal::record::WalRecordType)> = Vec::new();
+        while let Some(rec) = reader.next_record().unwrap() {
+            if matches!(
+                rec.record_type,
+                HnswNodeInit
+                    | HnswSetNeighbors
+                    | HnswMetaUpdate
+                    | HnswNodeTombstone
+                    | HnswDirAppend
+                    | HnswDirLink
+                    | HnswPublishLive
+            ) {
+                seq.push((rec.lsn, rec.record_type));
+            }
+        }
+        let types: Vec<_> = seq.iter().map(|(_, t)| *t).collect();
+        assert_eq!(
+            types,
+            vec![HnswNodeInit, HnswDirAppend, HnswMetaUpdate, HnswPublishLive],
+            "an empty-graph first insert is exactly the §8.1 prefix"
+        );
+        let lsns: Vec<_> = seq.iter().map(|(l, _)| *l).collect();
+        assert!(
+            lsns.windows(2).all(|w| w[0] < w[1]),
+            "record LSNs must be strictly ascending"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Node-page AND directory-page overflow: dim = 1 with minimal
+    /// parameters, N = 900 > 813 (DIR_ENTRIES_PER_PAGE) — the chain grows a
+    /// second page mid-stream and the topology still matches the in-memory
+    /// twin.
+    #[test]
+    fn insert_overflows_node_and_directory_pages() {
+        let dir = fresh_dir("overflow");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let params = HnswParams::new(2, 2, 4, 2).unwrap();
+        let mut index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            params,
+            1,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            0xBEEF,
+        )
+        .unwrap();
+        let mut mem = crate::graph::Hnsw::new(1, Metric::L2, params, 0xBEEF).unwrap();
+        for v in det_vectors(0xFACE, 900, 1) {
+            let m_id = mem.insert(&v).unwrap();
+            let p_id = index
+                .insert(engine.buffer_pool(), engine.wal_writer(), &v)
+                .unwrap();
+            assert_eq!(m_id, p_id);
+        }
+        assert_eq!(index.hwm(), 900);
+        assert_eq!(
+            index.dir_pages.len(),
+            2,
+            "900 entries overflow the 813-entry head page"
+        );
+        assert_eq!(
+            paged_topology(engine.buffer_pool(), &index),
+            memory_topology(&mem)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Coding-plan Stage C row 4 acceptance: a checkpointless crash mid-run
+    /// loses nothing — reopen replays the records, `open` re-derives hwm
+    /// and skip-ahead restores the rng, and continuation inserts draw the
+    /// exact level stream of the never-crashed run.
+    #[test]
+    fn reopen_continues_the_level_stream() {
+        let dir = fresh_dir("level-stream");
+        let config = StorageConfig::new(&dir);
+        const K: u64 = 50;
+        const J: u64 = 20;
+        let vectors = det_vectors(0x1234, (K + J) as usize, DIM as usize);
+        let meta_page_id = {
+            let engine = StorageEngine::open(&dir, &config).unwrap();
+            let mut index = create(
+                engine.buffer_pool(),
+                engine.wal_writer(),
+                HnswParams::default(),
+                DIM,
+                Metric::L2,
+                NeighborSelection::Heuristic,
+                SEED,
+            )
+            .unwrap();
+            for v in &vectors[..K as usize] {
+                index
+                    .insert(engine.buffer_pool(), engine.wal_writer(), v)
+                    .unwrap();
+            }
+            let meta = index.meta_page_id();
+            std::mem::forget(engine); // crash: no checkpoint
+            meta
+        };
+
+        let engine = StorageEngine::open_with_redo_handlers(
+            &dir,
+            &config,
+            crate::redo::hnsw_redo_handlers(),
+            vec![],
+        )
+        .unwrap();
+        let mut index = open(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            meta_page_id,
+            &make_expected(),
+        )
+        .unwrap()
+        .index;
+        assert_eq!(index.hwm(), K, "reopen must re-derive the hwm");
+        for v in &vectors[K as usize..] {
+            index
+                .insert(engine.buffer_pool(), engine.wal_writer(), v)
+                .unwrap();
+        }
+        assert_eq!(index.hwm(), K + J);
+
+        // The continuation's level stream, read back off the pages…
+        let g = PagedGraph::new(
+            engine.buffer_pool(),
+            &index.dir_pages,
+            index.hwm,
+            DIM,
+            16,
+            32,
+            Metric::L2,
+        );
+        let actual: Vec<u8> = (K..K + J)
+            .map(|i| {
+                let (p, s) = g.resolve(NodeId(i as u32)).unwrap();
+                let guard = engine.buffer_pool().pin(p).unwrap();
+                let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+                apply::entry_top_level(page, s, DIM).unwrap()
+            })
+            .collect();
+        // …must equal the never-crashed reference stream.
+        let mut reference = Xoshiro256StarStar::new(SEED);
+        for _ in 0..K {
+            reference.next_level(16);
+        }
+        let expected: Vec<u8> = (0..J).map(|_| reference.next_level(16)).collect();
+        assert_eq!(
+            actual, expected,
+            "§5 skip-ahead: the level stream continues exactly"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §5 entry validation on the write path: wrong dimension, NaN
+    /// component, and the cosine zero vector are loud errors that change NO
+    /// state (hwm unmoved, and a legal insert afterwards still works).
+    #[test]
+    fn insert_rejects_bad_vectors_without_state_change() {
+        let dir = fresh_dir("bad-vectors");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let params = HnswParams::new(4, 8, 16, 4).unwrap();
+        let mut index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            params,
+            4,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            7,
+        )
+        .unwrap();
+        assert!(matches!(
+            index.insert(engine.buffer_pool(), engine.wal_writer(), &[1.0, 2.0]),
+            Err(HnswError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            index.insert(engine.buffer_pool(), engine.wal_writer(), &[f32::NAN; 4]),
+            Err(HnswError::InvalidArgument(_))
+        ));
+        assert_eq!(index.hwm(), 0, "a rejected insert must not allocate");
+
+        let mut cosine = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            params,
+            4,
+            Metric::Cosine,
+            NeighborSelection::Heuristic,
+            7,
+        )
+        .unwrap();
+        assert!(matches!(
+            cosine.insert(engine.buffer_pool(), engine.wal_writer(), &[0.0; 4]),
+            Err(HnswError::ZeroVector)
+        ));
+        assert_eq!(cosine.hwm(), 0);
+
+        // Validation changed nothing: a legal insert still succeeds.
+        let id = index
+            .insert(engine.buffer_pool(), engine.wal_writer(), &[1.0; 4])
+            .unwrap();
+        assert_eq!(id, NodeId(0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

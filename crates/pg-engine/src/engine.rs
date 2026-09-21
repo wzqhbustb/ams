@@ -1431,6 +1431,29 @@ impl Engine {
         )?)
     }
 
+    /// Insert a vector into an open HNSW index (thin wrapper over
+    /// [`pg_am_hnsw::HnswIndex::insert`], tech-selection §8.1; M5 Stage C
+    /// slice 3).
+    ///
+    /// Utility/auto-commit shape, aligned with [`Self::create_hnsw_index`] /
+    /// [`Self::open_hnsw_index`]: single-threaded per index handle, and the
+    /// §8.1 boundary-① success flush (`flush_to` the PublishLive LSN) is
+    /// already executed inside the crate before `Ok` escapes — the caller
+    /// owes no further flush. A mid-sequence `Err` or crash leaves a §8.2
+    /// crash-window residue that slice-1 redo replays and the open protocol
+    /// repairs.
+    pub fn hnsw_insert(
+        &self,
+        index: &mut pg_am_hnsw::HnswIndex,
+        vector: &[f32],
+    ) -> Result<pg_am_hnsw::NodeId> {
+        Ok(index.insert(
+            self.storage.buffer_pool(),
+            self.storage.wal_writer(),
+            vector,
+        )?)
+    }
+
     /// The catalog-writing half of `create_index`, inside transaction `snap`.
     fn create_index_catalog_rows(
         &self,
