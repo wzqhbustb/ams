@@ -1442,6 +1442,10 @@ impl Engine {
     /// owes no further flush. A mid-sequence `Err` or crash leaves a §8.2
     /// crash-window residue that slice-1 redo replays and the open protocol
     /// repairs.
+    ///
+    /// `index` must be a handle opened against THIS engine's storage
+    /// (handles do not cross engines: the page ids inside name frames of
+    /// the originating data directory — same premise as `BTreeIndex`).
     pub fn hnsw_insert(
         &self,
         index: &mut pg_am_hnsw::HnswIndex,
@@ -1452,6 +1456,29 @@ impl Engine {
             self.storage.wal_writer(),
             vector,
         )?)
+    }
+
+    /// k-nearest-neighbor search on an open HNSW index (thin wrapper over
+    /// [`pg_am_hnsw::HnswIndex::search`], tech-selection §4.4/§8.1; M5
+    /// Stage C slice 4).
+    ///
+    /// Read-only: no WAL records, no page mutations, no flush owed by the
+    /// caller. `ef = None` uses the meta-pinned `ef_search_default`; the
+    /// only per-query invariant is `ef >= k`. Same single-threaded serving
+    /// premise as the crate-level search (paged.rs module header). The
+    /// INITIALIZING state bit is deliberately NOT a visibility filter
+    /// (§8.1③): a crash-window residue node is recallable.
+    ///
+    /// `index` must be a handle opened against THIS engine's storage —
+    /// same premise as [`Self::hnsw_insert`].
+    pub fn hnsw_search(
+        &self,
+        index: &pg_am_hnsw::HnswIndex,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+    ) -> Result<Vec<(pg_am_hnsw::NodeId, f64)>> {
+        Ok(index.search(self.storage.buffer_pool(), query, k, ef)?)
     }
 
     /// The catalog-writing half of `create_index`, inside transaction `snap`.

@@ -32,6 +32,16 @@
 //! `Result` (a slice-2 design rollback touching both algorithm cores and
 //! the in-memory reference) — registered as a Phase-4 hardening option,
 //! not an M5 defect.
+//!
+//! **Allocation accounting** (2026-09-21, slice 4 P3-B closure — the
+//! slice-3 final review's registered evaluation point; conclusion: the
+//! `vector_iter` + iterator-distance path, zero unsafe):
+//! `dist_to_query` is allocation-free (the stored vector streams off the
+//! pinned page through `apply::vector_iter` into
+//! `Metric::distance_iter`); `dist_between` keeps exactly ONE allocation
+//! (node a's vector is materialized, its guard dropped, then node b
+//! streams) because the deadlock discipline forbids holding two page pins
+//! at once.
 
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::types::{PageId, PAGE_SIZE};
@@ -163,9 +173,12 @@ impl GraphAccess for PagedGraph<'_> {
     }
 
     fn dist_to_query(&self, query: &[f32], node: NodeId) -> f64 {
+        // Allocation-free (P3-B): the stored vector streams off the pinned
+        // page through `vector_iter` into the bit-identical iterator
+        // distance — the computation completes inside the guard's lifetime.
         self.with_node(node, |page, slot| {
-            let v = apply::entry_vector(page, slot, self.dim)?;
-            self.metric.distance(query, &v)
+            let v = apply::vector_iter(page, slot, self.dim)?;
+            self.metric.distance_iter(query, v)
         })
         .expect("PagedGraph::dist_to_query: nodes handed to the algorithm cores resolve through a directory the open protocol validated (chain structure + node page type), and all vectors passed §5 entry validation at insert — a failure here is on-disk corruption beneath that validation")
     }
@@ -173,15 +186,16 @@ impl GraphAccess for PagedGraph<'_> {
     fn dist_between(&self, a: NodeId, b: NodeId) -> f64 {
         // Sequential short-lived pins: never hold one node's guard while
         // resolving/pinning the other (deadlock discipline, module header).
+        // Exactly one allocation (P3-B): node a's vector is materialized
+        // and its guard dropped; node b then streams through `vector_iter`.
         let va = self
             .with_node(a, |page, slot| apply::entry_vector(page, slot, self.dim))
             .expect("PagedGraph::dist_between: same validated-resolution premise as dist_to_query");
-        let vb = self
-            .with_node(b, |page, slot| apply::entry_vector(page, slot, self.dim))
-            .expect("PagedGraph::dist_between: same validated-resolution premise as dist_to_query");
-        self.metric
-            .distance(&va, &vb)
-            .expect("PagedGraph::dist_between: both vectors passed §5 entry validation at insert, so the distance cannot fail")
+        self.with_node(b, |page, slot| {
+            let vb = apply::vector_iter(page, slot, self.dim)?;
+            self.metric.distance_iter(&va, vb)
+        })
+        .expect("PagedGraph::dist_between: both vectors passed §5 entry validation at insert, so the distance cannot fail")
     }
 
     fn for_each_neighbor(&self, node: NodeId, level: u8, mut f: impl FnMut(NodeId)) {

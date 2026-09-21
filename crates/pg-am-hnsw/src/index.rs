@@ -123,6 +123,16 @@ impl HnswIndex {
     /// LSN (the PublishLive) before returning `Ok` — every record of the
     /// sequence precedes it in WAL order.
     ///
+    /// **Err-after-draw semantics** (slice-3 leftover, slice-4 final review
+    /// round 3 nano): entry-validation failures change nothing, but a
+    /// failure AFTER the step-1 level draw (page alloc, WAL append, apply,
+    /// flush) leaves the rng stream one draw ahead of `hwm` — a retry on
+    /// the same handle draws the NEXT level, so the resulting level
+    /// allocation is legal but not identical to a run where the failed
+    /// attempt never happened (the in-memory twin has no post-validation
+    /// failure points and never diverges this way). Reopening re-syncs the
+    /// stream via skip-ahead (exactly `hwm` draws).
+    ///
     /// **Single-threaded premise**: one writer per index handle; the buffer
     /// pool's latches make the page touches safe, but the eight steps are
     /// not isolated against a concurrent inserter.
@@ -492,6 +502,78 @@ impl HnswIndex {
             .flush_to(last_lsn)
             .map_err(|e| crate::page::storage_err("insert: success-boundary flush", e))?;
         Ok(node_id)
+    }
+
+    /// k-nearest-neighbor search on the page-resident graph (paper
+    /// Algorithm 5 = greedy descent + Algorithm 2 level-0 beam) — Phase 2
+    /// M5 Stage C slice 4. Mirrors `graph.rs`'s `Hnsw::search` semantics
+    /// and error-priority order exactly (dim mismatch → §5 entry validation
+    /// → ef >= k → empty graph → k == 0), so the cross-form parity tests
+    /// pin identical outputs AND identical failure variants.
+    ///
+    /// Returns up to `k` hits as `(NodeId, distance)`, sorted ascending by
+    /// `(distance, NodeId)` (§4.1 prerequisite ①). `ef` is the beam width;
+    /// `None` uses the meta-pinned `ef_search_default` (creation-pinned,
+    /// §4.4). The only per-query invariant is `ef >= k`.
+    ///
+    /// **INITIALIZING semantics** (§8.1③, frozen): the state bit is NOT
+    /// checked anywhere on the search path — an INITIALIZING node has its
+    /// vector, is recallable, and is a legal answer. That is deliberate
+    /// (the bit is a recovery-progress marker, not a visibility filter);
+    /// the `search_recalls_initializing_nodes` test pins it.
+    ///
+    /// **Premises** (paged.rs module header): single-threaded serving;
+    /// directory corruption beneath the open protocol's validation is
+    /// fail-stop (panic with the premise in the message), never a wrong
+    /// answer.
+    pub fn search(
+        &self,
+        buffer_pool: &BufferPool,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+    ) -> Result<Vec<(NodeId, f64)>> {
+        // Entry validation, same order as the in-memory twin (graph.rs
+        // Hnsw::search): dimension first, then the metric self-distance
+        // funnel (finiteness + cosine zero vector, §5).
+        if query.len() != usize::from(self.params.dim) {
+            return Err(HnswError::InvalidArgument(format!(
+                "search: query has {} components, index dim is {} (§3: same index never mixes dimensions)",
+                query.len(),
+                self.params.dim
+            )));
+        }
+        self.params.metric.distance(query, query)?;
+        let ef = ef.unwrap_or(self.params.ef_search_default as usize);
+        if ef < k {
+            return Err(HnswError::InvalidArgument(format!(
+                "ef = {ef} < k = {k} (§4.4: the beam must fit the result set; this is the only per-query invariant)"
+            )));
+        }
+        if self.params.entry_point == NodeId::INVALID.0 {
+            return Ok(Vec::new()); // empty graph
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let g = PagedGraph::new(
+            buffer_pool,
+            &self.dir_pages,
+            self.hwm,
+            self.params.dim,
+            self.params.m,
+            self.params.m_max0,
+            self.params.metric,
+        );
+        // Greedy descent (ef = 1) through the upper layers, then a beam
+        // search of width ef on level 0 (Algorithm 5).
+        let mut ep = NodeId(self.params.entry_point);
+        for l in (1..=self.params.max_level).rev() {
+            ep = crate::graph::search_layer(&g, query, &[ep], 1, l)[0].id;
+        }
+        let w = crate::graph::search_layer(&g, query, &[ep], ef, 0);
+        Ok(w.into_iter().take(k).map(|c| (c.id, c.dist)).collect())
     }
 }
 
@@ -1770,6 +1852,347 @@ mod tests {
             .insert(engine.buffer_pool(), engine.wal_writer(), &[1.0; 4])
             .unwrap();
         assert_eq!(id, NodeId(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // 2026-09-21, Stage C slice 4: the page-resident search path. The
+    // load-bearing pin is the cross-form parity test — every query/grid
+    // point must match the in-memory twin to the last f64 bit, and the
+    // error variants must match too.
+    // -----------------------------------------------------------------
+
+    /// Build the in-memory and page-resident twins over the same vectors.
+    fn build_twins(
+        tag: &str,
+        dim: u16,
+        params: HnswParams,
+        metric: Metric,
+        seed: u64,
+        vectors: &[Vec<f32>],
+    ) -> (crate::graph::Hnsw, HnswIndex, StorageEngine, PathBuf) {
+        let dir = fresh_dir(tag);
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let mut index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            params,
+            dim,
+            metric,
+            NeighborSelection::Heuristic,
+            seed,
+        )
+        .unwrap();
+        let mut mem = crate::graph::Hnsw::new(dim, metric, params, seed).unwrap();
+        for v in vectors {
+            let m_id = mem.insert(v).unwrap();
+            let p_id = index
+                .insert(engine.buffer_pool(), engine.wal_writer(), v)
+                .unwrap();
+            assert_eq!(m_id, p_id);
+        }
+        (mem, index, engine, dir)
+    }
+
+    /// `(NodeId, to_bits)` pairs — the exact comparison currency.
+    fn bits(hits: &[(NodeId, f64)]) -> Vec<(u32, u64)> {
+        hits.iter().map(|(id, d)| (id.0, d.to_bits())).collect()
+    }
+
+    /// One parity configuration: a query grid (queries × k × ef) must
+    /// produce the same OUTCOME on both forms — bitwise-identical hits, or
+    /// the same error variant (ef < k is a legal grid point: both sides
+    /// must fail alike; the ef = None column is only satisfiable when the
+    /// meta default reaches k).
+    fn assert_search_parity(tag: &str, dim: u16, params: HnswParams, metric: Metric, n: usize) {
+        let vectors = det_vectors(0xDEC0DE, n, dim as usize);
+        let queries = det_vectors(0x0B5E55, 4, dim as usize);
+        let (mem, index, engine, dir) = build_twins(tag, dim, params, metric, 0xC0FFEE, &vectors);
+        let pool = engine.buffer_pool();
+        for (qi, q) in queries.iter().enumerate() {
+            for k in [1usize, 3, 10] {
+                // ef grid: default / exactly k / one above / generous.
+                for ef in [None, Some(k), Some(k + 1), Some(500)] {
+                    let ctx = format!("{tag} query {qi} k={k} ef={ef:?}");
+                    match (mem.search(q, k, ef), index.search(pool, q, k, ef)) {
+                        (Ok(m_hits), Ok(p_hits)) => assert_eq!(
+                            bits(&p_hits),
+                            bits(&m_hits),
+                            "{ctx}: page-resident must equal in-memory bitwise"
+                        ),
+                        (Err(m_err), Err(p_err)) => assert_eq!(
+                            std::mem::discriminant(&m_err),
+                            std::mem::discriminant(&p_err),
+                            "{ctx}: error variant parity: in-memory {m_err}, paged {p_err}"
+                        ),
+                        (m, p) => panic!(
+                            "{ctx}: outcome mismatch — in-memory ok = {}, paged ok = {}",
+                            m.is_ok(),
+                            p.is_ok()
+                        ),
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paged_search_matches_in_memory_bitwise() {
+        // dim=4 / N=200 at m=4 (the slice-3 parity shape), all three
+        // metrics…
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+            let params = HnswParams::new(4, 8, 16, 4).unwrap();
+            assert_search_parity("parity-m4", 4, params, metric, 200);
+        }
+        // …and the dim=1 / N=900 double-overflow shape (node pages AND the
+        // directory chain grow past one page).
+        let params = HnswParams::new(2, 2, 4, 2).unwrap();
+        assert_search_parity("parity-overflow", 1, params, Metric::L2, 900);
+    }
+
+    /// Error parity: the same bad input fails with the same error variant
+    /// on both forms (the error-priority order is part of the contract).
+    #[test]
+    fn paged_search_error_parity() {
+        let params = HnswParams::new(4, 8, 16, 4).unwrap();
+        let vectors = det_vectors(0xDEC0DE, 50, 4);
+        let (mem, index, engine, dir) =
+            build_twins("parity-err", 4, params, Metric::L2, 0xC0FFEE, &vectors);
+        let pool = engine.buffer_pool();
+        let cases: Vec<(Vec<f32>, usize, Option<usize>)> = vec![
+            (vec![1.0, 2.0], 1, None),         // dim mismatch
+            (vec![f32::NAN; 4], 1, None),      // non-finite
+            (vec![f32::INFINITY; 4], 1, None), // ±inf
+            (vec![1.0; 4], 3, Some(2)),        // ef < k
+        ];
+        for (q, k, ef) in &cases {
+            let m = mem.search(q, *k, *ef).unwrap_err();
+            let p = index.search(pool, q, *k, *ef).unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&m),
+                std::mem::discriminant(&p),
+                "error variant parity: in-memory {m}, paged {p}"
+            );
+        }
+
+        // Compound faults (2026-09-21, slice-4 adversarial review P3-1):
+        // a discriminant-only comparison cannot see the error-PRIORITY
+        // order — two faults at once must fail on the FIRST check of the
+        // frozen order (dim → §5 finiteness → ef >= k) on BOTH forms, and
+        // the message fragment pins which check fired (a same-variant
+        // different-message divergence would pass the loop above).
+        let compound: Vec<(Vec<f32>, usize, Option<usize>, &str)> = vec![
+            (vec![1.0, 2.0], 3, Some(2), "components"), // dim + ef<k: dim wins
+            (vec![f32::NAN; 4], 3, Some(2), "non-finite"), // NaN + ef<k: §5 wins
+            (vec![f32::NAN, 7.0], 3, Some(2), "components"), // NaN + dim: dim wins
+        ];
+        for (q, k, ef, fragment) in &compound {
+            let m = mem.search(q, *k, *ef).unwrap_err();
+            let p = index.search(pool, q, *k, *ef).unwrap_err();
+            assert_eq!(std::mem::discriminant(&m), std::mem::discriminant(&p));
+            assert!(
+                m.to_string().contains(fragment),
+                "in-memory error must name the first-failed check ({fragment}): {m}"
+            );
+            assert!(
+                p.to_string().contains(fragment),
+                "paged error must name the first-failed check ({fragment}): {p}"
+            );
+        }
+
+        // Cosine zero query: ZeroVector on both forms.
+        let (mem_c, index_c, engine_c, dir_c) = build_twins(
+            "parity-err-cos",
+            4,
+            params,
+            Metric::Cosine,
+            0xC0FFEE,
+            &vectors,
+        );
+        let m = mem_c.search(&[0.0; 4], 1, None).unwrap_err();
+        let p = index_c
+            .search(engine_c.buffer_pool(), &[0.0; 4], 1, None)
+            .unwrap_err();
+        assert!(matches!(m, HnswError::ZeroVector));
+        assert!(matches!(p, HnswError::ZeroVector));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_c);
+    }
+
+    /// §8.1③ frozen semantics: the state bit is NOT a search filter — an
+    /// INITIALIZING node (the §8.2 crash-window residue: fully written,
+    /// never PublishLive'd) has its vector, is recallable, and is a legal
+    /// answer. Hand-built crash residue in image form (the
+    /// open_repairs_entry_point_and_skips_ahead pattern).
+    #[test]
+    fn search_recalls_initializing_nodes() {
+        let dir = fresh_dir("initializing-recall");
+        let config = StorageConfig::new(&dir);
+        let geo = NodeGeometry {
+            dim: DIM,
+            m: 16,
+            m_max0: 32,
+        };
+        let meta_page_id = {
+            let engine = StorageEngine::open(&dir, &config).unwrap();
+            let index = create(
+                engine.buffer_pool(),
+                engine.wal_writer(),
+                HnswParams::default(),
+                DIM,
+                Metric::L2,
+                NeighborSelection::Heuristic,
+                SEED,
+            )
+            .unwrap();
+            // Residue: node 0 LIVE with level-0 neighbor [1]; node 1
+            // INITIALIZING (crash between SetNeighbors and PublishLive);
+            // directory maps both; meta entry_point = 0.
+            let node_page_id = {
+                let mut guard = engine.buffer_pool().new_page().unwrap();
+                let page_id = guard.page_id();
+                let page = page_mut(&mut guard);
+                init_node_page(page);
+                log_page_init(engine.wal_writer(), page_id, page).unwrap();
+                page_id
+            };
+            {
+                let mut guard = engine.buffer_pool().pin_mut(node_page_id).unwrap();
+                let page = page_mut(&mut guard);
+                let s0 = apply::append_node(page, 0, 0, geo, &[1.0; DIM as usize]).unwrap();
+                let _s1 = apply::append_node(page, 1, 0, geo, &[2.0; DIM as usize]).unwrap();
+                apply::set_neighbors(page, s0, geo, 0, &[1]).unwrap();
+                apply::publish_live(page, s0, DIM).unwrap();
+                // node 1 deliberately stays INITIALIZING.
+                let lsn = engine
+                    .wal_writer()
+                    .append(WalRecord::full_page_image(node_page_id, page.to_vec()).unwrap())
+                    .unwrap();
+                pg_storage::page::set_page_pd_lsn(page, lsn);
+            }
+            {
+                let mut guard = engine.buffer_pool().pin_mut(index.dir_head()).unwrap();
+                let page = page_mut(&mut guard);
+                apply::dir_append(page, 0, node_page_id, 0).unwrap();
+                apply::dir_append(page, 1, node_page_id, 1).unwrap();
+                let lsn = engine
+                    .wal_writer()
+                    .append(WalRecord::full_page_image(index.dir_head(), page.to_vec()).unwrap())
+                    .unwrap();
+                pg_storage::page::set_page_pd_lsn(page, lsn);
+            }
+            {
+                let mut guard = engine.buffer_pool().pin_mut(index.meta_page_id()).unwrap();
+                let page = page_mut(&mut guard);
+                apply::apply_meta(page, 0, 0);
+                let lsn = engine
+                    .wal_writer()
+                    .append(
+                        WalRecord::full_page_image(index.meta_page_id(), page.to_vec()).unwrap(),
+                    )
+                    .unwrap();
+                pg_storage::page::set_page_pd_lsn(page, lsn);
+            }
+            engine.wal_writer().flush().unwrap();
+            std::mem::forget(engine); // crash: no checkpoint
+            index.meta_page_id()
+        };
+
+        let engine = StorageEngine::open_with_redo_handlers(
+            &dir,
+            &config,
+            crate::redo::hnsw_redo_handlers(),
+            vec![],
+        )
+        .unwrap();
+        let index = open(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            meta_page_id,
+            &make_expected(),
+        )
+        .unwrap()
+        .index;
+        assert_eq!(index.hwm(), 2);
+
+        // Premise: node 1 is INITIALIZING on disk.
+        let g = PagedGraph::new(
+            engine.buffer_pool(),
+            &index.dir_pages,
+            index.hwm,
+            DIM,
+            16,
+            32,
+            Metric::L2,
+        );
+        let (npage, nslot) = g.resolve(NodeId(1)).unwrap();
+        let guard = engine.buffer_pool().pin(npage).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        assert!(!apply::entry_is_live(page, nslot, DIM).unwrap());
+        drop(guard);
+
+        // The frozen semantics: search for node 1's own vector must recall
+        // node 1 — as the nearest hit (L2 self-distance 0) — with no state
+        // check anywhere on the path.
+        let hits = index
+            .search(engine.buffer_pool(), &vec![2.0; DIM as usize], 2, Some(10))
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, NodeId(1));
+        assert_eq!(hits[0].1, 0.0);
+        assert_eq!(hits[1].0, NodeId(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Early-exit pins: an empty graph answers `[]` (any ef), and k = 0
+    /// answers `[]` on a non-empty graph.
+    #[test]
+    fn search_early_exits() {
+        let dir = fresh_dir("search-early-exit");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let mut index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            HnswParams::default(),
+            DIM,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            SEED,
+        )
+        .unwrap();
+        // Empty graph.
+        assert_eq!(
+            index
+                .search(engine.buffer_pool(), &vec![1.0; DIM as usize], 5, None)
+                .unwrap(),
+            vec![]
+        );
+        assert_eq!(
+            index
+                .search(engine.buffer_pool(), &vec![1.0; DIM as usize], 5, Some(5))
+                .unwrap(),
+            vec![]
+        );
+        // k = 0 on a non-empty graph.
+        index
+            .insert(
+                engine.buffer_pool(),
+                engine.wal_writer(),
+                &vec![1.0; DIM as usize],
+            )
+            .unwrap();
+        assert_eq!(
+            index
+                .search(engine.buffer_pool(), &vec![1.0; DIM as usize], 0, Some(0))
+                .unwrap(),
+            vec![]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

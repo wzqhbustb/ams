@@ -256,3 +256,71 @@ fn hnsw_insert_survives_a_checkpointless_crash() {
     assert_eq!(index.hwm(), 7);
     assert_eq!(index.entry_point(), reference_entry_point(7));
 }
+
+/// 2026-09-21, Stage C slice 4: the engine-side search path — insert a
+/// handful of vectors, search each (self is the nearest hit, L2 distance
+/// exactly 0.0), then crash WITHOUT a checkpoint (`mem::forget`) and
+/// verify the reopened index answers every query bitwise-identically
+/// (slice-1 redo rebuilt the pages; the search path itself is read-only).
+#[test]
+fn hnsw_search_is_bitwise_stable_across_a_crash() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+
+    let vectors: Vec<Vec<f32>> = (0..12u32)
+        .map(|i| {
+            let mut v = vec![0.0f32; DIM as usize];
+            v[(i as usize) % DIM as usize] = 1.0 + i as f32;
+            v[(i as usize * 7 + 3) % DIM as usize] = 0.5;
+            v
+        })
+        .collect();
+    let bits = |hits: &[(pg_am_hnsw::NodeId, f64)]| -> Vec<(u32, u64)> {
+        hits.iter().map(|(id, d)| (id.0, d.to_bits())).collect()
+    };
+
+    let (meta_page, before) = {
+        let engine = Engine::open(dir, EngineConfig::new(dir)).unwrap();
+        let (_oid, meta_page) = engine
+            .create_hnsw_index(
+                HnswParams::default(),
+                DIM,
+                Metric::L2,
+                NeighborSelection::Heuristic,
+                SEED,
+            )
+            .unwrap();
+        let mut index = engine
+            .open_hnsw_index(meta_page, &expected())
+            .unwrap()
+            .index;
+        for v in &vectors {
+            engine.hnsw_insert(&mut index, v).unwrap();
+        }
+        // Every vector recalls itself as the nearest hit at distance 0.
+        let mut before = Vec::new();
+        for (i, v) in vectors.iter().enumerate() {
+            let hits = engine.hnsw_search(&index, v, 3, None).unwrap();
+            assert_eq!(hits[0].0, pg_am_hnsw::NodeId(i as u32));
+            assert_eq!(hits[0].1, 0.0, "L2 self-distance");
+            before.push(bits(&hits));
+        }
+        std::mem::forget(engine); // crash: no checkpoint
+        (meta_page, before)
+    };
+
+    let engine = Engine::open(dir, EngineConfig::new(dir)).unwrap();
+    let index = engine
+        .open_hnsw_index(meta_page, &expected())
+        .unwrap()
+        .index;
+    assert_eq!(index.hwm(), vectors.len() as u64);
+    for (i, v) in vectors.iter().enumerate() {
+        let hits = engine.hnsw_search(&index, v, 3, None).unwrap();
+        assert_eq!(
+            bits(&hits),
+            before[i],
+            "query {i}: post-crash search must be bitwise identical"
+        );
+    }
+}

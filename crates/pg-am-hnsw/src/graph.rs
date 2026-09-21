@@ -67,6 +67,23 @@ impl Metric {
         }
     }
 
+    /// Iterator-sided twin of [`Metric::distance`] (2026-09-21, M5 Stage C
+    /// slice 4, P3-B): the page-resident search hands stored vectors in as
+    /// zero-copy page iterators (`apply::vector_iter`), so dispatch lands
+    /// on the bit-identical `*_iter` variants. Same validation premise as
+    /// the iterator layer: shape only, no finiteness re-check (hot path).
+    pub(crate) fn distance_iter(
+        self,
+        a: &[f32],
+        b: impl ExactSizeIterator<Item = f32>,
+    ) -> Result<f64> {
+        match self {
+            Metric::L2 => distance::l2_squared_iter(a, b),
+            Metric::Cosine => distance::cosine_iter(a, b),
+            Metric::InnerProduct => distance::negative_inner_product_iter(a, b),
+        }
+    }
+
     /// On-disk discriminant (0=L2, 1=Cosine, 2=InnerProduct) — the metric's
     /// FIRST persistence (2026-09-15, M5 Stage B slice 2): the M4 snapshot
     /// deliberately carries no metric (§3; a snapshot stores geometry only),

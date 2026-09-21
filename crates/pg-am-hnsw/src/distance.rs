@@ -89,6 +89,88 @@ pub fn negative_inner_product(a: &[f32], b: &[f32]) -> Result<f64> {
     Ok(-acc)
 }
 
+// ---------------------------------------------------------------------
+// Iterator variants (2026-09-21, M5 Stage C slice 4 — the P3-B
+// zero-allocation evaluation's landing conclusion): the page-resident
+// search reads stored vectors off pages through `apply::vector_iter`
+// (zero-copy), so the distance layer takes the RIGHT side as an iterator
+// and never materializes a Vec.
+//
+// **Bit-identical contract**: each variant accumulates in component order
+// 0..dim with the same f32→f64 exact promotion and the same accumulator
+// sequence as its slice twin — mathematically same order, bitwise same
+// result (pinned by `to_bits()` tests below).
+//
+// **Validation** (hot-path premise, mirroring the `GraphAccess` trait
+// contract in graph.rs): only the shape checks run — iterator length must
+// equal `a.len()` (dimension mismatch) and `dim = 0` is rejected; cosine's
+// zero-vector rejection is preserved. **Finiteness is NOT re-checked**:
+// the query was entry-validated (§5) and stored vectors were validated by
+// the write path. Do not call these on unvalidated input.
+// ---------------------------------------------------------------------
+
+/// Shared shape validation for the iterator variants: the iterator must
+/// declare exactly `a.len()` components (ExactSizeIterator), and `dim = 0`
+/// is rejected like the slice entry points.
+fn validate_iter_shape<I: ExactSizeIterator<Item = f32>>(a: &[f32], b: &I) -> Result<()> {
+    if b.len() != a.len() {
+        return Err(HnswError::InvalidArgument(format!(
+            "dimension mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    if a.is_empty() {
+        return Err(HnswError::InvalidArgument("dim = 0 vector".to_string()));
+    }
+    Ok(())
+}
+
+/// Iterator-sided twin of [`l2_squared`] — bit-identical accumulation (see
+/// the section comment for the contract and the validation premise).
+pub(crate) fn l2_squared_iter(a: &[f32], b: impl ExactSizeIterator<Item = f32>) -> Result<f64> {
+    validate_iter_shape(a, &b)?;
+    let mut acc = 0.0f64;
+    // Same component order 0..dim, same f64 accumulator chain as the slice
+    // twin (lengths were shape-checked, so zip cannot truncate early).
+    for (&x, y) in a.iter().zip(b) {
+        let d = f64::from(x) - f64::from(y);
+        acc += d * d;
+    }
+    Ok(acc)
+}
+
+/// Iterator-sided twin of [`cosine`] — bit-identical accumulation; the
+/// zero-vector rejection is preserved (aa/bb are exact sums of squares).
+pub(crate) fn cosine_iter(a: &[f32], b: impl ExactSizeIterator<Item = f32>) -> Result<f64> {
+    validate_iter_shape(a, &b)?;
+    let (mut ab, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+    for (&x, y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(x), f64::from(y));
+        ab += x * y;
+        aa += x * x;
+        bb += y * y;
+    }
+    if aa == 0.0 || bb == 0.0 {
+        return Err(HnswError::ZeroVector);
+    }
+    Ok(1.0 - ab / (aa.sqrt() * bb.sqrt()))
+}
+
+/// Iterator-sided twin of [`negative_inner_product`] — bit-identical
+/// accumulation.
+pub(crate) fn negative_inner_product_iter(
+    a: &[f32],
+    b: impl ExactSizeIterator<Item = f32>,
+) -> Result<f64> {
+    validate_iter_shape(a, &b)?;
+    let mut acc = 0.0f64;
+    for (&x, y) in a.iter().zip(b) {
+        acc += f64::from(x) * f64::from(y);
+    }
+    Ok(-acc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +363,73 @@ mod tests {
             (got_ip - ref_ip).abs() <= 1e-12 * ref_ip.abs().max(1.0),
             "ip: got {got_ip}, ref {ref_ip}"
         );
+    }
+
+    // ---- iterator variants (2026-09-21, Stage C slice 4, P3-B) ----
+
+    /// The bit-identical contract: every iterator variant must produce the
+    /// exact `to_bits()` of its slice twin, across metrics, magnitudes,
+    /// signs, and a 960-dim group (the M4 acceptance dimension).
+    #[test]
+    fn iter_variants_are_bit_identical_to_slice_twins() {
+        let groups: Vec<(Vec<f32>, Vec<f32>)> = vec![
+            (vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
+            (vec![1.0, 0.0, -1.0, 2.0], vec![0.0, 1.0, 1.0, -2.0]),
+            (vec![0.0; 8], vec![1.0; 8]), // zero left side (L2/IP legal)
+            (vec![-3.5; 17], vec![2.25; 17]),
+            (
+                (0..960u32)
+                    .map(|i| ((i * 37 + 11) % 251) as f32 / 64.0 - 2.0)
+                    .collect(),
+                (0..960u32)
+                    .map(|i| ((i * 91 + 7) % 233) as f32 / 128.0 - 1.0)
+                    .collect(),
+            ),
+        ];
+        for (a, b) in &groups {
+            assert_eq!(
+                l2_squared(a, b).unwrap().to_bits(),
+                l2_squared_iter(a, b.iter().copied()).unwrap().to_bits(),
+                "l2 iter must be bit-identical"
+            );
+            assert_eq!(
+                negative_inner_product(a, b).unwrap().to_bits(),
+                negative_inner_product_iter(a, b.iter().copied())
+                    .unwrap()
+                    .to_bits(),
+                "ip iter must be bit-identical"
+            );
+            if a.iter().any(|&x| x != 0.0) && b.iter().any(|&x| x != 0.0) {
+                assert_eq!(
+                    cosine(a, b).unwrap().to_bits(),
+                    cosine_iter(a, b.iter().copied()).unwrap().to_bits(),
+                    "cosine iter must be bit-identical"
+                );
+            }
+        }
+        // Cosine zero-vector rejection survives the iterator surface.
+        assert!(matches!(
+            cosine_iter(&[0.0, 0.0], [1.0, 2.0].into_iter()),
+            Err(HnswError::ZeroVector)
+        ));
+    }
+
+    #[test]
+    fn iter_variants_reject_shape_mismatch() {
+        // Iterator length != slice length (ExactSizeIterator::len drives
+        // the check, before any element is consumed).
+        assert!(matches!(
+            l2_squared_iter(&[1.0, 2.0], [1.0].into_iter()),
+            Err(HnswError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            cosine_iter(&[1.0], [1.0, 2.0].into_iter()),
+            Err(HnswError::InvalidArgument(_))
+        ));
+        // dim = 0 rejected like the slice entry points.
+        assert!(matches!(
+            negative_inner_product_iter(&[], [].into_iter()),
+            Err(HnswError::InvalidArgument(_))
+        ));
     }
 }
