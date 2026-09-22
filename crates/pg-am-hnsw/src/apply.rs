@@ -575,6 +575,22 @@ pub(crate) fn slot_is_occupied(node_page: &[u8; PAGE_SIZE], slot: u16) -> bool {
     read_lp(node_page, slot).is_some()
 }
 
+/// Number of slots (line pointers) on a node page — the Stage D audit's
+/// per-page traversal bound (§11.3). Same `pd_lower` clamping discipline
+/// as `read_lp` (page content is untrusted: in-range AND 4-byte-aligned,
+/// else loud `Corrupted`).
+pub(crate) fn slot_count(node_page: &[u8; PAGE_SIZE]) -> Result<u16> {
+    let lower = pd_lower(node_page) as usize;
+    if !(PAGE_HEADER_SIZE..=PAGE_SIZE).contains(&lower)
+        || (lower - PAGE_HEADER_SIZE) % LINE_POINTER_SIZE != 0
+    {
+        return Err(HnswError::Corrupted(format!(
+            "slot_count: page is not slotted-initialized (pd_lower={lower})"
+        )));
+    }
+    Ok(((lower - PAGE_HEADER_SIZE) / LINE_POINTER_SIZE) as u16)
+}
+
 /// The entry's top level (state byte bits 0-5).
 pub(crate) fn entry_top_level(node_page: &[u8; PAGE_SIZE], slot: u16, dim: u16) -> Result<u8> {
     let entry = entry_at(node_page, slot, "entry_top_level")?;

@@ -575,6 +575,15 @@ impl HnswIndex {
         let w = crate::graph::search_layer(&g, query, &[ep], ef, 0);
         Ok(w.into_iter().take(k).map(|c| (c.id, c.dist)).collect())
     }
+
+    /// Run the §11.3 post-recovery audit against this index (Stage D
+    /// slice 1, [`crate::audit`]). The audit re-walks the directory chain
+    /// and re-reads every entry ITSELF — it deliberately trusts none of
+    /// this handle's caches (`dir_pages`, `hwm`, …), so a broken cache
+    /// cannot mask on-disk corruption.
+    pub fn audit(&self, buffer_pool: &BufferPool) -> Result<crate::audit::AuditReport> {
+        crate::audit::audit_index(buffer_pool, self.meta_page_id)
+    }
 }
 
 /// Create a brand-new index (§10.3 creation sequence, §7.2 creation

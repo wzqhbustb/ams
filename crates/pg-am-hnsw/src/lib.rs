@@ -47,6 +47,9 @@
 // the Stage C write path / search consumers (same discipline as before).
 #[allow(dead_code)]
 pub(crate) mod apply;
+// Stage D slice 1 (2026-09-21): the §11.3 post-recovery audit — see
+// [`audit`].
+pub mod audit;
 pub mod dataset;
 // Stage B slice 1 (2026-09-15): node-entry and directory-chain format
 // owners. Their consumers (index.rs / open-time chain walk) land in
@@ -83,6 +86,7 @@ pub mod snapshot;
 
 pub(crate) mod validate;
 
+pub use audit::AuditReport;
 pub use error::{HnswError, Result};
 pub use graph::{Hnsw, Metric, NeighborSelection};
 pub use index::{ExpectedParams, HnswIndex, OpenOutcome};

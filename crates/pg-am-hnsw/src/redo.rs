@@ -13,6 +13,11 @@
 //!
 //! Every handler follows the same sequence:
 //!
+//! 0. **txn_id gate** (§11.3 assertion ④, in-stream side; 2026-09-21,
+//!    Stage D slice 1 — closes the implementation gap the coding plan
+//!    registered as "already in Stage C"): HNSW records are utility
+//!    operations (§8.1) and must carry `txn_id = INVALID`. Rejected before
+//!    the decode and any page touch (`require_utility_txn`).
 //! 1. **Bounded decode** (pg-storage's `wal::record` decoders — malformed
 //!    payloads fail loudly per §8.1); the two state-bit kinds (124/127)
 //!    additionally decode through the record's `flags` version nibble.
@@ -43,7 +48,7 @@ use pg_storage::buffer_pool::{BufferPool, PageGuardMut};
 use pg_storage::error::{Result, StorageError};
 use pg_storage::page::{page_pd_lsn, set_page_pd_lsn};
 use pg_storage::recovery::{RedoContext, RedoHandler};
-use pg_storage::types::{Lsn, PageId, PAGE_SIZE};
+use pg_storage::types::{Lsn, PageId, TxnId, PAGE_SIZE};
 use pg_storage::wal::record::{
     HnswDirAppendRecord, HnswDirLinkRecord, HnswMetaUpdateRecord, HnswNodeInitRecord,
     HnswNodeTombstoneRecord, HnswPublishLiveRecord, HnswSetNeighborsRecord, WalRecord,
@@ -73,6 +78,22 @@ fn require_pool<'a>(ctx: &RedoContext<'a>) -> Result<&'a BufferPool> {
             "hnsw redo requires a buffer pool in RedoContext".to_string(),
         )
     })
+}
+
+/// §11.3 assertion ④, the in-stream side (2026-09-21, Stage D slice 1 —
+/// this gate closes an implementation gap, not a protocol change: the
+/// coding plan registered ④ as "already in Stage C" but no redo-side
+/// check ever landed). HNSW records are utility operations (§8.1) and
+/// must carry `txn_id = INVALID`. The gate runs BEFORE the decode and any
+/// page touch, so a transactional record can never drive a page mutation.
+fn require_utility_txn(record: &WalRecord) -> Result<()> {
+    if record.txn_id != TxnId::INVALID {
+        return Err(StorageError::MetadataCorrupted(format!(
+            "hnsw redo: HNSW record carries txn_id {:?} — index records are utility operations (§8.1) and must be non-transactional (§11.3 assertion ④)",
+            record.txn_id
+        )));
+    }
+    Ok(())
 }
 
 /// Map an HNSW-layer failure into a storage error for the redo dispatch
@@ -171,6 +192,7 @@ impl RedoHandler for NodeInitRedo {
     }
 
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        require_utility_txn(record)?;
         let rec = HnswNodeInitRecord::decode(&record.payload)?;
         let pool = require_pool(ctx)?;
         let mut guard = pool.pin_mut(rec.head.page_id)?;
@@ -221,6 +243,7 @@ impl RedoHandler for SetNeighborsRedo {
     }
 
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        require_utility_txn(record)?;
         let rec = HnswSetNeighborsRecord::decode(&record.payload)?;
         let pool = require_pool(ctx)?;
         let mut guard = pool.pin_mut(rec.head.page_id)?;
@@ -285,6 +308,7 @@ impl RedoHandler for MetaUpdateRedo {
     }
 
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        require_utility_txn(record)?;
         let rec = HnswMetaUpdateRecord::decode(&record.payload)?;
         let pool = require_pool(ctx)?;
         let mut guard = pool.pin_mut(rec.meta_page_id)?;
@@ -328,6 +352,7 @@ impl RedoHandler for TombstoneRedo {
     }
 
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        require_utility_txn(record)?;
         let rec = HnswNodeTombstoneRecord::decode(&record.payload, record.flags)?;
         let pool = require_pool(ctx)?;
         let mut guard = pool.pin_mut(rec.page_id)?;
@@ -369,6 +394,7 @@ impl RedoHandler for DirAppendRedo {
     }
 
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        require_utility_txn(record)?;
         let rec = HnswDirAppendRecord::decode(&record.payload)?;
         let pool = require_pool(ctx)?;
         let mut guard = pool.pin_mut(rec.dir_tail_page)?;
@@ -435,6 +461,7 @@ impl RedoHandler for DirLinkRedo {
     }
 
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        require_utility_txn(record)?;
         let rec = HnswDirLinkRecord::decode(&record.payload)?;
         let pool = require_pool(ctx)?;
         let mut guard = pool.pin_mut(rec.old_tail_page)?;
@@ -516,6 +543,7 @@ impl RedoHandler for PublishLiveRedo {
     }
 
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        require_utility_txn(record)?;
         let rec = HnswPublishLiveRecord::decode(&record.payload, record.flags)?;
         let pool = require_pool(ctx)?;
         let mut guard = pool.pin_mut(rec.page_id)?;
@@ -1121,5 +1149,101 @@ mod tests {
                 rec.record_type
             );
         }
+    }
+
+    /// 2026-09-21, Stage D slice 1 (§11.3 assertion ④, the in-stream side
+    /// — closes the coding-plan's falsely registered "already in Stage C"
+    /// gap): EVERY handler rejects a record whose `txn_id` is not INVALID,
+    /// before the decode and any page touch (target page bytes pinned
+    /// unchanged across the failed apply).
+    #[test]
+    fn handlers_reject_transactional_records() {
+        let dir = fresh_dir("txn-gate");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let (meta, dir_head, node, node_init_lsn) = create_env(&engine);
+        let (dir_page_1, dir_1_init_lsn) = {
+            let mut guard = engine.buffer_pool().new_page().unwrap();
+            let page_id = guard.page_id();
+            let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+            init_dir_page(page, 1);
+            let lsn = log_page_init(engine.wal_writer(), page_id, page).unwrap();
+            (page_id, lsn)
+        };
+
+        let mut lsn = node_init_lsn.0.max(dir_1_init_lsn.0);
+        let mut next_lsn = || {
+            lsn += 1;
+            Lsn(lsn)
+        };
+        let mut records: Vec<(WalRecord, PageId)> = vec![
+            (
+                WalRecord::hnsw_node_init(meta, node, 0, 0, 1, DIM, vec![1.0; DIM as usize])
+                    .unwrap(),
+                node,
+            ),
+            (
+                WalRecord::hnsw_set_neighbors(meta, node, 0, 0, 0, vec![2, 5, 9]).unwrap(),
+                node,
+            ),
+            (WalRecord::hnsw_meta_update(meta, 0, 1).unwrap(), meta),
+            (
+                WalRecord::hnsw_node_tombstone(meta, node, 0, 0, DIM).unwrap(),
+                node,
+            ),
+            (
+                WalRecord::hnsw_dir_append(dir_head, 0, node, 0).unwrap(),
+                dir_head,
+            ),
+            (
+                WalRecord::hnsw_dir_link(dir_head, dir_page_1).unwrap(),
+                dir_head,
+            ),
+            (
+                WalRecord::hnsw_publish_live(meta, node, 0, 0, DIM).unwrap(),
+                node,
+            ),
+        ];
+        for (rec, _) in &mut records {
+            rec.lsn = next_lsn();
+            rec.txn_id = TxnId(7); // a transactional record — the ④ violation
+        }
+
+        let handlers = hnsw_redo_handlers();
+        let mut parts = CtxParts::new();
+        for (record, target_page) in &records {
+            let before = {
+                let guard = engine.buffer_pool().pin(*target_page).unwrap();
+                guard.page().to_vec()
+            };
+            let handler = handlers
+                .iter()
+                .find(|h| h.kind() == record.record_type)
+                .expect("handler registered");
+            let mut ctx = RedoContext {
+                buffer_pool: Some(engine.buffer_pool()),
+                page_allocator: engine.page_allocator(),
+                clog: &parts.clog,
+                att: &mut parts.att,
+                dpt: &mut parts.dpt,
+                incomplete_splits: &mut parts.splits,
+            };
+            let err = handler
+                .apply(record, &mut ctx)
+                .expect_err("a transactional record must be rejected");
+            assert!(err.to_string().contains("txn_id"), "{err}");
+            assert!(err.to_string().contains("hnsw redo"), "{err}");
+            let after = {
+                let guard = engine.buffer_pool().pin(*target_page).unwrap();
+                guard.page().to_vec()
+            };
+            assert_eq!(
+                before, after,
+                "{:?}: the ④ gate must fire before any page mutation",
+                record.record_type
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

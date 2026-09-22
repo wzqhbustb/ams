@@ -1332,7 +1332,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 
 ## Stage C(M5):WAL 记录 + redo handler ×7 + 正常写入路径 + 页驻查询
 
-**状态**:🚧 进行中——slice 1(redo handler ×7)✅ commit(0341d66);slice 2（算法核心泛型化）✅ commit(d068a5d);slice 3(insert 写入路径）✅ 完成（2026-09-20 落码 + 主线验收 + agent-23 对抗审查 PASS + 2 P3 口径入 §10.2);slice 4（页驻 search）未开工。pg-am-hnsw lib **142 绿**、全套件 **196 绿**、pg-engine m5_hnsw_create_open **4/4**、workspace check 绿、clippy -D warnings / fmt / doc 全绿；slice 3 未 commit——等用户终审确认，message 前缀 `PHASE2-M5-StageC`
+**状态**:✅ 完成（2026-09-21 收口）——slice 1（redo handler ×7）commit(0341d66)、slice 2（算法核心泛型化）commit(d068a5d)、slice 3（insert 写入路径）commit(eb31d22)、slice 4（页驻 search）commit(f24c17b)；终态：pg-am-hnsw lib **148 绿**、全套件 **202 绿**、pg-engine m5_hnsw_create_open **5/5**、workspace check / clippy -D warnings / fmt / doc 全绿
 
 ### slice 1 交付内容（redo handler ×7,2026-09-18)
 
@@ -1426,3 +1426,23 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 **slice 4 终审二轮回流（2026-09-21，组合态攻击面，与一审不重复）**：三枚新探针钉（临时集成测试，公共 API only，跑完即删）全绿：① **崩溃→重开→续插→搜索跨形态 parity**——150 insert → mem::forget 崩溃 → 重开续插 150（NodeId 150.. 逐值断言）→ 混合"重放页 + 新写页"图与从未崩溃的内存孪生 45 查询点（5 查询 × k{1,5,20} × ef{None,k,2k+3}）逐位对拍零分歧——slice 3 skip-ahead × slice 4 搜索的交集面闭合（committed 测试未覆盖此组合）;② **search WAL 静默钉**——搜索前后 WAL 记录数不变（只读契约：无记录、无页变更、无 flush 义务）;③ **空图错误优先级**——ef<k 先于空图早退，两形态同变体同消息（"ef = 2 < k = 3")。**首轮红如实登记**：探针自身 bug(ef=None 默认 8 < k=20 的合法网格点误用 unwrap，两形态同错本应走 Outcome 对拍），修正后全绿；非被测代码缺陷。验证：lib 148 绿（主线亲跑）
 
 **slice 4 终审三轮（2026-09-21，用户终审 P3-nano,slice 3 遗留第三次标记，核实属实顺手闭合）**:**同句柄 insert-Err 复用使 rng 流位超前 hwm 一格**——步骤 0 入口校验失败不抽层（零状态变更，既有负例钉住）；步骤 1 抽层之后的失败（页分配/WAL append/apply/flush_to）消费一格 rng 而 hwm 不动，同句柄重试抽下一档——层分配合法但偏离"从未失败"参照流（内存孪生校验后无失败点，不产生此分叉）；重开经 skip-ahead（恰 hwm 次抽取）重新同步参照流。处置：insert rustdoc 补 **Err-after-draw** 段立文（纯文档闭合，零代码变更）;lib 148 无回归、doc 绿
+
+## Stage D(M5)：崩溃测试 harness + §11.3 审计
+
+**状态**:🚧 进行中——slice 1(audit.rs + redo txn_id 前置门)✅ 落码 + 主线验收 + agent-23 对抗审查 PASS + 主线终审两轮（1 P2 + 1 P3 修复）（2026-09-21);pg-am-hnsw lib **158 绿**、全套件 **212 绿**、pg-engine **147 绿**无回归、clippy -D warnings / fmt / doc 全绿（主线亲跑）；未 commit——等用户终审确认，message 前缀 `PHASE2-M5-StageD`
+
+### slice 1 交付内容（§11.3 审计 + ④ 补漏，2026-09-21)
+
+1. **audit.rs（新建，pub)**:§11.3 恢复后审计——不信句柄缓存（meta 重读、链重走 `check_dir_chain`、条目逐条重读；冷路径逐节点重 pin，不物化全图邻接）。断言覆盖：**a**（前向：目录条目 → 占用槽且在界内；端点：被引 id < 链导出 hwm)、**b**(level-L 边目标 top_level ≥ L)、**c**（空图 ⟺ entry_point=INVALID ∧ max_level=0;entry_point < hwm;top_level(entry_point) == max_level——v1.8/§8.3① 弱化口径，隐藏高层节点计 `hidden_high_level_count` 不拒绝）、**d/e**（可求值性归约：post-hoc payload 同一性不可求值——§7.2 条目不存 node_id；残余 = **映射唯一性**（无两条目同指 (page,slot))+ 占用性，payload 级同一性由 redo 期 LSN 序承载）、**f**（目录条目目标页 = PAGE_TYPE_NODE——slice 3 终审 P3-A 登记的缺口闭合）;**度数 cap** 经 `neighbor_iter` 的 checked_count 顺带承载（count > 预留容量即 Corrupted)。**§8.3⑤ 统计不阻断**:INITIALIZING 幽灵（4–5 窗）、孤儿条目（3–4 窗，引用页全槽遍历 − 映射集）、tombstoned(M5 无生产者，M6 语义，只计数）
+2. **apply.rs `slot_count`**:pd_lower 钳制与 read_lp 同纪律的槽位计数读器（孤儿扫描的遍历界）
+3. **redo.rs ④ txn_id 前置门（补漏）**:`require_utility_txn` 单点，七 handler 顶部各一调用（拒绝先于 decode 与任何页触碰）——coding-plan 曾虚报"④ 已在 Stage C"，实未落地；本 slice 闭合**实现缺口**(§11.3 ④ 为既定规范，非协议修订）
+4. **`HnswIndex::audit` 薄方法**（委派 audit_index(meta_page_id)，审计不信句柄缓存）+ lib.rs 导出（`pub mod audit` + `pub use audit::AuditReport`)
+5. **测试 +5**(lib 148→153):`audit_clean_graph`(200 节点真插入路径，报告逐字段精确断言）、`audit_empty_graph`（空图报告:entry_point=INVALID、计数全零）、`audit_counts_initializing_and_orphans`（孤儿与映射幽灵分别计数不重叠）、`audit_negative_matrix` 九连负例（f / a 前向 / a 端点 / b / c / 弱化不变量 / d-e 重映射 / 未排序 / 自环，fragment 全钉死，直调 audit_index 绕开 open 防线）、redo `handlers_reject_transactional_records`（七种记录 txn_id=7 → Err 含 fragment 且目标页字节不变——拒绝先于变更）
+
+**slice 1 验收**:agent-21 落码、主线 diff 逐行验收 + 全量亲跑（207 绿 / 147 绿 / clippy / fmt / doc)。**agent-21 偏离裁决两桩（主线认可）**：映射唯一性用 BTreeSet 而非 HashSet(crate no-HashMap 纪律，仅成员判定无迭代序暴露，语义等价）；孤儿不重复计入 initializing_count（字段语义无重叠——孤儿未映射，initializing 只计映射幽灵）
+
+**slice 1 对抗审查回流（2026-09-21,agent-23 verdict **PASS**,2 P3 当轮闭合，均为一行级口径立文）**:**P3-1**——audit_index 对 open-repair 前态（§8.2 6–7 窗：hwm>0 ∧ entry_point=INVALID）会被 c 条拒绝，而该残态**合法**(open-repair 存在的全部理由）；层序 redo → open（修复）→ audit 下无害，但 pub API 未立文时"恢复了没 open 过"的调用会被误拒——模块头新增 Consumption premise 段 + audit_index rustdoc 前置行闭合。**P3-2**——孤儿扫描只覆盖目录引用页：3–4 窗孤儿若独占新分配页（该页无任何映射条目）则漏计（低估方向，§12 泄漏量化喂 M6 vacuum);orphan_entry_count 字段 rustdoc 补 referenced-pages-only 口径，全页分配器扫描评估后登记不做（审计走索引不走存储文件）。**探查为净（下轮勿重复）**：负例九连各自只触发目标分支（neg-b 的 c 条先行通过不掩码）;pass2 的 top_levels[nb] 索引有 a 端点检查先行无 OOB 通路；txn 门 7 调用点齐、在 pd_lsn 守卫前不影响合法流幂等（合法流恒 INVALID);slot_count 钳制与 read_lp 同纪律（含空页 → 0)；干净图 hidden_high_level==0 推理成立（max_level 只升不滞后）;d/e 归约论证成立。验证：lib 153 绿、clippy/fmt/doc 绿（主线亲跑）
+
+**slice 1 主线终审回流（2026-09-21，与 agent-23 攻击面不重复——攻跨模块契约引用）**:**1 P2 属实修复**：graph.rs 的 GraphAccess trait 契约（slice 2 终审 nano-1）明文引用"§11.3 open 后审计"为存储向量有限性的保证方之一，而 audit 实现只读 state 字节与邻接、**从不校验向量内容**——引用为虚；页无 checksum,bit-rot 的 NaN/±inf 分量会直达搜索路径 Cand::cmp 的 panic。修复：audit pass 1 补存储向量校验（全分量有限 + cosine 零向量拒绝，§5 入口规则的存储侧镜像；页已 pin，边际成本 = 内存带宽扫描），引用自此为真。**测试 +4**(lib 153→157)：存储向量 NaN 注入拒绝（bit-rot 注入经 pg-storage 的 LP 布局属主 `decode_line_pointer`，不重推导布局）、cosine 零存储向量拒绝、**弱化不变量的接受侧钉**（合法 §8.2 6–7 窗残态：node1 全连通但 top_level=1 > max_level=0 → audit 通过 + hidden_high_level_count=1——此前只钉了拒绝侧）、**孤儿扫描口径行为钉**（未引用页上的孤儿计 0——对抗审查 P3-2 登记口径的钉死）。验证：全套件 **211 绿**(157 lib + 3+5+2+1+3+40)、clippy/fmt/doc 绿（主线亲跑）
+
+**slice 1 主线终审二轮回流（2026-09-21，攻击面：状态机合法性 + 一轮新代码的判别力）**:**1 P3 属实修复**——一轮登记的"tombstoned 只计数不拒绝"口径过宽：`tombstoned ∧ ¬LIVE` 在任何合法记录流下不可达（Tombstone funnel 前置要求 LIVE、PublishLive 只置 LIVE 位、INITIALIZING 不可被 tombstone——M6 语义下同样成立），纯页腐败才产得出；audit 补状态机合法性拒绝（Corrupted,fragment "tombstoned but not LIVE")，模块头口径同步收窄（tombstoned ∧ LIVE 仍只计数）。**测试 +1**(lib 157→158):`audit_rejects_tombstoned_but_not_live`（经纯应用原语注入——funnel 的 LIVE 前置不入 apply 层，位可落，正为腐败替身）。**探查为净（下轮勿重复）**:hwm 的 `id as u32` 截断面不可达（链导出 hwm 受真实页数约束，check_dir_chain 的 ordinal 连续断言逼腐败者真供 40GB 目录页）；邻居重复 id 被严格升序检查覆盖；u32::MAX 邻居被 a 条覆盖（nb ≥ hwm)；孤儿条目不校验向量（不可达即无关，口径一致）；链型互指腐败被 check_dir_chain 页型断言覆盖；④ 门与 FPI 记录无交集（FPI 非 HNSW handler 类）。验证：全套件 **212 绿**(158 lib + 3+5+2+1+3+40)、clippy/fmt/doc 绿（主线亲跑）
