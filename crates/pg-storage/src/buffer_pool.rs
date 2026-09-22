@@ -904,11 +904,18 @@ impl BufferPool {
         // came from recovery replay (not a live append), so the WAL record
         // is already durable on disk. `flush_to` would reject it anyway
         // (LsnNotAvailable — the clock was never advanced to this LSN).
+        //
+        // Boundary convention (flush_to rustdoc): `synced_lsn` sits on
+        // record-END boundaries, and the page's pd_lsn is the last-toucher
+        // record's START. The record is provably fsynced only when
+        // synced_lsn is STRICTLY past page_lsn (equality = the record
+        // itself not yet synced), and the flush target must be the current
+        // end boundary, not the record's start.
         if page_lsn.is_valid()
             && page_lsn <= self.wal_writer.current_lsn()
-            && self.wal_writer.synced_lsn() < page_lsn
+            && self.wal_writer.synced_lsn() <= page_lsn
         {
-            if let Err(e) = self.wal_writer.flush_to(page_lsn) {
+            if let Err(e) = self.wal_writer.flush_to(self.wal_writer.current_lsn()) {
                 let mut meta = self.frames[frame_id.0].meta.lock();
                 meta.dirty = true;
                 restore_first_dirty_lsn(&mut meta.first_dirty_lsn, saved_first_dirty_lsn);

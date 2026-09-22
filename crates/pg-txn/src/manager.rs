@@ -12,7 +12,10 @@
 //! CLOG authoritatively from the WAL:
 //!
 //! 1. `wal.append(TxnCommit)` — stage the record.
-//! 2. `wal.flush_to(lsn)` — fsync it (the commit is durable here).
+//! 2. `wal.flush_to(record end)` — fsync through the record's END boundary
+//!    (the commit is durable here; flush_to's prefix semantics early-exit
+//!    on a record's own start LSN right after a group-commit wave or a
+//!    reopen — see its rustdoc).
 //! 3. `clog.set_state(xid, Committed)` — flip the in-memory bit.
 //! 4. `remove_active(xid)` — drop the XID from the active set.
 //!
@@ -25,11 +28,12 @@
 //!
 //! `PageAllocator::alloc_page` / `free_page` are append-only: they write their
 //! WAL record to the segment file but do **not** fsync. The commit's single
-//! `flush_to(lsn)` at step 2 therefore amortizes every allocation fsync
+//! `flush_to` at step 2 therefore amortizes every allocation fsync
 //! accumulated during the transaction into one syscall — a `CREATE TABLE` that
 //! extends many pages pays for one fsync at commit instead of one per page.
-//! This is safe because `flush_to(commit_lsn)` fsyncs the whole WAL prefix up
-//! to the commit record, and the LSN clock is monotonic, so every earlier
+//! This is safe because the flush runs through the commit record's END
+//! boundary, covering the whole WAL prefix up to and including the commit
+//! record, and the LSN clock is monotonic, so every earlier
 //! `PageAlloc`/`PageFree` LSN is covered.
 //!
 //! # Snapshot registry + vacuum horizon (M3 Stage A, tech-selection §3.3)
@@ -438,9 +442,15 @@ impl TxnManager {
             )));
         }
         // 1. Append the commit record.
-        let lsn = self.wal.append(WalRecord::txn_commit(xid)?)?;
-        // 2. fsync it — the commit becomes durable here.
-        self.wal.flush_to(lsn)?;
+        let record = WalRecord::txn_commit(xid)?;
+        let record_len = record.record_size() as u64;
+        let lsn = self.wal.append(record)?;
+        // 2. fsync it — the commit becomes durable here. Flush through the
+        //    record's END boundary (start + size): flush_to's prefix
+        //    semantics early-exit on the record's own start LSN whenever a
+        //    group-commit wave or a reopen already reached it, which would
+        //    leave the commit record itself unsynced (flush_to rustdoc).
+        self.wal.flush_to(Lsn(lsn.0 + record_len))?;
         // 3. Flip the in-memory CLOG bit (only after the record is durable).
         // 4. Drop the XID from the active set and wake row-lock waiters.
         self.end_txn(xid, TxnState::Committed);
@@ -460,8 +470,12 @@ impl TxnManager {
     pub fn abort_txn(&self, xid: TxnId) -> Result<()> {
         // Same commit-barrier read guard as commit_txn (see there).
         let _barrier = self.commit_barrier.read();
-        let lsn = self.wal.append(WalRecord::txn_abort(xid)?)?;
-        self.wal.flush_to(lsn)?;
+        let record = WalRecord::txn_abort(xid)?;
+        let record_len = record.record_size() as u64;
+        let lsn = self.wal.append(record)?;
+        // Flush through the record's END boundary (same boundary
+        // convention as commit_txn — see there and flush_to's rustdoc).
+        self.wal.flush_to(Lsn(lsn.0 + record_len))?;
         self.end_txn(xid, TxnState::Aborted);
         Ok(())
     }

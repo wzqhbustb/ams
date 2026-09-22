@@ -551,9 +551,11 @@ FPI（自描述头随之落盘）+ 旧尾页写链指针（HnswDirLink，单页�
 8. `HnswPublishLive`:state 翻 LIVE（独立记录 127,v1.7 P1-2)。
 
 **成功边界与可见性**(v1.5 审查 P1-7，明文四条）:
-① insert 的耐久边界 = `flush_to`（本 insert 全部记录的最后 LSN)——对齐
-   group commit 惯例（pg-txn/src/manager.rs:14-16 的 append→flush_to 硬序；
-   HNSW 无 CLOG 位，flush_to 即边界）;
+① insert 的耐久边界 = flush 至末记录的**末边界**(append 后取
+   `current_lsn()`;flush_to 的前缀语义对记录自身起始 LSN 会在
+   group-commit 波次/重开后早退——v1.45 登记,pg-storage flush_to
+   rustdoc 立文)——对齐 group commit 惯例(pg-txn manager.rs 的
+   append→flush 硬序;HNSW 无 CLOG 位,flush 即边界);
 ② **未返回成功的 insert 恢复后允许可见**——索引记录 txn_id 恒 INVALID、
    无 undo;**措辞修正**(v1.6 复核 P3-4)：这不是"与 heap/btree 同口径"
    ——heap/btree 的未提交不可见由 CLOG 事务状态 + index-undo 达成，
@@ -1071,3 +1073,5 @@ pg-am-hnsw（页布局/WAL 记录）与 pg-engine（崩溃 rounds）两侧。
 | v1.41 | 2026-09-21 | M5 Stage D slice 1(审计)落码回流:① **§11.3 d/e 可求值性归约立文**——post-hoc payload 同一性(PublishLive node_id ↔ 映射、SetNeighbors owner ↔ (page,slot) 映射)不可求值:§7.2 条目不存 node_id,v1.12 的"审计期一次遍历求值"按字面不成立;审计残余 = **映射唯一性(无两目录条目同指 (page,slot))+ 占用性**,payload 级同一性由 redo 期 LSN 序承载(§10.1 冻结清单不变,本行仅收窄 §11.3 的审计口径表述,audit.rs 模块头同文)。② **④ loser 断言 redo 侧补漏**:coding-plan 曾登记"redo 期流内 txn_id 检查已在 Stage C",实未落地——redo.rs 补 require_utility_txn 单点门(七 handler 统一,拒绝先于 decode 与任何页触碰),实现缺口闭合,非协议修订。③ tombstoned 条目审计口径:M5 无生产者,计数不拒绝(M6 语义落地时再议硬断言)。无格式/协议变更。coding-plan v1.47、stage_spec Stage D 节同步 |
 | v1.42 | 2026-09-21 | M5 Stage D slice 1 主线终审回流(1 P2):**§11.3 审计范围补存储向量校验**——slice 2 终审 nano-1 给 GraphAccess trait 立有限性前提时明文引用"§11.3 open 后审计"为保证方之一,而审计实现从不校验向量内容(引用为虚);页无 checksum,bit-rot NaN/±inf 直达搜索路径 panic。修复:audit pass 1 对每映射条目重校验向量(全分量有限 + cosine 零向量拒绝,§5 存储侧镜像;冷路径,页已 pin,边际成本 = 内存带宽)。§11.3 ① 结构不变量自此含向量内容一维;coding-plan v1.49、stage_spec slice 1 段同步 |
 | v1.43 | 2026-09-21 | M5 Stage D slice 1 主线终审二轮回流(1 P3):**§11.3 审计补状态机合法性断言**——`tombstoned ∧ ¬LIVE` 在任何合法记录流(含 M6)下不可达(Tombstone funnel 前置 LIVE、PublishLive 只置位、INITIALIZING 不可 tombstone),v1.41③ 的"tombstoned 只计数"口径收窄为:tombstoned ∧ LIVE 计数不拒绝,tombstoned ∧ ¬LIVE 响亮 Corrupted。coding-plan v1.50、stage_spec slice 1 段同步 |
+| v1.44 | 2026-09-22 | M5 Stage D slice 2(崩溃窗口矩阵)落码回流:① §11.1 的"多步协议若需暴露内部步骤,对齐 SplitState 先例暴露 InsertState 式测试 API"条件句求值为**不需要**——insert 刻意单体(§8.4),改采故障注入栅栏(probe barrier:9 类追加边界、10 个插桩点,到界先 flush 至末边界再注入 Err;窗口残态由真实生产 insert 产出,对手工构造零漂移),§8.2 表 10 行 × 13 枚 forget 测试落 tests/m5_insert_crash.rs。② **矩阵抓到实现 bug(非协议问题)**:open() 的 current_node_page 解析在空链尾残态(§8.2"2 后 3 前"窗口)下与 PagedGraph::resolve 公式不一致(链尾页 vs pages[(hwm-1)/813]),open 即响亮失败;已修,本文 HWM 公式(§4.2/§6/§7.1)无需变更。无格式/协议变更。coding-plan v1.51/v1.52、stage_spec Stage D 节同步 |
+| v1.45 | 2026-09-22 | M5 Stage D slice 2 终审三轮回流(用户审查,**1 P1 系统性预存问题**):**flush_to 边界语义 doc/impl 偏一**——flush_to 文档承诺"LSN ≤ lsn 的记录已 fsync",而 synced_lsn 只落记录**末**边界(波次 cover=lsn_clock.current()、重开播种=末完整记录末尾),append 返回的是记录**起始** LSN——波次/重开后第一条记录的 flush_to(起始) 恰好早退,记录自身未 fsync(真 OS 崩溃才可观测,同进程/子进程 harness 不可达,故历轮未被抓;commit 路径后果 = 崩溃窗内恢复判 aborted 而客户端已见 committed)。修复 = **全库统一末边界**:① pg-storage flush_to rustdoc 改写为前缀(排他)语义 + 边界约定立文 + 钉测试 flush_to_start_boundary_does_not_cover_the_record;② checkpoint.rs CheckpointEnd 后 flush 改 current_lsn();③ buffer_pool 逐出 WAL-before-data 守卫条件 synced<page_lsn 改 <=(等号 = 记录自身未同步)+ flush 目标改 current_lsn();④ pg-txn commit/abort 改 flush_to(start+record_size)(CommitWal trait 无 current_lsn,精确末边界;commit_hard_order 断言同步改钉末边界);⑤ pg-am-hnsw insert 成功边界(§8.1①)改 current_lsn()、probe barrier 去 lsn 形参统一 current_lsn()(消除"同函数两种形态"的线索)。备选 flush_through API 否决——call-site 统一更简且与 flush() 既有模型一致。§8.1① 措辞同步修正("最后 LSN"→"末边界")。无格式/协议变更。coding-plan v1.55、stage_spec Stage D 节同步 |

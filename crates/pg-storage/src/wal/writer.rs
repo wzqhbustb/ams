@@ -380,7 +380,19 @@ impl WalWriter {
         self.flush_to(target)
     }
 
-    /// Block until all records with LSN `<= lsn` have been fsynced.
+    /// Block until every WAL byte before `lsn` has been fsynced — LSNs are
+    /// byte offsets, so the guarantee is the prefix up to `lsn` EXCLUSIVE.
+    ///
+    /// **Boundary convention** (2026-09-22, M5 Stage D slice-2 review P1):
+    /// `synced_lsn` only ever sits on record-END boundaries (each wave
+    /// covers `lsn_clock.current()` = the byte past the last appended
+    /// record; a reopen seeds it at the end of the last complete record).
+    /// Passing a record's own START LSN therefore early-exits whenever a
+    /// wave (or a reopen) already reached that boundary — the record
+    /// itself is NOT fsynced in that case. A caller that needs a specific
+    /// record durable (commit, checkpoint end, a success boundary) must
+    /// flush through the record's END: `flush_to(start + record_size)` or
+    /// `flush_to(current_lsn())` right after the append.
     #[cfg(not(loom))]
     pub fn flush_to(&self, lsn: Lsn) -> Result<()> {
         let mut state = self.inner.lock();
@@ -892,6 +904,50 @@ mod tests {
         // immediately without error.
         writer.flush_to(lsn).unwrap();
         assert!(writer.synced_lsn() >= lsn);
+    }
+
+    /// 2026-09-22, M5 Stage D slice-2 review P1 — pin the boundary
+    /// convention: `synced_lsn` sits on record-END boundaries, so after a
+    /// completed wave `flush_to(next record's START)` early-exits WITHOUT
+    /// covering that record, while `flush_to(current_lsn())` after its
+    /// append covers it. Deterministic: long timeout + large batch keep
+    /// `append` from waking the worker; only explicit flushes run waves.
+    #[test]
+    fn flush_to_start_boundary_does_not_cover_the_record() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = writer_config(&tmp);
+        cfg.wal_group_commit_timeout_ms = 1000;
+        cfg.wal_group_commit_batch_size = 100;
+        let writer = WalWriter::open(tmp.path(), &cfg).unwrap();
+
+        // Record 1: append + explicit end-boundary flush → the wave leaves
+        // synced_lsn == end(record 1) == the next record's start.
+        writer
+            .append(WalRecord::page_alloc(PageId(1)).unwrap())
+            .unwrap();
+        writer.flush_to(writer.current_lsn()).unwrap();
+        let boundary = writer.synced_lsn();
+        assert_eq!(boundary, writer.current_lsn());
+
+        // Record 2 starts exactly at the synced boundary.
+        let lsn2 = writer
+            .append(WalRecord::page_alloc(PageId(2)).unwrap())
+            .unwrap();
+        assert_eq!(lsn2, boundary);
+
+        // Prefix semantics: flushing the record's own START early-exits —
+        // synced_lsn does not advance and the record is NOT covered.
+        writer.flush_to(lsn2).unwrap();
+        assert_eq!(
+            writer.synced_lsn(),
+            boundary,
+            "a start-boundary flush must not cover the record itself"
+        );
+        assert!(writer.synced_lsn() < writer.current_lsn());
+
+        // The end-boundary flush covers it.
+        writer.flush_to(writer.current_lsn()).unwrap();
+        assert!(writer.synced_lsn() >= writer.current_lsn());
     }
 
     #[test]

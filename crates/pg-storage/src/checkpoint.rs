@@ -542,8 +542,13 @@ impl CheckpointCoordinator {
 
         // 7. Ensure CheckpointEnd and everything before it is fsynced before the
         //    freelist snapshot or superblock is written. (append() no longer
-        //    fsyncs implicitly; this explicit flush_to is required.)
-        self.wal_writer.flush_to(end_lsn)?;
+        //    fsyncs implicitly; this explicit flush is required.) Flush through
+        //    the record's END boundary: flush_to's prefix semantics early-exit
+        //    on the record's own start LSN whenever a group-commit wave (or a
+        //    reopen) already reached it, leaving CheckpointEnd itself unsynced
+        //    (see flush_to's rustdoc).
+        let end_boundary = self.wal_writer.current_lsn();
+        self.wal_writer.flush_to(end_boundary)?;
 
         // 8. Write the freelist snapshot BEFORE the superblock. This is an
         //    acceleration hint for recovery: if present and valid, recovery

@@ -26,8 +26,72 @@ use crate::paged::PagedGraph;
 use crate::params::{HnswParams, NodeId};
 use crate::rng::Xoshiro256StarStar;
 
+/// WAL-append boundary marks for the Stage D slice-2 crash-window test
+/// matrix (§8.1 eight-step sequence × §8.2 window table). TEST-ONLY
+/// instrumentation: the production path never reads these; they exist so
+/// the crash-matrix tests can drive the REAL `insert` to an exact record
+/// boundary (zero state drift vs. hand-built residues).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeMark {
+    /// A fresh node page was allocated + init-FPI'd (§8.1 step 1).
+    NodePageInit,
+    /// A fresh directory page was allocated + init-FPI'd (§8.1 step 2).
+    DirPageInit,
+    /// The old directory tail was linked to the fresh page.
+    DirLink,
+    /// The node entry was created (INITIALIZING).
+    NodeInit,
+    /// The NodeId mapping was published at the directory tail.
+    DirAppend,
+    /// One backward edge's SetNeighbors post-image landed.
+    NeighborEdge {
+        /// The level whose list was rewritten.
+        level: u8,
+        /// Whether this edge triggered the shrink heuristic.
+        shrank: bool,
+    },
+    /// The new node's own level list post-image landed.
+    OwnList {
+        /// The level whose list was written.
+        level: u8,
+    },
+    /// The meta entry-point/max-level post-image landed.
+    MetaUpdate,
+    /// The entry's LIVE bit was set.
+    PublishLive,
+}
+
+/// Test-only crash-probe state (Stage D slice 2): the append-boundary mark
+/// log plus an optional crash point (`crash_after` = the number of marks
+/// after which the next `barrier` fails the insert as a simulated crash).
+/// A `RefCell` because the connect phase holds a `&self`-borrowing
+/// `PagedGraph` while barrier calls fire (single-threaded premise, §8.4).
+///
+/// NOTE: the mark log grows with the insert count (a few entries per
+/// insert) — diagnostic plumbing for the test matrix. Production handles
+/// never arm the probe and never enable logging, so their `barrier` calls
+/// return before any push (the log stays empty); tests bound the log with
+/// `probe_clear_marks`.
+#[derive(Debug, Default)]
+struct ProbeState {
+    /// Append-boundary marks, in order. Filled only while `logging` is on
+    /// or a crash point is armed (production: never — see the NOTE above).
+    marks: Vec<ProbeMark>,
+    /// The simulated crash point: `barrier` fails the insert once this many
+    /// marks have been logged.
+    crash_after: Option<usize>,
+    /// Whether `barrier` records marks without an armed crash point (the
+    /// discovery mode of the window-matrix tests). Default off: with no
+    /// crash point armed either, `barrier` is a no-op branch.
+    logging: bool,
+}
+
 /// A live handle on one HNSW index (meta page + directory chain + runtime
 /// graph state).
+///
+/// Single-threaded premise (§8.4): one writer per handle — and the probe's
+/// `RefCell` makes the handle `!Sync` outright (it stays `Send`).
 pub struct HnswIndex {
     meta_page_id: PageId,
     dir_head: PageId,
@@ -44,6 +108,11 @@ pub struct HnswIndex {
     /// empty graph); insert re-selects when it has no room for the next
     /// entry.
     current_node_page: Option<PageId>,
+    /// Stage D slice-2 crash probe (test-only; see [`ProbeMark`] /
+    /// [`ProbeState`]). Production handles never arm it and never enable
+    /// logging, so their `barrier` calls are one no-op branch — zero
+    /// behavior change on the production path (§8.4).
+    probe: std::cell::RefCell<ProbeState>,
 }
 
 impl HnswIndex {
@@ -100,6 +169,65 @@ impl HnswIndex {
         self.params.max_level = max_level;
     }
 
+    /// TEST-ONLY (Stage D slice-2 crash-window matrix): a copy of the
+    /// probe mark log — every WAL-append boundary the inserts on this
+    /// handle have passed, in order.
+    #[doc(hidden)]
+    pub fn probe_marks(&self) -> Vec<ProbeMark> {
+        self.probe.borrow().marks.clone()
+    }
+
+    /// TEST-ONLY: clear the probe mark log (bounds it between the inserts
+    /// a test dissects).
+    #[doc(hidden)]
+    pub fn probe_clear_marks(&self) {
+        self.probe.borrow_mut().marks.clear();
+    }
+
+    /// TEST-ONLY: set the simulated crash point — the `barrier` fails the
+    /// insert with a fixed "crash probe" error once `crash_after` marks
+    /// have been logged (the just-appended record is flushed first: a real
+    /// crash's visibility is the durable-record prefix).
+    #[doc(hidden)]
+    pub fn probe_set_crash_after(&self, crash_after: Option<usize>) {
+        self.probe.borrow_mut().crash_after = crash_after;
+    }
+
+    /// TEST-ONLY: switch mark logging on/off (the discovery mode of the
+    /// window-matrix tests). Off by default: with no crash point armed a
+    /// production handle's `barrier` returns without touching the log.
+    #[doc(hidden)]
+    pub fn probe_set_logging(&self, logging: bool) {
+        self.probe.borrow_mut().logging = logging;
+    }
+
+    /// The crash-probe barrier (Stage D slice 2): log the append-boundary
+    /// `mark`; when the log reaches the armed `crash_after` length, flush
+    /// through the current END boundary — `current_lsn()` covers the
+    /// just-appended record (flush_to's prefix semantics, its rustdoc) —
+    /// and fail the insert as a simulated kill -9 (crash visibility = the
+    /// durable prefix). With no crash point armed AND logging off (every
+    /// production handle) this is one no-op branch.
+    fn barrier(&self, wal_writer: &WalWriter, mark: ProbeMark) -> Result<()> {
+        let crash_after = {
+            let mut probe = self.probe.borrow_mut();
+            if probe.crash_after.is_none() && !probe.logging {
+                return Ok(());
+            }
+            probe.marks.push(mark);
+            probe.crash_after.filter(|&n| probe.marks.len() == n)
+        };
+        if let Some(n) = crash_after {
+            wal_writer
+                .flush_to(wal_writer.current_lsn())
+                .map_err(|e| crate::page::storage_err("crash probe: flush", e))?;
+            return Err(HnswError::InvalidOperation(format!(
+                "stage-d crash probe: simulated crash after mark #{n} ({mark:?})"
+            )));
+        }
+        Ok(())
+    }
+
     /// Insert a vector into the page-resident graph (tech-selection §8.1
     /// eight-step sequence; Stage C slice 3). Returns the freshly allocated
     /// [`NodeId`] (dense, never reused — §3).
@@ -119,9 +247,12 @@ impl HnswIndex {
     /// replayable (slice-1 redo) and open-repairable; the graph is
     /// observably consistent only after the success boundary.
     ///
-    /// **Success boundary** (§8.1 boundary ①): `flush_to` the last record's
-    /// LSN (the PublishLive) before returning `Ok` — every record of the
-    /// sequence precedes it in WAL order.
+    /// **Success boundary** (§8.1 boundary ①): flush through the last
+    /// record's END boundary (`current_lsn()` after the PublishLive
+    /// append) before returning `Ok` — every record of the sequence
+    /// precedes it in WAL order. (flush_to's prefix semantics early-exit
+    /// on a record's own START LSN right after a group-commit wave —
+    /// 2026-09-22 review P1; see its rustdoc.)
     ///
     /// **Err-after-draw semantics** (slice-3 leftover, slice-4 final review
     /// round 3 nano): entry-validation failures change nothing, but a
@@ -190,12 +321,14 @@ impl HnswIndex {
                 } else {
                     let fresh = alloc_node_page(buffer_pool, wal_writer)?;
                     self.current_node_page = Some(fresh);
+                    self.barrier(wal_writer, ProbeMark::NodePageInit)?;
                     fresh
                 }
             }
             None => {
                 let fresh = alloc_node_page(buffer_pool, wal_writer)?;
                 self.current_node_page = Some(fresh);
+                self.barrier(wal_writer, ProbeMark::NodePageInit)?;
                 fresh
             }
         };
@@ -221,6 +354,7 @@ impl HnswIndex {
             };
             if tail_full {
                 let new_dir = alloc_dir_page(buffer_pool, wal_writer, self.dir_pages.len() as u64)?;
+                self.barrier(wal_writer, ProbeMark::DirPageInit)?;
                 let mut guard = buffer_pool
                     .pin_mut(dir_tail)
                     .map_err(|e| crate::page::storage_err("insert: pin_mut directory tail", e))?;
@@ -236,6 +370,7 @@ impl HnswIndex {
                 crate::apply::dir_link(page, new_dir);
                 pg_storage::page::set_page_pd_lsn(page, lsn);
                 drop(guard);
+                self.barrier(wal_writer, ProbeMark::DirLink)?;
                 self.dir_pages.push(new_dir);
                 dir_tail = new_dir;
             }
@@ -268,6 +403,7 @@ impl HnswIndex {
                 .map_err(|e| crate::page::storage_err("insert: WAL append NodeInit", e))?;
             crate::apply::apply_node_at(page, slot, node_id.0, level, geometry, vector)?;
             pg_storage::page::set_page_pd_lsn(page, lsn);
+            self.barrier(wal_writer, ProbeMark::NodeInit)?;
             slot
         };
 
@@ -288,6 +424,7 @@ impl HnswIndex {
                 .expect("a buffer frame is exactly PAGE_SIZE");
             crate::apply::dir_append(page, node_id.0, node_page_id, slot)?;
             pg_storage::page::set_page_pd_lsn(page, lsn);
+            self.barrier(wal_writer, ProbeMark::DirAppend)?;
         }
         self.set_hwm(self.hwm + 1);
 
@@ -368,7 +505,8 @@ impl HnswIndex {
                         // Shrink through the SAME heuristic (§4.3 "both
                         // sides"): the neighbor's own vector is the
                         // reference, distances recomputed against it.
-                        let final_list = if list.len() > m_max(l) {
+                        let shrank = list.len() > m_max(l);
+                        let final_list = if shrank {
                             let cands: Vec<crate::graph::Cand> = list
                                 .iter()
                                 .map(|&c| crate::graph::Cand {
@@ -407,6 +545,7 @@ impl HnswIndex {
                             .expect("a buffer frame is exactly PAGE_SIZE");
                         crate::apply::set_neighbors(page, nb_slot, geometry, l, &final_list)?;
                         pg_storage::page::set_page_pd_lsn(page, lsn);
+                        self.barrier(wal_writer, ProbeMark::NeighborEdge { level: l, shrank })?;
                     }
                     own_lists[usize::from(l)] = neighbors.iter().map(|n| n.0).collect();
                     ep = w[0].id; // nearest result carries the descent
@@ -445,6 +584,7 @@ impl HnswIndex {
                     .expect("a buffer frame is exactly PAGE_SIZE");
                 crate::apply::set_neighbors(page, slot, geometry, l as u8, list)?;
                 pg_storage::page::set_page_pd_lsn(page, lsn);
+                self.barrier(wal_writer, ProbeMark::OwnList { level: l as u8 })?;
             }
         }
 
@@ -467,12 +607,13 @@ impl HnswIndex {
             crate::apply::apply_meta(page, node_id.0, level);
             pg_storage::page::set_page_pd_lsn(page, lsn);
             drop(guard);
+            self.barrier(wal_writer, ProbeMark::MetaUpdate)?;
             self.set_entry_point(node_id.0, level);
         }
 
         // Step 9 (§8.1 step 8): PublishLive — the state post-image lands
         // only after all of the node's own level lists are written (v1.7).
-        let last_lsn = {
+        {
             let mut guard = buffer_pool
                 .pin_mut(node_page_id)
                 .map_err(|e| crate::page::storage_err("insert: pin_mut node page", e))?;
@@ -493,13 +634,16 @@ impl HnswIndex {
                 .expect("a buffer frame is exactly PAGE_SIZE");
             crate::apply::publish_live(page, slot, self.params.dim)?;
             pg_storage::page::set_page_pd_lsn(page, lsn);
-            lsn
-        };
+            self.barrier(wal_writer, ProbeMark::PublishLive)?;
+        }
 
         // Step 10 (§8.1 boundary ①): the success boundary — every record
-        // of the sequence is durable before Ok escapes.
+        // of the sequence is durable before Ok escapes. Flush through the
+        // current END boundary (`current_lsn()` covers the PublishLive
+        // record): flush_to's prefix semantics early-exit on a record's
+        // own start LSN right after a group-commit wave (its rustdoc).
         wal_writer
-            .flush_to(last_lsn)
+            .flush_to(wal_writer.current_lsn())
             .map_err(|e| crate::page::storage_err("insert: success-boundary flush", e))?;
         Ok(node_id)
     }
@@ -675,6 +819,7 @@ pub fn create(
         rng: Xoshiro256StarStar::new(rng_seed),
         dir_pages: vec![dir_head],
         current_node_page: None,
+        probe: std::cell::RefCell::new(ProbeState::default()),
     })
 }
 
@@ -896,12 +1041,20 @@ pub fn open(
     // ordinal-ordered chain pages come from the walk; the current node page
     // is the page of the most recent directory entry (`None` when the graph
     // is empty).
+    //
+    // 2026-09-22, Stage D slice 2 (the crash matrix's `empty_linked_tail`
+    // window caught this): the last ENTRY lives on page
+    // `pages[(hwm-1) / DIR_ENTRIES_PER_PAGE]` — NOT necessarily the chain
+    // tail (a fresh tail linked by a crashed insert is empty, and
+    // `dir_entry(tail, (hwm-1) % 813)` would read past its count = 0).
     let current_node_page = if chain.hwm > 0 {
-        let tail_page_id = *chain.pages.last().expect("the chain is non-empty");
-        let idx = ((chain.hwm - 1) % u64::from(crate::dir::DIR_ENTRIES_PER_PAGE)) as u32;
+        let last = chain.hwm - 1;
+        let per_page = u64::from(crate::dir::DIR_ENTRIES_PER_PAGE);
+        let entry_page_id = chain.pages[(last / per_page) as usize];
+        let idx = (last % per_page) as u32;
         let guard = buffer_pool
-            .pin(tail_page_id)
-            .map_err(|e| crate::page::storage_err("open: pin directory tail", e))?;
+            .pin(entry_page_id)
+            .map_err(|e| crate::page::storage_err("open: pin directory page of last entry", e))?;
         let page: &[u8; PAGE_SIZE] = guard
             .page()
             .try_into()
@@ -920,6 +1073,7 @@ pub fn open(
             rng,
             dir_pages: chain.pages,
             current_node_page,
+            probe: std::cell::RefCell::new(ProbeState::default()),
         },
         warnings,
     })
