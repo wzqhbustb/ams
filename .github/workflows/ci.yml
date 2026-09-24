@@ -210,3 +210,12 @@ jobs:
         run: cargo test -p pg-am-hnsw --release --test recall_siftsmall
         env:
           M4_REQUIRE_DATASET: "1"
+      # Phase 2 M5 Stage D slice 4 (coding plan CI 清单 #11): the §11.3 ②
+      # post-recovery recall gate runs HERE, alongside recall_siftsmall —
+      # it reuses the M4_REQUIRE_DATASET=1 hard-failure semantics (a plain
+      # matrix job has no dataset and would skip it forever, the exact
+      # "green but never ran" shape this job exists to prevent).
+      - name: Post-recovery recall hard gate (M5)
+        run: cargo test -p pg-am-hnsw --release --test m5_recall_after_recovery
+        env:
+          M4_REQUIRE_DATASET: "1"
