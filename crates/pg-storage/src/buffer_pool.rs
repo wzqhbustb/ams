@@ -108,7 +108,9 @@ struct FrameMeta {
     /// and a caller with a durability contract (B+Tree `split_copy`'s
     /// right-page flush) would otherwise release its left-page latch before
     /// the right page is truly durable (Stage Q review H1). Waiters block
-    /// on [`BufferPool::flush_done`].
+    /// on [`BufferPool::flush_done`]. Eviction SKIPS flushing frames: the
+    /// in-flight flush completes by frame id, and the frame must still
+    /// belong to the flushing page when that completion runs.
     flushing: bool,
 }
 
@@ -181,6 +183,42 @@ pub struct BufferPool {
     hits: AtomicU64,
     /// Cache misses (page had to be read from the data file).
     misses: AtomicU64,
+    /// Test-only I/O counters (Stage E review): the batch contract pins —
+    /// N writes / ONE fsync per non-empty batch, zero of either on a clean
+    /// pool. `cfg(test)` so production flush paths pay NO atomic RMW for
+    /// test accounting (loom builds excluded the same way).
+    #[cfg(test)]
+    data_writes: AtomicU64,
+    /// See [`Self::data_writes`].
+    #[cfg(test)]
+    data_syncs: AtomicU64,
+    /// Test-only fault injection for the batch flush's trailing fsync
+    /// (Stage E review): when set, `flush_all_dirty`'s `sync_all` fails
+    /// once. Proves the clean-pool no-op attempts NO fsync at all (the
+    /// assertion is `Ok(0)` while the injection is armed) and exercises
+    /// the error-restore path. Fully qualified so loom builds (no
+    /// `cfg(test)`) are untouched.
+    #[cfg(test)]
+    fail_batch_sync: crate::sync::atomic::AtomicBool,
+    /// Test-only fault injection for a page write in `flush_frame_write`
+    /// (Stage E review): `usize::MAX` = disarmed; otherwise the value
+    /// counts down one per write attempt and the attempt observing 0
+    /// fails, then the counter re-disarms. 0 = fail the FIRST write (no
+    /// claim pending yet); 1 = fail the SECOND (one successful claim
+    /// already in the batch's pending list — the mid-batch failure).
+    #[cfg(test)]
+    fail_write_after: crate::sync::atomic::AtomicUsize,
+    /// Test-only rendezvous gate for the batch flush (Stage E review):
+    /// 0 = inactive, 1 = armed-and-closed (the batch parks between the
+    /// claim phase and the trailing fsync), 2 = open. Lets a test put a
+    /// REAL waiter on the H1 condvar while a REAL batch holds the claim.
+    #[cfg(test)]
+    batch_pre_sync: crate::sync::atomic::AtomicU8,
+    /// Test-only probe: threads currently parked on the H1 condvar inside
+    /// `flush_frame_write`. The only way to prove a waiter is IN the wait
+    /// (not merely started) without a sleep guess.
+    #[cfg(test)]
+    flush_waiters: AtomicU64,
 }
 
 impl BufferPool {
@@ -222,6 +260,18 @@ impl BufferPool {
             flush_done: Condvar::new(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            #[cfg(test)]
+            data_writes: AtomicU64::new(0),
+            #[cfg(test)]
+            data_syncs: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_batch_sync: crate::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_write_after: crate::sync::atomic::AtomicUsize::new(usize::MAX),
+            #[cfg(test)]
+            batch_pre_sync: crate::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            flush_waiters: AtomicU64::new(0),
         })
     }
 
@@ -263,6 +313,13 @@ impl BufferPool {
         } else {
             hits as f64 / total as f64
         }
+    }
+
+    /// Test-only: threads currently parked on the H1 condvar (the probe
+    /// that makes "the waiter is IN the wait" observable without sleeps).
+    #[cfg(test)]
+    fn flush_waiters(&self) -> u64 {
+        self.flush_waiters.load(Ordering::Relaxed)
     }
 
     /// Pin a page for read access.
@@ -486,6 +543,105 @@ impl BufferPool {
         };
 
         self.flush_frame(frame_id)?;
+        Ok(())
+    }
+
+    /// Flush every dirty page, then fsync ONCE for the whole batch. Returns
+    /// the number of pages written.
+    ///
+    /// [`Self::flush`]'s group-fsync coalescing only engages for CONCURRENT
+    /// flushers: a sequential `for page in dirty { flush(page) }` loop pays
+    /// one fsync per page (~5.6 ms on the Stage E bench machine — a
+    /// 20k-insert redo replay window dirtied 1,776 pages ≈ 9.9 s, 80% of
+    /// the measured recovery time, against §13.2's 30 s budget for a 5×
+    /// larger window). Durability only requires every page's write issued
+    /// before a single trailing `sync_all`, which is exactly this batch
+    /// contract. Crash recovery's post-replay flush is the caller this was
+    /// built for.
+    ///
+    /// The Stage Q H1 invariant is preserved: `meta.flushing` clears only
+    /// AFTER the batch fsync (the durability decision), so no observer can
+    /// treat a written-but-unsynced page as durable. Pages evicted between
+    /// the dirty scan and the claim are already durable (eviction flushes)
+    /// and skipped, mirroring the checkpoint loop's PageNotFound tolerance.
+    /// A CLAIMED frame cannot be evicted underneath the pending list:
+    /// `evict_frame` skips `flushing` frames, so the frame keyed by each
+    /// [`PendingFlush`] still belongs to the flushing page when the
+    /// post-fsync (or error-restore) completion mutates its meta by frame
+    /// id (Stage E review P1 — without the skip, eviction could reuse the
+    /// frame mid-batch and the completion would hit the NEW tenant).
+    ///
+    /// The batch covers the dirty set AS OF the scan: pages dirtied after
+    /// `dirty_page_ids()` returns belong to the next batch (crash recovery
+    /// replays single-threaded, so no such page exists for the intended
+    /// caller; concurrent callers must provide their own exclusion).
+    ///
+    /// A clean pool is a TRUE no-op: zero writes, zero fsyncs, `Ok(0)`
+    /// (previously the batch paid one `sync_all` even with nothing claimed).
+    #[cfg(not(loom))]
+    pub fn flush_all_dirty(&self) -> Result<usize> {
+        let mut pending = Vec::new();
+        let sync_result = self.claim_all_dirty_writes(&mut pending).and_then(|()| {
+            // No write was issued for an empty batch, so no fsync is owed
+            // either — the clean-pool no-op contract.
+            if pending.is_empty() {
+                Ok(())
+            } else {
+                // Test-only rendezvous: park between the claim phase and
+                // the trailing fsync so a test can place a real H1 waiter.
+                #[cfg(test)]
+                while self.batch_pre_sync.load(Ordering::Relaxed) == 1 {
+                    std::thread::yield_now();
+                }
+                #[cfg(test)]
+                if self.fail_batch_sync.swap(false, Ordering::Relaxed) {
+                    return Err(StorageError::Io(std::io::Error::other(
+                        "injected batch sync failure",
+                    )));
+                }
+                #[cfg(test)]
+                self.data_syncs.fetch_add(1, Ordering::Relaxed);
+                self.data_file.sync_all()
+            }
+        });
+        if let Err(e) = sync_result {
+            // The batch failed before durability: restore every claimed
+            // epoch's dirty state (same restore as flush_frame's error
+            // paths) so no frame is left clean-but-undurable, and release
+            // the flushing claim so future flushers do not wait forever.
+            for claim in &pending {
+                let mut meta = self.frames[claim.frame_id.0].meta.lock();
+                meta.dirty = true;
+                restore_first_dirty_lsn(&mut meta.first_dirty_lsn, claim.saved_first_dirty_lsn);
+                meta.flushing = false;
+                self.flush_done.notify_all();
+            }
+            return Err(e);
+        }
+        for claim in &pending {
+            self.frames[claim.frame_id.0].meta.lock().flushing = false;
+            self.flush_done.notify_all();
+        }
+        Ok(pending.len())
+    }
+
+    /// The scan + write phase of [`Self::flush_all_dirty`]: every claimed
+    /// epoch lands in `pending` (write issued, fsync still owed).
+    #[cfg(not(loom))]
+    fn claim_all_dirty_writes(&self, pending: &mut Vec<PendingFlush>) -> Result<()> {
+        for page_id in self.dirty_page_ids() {
+            let frame_id = {
+                let shard = self.page_table[self.shard_index(page_id)].lock();
+                match shard.get(&page_id) {
+                    Some(&frame_id) => frame_id,
+                    // Evicted (hence flushed) between the scan and the claim.
+                    None => continue,
+                }
+            };
+            if let Some(claim) = self.flush_frame_write(frame_id)? {
+                pending.push(claim);
+            }
+        }
         Ok(())
     }
 
@@ -769,7 +925,18 @@ impl BufferPool {
                 None => continue,
             };
 
-            if meta.pin_count > 0 || meta.evicting {
+            // A frame mid-flush (dirty epoch claimed: `dirty` already false,
+            // `flushing` true, fsync still owed) must NOT be evicted: the
+            // in-flight flush's durability decision completes by FRAME ID
+            // (`flush_frame`'s tail / `flush_all_dirty`'s pending list), so
+            // resetting the meta for a new tenant first would let that
+            // completion mutate the NEW tenant's state — clearing `flushing`
+            // prematurely (breaking the H1 durability handshake) or, on the
+            // error path, restoring the OLD page's dirty flag and rec_lsn
+            // anchor onto it. The flush finishes within one fsync, so the
+            // next CLOCK pass finds the frame evictable again; skipping is
+            // the same treatment as `pin_count`/`evicting`.
+            if meta.pin_count > 0 || meta.evicting || meta.flushing {
                 continue;
             }
 
@@ -840,29 +1007,14 @@ impl BufferPool {
 
     /// Flush a single frame to disk if it is dirty.
     ///
-    /// **Dirty flag protocol (PG-style clear-before-write)**: `meta.dirty` is
-    /// cleared *before* the write begins. If a concurrent `pin_mut` modifies
-    /// the page while this flush is in progress, it will re-set `dirty = true`,
-    /// ensuring the next checkpoint picks up the newer version. On I/O error
-    /// the flag is restored so the page is retried later.
-    ///
-    /// **WAL-before-data invariant**: the content read lock is held from the
-    /// moment we sample `pd_lsn` through `flush_to` and `write_all_at`. This
-    /// prevents a concurrent `pin_mut` from advancing `pd_lsn` between the WAL
-    /// flush and the data write.
-    ///
-    /// `sync_all` is issued **after** releasing `content.read()`. This is safe
-    /// because:
-    /// - During eviction the frame is marked `evicting = true`, which prevents
-    ///   new `pin_mut` calls from targeting it.
-    /// - `fsync` flushes all prior writes to the inode regardless of whether
-    ///   the content lock is still held.
-    ///
     /// **Group-fsync coalescing**: multiple concurrent flushes share a single
     /// `fsync` via the `flush_gen` / `synced_gen` atomic pair. A flusher that
     /// observes `synced_gen >= its_gen` knows a concurrent fsync — one that
     /// started after this thread's `write_all_at` returned — already made the
-    /// write durable, so it can skip its own syscall.
+    /// write durable, so it can skip its own syscall. (Coalescing only helps
+    /// CONCURRENT flushers; a sequential batch belongs in
+    /// [`Self::flush_all_dirty`].)
+    ///
     /// **In-flight flush tracking (Stage Q review H1)**: claiming the dirty
     /// epoch sets `meta.flushing`; it clears only AFTER the durability
     /// decision (fsync completed, or group-fsync coalescing confirmed a
@@ -874,16 +1026,80 @@ impl BufferPool {
     /// left-past-copy / right-missing state to redo).
     #[cfg(not(loom))]
     fn flush_frame(&self, frame_id: FrameId) -> Result<()> {
+        let Some(pending) = self.flush_frame_write(frame_id)? else {
+            return Ok(());
+        };
+        let my_gen = self.flush_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        // Group-fsync coalescing: skip if a concurrent sync already covers us.
+        if self.synced_gen.load(Ordering::Acquire) < my_gen {
+            let covered_gen = self.flush_gen.load(Ordering::Acquire);
+            #[cfg(test)]
+            self.data_syncs.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = self.data_file.sync_all() {
+                let mut meta = self.frames[pending.frame_id.0].meta.lock();
+                meta.dirty = true;
+                restore_first_dirty_lsn(&mut meta.first_dirty_lsn, pending.saved_first_dirty_lsn);
+                meta.flushing = false;
+                self.flush_done.notify_all();
+                return Err(e);
+            }
+            self.synced_gen.fetch_max(covered_gen, Ordering::AcqRel);
+        }
+        // The durability decision is complete (fsync done or coverage
+        // confirmed): only NOW may waiters observe the page as flushed.
+        {
+            let mut meta = self.frames[pending.frame_id.0].meta.lock();
+            meta.flushing = false;
+            self.flush_done.notify_all();
+        }
+        Ok(())
+    }
+
+    /// The write half of [`Self::flush_frame`]: claim the dirty epoch,
+    /// enforce WAL-before-data, issue the page write, and mark `needs_fpi`
+    /// — but do NOT fsync and do NOT clear `meta.flushing`.
+    ///
+    /// The returned [`PendingFlush`] is an obligation: the caller MUST
+    /// complete the durability decision — one fsync covering the write —
+    /// and only THEN clear `flushing` (Stage Q H1); on failure it must
+    /// restore the claimed epoch's dirty state. `Ok(None)` means the frame
+    /// was clean (or another flusher completed it while we waited).
+    /// [`Self::flush_all_dirty`] is the batched caller: it defers the
+    /// single fsync until every page's write has been issued.
+    ///
+    /// **Dirty flag protocol (PG-style clear-before-write)**: `meta.dirty` is
+    /// cleared *before* the write begins. If a concurrent `pin_mut` modifies
+    /// the page while this flush is in progress, it will re-set `dirty = true`,
+    /// ensuring the next checkpoint picks up the newer version. On I/O error
+    /// the flag is restored so the page is retried later.
+    ///
+    /// **WAL-before-data invariant**: the content read lock is held from the
+    /// moment we sample `pd_lsn` through `flush_to` and `write_all_at`. This
+    /// prevents a concurrent `pin_mut` from advancing `pd_lsn` between the WAL
+    /// flush and the data write.
+    ///
+    /// `sync_all` is issued by callers **after** releasing `content.read()`.
+    /// This is safe because:
+    /// - During eviction the frame is marked `evicting = true`, which prevents
+    ///   new `pin_mut` calls from targeting it.
+    /// - `fsync` flushes all prior writes to the inode regardless of whether
+    ///   the content lock is still held.
+    #[cfg(not(loom))]
+    fn flush_frame_write(&self, frame_id: FrameId) -> Result<Option<PendingFlush>> {
         let (page_id, saved_first_dirty_lsn) = {
             let mut meta = self.frames[frame_id.0].meta.lock();
             // Wait out an in-flight flush BEFORE judging cleanliness: the
             // dirty flag was cleared at claim time, so "clean" can still
             // mean "another flusher's write/fsync is in progress".
             while meta.flushing {
+                #[cfg(test)]
+                self.flush_waiters.fetch_add(1, Ordering::Relaxed);
                 self.flush_done.wait(&mut meta);
+                #[cfg(test)]
+                self.flush_waiters.fetch_sub(1, Ordering::Relaxed);
             }
             if !meta.dirty || meta.page_id == PageId::INVALID {
-                return Ok(());
+                return Ok(None);
             }
             meta.flushing = true;
             meta.dirty = false;
@@ -926,7 +1142,26 @@ impl BufferPool {
         }
 
         let offset = (page_id.0 - 1) * self.config.page_size() as u64;
-        if let Err(e) = self.data_file.write_all_at(&*content, offset) {
+        #[cfg(test)]
+        let write_result = {
+            let remaining = self.fail_write_after.load(Ordering::Relaxed);
+            if remaining == usize::MAX {
+                self.data_file.write_all_at(&*content, offset)
+            } else if remaining == 0 {
+                // One-shot: re-disarm, then fail this attempt.
+                self.fail_write_after.store(usize::MAX, Ordering::Relaxed);
+                Err(StorageError::Io(std::io::Error::other(
+                    "injected page write failure",
+                )))
+            } else {
+                self.fail_write_after
+                    .store(remaining - 1, Ordering::Relaxed);
+                self.data_file.write_all_at(&*content, offset)
+            }
+        };
+        #[cfg(not(test))]
+        let write_result = self.data_file.write_all_at(&*content, offset);
+        if let Err(e) = write_result {
             let mut meta = self.frames[frame_id.0].meta.lock();
             meta.dirty = true;
             restore_first_dirty_lsn(&mut meta.first_dirty_lsn, saved_first_dirty_lsn);
@@ -934,7 +1169,8 @@ impl BufferPool {
             self.flush_done.notify_all();
             return Err(e);
         }
-        let my_gen = self.flush_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(test)]
+        self.data_writes.fetch_add(1, Ordering::Relaxed);
 
         // Mark needs_fpi BEFORE releasing the content lock. The page now has
         // an on-disk image (the write is issued; durability follows from the
@@ -951,60 +1187,44 @@ impl BufferPool {
         self.frames[frame_id.0].meta.lock().needs_fpi = true;
         drop(content);
 
-        // Group-fsync coalescing: skip if a concurrent sync already covers us.
-        if self.synced_gen.load(Ordering::Acquire) < my_gen {
-            let covered_gen = self.flush_gen.load(Ordering::Acquire);
-            if let Err(e) = self.data_file.sync_all() {
-                let mut meta = self.frames[frame_id.0].meta.lock();
-                meta.dirty = true;
-                restore_first_dirty_lsn(&mut meta.first_dirty_lsn, saved_first_dirty_lsn);
-                meta.flushing = false;
-                self.flush_done.notify_all();
-                return Err(e);
-            }
-            self.synced_gen.fetch_max(covered_gen, Ordering::AcqRel);
-        }
-
-        // The durability decision is complete (fsync done or coverage
-        // confirmed): only NOW may waiters observe the page as flushed.
-        {
-            let mut meta = self.frames[frame_id.0].meta.lock();
-            meta.flushing = false;
-            self.flush_done.notify_all();
-        }
-        Ok(())
+        Ok(Some(PendingFlush {
+            frame_id,
+            saved_first_dirty_lsn,
+        }))
     }
 
-    /// `cfg(loom)` variant of [`Self::flush_frame`]: performs only the
+    /// `cfg(loom)` variant of [`Self::flush_frame_write`]: performs only the
     /// dirty / rec_lsn / needs_fpi / flushing state transitions and skips
     /// the WAL flush, the data-file write, and the fsync. Loom models must
     /// size the pool so no eviction happens — an evicted page reloaded from
     /// disk would read zeros, since nothing is ever written in a model
     /// build. See the `crate::sync` module docs.
     ///
-    /// The `flushing` claim/clear is mirrored for state parity, but the
-    /// production condvar WAIT is not: model builds have a single flusher
-    /// (no eviction, no checkpoint, and B+Tree splits serialize on the root
-    /// latch), so a second flush can never observe `flushing` set — assert
-    /// that instead of adding a condvar wait loom's wrapper omits.
+    /// The `flushing` claim is mirrored for state parity, but the production
+    /// condvar WAIT is not: model builds have a single flusher (no eviction,
+    /// no checkpoint, and B+Tree splits serialize on the root latch), so a
+    /// second flush can never observe `flushing` set — assert that instead
+    /// of adding a condvar wait loom's wrapper omits.
     #[cfg(loom)]
-    fn flush_frame(&self, frame_id: FrameId) -> Result<()> {
-        {
+    fn flush_frame_write(&self, frame_id: FrameId) -> Result<Option<PendingFlush>> {
+        let saved_first_dirty_lsn = {
             let mut meta = self.frames[frame_id.0].meta.lock();
             debug_assert!(
                 !meta.flushing,
                 "concurrent flush in a loom model (models have a single flusher)"
             );
             if !meta.dirty || meta.page_id == PageId::INVALID {
-                return Ok(());
+                return Ok(None);
             }
             meta.flushing = true;
             meta.dirty = false;
+            let saved = meta.first_dirty_lsn;
             meta.first_dirty_lsn = Lsn::INVALID;
-        }
+            saved
+        };
         // Scheduling-point parity with the real path (Stage Q review): the
-        // real `flush_frame` holds `content.read` across the WAL flush and
-        // data write, and re-locks `meta` (for `needs_fpi`) WHILE content
+        // real `flush_frame_write` holds `content.read` across the WAL flush
+        // and data write, and re-locks `meta` (for `needs_fpi`) WHILE content
         // is still held. Mirror that exact lock sequence here — without
         // touching any data — so loom explores interleavings through the
         // same content → meta nesting instead of silently dropping that
@@ -1013,10 +1233,48 @@ impl BufferPool {
         {
             let mut meta = self.frames[frame_id.0].meta.lock();
             meta.needs_fpi = true;
-            meta.flushing = false;
         }
         drop(content);
+        Ok(Some(PendingFlush {
+            frame_id,
+            saved_first_dirty_lsn,
+        }))
+    }
+
+    /// `cfg(loom)` variant of [`Self::flush_frame`]: the durability decision
+    /// is modelled as instantaneous (no fsync exists in a model build), so
+    /// the claim releases immediately after the write-half transitions.
+    #[cfg(loom)]
+    fn flush_frame(&self, frame_id: FrameId) -> Result<()> {
+        if let Some(pending) = self.flush_frame_write(frame_id)? {
+            // `saved_first_dirty_lsn` is consumed only by the not(loom)
+            // error-restore paths; touch it so loom builds stay warning-free.
+            let _ = pending.saved_first_dirty_lsn;
+            self.frames[pending.frame_id.0].meta.lock().flushing = false;
+        }
         Ok(())
+    }
+
+    /// `cfg(loom)` variant of [`Self::flush_all_dirty`]: transitions only —
+    /// the batch fsync does not exist in a model build.
+    #[cfg(loom)]
+    pub fn flush_all_dirty(&self) -> Result<usize> {
+        let mut flushed = 0usize;
+        for page_id in self.dirty_page_ids() {
+            let frame_id = {
+                let shard = self.page_table[self.shard_index(page_id)].lock();
+                match shard.get(&page_id) {
+                    Some(&frame_id) => frame_id,
+                    None => continue,
+                }
+            };
+            if let Some(pending) = self.flush_frame_write(frame_id)? {
+                let _ = pending.saved_first_dirty_lsn;
+                self.frames[pending.frame_id.0].meta.lock().flushing = false;
+                flushed += 1;
+            }
+        }
+        Ok(flushed)
     }
 
     fn unpin(&self, frame_id: FrameId) {
@@ -1024,6 +1282,16 @@ impl BufferPool {
         debug_assert!(meta.pin_count > 0, "unpin called on unpinned frame");
         meta.pin_count -= 1;
     }
+}
+
+/// A dirty epoch claimed by [`BufferPool::flush_frame_write`] whose page
+/// write has been issued but whose durability decision (one covering
+/// fsync) is still pending. The caller must complete that decision and
+/// only then clear `meta.flushing` (Stage Q H1); on failure it must
+/// restore the epoch's dirty state from `saved_first_dirty_lsn`.
+struct PendingFlush {
+    frame_id: FrameId,
+    saved_first_dirty_lsn: Lsn,
 }
 
 /// Restore a saved first-dirty anchor after a failed flush, keeping the
@@ -1038,7 +1306,7 @@ impl BufferPool {
 /// "already on disk", silently skipping redo. A `saved` of
 /// [`Lsn::INVALID`] (dirty page whose writer never stamped a WAL LSN)
 /// restores nothing.
-#[cfg_attr(loom, allow(dead_code))] // only called by the real `flush_frame`
+#[cfg_attr(loom, allow(dead_code))] // only called by the not(loom) flush paths
 fn restore_first_dirty_lsn(current: &mut Lsn, saved: Lsn) {
     if saved.is_valid() && (*current == Lsn::INVALID || saved < *current) {
         *current = saved;
@@ -1450,6 +1718,457 @@ mod tests {
             &guard.page()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4],
             &[1, 2, 3, 4]
         );
+    }
+
+    /// Stage E: the batched flush makes every dirty page durable with a
+    /// single trailing fsync, leaves no frame dirty or mid-flush, and is a
+    /// no-op on a clean pool.
+    #[test]
+    fn flush_all_dirty_persists_every_page() {
+        let tmp = TempDir::new().unwrap();
+        let (_, _, pool) = setup(&tmp);
+
+        let mut page_ids = Vec::new();
+        for byte in 0u8..4 {
+            let mut guard = pool.new_page().unwrap();
+            page_ids.push(guard.page_id());
+            guard.page_mut()[PAGE_HEADER_SIZE] = byte;
+        }
+
+        assert_eq!(pool.flush_all_dirty().unwrap(), 4);
+        assert!(
+            pool.dirty_page_ids().is_empty(),
+            "no frame may stay dirty after the batch flush"
+        );
+        // The batch contract in counted I/O (Stage E review): exactly N
+        // writes and exactly ONE fsync for N dirty pages.
+        assert_eq!(
+            pool.data_writes.load(Ordering::Relaxed),
+            4,
+            "one write per dirty page"
+        );
+        assert_eq!(
+            pool.data_syncs.load(Ordering::Relaxed),
+            1,
+            "one fsync for the whole batch"
+        );
+        // A second call on the clean pool is a true no-op (no write, no
+        // fsync — Stage E review): the counters must not move.
+        assert_eq!(pool.flush_all_dirty().unwrap(), 0);
+        assert_eq!(pool.data_writes.load(Ordering::Relaxed), 4);
+        assert_eq!(pool.data_syncs.load(Ordering::Relaxed), 1);
+
+        // Drop the pool and reopen it; every page must be readable with its
+        // written content.
+        let (_, _, pool2) = setup(&tmp);
+        for (byte, page_id) in page_ids.iter().enumerate() {
+            let guard = pool2.pin(*page_id).unwrap();
+            assert_eq!(guard.page()[PAGE_HEADER_SIZE], byte as u8);
+        }
+    }
+
+    /// Stage E review (P1): a frame whose flush is between the write and the
+    /// fsync (dirty epoch claimed: `dirty == false`, `flushing == true`) must
+    /// be invisible to eviction. The in-flight flush's durability decision
+    /// completes by FRAME ID, so stealing the frame first would let that
+    /// completion mutate the NEW tenant's meta: clearing `flushing`
+    /// prematurely (breaking the H1 durability handshake a concurrent
+    /// `flush(page)` waits on) or, on the error path, restoring the OLD
+    /// page's dirty flag and rec_lsn anchor onto the new tenant.
+    ///
+    /// The test drives the racy interleaving deterministically, in-thread:
+    /// claim the flush exactly the way `flush_all_dirty` does (write issued,
+    /// fsync still owed), force an eviction attempt against a pool whose only
+    /// other frame is pinned, and require the pool to report FULL rather than
+    /// steal the claimed frame. Without the `evict_frame` flushing skip this
+    /// allocation succeeds (the frame is stolen and its meta reset).
+    #[test]
+    fn eviction_skips_frame_with_flush_in_flight() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = StorageConfig::new(tmp.path());
+        cfg.buffer_pool_size = 2 * cfg.page_size(); // exactly 2 frames
+        cfg.buffer_pool_shards = 1;
+        cfg.wal_group_commit_timeout_ms = 1;
+        cfg.wal_group_commit_batch_size = 1;
+        let wal = Arc::new(WalWriter::open(tmp.path(), &cfg).unwrap());
+        let allocator = Arc::new(Mutex::new(
+            PageAllocator::open(tmp.path(), &cfg, Arc::clone(&wal)).unwrap(),
+        ));
+        let pool =
+            BufferPool::open(tmp.path(), &cfg, Arc::clone(&allocator), Arc::clone(&wal)).unwrap();
+
+        // Fill both frames: A is the flush target, B stays pinned so A's
+        // frame is the ONLY eviction candidate.
+        let a_id = {
+            let mut guard = pool.new_page().unwrap();
+            let id = guard.page_id();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xA1;
+            id
+        };
+        let b_id = pool.new_page().unwrap().page_id();
+        let b_pin = pool.pin(b_id).unwrap();
+
+        // Claim A's dirty epoch — the real write half of the batch flush:
+        // the page write is issued, the fsync is still owed, `flushing`
+        // stays set.
+        let a_frame = pool.page_table[pool.shard_index(a_id)].lock()[&a_id];
+        let pending = pool
+            .flush_frame_write(a_frame)
+            .unwrap()
+            .expect("A is dirty: the claim must yield a PendingFlush");
+        {
+            let meta = pool.frames[a_frame.0].meta.lock();
+            assert!(meta.flushing && !meta.dirty, "post-claim state");
+        }
+
+        // A third page needs a frame: A is mid-flush (must skip), B is
+        // pinned (must skip) — the only legal answer is BufferPoolFull.
+        assert!(
+            matches!(pool.new_page(), Err(StorageError::BufferPoolFull)),
+            "eviction must not steal a frame whose flush is between write and fsync"
+        );
+        // A's mapping and tenant state survived the eviction attempt.
+        assert_eq!(
+            pool.page_table[pool.shard_index(a_id)].lock().get(&a_id),
+            Some(&a_frame)
+        );
+        {
+            let meta = pool.frames[a_frame.0].meta.lock();
+            assert!(
+                meta.flushing && meta.page_id == a_id && !meta.evicting,
+                "the claimed frame's meta must be untouched by the eviction attempt"
+            );
+        }
+
+        // Complete the durability decision exactly as `flush_all_dirty`'s
+        // post-fsync tail does, then release B's pin: the frame becomes
+        // evictable again and allocation recovers.
+        pool.data_file.sync_all().unwrap();
+        {
+            let mut meta = pool.frames[pending.frame_id.0].meta.lock();
+            meta.flushing = false;
+        }
+        pool.flush_done.notify_all();
+        drop(b_pin);
+        drop(pool.new_page().unwrap());
+
+        // A's write went out before the fsync: a fresh pool reads it back.
+        drop(pool);
+        let pool2 = BufferPool::open(tmp.path(), &cfg, allocator, wal).unwrap();
+        assert_eq!(pool2.pin(a_id).unwrap().page()[PAGE_HEADER_SIZE], 0xA1);
+    }
+
+    /// Stage E review: the clean-pool no-op must attempt NO fsync at all.
+    /// The armed injection turns any attempted `sync_all` into an error, so
+    /// `Ok(0)` here proves none was attempted — the pre-fix implementation
+    /// (which synced unconditionally) would fail this test.
+    #[test]
+    fn flush_all_dirty_clean_pool_attempts_no_fsync() {
+        let tmp = TempDir::new().unwrap();
+        let (_, _, pool) = setup(&tmp);
+        pool.fail_batch_sync.store(true, Ordering::Relaxed);
+        assert_eq!(pool.flush_all_dirty().unwrap(), 0);
+    }
+
+    /// Stage E review: the batch flush's failure path restores EVERY claimed
+    /// epoch — dirty flag, a REAL first_dirty_lsn anchor, and the H1
+    /// `flushing` release — so a later flush retries the batch instead of
+    /// leaking a clean-but-undurable frame or a flusher flag that blocks
+    /// waiters forever. Counted I/O pins the contract: both pages are
+    /// re-written before the (injected) trailing fsync fails.
+    #[test]
+    fn flush_all_dirty_sync_failure_restores_claims() {
+        let tmp = TempDir::new().unwrap();
+        let (_, _, pool) = setup(&tmp);
+
+        let mut page_ids = Vec::new();
+        for byte in 1u8..=2 {
+            let mut guard = pool.new_page().unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = byte;
+            page_ids.push(guard.page_id());
+        }
+        // Flush clean, then drive REAL rec_lsn anchors: with a checkpoint
+        // LSN published, the re-dirty goes through the FPI path, which sets
+        // `first_dirty_lsn = fpi_lsn` (valid).
+        assert_eq!(pool.flush_all_dirty().unwrap(), 2);
+        assert_eq!(
+            (
+                pool.data_writes.load(Ordering::Relaxed),
+                pool.data_syncs.load(Ordering::Relaxed)
+            ),
+            (2, 1)
+        );
+        pool.set_checkpoint_lsn(Lsn(1_000));
+        for &pid in &page_ids {
+            let mut guard = pool.pin_mut(pid).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE + 1] = 0xEE;
+        }
+
+        let frame_of = |pool: &BufferPool, page_id: PageId| {
+            pool.page_table[pool.shard_index(page_id)].lock()[&page_id]
+        };
+        let pre_claim: Vec<(bool, Lsn)> = page_ids
+            .iter()
+            .map(|&pid| {
+                let meta = pool.frames[frame_of(&pool, pid).0].meta.lock();
+                (meta.dirty, meta.first_dirty_lsn)
+            })
+            .collect();
+        assert!(pre_claim.iter().all(|&(dirty, _)| dirty));
+        assert!(
+            pre_claim.iter().all(|&(_, lsn)| lsn.is_valid()),
+            "the FPI path must install a REAL rec_lsn anchor, not INVALID"
+        );
+
+        pool.fail_batch_sync.store(true, Ordering::Relaxed);
+        assert!(
+            pool.flush_all_dirty().is_err(),
+            "the injected sync failure must surface"
+        );
+        assert_eq!(
+            (
+                pool.data_writes.load(Ordering::Relaxed),
+                pool.data_syncs.load(Ordering::Relaxed)
+            ),
+            (4, 1),
+            "both pages were re-written before the injected fsync failure"
+        );
+
+        for (&pid, &(pre_dirty, pre_lsn)) in page_ids.iter().zip(&pre_claim) {
+            let meta = pool.frames[frame_of(&pool, pid).0].meta.lock();
+            assert_eq!(meta.dirty, pre_dirty, "dirty epoch must be restored");
+            assert_eq!(
+                meta.first_dirty_lsn, pre_lsn,
+                "the saved (valid) rec_lsn anchor must be restored"
+            );
+            assert!(
+                !meta.flushing,
+                "H1 release: the flusher flag must not leak (waiters would block forever)"
+            );
+        }
+
+        // The injection is consumed: the retry succeeds and makes both
+        // pages durable (both modification epochs' bytes).
+        assert_eq!(pool.flush_all_dirty().unwrap(), 2);
+        assert_eq!(
+            (
+                pool.data_writes.load(Ordering::Relaxed),
+                pool.data_syncs.load(Ordering::Relaxed)
+            ),
+            (6, 2)
+        );
+        let (_, _, pool2) = setup(&tmp);
+        for (i, &pid) in page_ids.iter().enumerate() {
+            let guard = pool2.pin(pid).unwrap();
+            assert_eq!(guard.page()[PAGE_HEADER_SIZE], i as u8 + 1);
+            assert_eq!(guard.page()[PAGE_HEADER_SIZE + 1], 0xEE);
+        }
+    }
+
+    /// Stage E review: a failing page write inside the batch must
+    /// self-restore THAT frame (dirty / anchor / H1 release) and stop the
+    /// claim loop immediately — no later frame's write is attempted and no
+    /// fsync is issued for a batch that never completed its writes.
+    #[test]
+    fn flush_all_dirty_write_failure_restores_failed_frame_only() {
+        let tmp = TempDir::new().unwrap();
+        let (_, _, pool) = setup(&tmp);
+
+        let mut page_ids = Vec::new();
+        for byte in 1u8..=2 {
+            let mut guard = pool.new_page().unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = byte;
+            page_ids.push(guard.page_id());
+        }
+        let frame_of = |pool: &BufferPool, page_id: PageId| {
+            pool.page_table[pool.shard_index(page_id)].lock()[&page_id]
+        };
+
+        pool.fail_write_after.store(0, Ordering::Relaxed);
+        assert!(
+            pool.flush_all_dirty().is_err(),
+            "the injected write failure must surface"
+        );
+        assert_eq!(
+            (
+                pool.data_writes.load(Ordering::Relaxed),
+                pool.data_syncs.load(Ordering::Relaxed)
+            ),
+            (0, 0),
+            "the failing first write stops the batch: no write landed, no fsync attempted"
+        );
+        for &pid in &page_ids {
+            let meta = pool.frames[frame_of(&pool, pid).0].meta.lock();
+            assert!(meta.dirty, "every frame stays dirty for the retry");
+            assert!(!meta.flushing, "no flusher flag leaks");
+        }
+
+        // Injection consumed: the retry flushes both pages with one fsync.
+        assert_eq!(pool.flush_all_dirty().unwrap(), 2);
+        assert_eq!(
+            (
+                pool.data_writes.load(Ordering::Relaxed),
+                pool.data_syncs.load(Ordering::Relaxed)
+            ),
+            (2, 1)
+        );
+    }
+
+    /// Stage E review: a write failure AFTER a successful claim (mid-batch)
+    /// must restore the pending claim via the batch's error tail and the
+    /// failed frame via `flush_frame_write`'s own restore — both with their
+    /// REAL (valid) rec_lsn anchors — leave the THIRD page's frame entirely
+    /// untouched, and issue no fsync for a batch that never completed its
+    /// writes.
+    #[test]
+    fn flush_all_dirty_write_failure_mid_batch_restores_both() {
+        let tmp = TempDir::new().unwrap();
+        let (_, _, pool) = setup(&tmp);
+
+        let mut page_ids = Vec::new();
+        for byte in 1u8..=3 {
+            let mut guard = pool.new_page().unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = byte;
+            page_ids.push(guard.page_id());
+        }
+        // Drive REAL rec_lsn anchors: flush clean, publish a checkpoint LSN,
+        // re-dirty through pin_mut — the FPI path sets
+        // `first_dirty_lsn = fpi_lsn` (valid).
+        assert_eq!(pool.flush_all_dirty().unwrap(), 3);
+        pool.set_checkpoint_lsn(Lsn(1_000));
+        for &pid in &page_ids {
+            let mut guard = pool.pin_mut(pid).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE + 1] = 0xEE;
+        }
+        let frame_of = |pool: &BufferPool, page_id: PageId| {
+            pool.page_table[pool.shard_index(page_id)].lock()[&page_id]
+        };
+        let pre_claim: Vec<Lsn> = page_ids
+            .iter()
+            .map(|&pid| {
+                pool.frames[frame_of(&pool, pid).0]
+                    .meta
+                    .lock()
+                    .first_dirty_lsn
+            })
+            .collect();
+        assert!(
+            pre_claim.iter().all(|lsn| lsn.is_valid()),
+            "the FPI path must install REAL rec_lsn anchors, not INVALID"
+        );
+
+        // Frames are scanned in index order: page 0's write lands (its
+        // claim enters the batch's pending list), page 1's write fails,
+        // page 2's frame is never claimed at all.
+        pool.fail_write_after.store(1, Ordering::Relaxed);
+        assert!(
+            pool.flush_all_dirty().is_err(),
+            "the injected mid-batch write failure must surface"
+        );
+        assert_eq!(
+            (
+                pool.data_writes.load(Ordering::Relaxed),
+                pool.data_syncs.load(Ordering::Relaxed)
+            ),
+            (4, 1),
+            "one write landed in the failed batch (3 + 1), no fsync attempted"
+        );
+        for (i, &pid) in page_ids.iter().enumerate() {
+            let meta = pool.frames[frame_of(&pool, pid).0].meta.lock();
+            assert!(meta.dirty, "frame {i} must stay dirty for the retry");
+            assert!(!meta.flushing, "frame {i}: no flusher flag leaks");
+            assert_eq!(
+                meta.first_dirty_lsn, pre_claim[i],
+                "frame {i}: the valid anchor must be intact (restored or untouched)"
+            );
+        }
+
+        // Injection re-disarmed: the retry flushes all three with one fsync.
+        assert_eq!(pool.flush_all_dirty().unwrap(), 3);
+        assert_eq!(
+            (
+                pool.data_writes.load(Ordering::Relaxed),
+                pool.data_syncs.load(Ordering::Relaxed)
+            ),
+            (7, 2)
+        );
+        let (_, _, pool2) = setup(&tmp);
+        for (i, &pid) in page_ids.iter().enumerate() {
+            let guard = pool2.pin(pid).unwrap();
+            assert_eq!(guard.page()[PAGE_HEADER_SIZE], i as u8 + 1);
+            assert_eq!(guard.page()[PAGE_HEADER_SIZE + 1], 0xEE);
+        }
+    }
+
+    /// Stage E review: a REAL waiter parked on the H1 condvar while a REAL
+    /// batch holds the claim must be woken by the batch's error tail (the
+    /// production `notify_all`, not a test replica) when the batch's
+    /// trailing fsync fails — and then complete the flush itself. The
+    /// rendezvous is deterministic: the pre-sync gate parks the batch
+    /// between claims and fsync, meta observation proves the claim is
+    /// held, and the `flush_waiters` probe proves the waiter is IN the
+    /// condvar wait before the gate opens. Deleting the production
+    /// notify_all turns this test red via the recv timeout.
+    #[test]
+    fn flush_waiter_wakes_on_batch_failure_and_completes() {
+        let tmp = TempDir::new().unwrap();
+        let (_, _, pool) = setup(&tmp);
+        let pool = Arc::new(pool);
+
+        let page_id = {
+            let mut guard = pool.new_page().unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0x77;
+            guard.page_id()
+        };
+        let frame = pool.page_table[pool.shard_index(page_id)].lock()[&page_id];
+
+        pool.fail_batch_sync.store(true, Ordering::Relaxed);
+        pool.batch_pre_sync.store(1, Ordering::Relaxed); // gate armed-and-closed
+
+        let batch_pool = Arc::clone(&pool);
+        let batch = std::thread::spawn(move || batch_pool.flush_all_dirty());
+        // The claim is held once the frame's meta shows it (no sleep guess,
+        // but bounded: a batch that died before claiming must not hang the
+        // test forever).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pool.frames[frame.0].meta.lock().flushing {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the batch never claimed the frame (died early?)"
+            );
+            std::thread::yield_now();
+        }
+
+        let waiter_pool = Arc::clone(&pool);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = waiter_pool.flush(page_id);
+            tx.send(result).unwrap();
+        });
+        // The waiter is IN the H1 wait only when the probe says so (same
+        // bounded spin).
+        while pool.flush_waiters() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiter never entered the H1 wait (died early?)"
+            );
+            std::thread::yield_now();
+        }
+
+        // Open the gate: the batch hits the injected failure; ONLY the
+        // error tail's production notify can wake the waiter now.
+        pool.batch_pre_sync.store(2, Ordering::Relaxed);
+        assert!(
+            batch.join().unwrap().is_err(),
+            "the injected sync failure must surface in the batch"
+        );
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("waiter never woke — the batch error tail lost its notify")
+            .expect("the woken waiter's own flush must succeed");
+        assert_eq!(pool.flush_waiters(), 0, "no waiter is left parked");
+
+        let (_, _, pool2) = setup(&tmp);
+        assert_eq!(pool2.pin(page_id).unwrap().page()[PAGE_HEADER_SIZE], 0x77);
     }
 
     #[test]

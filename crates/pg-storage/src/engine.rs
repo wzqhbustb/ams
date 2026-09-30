@@ -679,10 +679,14 @@ impl StorageEngine {
 
         // Flush all pages dirtied by redo through the buffer pool, which makes
         // them durable (WAL-before-data + fsync). This replaces the M1
-        // direct-write + data_file.sync_all() path.
-        for page_id in buffer_pool.dirty_page_ids() {
-            buffer_pool.flush(page_id)?;
-        }
+        // direct-write + data_file.sync_all() path. Batched (Stage E): ONE
+        // fsync for the whole dirty set — a sequential per-page flush() loop
+        // gets zero benefit from flush()'s group-fsync coalescing (it only
+        // engages for CONCURRENT flushers) and pays one fsync per page,
+        // which measured ~5.6 ms/page on the Stage E bench machine: 80% of
+        // the recovery time for a 20k-insert replay window, against §13.2's
+        // 30 s budget for a window 5× larger.
+        buffer_pool.flush_all_dirty()?;
 
         info!(records_replayed, "WAL replay complete");
         Ok((max_txn_id, incomplete_splits))

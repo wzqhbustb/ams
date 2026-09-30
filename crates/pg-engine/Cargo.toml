@@ -7,6 +7,18 @@ authors.workspace = true
 license.workspace = true
 description = "pg_rust engine — top-level assembly of storage, txn, catalog, and AMs"
 
+# Only the [[bench]] criterion targets are benchmarks; without this,
+# `cargo bench --workspace -- --quick` also feeds --quick to the lib's
+# bench-profile unittest binary (libtest rejects it — Stage E review).
+[lib]
+bench = false
+
+# Same for the implicit bin bench target (libtest rejects --quick).
+[[bin]]
+name = "pg-diag"
+path = "src/bin/pg-diag.rs"
+bench = false
+
 [dependencies]
 pg-storage = { path = "../pg-storage" }
 pg-txn = { path = "../pg-txn" }

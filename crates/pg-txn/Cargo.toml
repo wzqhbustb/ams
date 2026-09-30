@@ -7,6 +7,12 @@ authors.workspace = true
 license.workspace = true
 description = "pg_rust transaction layer — XID, CLOG, Snapshot, Visibility Oracle, Lock Manager"
 
+# Only the [[bench]] criterion targets are benchmarks; without this,
+# `cargo bench --workspace -- --quick` also feeds --quick to the lib's
+# bench-profile unittest binary (libtest rejects it — Stage E review).
+[lib]
+bench = false
+
 [dependencies]
 pg-storage = { path = "../pg-storage" }
 

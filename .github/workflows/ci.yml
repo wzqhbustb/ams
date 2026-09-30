@@ -156,8 +156,16 @@ jobs:
         run: cargo install cargo-tarpaulin --locked
       # Only pg-am-hnsw is instrumented — the M4 coverage gate (§12) applies
       # to the new crate; Phase 1 crates keep their existing test jobs.
+      # --fail-under 90 (M5 Stage E review): without it the job is green at
+      # ANY coverage and the ≥90% gate is a gate in name only.
+      # --skip concurrent_save_same_target_with_concurrent_load: under
+      # instrumentation the test's thread-timing premise (a writer thread
+      # must observe an overlapping load within 10k iterations) cannot be
+      # met — always red under local llvm-cov, expected same under
+      # tarpaulin's ptrace tracing (non-instrumented debug/release suites
+      # are always green; registered in stage_spec Stage E ⑤, v1.68).
       - name: Run tarpaulin
-        run: cargo tarpaulin -p pg-am-hnsw --out Xml --output-dir coverage
+        run: cargo tarpaulin -p pg-am-hnsw --out Xml --output-dir coverage --fail-under 90 -- --skip concurrent_save_same_target_with_concurrent_load
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-pg-am-hnsw

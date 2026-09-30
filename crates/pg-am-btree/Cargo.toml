@@ -7,6 +7,12 @@ authors.workspace = true
 license.workspace = true
 description = "pg_rust B+Tree access method — latch coupling, split/merge, Blink variant"
 
+# Only the [[bench]] criterion targets are benchmarks; without this,
+# `cargo bench --workspace -- --quick` also feeds --quick to the lib's
+# bench-profile unittest binary (libtest rejects it — Stage E review).
+[lib]
+bench = false
+
 [dependencies]
 # pg-storage: page format + physical types, buffer pool, WAL, redo dispatch.
 pg-storage = { path = "../pg-storage" }

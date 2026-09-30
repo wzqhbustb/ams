@@ -30,9 +30,15 @@
 //!   and the reachable-residue consistency pins (ghost ⟹ hwm == n+1,
 //!   orphan ⟹ hwm == n, hidden ⟹ ghost). With zero residue the bitwise
 //!   twin comparison still runs; with a residue the ghost's half-written
-//!   edges legitimately diverge from any clean replay, so only functional
-//!   sanity (queries answer, exact hit count) is asserted — noted here as
-//!   deliberate, not a gap.
+//!   edges legitimately diverge from any clean replay, so the assertion is
+//!   the slice-2 legality floor (queries answer; every hit names a real
+//!   node < hwm and carries EXACTLY its recomputed stored-vector distance)
+//!   — NOT an exact hit count: a kill inside §8.1 step 5 (others' lists, before
+//!   the own lists) leaves a ghost with inbound edges and EMPTY own lists,
+//!   and a query whose descent moves into it can be trapped with fewer
+//!   than k hits (round 521 of the 1000-round acceptance; a legal residue
+//!   shape, registered for M6's ghost-recycle protocol — see the module
+//!   trail in docs/stage_spec.md).
 //!
 //! Timing note (same accepted shape as m2b): the mid-mode kill lands within
 //! one parent poll (2 ms) of the expectation reaching the target. Each child
@@ -282,6 +288,45 @@ fn wait_for_file(path: &Path, timeout: Duration, what: &str, round: u64) {
     }
 }
 
+/// RAII reaper for a crash-round child: a mid-round panic (assertion
+/// failure, timeout) would otherwise leak the child — still alive,
+/// holding its data dir lock and fsyncing against a deleted TempDir
+/// forever (same Stage E review shape as m5_recovery_time).
+struct ChildGuard {
+    child: Option<std::process::Child>,
+}
+
+impl ChildGuard {
+    fn spawn(data_dir: &Path, seed: u64) -> Self {
+        Self {
+            child: Some(spawn_child(data_dir, seed)),
+        }
+    }
+
+    /// The normal path: loud on kill/reap failure (unchanged semantics).
+    /// The child stays owned by the guard until the reap SUCCEEDS — on a
+    /// kill/wait failure panic, `Drop` still retries (Stage E review).
+    fn kill_and_reap(&mut self, round: u64) {
+        let child = self.child.as_mut().expect("child already reaped");
+        child
+            .kill()
+            .unwrap_or_else(|e| panic!("round {round}: failed to kill crash child: {e}"));
+        child
+            .wait()
+            .unwrap_or_else(|e| panic!("round {round}: failed to reap crash child: {e}"));
+        self.child = None;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// The M5 Stage D slice-3 crash automation: `M5_CRASH_ROUNDS` kill -9 +
 /// reopen cycles against the page-resident HNSW index (default 25; 1000
 /// for acceptance).
@@ -304,7 +349,7 @@ fn m5_hnsw_crash_rounds() {
     for round in 0..rounds {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
-        let mut child = spawn_child(&data_dir, round);
+        let mut child = ChildGuard::spawn(&data_dir, round);
 
         if round % 2 == 0 {
             // Even rounds: let the full workload commit, then kill.
@@ -341,8 +386,7 @@ fn m5_hnsw_crash_rounds() {
                 thread::sleep(Duration::from_millis(2));
             }
         }
-        child.kill().expect("failed to kill crash child");
-        child.wait().expect("failed to reap crash child");
+        child.kill_and_reap(round);
 
         // The SIGKILLed child left its `{data_dir}/lock` behind; play the
         // documented operator action before reopening (m2b precedent). The
@@ -512,13 +556,43 @@ fn verify_round(round: u64, data_dir: &Path) {
             assert_bitwise_twin(&engine, &index, round, live);
         } else {
             // The ghost's half-written edges legitimately diverge from any
-            // clean replay — functional sanity only (module header note).
-            // live >= 30 (the progress floor) guarantees enough hits.
+            // clean replay — the slice-2 legality floor, not a bitwise twin
+            // (module header note). The reachable floor is NOT k: a kill
+            // inside §8.1 step 5 (others' lists, before the own lists are
+            // written) leaves the ghost with inbound edges and EMPTY own
+            // lists; a query whose greedy descent moves into that ghost is
+            // trapped there and may return just the ghost itself
+            // (1000-round acceptance, round 521: hits = 1 for k = 5 with
+            // live = 71 — diagnosed by the window probe, a LEGAL residue
+            // shape, not corruption). Sanity = the query path answers and
+            // every hit is a real node carrying EXACTLY its recomputed
+            // stored-vector distance — the same floor as the slice-2
+            // matrix's `assert_hits_legal` (node i's vector is
+            // vector_at(round, i) by construction, so the parent can
+            // recompute; restored after the round-521 fix narrowed the
+            // check to existence-only).
             let query_seed = round ^ 0x0A11_CE55_0A11_CE55;
             for j in 0..2u64 {
                 let q = vector_at(query_seed, j);
                 let hits = engine.hnsw_search(&index, &q, 5, None).unwrap();
-                assert_eq!(hits.len(), 5, "round {round}: functional sanity");
+                assert!(
+                    !hits.is_empty(),
+                    "round {round}: search must answer on a residue graph (live >= 30)"
+                );
+                for (id, dist) in &hits {
+                    assert!(
+                        (id.0 as u64) < index.hwm(),
+                        "round {round}: hit {id:?} names no real node (< hwm)"
+                    );
+                    let expected =
+                        pg_am_hnsw::distance::l2_squared(&q, &vector_at(round, id.0 as u64))
+                            .expect("query and node vectors share DIM by construction");
+                    assert_eq!(
+                        dist.to_bits(),
+                        expected.to_bits(),
+                        "round {round}: hit {id:?} distance must be the exact stored-vector distance"
+                    );
+                }
             }
         }
     }

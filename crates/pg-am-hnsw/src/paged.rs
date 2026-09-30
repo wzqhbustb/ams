@@ -208,3 +208,112 @@ impl GraphAccess for PagedGraph<'_> {
         .expect("PagedGraph::for_each_neighbor: same validated-resolution premise as dist_to_query; a level above the entry's top level is an algorithm-core bug, not input")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Stage E coverage top-up (2026-09-29): the resolve/with_node loud-
+    //! corruption arms — "resolution past the published mapping must fail
+    //! loudly, never fabricate" is a CONTRACT (§8.1③) and gets pinned here
+    //! directly, not just by coverage accounting.
+    use super::*;
+    use crate::page::{init_dir_page, init_meta_page, log_page_init};
+    use pg_storage::config::StorageConfig;
+    use pg_storage::engine::StorageEngine;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// Manual temp dir (no tempfile dev-dependency — M4's dependency freeze).
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pg_am_hnsw_paged-{}-{}-{tag}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_engine(tag: &str) -> (StorageEngine, PathBuf) {
+        let dir = fresh_dir(tag);
+        // A handful of frames is plenty for these page-type pins — the
+        // 128 MiB default across three parallel tests was ~384 MiB of
+        // waste (Stage E review).
+        let mut cfg = StorageConfig::new(&dir);
+        cfg.buffer_pool_size = 16 * cfg.page_size();
+        let engine = StorageEngine::open(&dir, &cfg).unwrap();
+        (engine, dir)
+    }
+
+    /// A freshly allocated + init'd page of the given type, WAL-logged.
+    fn alloc_page(engine: &StorageEngine, init: impl FnOnce(&mut [u8; PAGE_SIZE])) -> PageId {
+        let mut guard = engine.buffer_pool().new_page().unwrap();
+        let page_id = guard.page_id();
+        {
+            let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+            init(page);
+            log_page_init(engine.wal_writer(), page_id, page).unwrap();
+        }
+        page_id
+    }
+
+    fn graph<'a>(pool: &'a BufferPool, dir_pages: &'a [PageId]) -> PagedGraph<'a> {
+        PagedGraph::new(pool, dir_pages, 1, 4, 4, 8, Metric::L2)
+    }
+
+    #[test]
+    fn resolve_past_the_chain_is_loud_corruption() {
+        let (engine, dir) = test_engine("past-chain");
+        {
+            let g = graph(engine.buffer_pool(), &[]);
+            let err = g.resolve(NodeId(0)).expect_err("out-of-chain id must fail");
+            assert!(
+                err.to_string().contains("maps past the directory chain"),
+                "{err}"
+            );
+        }
+        // Cleanup discipline: the graph borrows the pool, so its scope ends
+        // first, and the dir is removed only AFTER the engine is down —
+        // with a loud failure, not a swallowed `let _ =` (Stage E review).
+        drop(engine);
+        std::fs::remove_dir_all(&dir).expect("temp dir cleanup");
+    }
+
+    #[test]
+    fn resolve_non_dir_page_is_loud_corruption() {
+        let (engine, dir) = test_engine("non-dir");
+        let meta = alloc_page(&engine, init_meta_page);
+        {
+            let dir_pages = [meta];
+            let g = graph(engine.buffer_pool(), &dir_pages);
+            let err = g.resolve(NodeId(0)).expect_err("non-dir page must fail");
+            assert!(err.to_string().contains("is not a directory page"), "{err}");
+        }
+        drop(engine);
+        std::fs::remove_dir_all(&dir).expect("temp dir cleanup");
+    }
+
+    #[test]
+    fn with_node_wrong_target_type_is_loud_corruption() {
+        let (engine, dir) = test_engine("wrong-type");
+        let meta = alloc_page(&engine, init_meta_page);
+        let dir_page = alloc_page(&engine, |p| init_dir_page(p, 0));
+        // Directory entry 0 maps node 0 at the META page (wrong type).
+        {
+            let mut guard = engine.buffer_pool().pin_mut(dir_page).unwrap();
+            let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+            crate::apply::dir_append(page, 0, meta, 0).unwrap();
+        }
+        {
+            let g_dir_pages = [dir_page];
+            let g = graph(engine.buffer_pool(), &g_dir_pages);
+            let err = g
+                .with_node(NodeId(0), |_, _| Ok(()))
+                .expect_err("wrong target page type must fail");
+            assert!(err.to_string().contains("wrong type"), "{err}");
+        }
+        drop(engine);
+        std::fs::remove_dir_all(&dir).expect("temp dir cleanup");
+    }
+}
