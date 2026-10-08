@@ -200,6 +200,13 @@ impl TupleHeader {
     }
 }
 
+/// Maximum dimension of an inline vector column (M6 tech-selection §11).
+/// 2000 keeps a single-column vector tuple inside an 8 KiB page:
+/// 64-byte header + 2000 × 4 = 8064 B ≤ `MAX_TUPLE_BYTES` (8140 B on 8 KiB
+/// pages). Larger dimensions belong to the M5 O1 out-of-line window, not
+/// the inline tuple format.
+pub const MAX_VECTOR_DIM: u32 = 2000;
+
 /// Column type descriptor needed to split the attribute area at decode time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
@@ -215,9 +222,27 @@ pub enum ColumnType {
     Text,
     /// Variable-length binary.
     Bytea,
+    /// Fixed-width vector of `f32` (M6 Stage 0): `dim × 4` bytes inline,
+    /// little-endian per component. `dim` is part of the type identity —
+    /// two `Vector` columns with different dims are different types, which
+    /// makes `encode_tuple`'s datum/column match reject a wrong-length
+    /// `Datum::Vector` without a separate check. Valid range is
+    /// `1..=MAX_VECTOR_DIM`; use [`ColumnType::vector`] to construct.
+    Vector(u32),
 }
 
 impl ColumnType {
+    /// Validated constructor for vector columns: `dim` must lie in
+    /// `1..=MAX_VECTOR_DIM` (M6 tech-selection §11's hard limit; oversized
+    /// dims are the M5 O1 window's concern, not the inline format's).
+    /// `ColumnType` is a plain enum, so the codec re-validates the range at
+    /// the encode/decode boundary — this constructor is the front door
+    /// (Stage C's `VECTOR(n)` DDL parsing), not the only check.
+    pub fn vector(dim: u32) -> Result<Self> {
+        check_vector_dim(dim)?;
+        Ok(ColumnType::Vector(dim))
+    }
+
     /// Fixed width in bytes, or `None` for varlena columns.
     fn fixed_width(self) -> Option<usize> {
         match self {
@@ -225,8 +250,19 @@ impl ColumnType {
             ColumnType::Int8 | ColumnType::Timestamptz => Some(8),
             ColumnType::Uuid => Some(16),
             ColumnType::Text | ColumnType::Bytea => None,
+            ColumnType::Vector(dim) => Some(dim as usize * 4),
         }
     }
+}
+
+/// Reject a vector dimension outside `1..=MAX_VECTOR_DIM`.
+fn check_vector_dim(dim: u32) -> Result<()> {
+    if !(1..=MAX_VECTOR_DIM).contains(&dim) {
+        return Err(HeapError::InvalidArgument(format!(
+            "vector dimension {dim} out of range 1..={MAX_VECTOR_DIM}"
+        )));
+    }
+    Ok(())
 }
 
 /// A single column value. `None` at the `values` level encodes SQL NULL.
@@ -244,6 +280,10 @@ pub enum Datum {
     Text(String),
     /// Variable-length binary.
     Bytea(Vec<u8>),
+    /// Fixed-width `f32` vector (M6 Stage 0); the length must equal the
+    /// column's `ColumnType::Vector(dim)` — enforced by the encode-side
+    /// datum/column match.
+    Vector(Vec<f32>),
     /// Out-of-line (TOASTed) value: the 20-byte pointer stored in the main
     /// tuple (§四). Resolving it is Stage I's job.
     External(ToastPointer),
@@ -279,6 +319,7 @@ impl Datum {
             Datum::Uuid(_) => ColumnType::Uuid,
             Datum::Text(_) => ColumnType::Text,
             Datum::Bytea(_) => ColumnType::Bytea,
+            Datum::Vector(v) => ColumnType::Vector(v.len() as u32),
             // An external pointer stands in for a varlena column; the schema
             // (Text or Bytea) decides how the detoasted bytes are read.
             Datum::External(_) => ColumnType::Bytea,
@@ -317,12 +358,21 @@ pub fn encode_tuple(
     let mut has_varwidth = false;
     let mut has_external = false;
     for (col, val) in columns.iter().zip(values.iter()) {
+        // A Vector schema column carries its own validity domain. The
+        // `ColumnType::vector` constructor enforces it, but the enum is
+        // public and catalog read-back constructs variants directly —
+        // re-validate at the codec boundary regardless of NULL-ness.
+        if let ColumnType::Vector(dim) = col {
+            check_vector_dim(*dim)?;
+        }
         match val {
             None => has_null = true,
             Some(datum) => {
-                // External pointers stand in for either varlena type.
+                // External pointers stand in for either varlena type; a
+                // vector datum must match the column's dim exactly.
                 let matches = match (col, datum) {
                     (_, Datum::External(_)) => col.fixed_width().is_none(),
+                    (ColumnType::Vector(dim), Datum::Vector(v)) => v.len() == *dim as usize,
                     (col, datum) => *col == datum.column_type(),
                 };
                 if !matches {
@@ -379,6 +429,13 @@ pub fn encode_tuple(
             Datum::Uuid(v) => out.extend_from_slice(v.as_bytes()),
             Datum::Text(s) => write_inline_varlena(&mut out, s.as_bytes())?,
             Datum::Bytea(b) => write_inline_varlena(&mut out, b)?,
+            Datum::Vector(v) => {
+                // Bit-exact little-endian per component; the length was
+                // pinned to the column dim by the match above.
+                for x in v {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
             Datum::External(ptr) => out.extend_from_slice(&ptr.encode()),
         }
     }
@@ -425,6 +482,18 @@ pub fn decode_tuple(
             columns.len()
         )));
     }
+    // The schema is disk-derived (catalog read-back) in production, so a
+    // Vector dim outside the constructor's domain is corruption, not a
+    // caller bug — fail loud before any read is sized by it.
+    for col in columns {
+        if let ColumnType::Vector(dim) = col {
+            if check_vector_dim(*dim).is_err() {
+                return Err(HeapError::Corrupted(format!(
+                    "vector column dimension {dim} out of range 1..={MAX_VECTOR_DIM}"
+                )));
+            }
+        }
+    }
     let t_hoff = header.t_hoff as usize;
     if t_hoff < TUPLE_HEADER_SIZE || t_hoff > bytes.len() || t_hoff % 8 != 0 {
         return Err(HeapError::Corrupted(format!(
@@ -464,6 +533,16 @@ pub fn decode_tuple(
                     }
                     ColumnType::Uuid => {
                         Datum::Uuid(uuid::Uuid::from_bytes(field.try_into().unwrap()))
+                    }
+                    ColumnType::Vector(dim) => {
+                        // `field` is exactly `dim × 4` bytes (the fixed
+                        // width); dim was range-checked above, so this
+                        // allocation is bounded by MAX_VECTOR_DIM.
+                        let mut v = Vec::with_capacity(*dim as usize);
+                        for chunk in field.chunks_exact(4) {
+                            v.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                        }
+                        Datum::Vector(v)
                     }
                     ColumnType::Text | ColumnType::Bytea => unreachable!(),
                 }
@@ -638,6 +717,123 @@ mod tests {
         assert!(matches!(
             encode_tuple(sample_header(), &columns, &values),
             Err(HeapError::InvalidArgument(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // M6 Stage 0: ColumnType::Vector / Datum::Vector (tech-selection §11).
+    // -----------------------------------------------------------------
+
+    /// Mixed-schema round-trip with exact f32 bit patterns (every value is
+    /// exactly representable, so PartialEq is bit equality here), plus a
+    /// NULL vector column to exercise the bitmap interplay.
+    #[test]
+    fn vector_round_trip_mixed_and_null() {
+        let columns = [
+            ColumnType::Int4,
+            ColumnType::vector(3).unwrap(),
+            ColumnType::Text,
+            ColumnType::vector(2).unwrap(),
+        ];
+        let values = vec![
+            Some(Datum::Int4(-7)),
+            Some(Datum::Vector(vec![1.5, -2.25, 3.75e-8])),
+            Some(Datum::Text("v".to_string())),
+            None,
+        ];
+        let bytes = encode_tuple(sample_header(), &columns, &values).unwrap();
+        let (header, decoded) = decode_tuple(&bytes, &columns).unwrap();
+        assert_eq!(decoded, values);
+        // Both vectors are fixed-width: no varwidth bit for them; the Text
+        // column sets it.
+        assert_ne!(header.t_infomask & HEAP_HASVARWIDTH, 0);
+        assert_ne!(header.t_infomask & HEAP_HASNULL, 0);
+    }
+
+    /// Boundary dims: 1 and MAX_VECTOR_DIM round-trip; 0 and
+    /// MAX_VECTOR_DIM + 1 are rejected by the constructor. The dim-2000
+    /// tuple is 64 + 8000 = 8064 bytes — under the 8 KiB page's
+    /// MAX_TUPLE_BYTES (8140), so the format cap is page-coherent.
+    #[test]
+    fn vector_boundary_dims() {
+        for dim in [1u32, MAX_VECTOR_DIM] {
+            let columns = [ColumnType::vector(dim).unwrap()];
+            let values = vec![Some(Datum::Vector(vec![0.5; dim as usize]))];
+            let bytes = encode_tuple(sample_header(), &columns, &values).unwrap();
+            assert_eq!(bytes.len(), 64 + 4 * dim as usize);
+            let (_, decoded) = decode_tuple(&bytes, &columns).unwrap();
+            assert_eq!(decoded, values);
+        }
+        assert!(matches!(
+            ColumnType::vector(0),
+            Err(HeapError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            ColumnType::vector(MAX_VECTOR_DIM + 1),
+            Err(HeapError::InvalidArgument(_))
+        ));
+    }
+
+    /// A datum whose length disagrees with the column dim is rejected, in
+    /// both directions (dim is part of the type identity).
+    #[test]
+    fn vector_dim_mismatch_rejected() {
+        let short = vec![Some(Datum::Vector(vec![1.0, 2.0]))];
+        assert!(matches!(
+            encode_tuple(sample_header(), &[ColumnType::vector(3).unwrap()], &short),
+            Err(HeapError::InvalidArgument(_))
+        ));
+        let long = vec![Some(Datum::Vector(vec![1.0, 2.0, 3.0, 4.0]))];
+        assert!(matches!(
+            encode_tuple(sample_header(), &[ColumnType::vector(3).unwrap()], &long),
+            Err(HeapError::InvalidArgument(_))
+        ));
+        // A vector datum against a non-vector column is an ordinary type
+        // mismatch.
+        assert!(matches!(
+            encode_tuple(sample_header(), &[ColumnType::Text], &short),
+            Err(HeapError::InvalidArgument(_))
+        ));
+    }
+
+    /// The enum is public, so the codec boundary re-validates the dim even
+    /// when the constructor was bypassed: encode fails as InvalidArgument
+    /// (caller bug), decode as Corrupted (disk-derived schema).
+    #[test]
+    fn vector_schema_dim_validated_at_codec() {
+        let bad = ColumnType::Vector(MAX_VECTOR_DIM + 1);
+        let values = vec![Some(Datum::Vector(vec![1.0; MAX_VECTOR_DIM as usize + 1]))];
+        assert!(matches!(
+            encode_tuple(sample_header(), &[bad], &values),
+            Err(HeapError::InvalidArgument(_))
+        ));
+        // Encode a valid Int4 tuple, then decode it against a corrupt
+        // vector schema (natts matches — the dim check must fire first).
+        let bytes = encode_tuple(
+            sample_header(),
+            &[ColumnType::Int4],
+            &[Some(Datum::Int4(1))],
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_tuple(&bytes, &[bad]),
+            Err(HeapError::Corrupted(_))
+        ));
+        assert!(matches!(
+            decode_tuple(&bytes, &[ColumnType::Vector(0)]),
+            Err(HeapError::Corrupted(_))
+        ));
+    }
+
+    /// A tuple truncated inside the vector payload fails loudly.
+    #[test]
+    fn vector_decode_rejects_truncated() {
+        let columns = [ColumnType::vector(3).unwrap()];
+        let values = vec![Some(Datum::Vector(vec![1.0, 2.0, 3.0]))];
+        let bytes = encode_tuple(sample_header(), &columns, &values).unwrap();
+        assert!(matches!(
+            decode_tuple(&bytes[..bytes.len() - 1], &columns),
+            Err(HeapError::Corrupted(_))
         ));
     }
 }

@@ -10,8 +10,9 @@
 //! | `Bytea`        | `\x` + lowercase hex (PG text)  | 17 (`bytea`) |
 //! | `Timestamptz`  | µs-since-epoch integer          | 20 (`int8`)  |
 //! | `Uuid`         | standard hyphenated string      | 25 (`text`)  |
+//! | `Vector`       | `[v0,v1,…]` (pgvector form)     | 25 (`text`)  |
 //!
-//! The last two rows **report a different OID than real PostgreSQL** on
+//! The last three rows **report a different OID than real PostgreSQL** on
 //! purpose: the encoding must round-trip through a stock client, and no
 //! stock client decodes a µs integer as `timestamptz` (1184) or accepts a
 //! bare string for `uuid` (2950) without type-specific support. Reporting
@@ -45,6 +46,9 @@ pub fn wire_type(ty: ColumnType) -> WireType {
         // (module docs). `typlen` 8 for the µs integer.
         ColumnType::Timestamptz => WireType { oid: 20, len: 8 },
         ColumnType::Uuid => WireType { oid: 25, len: -1 },
+        // Text form is variable-length; the true vector wire type is a
+        // Phase 4a/4b concern (module docs).
+        ColumnType::Vector(_) => WireType { oid: 25, len: -1 },
     }
 }
 
@@ -59,6 +63,7 @@ pub fn column_type_of(d: &Datum) -> ColumnType {
         Datum::Bytea(_) => ColumnType::Bytea,
         Datum::Timestamptz(_) => ColumnType::Timestamptz,
         Datum::Uuid(_) => ColumnType::Uuid,
+        Datum::Vector(v) => ColumnType::Vector(v.len() as u32),
         // The underlying type of a TOASTed value is unknowable here; TEXT
         // is the least-wrong placeholder since the encode path errors out
         // on `External` anyway.
@@ -76,6 +81,22 @@ pub fn encode_text(d: &Datum) -> Result<Vec<u8>> {
         Datum::Timestamptz(us) => us.to_string().into_bytes(),
         Datum::Uuid(u) => u.to_string().into_bytes(),
         Datum::Text(s) => s.as_bytes().to_vec(),
+        // pgvector text form `[v0,v1,…]`; Rust's f32 Display is the
+        // shortest representation that round-trips for FINITE values
+        // (NaN/±inf print as non-numeric text — no wire read-back path
+        // exists in M6, so this is display-only).
+        Datum::Vector(v) => {
+            let mut out = Vec::with_capacity(v.len() * 8 + 2);
+            out.push(b'[');
+            for (i, x) in v.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(x.to_string().as_bytes());
+            }
+            out.push(b']');
+            out
+        }
         Datum::Bytea(b) => {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             let mut out = Vec::with_capacity(2 + b.len() * 2);

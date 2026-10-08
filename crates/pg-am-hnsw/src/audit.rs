@@ -71,6 +71,22 @@
 //! INVALID >= hwm`) — expected, not a false positive: the layer order is
 //! redo → open (repair) → audit.
 //!
+//! **Reachability scan** (M6 Stage 0, M6 tech-selection §8.3 先导):
+//! [`audit_reachability`] BFS-walks the graph from the entry point under
+//! the search path's level discipline (a level-`l` edge may only be
+//! followed to a node whose `top_level >= l`, descending within a node is
+//! free) and reports the LIVE nodes no legal search can ever reach — the
+//! input of §14.1's hanging-node verdict. State bits are NOT traversal
+//! predicates (the search path never checks them; INITIALIZING/tombstoned
+//! nodes route fine) — they only partition the UNREACHABLE set in the
+//! report. The scan REPORTS, never rejects: unreachable nodes are a legal
+//! residue shape (crash windows, and in M6 delete/vacuum interleavings);
+//! structural corruption (bad page type, neighbor ≥ hwm, level-discipline
+//! violation) still fails stop as `Corrupted`, mirroring assertions a/b/f.
+//! Same consumption premise as [`audit_index`] — run after `open`, and
+//! only at quiesce (M6 §12.5: under concurrent writes the scan would
+//! misread legal intermediate states).
+//!
 //! **Degree caps** ride along for free: `apply::neighbor_iter`'s
 //! `checked_count` rejects a stored count above the level's reserved
 //! capacity as `Corrupted` before any id is read.
@@ -370,6 +386,263 @@ pub fn audit_index(buffer_pool: &BufferPool, meta_page_id: PageId) -> Result<Aud
         hidden_high_level_count,
         orphan_entry_count,
         edge_count,
+    })
+}
+
+/// Outcome of [`audit_reachability`]: how many nodes the search path can
+/// reach from the entry point, and the unreachable set partitioned by
+/// state (M6 Stage 0, M6 tech-selection §8.3 先导 — the §14.1
+/// hanging-node verdict reads `unreachable_live`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachabilityReport {
+    /// Directory-mapped node count (the chain high-water mark).
+    pub node_count: u64,
+    /// Nodes reachable from the entry point under the level discipline
+    /// (any state — INITIALIZING/tombstoned nodes route; see the module
+    /// header).
+    pub reachable_count: u64,
+    /// LIVE, non-tombstoned nodes no legal search can reach — the
+    /// hanging-node set. Reported, never rejected (a legal residue shape;
+    /// the §14.1 threshold verdict belongs to the caller).
+    pub unreachable_live: Vec<u32>,
+    /// Unreachable INITIALIZING nodes (crash-window residue) — counted.
+    pub unreachable_initializing_count: u64,
+    /// Unreachable tombstoned nodes (M6 delete residue) — counted. A
+    /// tombstoned node that is NOT live is unreachable via any legal
+    /// record stream (audit_index's loud combination) and fails stop.
+    pub unreachable_tombstoned_count: u64,
+}
+
+/// BFS from the entry point under the search path's level discipline
+/// (module header, "Reachability scan"). Reports the unreachable set by
+/// state; fails stop (`Corrupted`) on structural violations — bad target
+/// page type, a neighbor id ≥ hwm, or a level-`l` edge to a node whose
+/// `top_level < l` (assertions f/a/b mirrored, since the BFS would
+/// otherwise mis-walk a corrupt shape).
+///
+/// **Premise: quiesce, after `open`** (M6 §12.5) — under concurrent
+/// writes the scan misreads legal intermediate states; a
+/// recovered-but-never-opened index with the §8.2 step 6–7 residue is
+/// rejected by the entry-point check, same as `audit_index`.
+///
+/// Cold path: neighbors are re-pinned per (node, level), same idiom as
+/// [`audit_index`]'s edge pass.
+pub fn audit_reachability(
+    buffer_pool: &BufferPool,
+    meta_page_id: PageId,
+) -> Result<ReachabilityReport> {
+    // 1. Meta page: type tag + full structural validation (audit_index's
+    // idiom — trust nothing cached).
+    let params = {
+        let guard = buffer_pool
+            .pin(meta_page_id)
+            .map_err(|e| storage_err("reachability: pin meta page", e))?;
+        let page: &[u8; PAGE_SIZE] = guard
+            .page()
+            .try_into()
+            .expect("a buffer frame is exactly PAGE_SIZE");
+        if page_type(page) != PAGE_TYPE_META {
+            return Err(HnswError::Corrupted(format!(
+                "reachability: page {} is not a meta page (page_type {})",
+                meta_page_id.0,
+                page_type(page)
+            )));
+        }
+        meta::read_meta(page)?
+    };
+    let geometry = NodeGeometry {
+        dim: params.dim,
+        m: params.m,
+        m_max0: params.m_max0,
+    };
+    let l_max = crate::rng::l_max(params.m);
+
+    // 2. Directory chain walk (same fetch idiom as the open protocol).
+    let fetch = |page_id: PageId| -> Result<[u8; PAGE_SIZE]> {
+        let guard = buffer_pool
+            .pin(page_id)
+            .map_err(|e| storage_err("reachability: pin directory page", e))?;
+        let page: &[u8; PAGE_SIZE] = guard
+            .page()
+            .try_into()
+            .expect("a buffer frame is exactly PAGE_SIZE");
+        Ok(*page)
+    };
+    let chain = dir::check_dir_chain(params.dir_head, fetch)?;
+    let hwm = chain.hwm;
+    let graph = PagedGraph::new(
+        buffer_pool,
+        &chain.pages,
+        hwm,
+        params.dim,
+        params.m,
+        params.m_max0,
+        params.metric,
+    );
+
+    if hwm == 0 {
+        // Assertion c's empty-graph shape, mirrored from audit_index: an
+        // empty chain must carry entry_point = INVALID ∧ max_level = 0 —
+        // anything else is a corrupt meta, loud here too (the same shape
+        // must not pass one entry point and fail the other).
+        if params.entry_point != NodeId::INVALID.0 || params.max_level != 0 {
+            return Err(HnswError::Corrupted(format!(
+                "reachability c: empty graph must carry entry_point = INVALID and max_level = 0 (found entry_point {}, max_level {})",
+                params.entry_point, params.max_level
+            )));
+        }
+        return Ok(ReachabilityReport {
+            node_count: 0,
+            reachable_count: 0,
+            unreachable_live: vec![],
+            unreachable_initializing_count: 0,
+            unreachable_tombstoned_count: 0,
+        });
+    }
+    // The BFS needs a valid start; assertion c's non-empty shape lives in
+    // audit_index, this is the same loud rejection.
+    if u64::from(params.entry_point) >= hwm {
+        return Err(HnswError::Corrupted(format!(
+            "reachability: entry_point {} >= chain high-water mark {hwm} — no BFS start",
+            params.entry_point
+        )));
+    }
+
+    // 3. Per-node shape pass: target page type (f), top_level, state —
+    // one pin per node. The scan walks edges later; only the BFS inputs
+    // are materialized here.
+    let mut top_levels: Vec<u8> = Vec::with_capacity(hwm as usize);
+    let mut live: Vec<bool> = Vec::with_capacity(hwm as usize);
+    let mut tombstoned: Vec<bool> = Vec::with_capacity(hwm as usize);
+    for id in 0..hwm {
+        let (page_id, slot) = graph.resolve(NodeId(id as u32))?;
+        let guard = buffer_pool
+            .pin(page_id)
+            .map_err(|e| storage_err("reachability: pin node page", e))?;
+        let page: &[u8; PAGE_SIZE] = guard
+            .page()
+            .try_into()
+            .expect("a buffer frame is exactly PAGE_SIZE");
+        if page_type(page) != PAGE_TYPE_NODE {
+            return Err(HnswError::Corrupted(format!(
+                "reachability f: directory entry {id} points at page {} of page_type {}, not a node page",
+                page_id.0,
+                page_type(page)
+            )));
+        }
+        let is_live = apply::entry_is_live(page, slot, params.dim)?;
+        let is_tombstoned = apply::entry_is_tombstoned(page, slot, params.dim)?;
+        // audit_index's loud combination: unreachable via any legal record
+        // stream (the Tombstone funnel requires LIVE; PublishLive only
+        // SETS the live bit) — only raw page corruption produces it.
+        if is_tombstoned && !is_live {
+            return Err(HnswError::Corrupted(format!(
+                "reachability: node {id} is tombstoned but not LIVE — unreachable via any legal record stream"
+            )));
+        }
+        let top = apply::entry_top_level(page, slot, params.dim)?;
+        // audit_index's hard bound, mirrored (review round 3): no level
+        // draw can produce top_level > l_max(m) — only corruption can.
+        // (Distinct from the hidden-high-level SOFT residue — top >
+        // max_level — which is legal and merely unrouted; only the hard
+        // bound is mirrored.)
+        if top > l_max {
+            return Err(HnswError::Corrupted(format!(
+                "reachability: node {id} has top_level {top} > l_max(m = {}) = {l_max} (no level draw can produce it)",
+                params.m
+            )));
+        }
+        top_levels.push(top);
+        live.push(is_live);
+        tombstoned.push(is_tombstoned);
+    }
+
+    // Assertion c's non-empty shape, mirrored from audit_index (review
+    // round 2): the entry point must sit AT max_level. A corrupt meta
+    // (top_level(entry) != max_level) would otherwise make the BFS
+    // silently start at the entry's actual top level and report a
+    // reachable set computed under a different discipline — loud instead.
+    let ep_top = top_levels[params.entry_point as usize];
+    if ep_top != params.max_level {
+        return Err(HnswError::Corrupted(format!(
+            "reachability c: entry point {} has top_level {ep_top} != meta max_level {} (the entry point must sit AT max_level)",
+            params.entry_point, params.max_level
+        )));
+    }
+
+    // 4. BFS, level by level from max_level down to 0. Seeds for level `l`
+    // are every reachable node with top_level >= l (reaching a node at a
+    // higher level descends within it for free — the search path's
+    // discipline). A node reached mid-level is pushed immediately, so its
+    // own level-l edges are walked in the same pass. The iteration never
+    // revisits a HIGHER level for a newly reached node — faithful to the
+    // search path, which descends greedily and never walks back up (so a
+    // node first reached at level 0 contributes only its level-0 edges,
+    // even if its top_level is higher).
+    let mut reachable = vec![false; hwm as usize];
+    reachable[params.entry_point as usize] = true;
+    for level in (0..=params.max_level).rev() {
+        let mut stack: Vec<u32> = (0..hwm as u32)
+            .filter(|&n| reachable[n as usize] && top_levels[n as usize] >= level)
+            .collect();
+        while let Some(n) = stack.pop() {
+            let (page_id, slot) = graph.resolve(NodeId(n))?;
+            let guard = buffer_pool
+                .pin(page_id)
+                .map_err(|e| storage_err("reachability: pin node page", e))?;
+            let page: &[u8; PAGE_SIZE] = guard
+                .page()
+                .try_into()
+                .expect("a buffer frame is exactly PAGE_SIZE");
+            for nb in apply::neighbor_iter(page, slot, geometry, level)? {
+                if u64::from(nb) >= hwm {
+                    return Err(HnswError::Corrupted(format!(
+                        "reachability a: node {n} level {level} references node {nb} >= high-water mark {hwm}"
+                    )));
+                }
+                if top_levels[nb as usize] < level {
+                    return Err(HnswError::Corrupted(format!(
+                        "reachability b: node {n} level {level} references node {nb} with top_level {} < {level} (level discipline)",
+                        top_levels[nb as usize]
+                    )));
+                }
+                if !reachable[nb as usize] {
+                    reachable[nb as usize] = true;
+                    stack.push(nb);
+                }
+            }
+        }
+    }
+
+    // 5. Partition the unreachable set by state. LIVE ∧ ¬tombstoned is the
+    // hanging-node set; INITIALIZING and tombstoned are counted (legal
+    // residues), never listed.
+    let mut reachable_count = 0u64;
+    let mut unreachable_live = Vec::new();
+    let mut unreachable_initializing_count = 0u64;
+    let mut unreachable_tombstoned_count = 0u64;
+    for n in 0..hwm as usize {
+        if reachable[n] {
+            reachable_count += 1;
+            continue;
+        }
+        if live[n] && !tombstoned[n] {
+            unreachable_live.push(n as u32);
+        }
+        if !live[n] {
+            unreachable_initializing_count += 1;
+        }
+        if tombstoned[n] {
+            unreachable_tombstoned_count += 1;
+        }
+    }
+
+    Ok(ReachabilityReport {
+        node_count: hwm,
+        reachable_count,
+        unreachable_live,
+        unreachable_initializing_count,
+        unreachable_tombstoned_count,
     })
 }
 
@@ -1045,6 +1318,356 @@ mod tests {
         }
         let err = audit_index(engine.buffer_pool(), meta).unwrap_err();
         assert!(err.to_string().contains("tombstoned but not LIVE"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // M6 Stage 0: audit_reachability (M6 tech-selection §8.3 先导 — the
+    // §14.1 hanging-node verdict's input).
+    // -----------------------------------------------------------------
+
+    /// Empty graph: an all-zero report (no entry point to start from is
+    /// the empty shape, not an error).
+    #[test]
+    fn reachability_empty_graph() {
+        let dir = fresh_dir("reach-empty");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            HnswParams::default(),
+            DIM,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            SEED,
+        )
+        .unwrap();
+        let report = audit_reachability(engine.buffer_pool(), index.meta_page_id()).unwrap();
+        assert_eq!(
+            report,
+            ReachabilityReport {
+                node_count: 0,
+                reachable_count: 0,
+                unreachable_live: vec![],
+                unreachable_initializing_count: 0,
+                unreachable_tombstoned_count: 0,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Single node: the entry point reaches itself.
+    #[test]
+    fn reachability_single_node() {
+        let (engine, meta, _node_page, dir) = build_live(
+            "reach-single",
+            Metric::L2,
+            &[spec(0, vec![vec![]], true)],
+            &[(None, 0)],
+            0,
+            0,
+        );
+        let report = audit_reachability(engine.buffer_pool(), meta).unwrap();
+        assert_eq!(report.node_count, 1);
+        assert_eq!(report.reachable_count, 1);
+        assert!(report.unreachable_live.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Multi-level descend: node 1 is reached at level 1 (its top level),
+    /// then seeds the level-0 pass; node 2 is level-0-only and reached
+    /// through node 0's level-0 list. All reachable.
+    #[test]
+    fn reachability_multi_level_descend() {
+        let (engine, meta, _node_page, dir) = build_live(
+            "reach-multi",
+            Metric::L2,
+            &[
+                spec(1, vec![vec![1, 2], vec![1]], true), // node 0: entry, top 1
+                spec(1, vec![vec![0, 2], vec![0]], true), // node 1: top 1
+                spec(0, vec![vec![0]], true),             // node 2: level-0 only
+            ],
+            &[(None, 0), (None, 1), (None, 2)],
+            0,
+            1,
+        );
+        let report = audit_reachability(engine.buffer_pool(), meta).unwrap();
+        assert_eq!(report.node_count, 3);
+        assert_eq!(report.reachable_count, 3);
+        assert!(report.unreachable_live.is_empty());
+        assert_eq!(report.unreachable_initializing_count, 0);
+        assert_eq!(report.unreachable_tombstoned_count, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hanging-node negative (§14.1's input): node 2 is LIVE but no
+    /// inbound edge exists at any level — reported in unreachable_live,
+    /// never rejected.
+    #[test]
+    fn reachability_reports_unreachable_live() {
+        let (engine, meta, _node_page, dir) = build_live(
+            "reach-hanging",
+            Metric::L2,
+            &[
+                spec(1, vec![vec![1], vec![1]], true),
+                spec(1, vec![vec![0], vec![0]], true),
+                spec(0, vec![vec![]], true), // node 2: LIVE, cut off
+            ],
+            &[(None, 0), (None, 1), (None, 2)],
+            0,
+            1,
+        );
+        let report = audit_reachability(engine.buffer_pool(), meta).unwrap();
+        assert_eq!(report.node_count, 3);
+        assert_eq!(report.reachable_count, 2);
+        assert_eq!(report.unreachable_live, vec![2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Residue counting: unreachable INITIALIZING (crash window) and
+    /// tombstoned (M6 delete residue) nodes are COUNTED, not listed in
+    /// unreachable_live — they still route as traversal intermediates
+    /// (state bits are not traversal predicates), so node 4 reached
+    /// THROUGH the tombstoned node 3 is reachable.
+    #[test]
+    fn reachability_counts_unreachable_residue() {
+        let (engine, meta, node_page, dir) = build_live(
+            "reach-residue",
+            Metric::L2,
+            &[
+                spec(0, vec![vec![3]], true),    // node 0: entry
+                spec(0, vec![vec![]], true),     // node 1: LIVE, cut off
+                spec(0, vec![vec![]], false),    // node 2: INITIALIZING, cut off
+                spec(0, vec![vec![0, 4]], true), // node 3: tombstoned router
+                spec(0, vec![vec![3]], true),    // node 4: reached via node 3
+            ],
+            &[(None, 0), (None, 1), (None, 2), (None, 3), (None, 4)],
+            0,
+            0,
+        );
+        {
+            let mut guard = engine.buffer_pool().pin_mut(node_page).unwrap();
+            let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+            apply::apply_tombstone(page, 3, DIM).unwrap();
+        }
+        let report = audit_reachability(engine.buffer_pool(), meta).unwrap();
+        assert_eq!(report.node_count, 5);
+        // 0, 3 (tombstoned routes), 4 (via 3) are reachable.
+        assert_eq!(report.reachable_count, 3);
+        assert_eq!(report.unreachable_live, vec![1]);
+        assert_eq!(report.unreachable_initializing_count, 1);
+        assert_eq!(report.unreachable_tombstoned_count, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Level-discipline violation fails stop: a level-1 edge to a
+    /// level-0-only node would make the BFS mis-walk (assertion b's
+    /// mirror).
+    #[test]
+    fn reachability_rejects_level_discipline_violation() {
+        let (engine, meta, _node_page, dir) = build_live(
+            "reach-badlevel",
+            Metric::L2,
+            &[
+                spec(1, vec![vec![], vec![1]], true), // node 0: L1 edge to node 1
+                spec(0, vec![vec![]], true),          // node 1: top_level 0
+            ],
+            &[(None, 0), (None, 1)],
+            0,
+            1,
+        );
+        let err = audit_reachability(engine.buffer_pool(), meta).unwrap_err();
+        assert!(err.to_string().contains("reachability b"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No valid BFS start (assertion c's shape) fails stop.
+    #[test]
+    fn reachability_rejects_entry_point_out_of_range() {
+        let (engine, meta, _node_page, dir) = build_live(
+            "reach-badentry",
+            Metric::L2,
+            &[spec(0, vec![vec![]], true)],
+            &[(None, 0)],
+            5,
+            0,
+        );
+        let err = audit_reachability(engine.buffer_pool(), meta).unwrap_err();
+        assert!(err.to_string().contains("no BFS start"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scan-cost sample on a real-insert graph (feeds Stage F's 24h
+    /// acceptance timing budget — M6 coding-plan Stage 0). Prints the wall
+    /// time; asserts no timing (flake-free), only shape sanity. Whether a
+    /// healthy graph has unreachable LIVE nodes is NOT pinned here (later
+    /// inserts' pruning can in principle evict every inbound edge) — the
+    /// strict set assertions live in the synthetic tests above.
+    #[test]
+    fn reachability_scan_cost_sample() {
+        let dir = fresh_dir("reach-cost");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let mut index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            HnswParams::default(),
+            DIM,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            SEED,
+        )
+        .unwrap();
+        let mut rng = crate::rng::Xoshiro256StarStar::new(0xDEC0DE);
+        // N is a cost-SAMPLE, not a scale gate: the scan is linear in
+        // nodes + edges, so 500 nodes calibrate the per-node figure
+        // without making the debug suite pay the insert cost of more.
+        const N: usize = 500;
+        for _ in 0..N {
+            let v: Vec<f32> = (0..DIM)
+                .map(|_| (rng.next_u64() % 4096) as f32 / 64.0)
+                .collect();
+            index
+                .insert(engine.buffer_pool(), engine.wal_writer(), &v)
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        let report = audit_reachability(engine.buffer_pool(), index.meta_page_id()).unwrap();
+        let elapsed = start.elapsed();
+        eprintln!(
+            "reachability scan cost: {N} nodes dim={DIM} -> {elapsed:?} ({:.2} µs/node); reachable {}/{}, unreachable_live {}, initializing {}, tombstoned {}",
+            elapsed.as_secs_f64() * 1e6 / N as f64,
+            report.reachable_count,
+            report.node_count,
+            report.unreachable_live.len(),
+            report.unreachable_initializing_count,
+            report.unreachable_tombstoned_count,
+        );
+        assert_eq!(report.node_count, N as u64);
+        assert!(report.reachable_count > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The meta page-type arm: pointing the scan at a NODE page fails
+    /// stop (review P3-2 — every loud arm gets one negative pin).
+    #[test]
+    fn reachability_rejects_non_meta_page() {
+        let (engine, _meta, node_page, dir) = build_live(
+            "reach-nonmeta",
+            Metric::L2,
+            &[spec(0, vec![vec![]], true)],
+            &[(None, 0)],
+            0,
+            0,
+        );
+        let err = audit_reachability(engine.buffer_pool(), node_page).unwrap_err();
+        assert!(err.to_string().contains("is not a meta page"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The f arm: a directory entry naming the META page (not a NODE
+    /// page) fails stop (audit_index's neg-f shape, mirrored).
+    #[test]
+    fn reachability_rejects_non_node_target() {
+        let (engine, meta, dir) =
+            build_residue_with("reach-negf", &[spec(0, vec![vec![]], true)], 0, 0, |meta| {
+                vec![(Some(meta), 0)]
+            });
+        let err = audit_reachability(engine.buffer_pool(), meta).unwrap_err();
+        assert!(err.to_string().contains("reachability f"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The a arm: a neighbor id past the high-water mark fails stop
+    /// (before it can index `top_levels` out of bounds).
+    #[test]
+    fn reachability_rejects_neighbor_past_hwm() {
+        let (engine, meta, _node_page, dir) = build_live(
+            "reach-nega",
+            Metric::L2,
+            &[
+                spec(0, vec![vec![5]], true), // node 0 references id 5 >= hwm = 2
+                spec(0, vec![vec![]], true),
+            ],
+            &[(None, 0), (None, 1)],
+            0,
+            0,
+        );
+        let err = audit_reachability(engine.buffer_pool(), meta).unwrap_err();
+        assert!(err.to_string().contains("reachability a"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tombstoned ∧ ¬LIVE arm: unreachable via any legal record
+    /// stream (audit_index's loud combination, mirrored) — injected
+    /// through the pure apply primitive, standing in for page corruption.
+    #[test]
+    fn reachability_rejects_tombstoned_not_live() {
+        let (engine, meta, node_page, dir) = build_live(
+            "reach-tomb",
+            Metric::L2,
+            &[spec(0, vec![vec![]], false)], // INITIALIZING
+            &[(None, 0)],
+            0,
+            0,
+        );
+        {
+            let mut guard = engine.buffer_pool().pin_mut(node_page).unwrap();
+            let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+            apply::apply_tombstone(page, 0, DIM).unwrap();
+        }
+        let err = audit_reachability(engine.buffer_pool(), meta).unwrap_err();
+        assert!(err.to_string().contains("tombstoned but not LIVE"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The empty-graph c mirror (review P3-1): an empty chain with a
+    /// non-INVALID entry point / nonzero max_level is a corrupt meta —
+    /// loud here, exactly as in audit_index.
+    #[test]
+    fn reachability_rejects_corrupt_empty_meta() {
+        let (engine, meta, _node_page, dir) =
+            build_live("reach-emptyc", Metric::L2, &[], &[], 5, 3);
+        let err = audit_reachability(engine.buffer_pool(), meta).unwrap_err();
+        assert!(err.to_string().contains("reachability c"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The non-empty c mirror (review round 2): an entry point whose
+    /// top_level disagrees with meta max_level is a corrupt meta — loud,
+    /// not a silent BFS from the entry's actual top level.
+    #[test]
+    fn reachability_rejects_entry_point_level_mismatch() {
+        let (engine, meta, _node_page, dir) = build_live(
+            "reach-badc",
+            Metric::L2,
+            &[spec(0, vec![vec![]], true)], // node 0: top_level 0
+            &[(None, 0)],
+            0,
+            1, // meta max_level 1 != top_level(entry) 0
+        );
+        let err = audit_reachability(engine.buffer_pool(), meta).unwrap_err();
+        assert!(err.to_string().contains("reachability c"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The l_max hard-bound mirror (review round 3): top_level 20 with
+    /// m = 16 (l_max = 13) is unproducible by any level draw — corruption,
+    /// loud. (Distinct from the legal hidden-high-level soft residue:
+    /// top > max_level but ≤ l_max stays merely unrouted.)
+    #[test]
+    fn reachability_rejects_top_level_above_l_max() {
+        let (engine, meta, _node_page, dir) = build_live(
+            "reach-lmax",
+            Metric::L2,
+            &[spec(20, vec![vec![]; 21], true)],
+            &[(None, 0)],
+            0,
+            20,
+        );
+        let err = audit_reachability(engine.buffer_pool(), meta).unwrap_err();
+        assert!(err.to_string().contains("l_max"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

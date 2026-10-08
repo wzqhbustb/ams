@@ -86,7 +86,7 @@ pub mod snapshot;
 
 pub(crate) mod validate;
 
-pub use audit::AuditReport;
+pub use audit::{AuditReport, ReachabilityReport};
 pub use error::{HnswError, Result};
 pub use graph::{Hnsw, Metric, NeighborSelection};
 pub use index::{ExpectedParams, HnswIndex, OpenOutcome};

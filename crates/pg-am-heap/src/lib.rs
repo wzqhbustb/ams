@@ -35,5 +35,5 @@ pub use redo::{
 };
 pub use slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
 pub use toast::ToastPointer;
-pub use tuple::{ColumnType, Datum, TupleHeader};
+pub use tuple::{ColumnType, Datum, TupleHeader, MAX_VECTOR_DIM};
 pub use undo::HeapUndoHandler;

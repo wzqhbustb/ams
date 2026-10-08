@@ -566,7 +566,7 @@ impl BufferPool {
     /// and skipped, mirroring the checkpoint loop's PageNotFound tolerance.
     /// A CLAIMED frame cannot be evicted underneath the pending list:
     /// `evict_frame` skips `flushing` frames, so the frame keyed by each
-    /// [`PendingFlush`] still belongs to the flushing page when the
+    /// `PendingFlush` still belongs to the flushing page when the
     /// post-fsync (or error-restore) completion mutates its meta by frame
     /// id (Stage E review P1 — without the skip, eviction could reuse the
     /// frame mid-batch and the completion would hit the NEW tenant).
