@@ -1,10 +1,20 @@
-//! M5 Stage D slice 2: the §8.1 × §8.2 crash-window matrix — every
-//! append boundary of the real `insert` path is crashed (test-only probe
-//! barrier, `HnswIndex::probe_*`), recovered (slice-1 redo + the open
-//! protocol), and audited (Stage D slice-1 `§11.3` audit). Determinism
+//! M5 Stage D slice 2 (re-numbered for the M6 §4.2 order, Stage A): the
+//! §8.1 × §8.2 crash-window matrix — every append boundary of the real
+//! `insert` path is crashed (test-only probe barrier, `HnswIndex::probe_*`),
+//! recovered (slice-1 redo + the open protocol), and audited (Stage D
+//! slice-1 `§11.3` audit + the Stage-0 reachability scan). Determinism
 //! premise: same seed + same params + same vector sequence ⇒ identical
 //! append-mark sequences in the discovery run (dir A) and the crashing
 //! run (dir B) — pinned by the sanity assertions and `probe_log_shape`.
+//!
+//! M6 Stage A note: the §8.2 swap moved the node's OWN lists (step 5)
+//! BEFORE the backward edges into other nodes' lists (step 6). Window
+//! consequences, pinned by the rows below: the M5 "inbound edges, empty
+//! own lists" GHOST shape is no longer constructible; the connect-window
+//! residue is now an ORPHAN (complete own lists, no inbound edges yet)
+//! that is unreachable and bitwise-invisible to search, and any node that
+//! IS reachable mid-connect carries complete own lists (M6 §4.2:
+//! reachable ⟹ own lists complete).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -162,14 +172,31 @@ fn recover(dir: &Path, cfg: &Cfg, meta: PageId) -> (StorageEngine, HnswIndex, Au
 
 /// Recover twice in a row (the second recovery replays the first
 /// recovery's own records — replay idempotence): the two audit reports
-/// must be EQUAL.
-fn recover_twice(dir: &Path, cfg: &Cfg, meta: PageId) -> (StorageEngine, HnswIndex, AuditReport) {
+/// AND the two reachability scans must be EQUAL.
+fn recover_twice(
+    dir: &Path,
+    cfg: &Cfg,
+    meta: PageId,
+) -> (
+    StorageEngine,
+    HnswIndex,
+    AuditReport,
+    pg_am_hnsw::ReachabilityReport,
+) {
     let (engine1, index1, report1) = recover(dir, cfg, meta);
+    let reach1 = pg_am_hnsw::audit::audit_reachability(engine1.buffer_pool(), meta)
+        .expect("reachability scan must parse the first recovery");
     std::mem::forget(index1);
     std::mem::forget(engine1);
     let (engine2, index2, report2) = recover(dir, cfg, meta);
+    let reach2 = pg_am_hnsw::audit::audit_reachability(engine2.buffer_pool(), meta)
+        .expect("reachability scan must parse the second recovery");
     assert_eq!(report1, report2, "replay must be idempotent across reopens");
-    (engine2, index2, report2)
+    assert_eq!(
+        reach1, reach2,
+        "reachability must be idempotent across reopens"
+    );
+    (engine2, index2, report2, reach2)
 }
 
 /// `(NodeId, distance)` as exact bits for comparisons.
@@ -249,6 +276,10 @@ struct Window {
     engine: StorageEngine,
     index: HnswIndex,
     report: AuditReport,
+    /// The Stage-0 reachability scan of the recovered graph — the M6 §4.2
+    /// invariant hook (orphan rows assert the victim UNREACHABLE; the
+    /// backward-edge rows assert it reachable).
+    reach: pg_am_hnsw::ReachabilityReport,
     victim: usize,
     baseline: Vec<Vec<(u32, u64)>>,
     pre_state: (u32, u8, u64),
@@ -294,6 +325,22 @@ fn run_window(
     // The pre-victim graph's audit (phase B, pre-crash) — the exact
     // edge-count baseline for the window rows' delta pins.
     let pre_report = b.index.audit(b.engine.buffer_pool()).unwrap();
+    // The baseline must be CLEAN: every pre-victim insert completed (the
+    // unwraps above ⟹ PublishLive landed), so all three residue counters
+    // are zero — the rows' `== 1` / `== 0` pins read deltas against a zero
+    // baseline, never an inherited residue.
+    assert_eq!(
+        pre_report.initializing_count, 0,
+        "clean pre-victim baseline"
+    );
+    assert_eq!(
+        pre_report.orphan_entry_count, 0,
+        "clean pre-victim baseline"
+    );
+    assert_eq!(
+        pre_report.hidden_high_level_count, 0,
+        "clean pre-victim baseline"
+    );
     b.index.probe_set_crash_after(Some(crash_after));
     let r = b.index.insert(
         b.engine.buffer_pool(),
@@ -309,12 +356,13 @@ fn run_window(
     );
     let (dir, meta) = crash(b);
 
-    let (engine, index, report) = recover_twice(&dir, cfg, meta);
+    let (engine, index, report, reach) = recover_twice(&dir, cfg, meta);
     Window {
         dir,
         engine,
         index,
         report,
+        reach,
         victim,
         baseline,
         pre_state,
@@ -324,16 +372,32 @@ fn run_window(
     }
 }
 
-/// The directed-edge delta of a mark prefix: each backward edge adds the
-/// victim to one neighbor list (+1), except a shrinking one (the victim
-/// in, one evicted node out — net 0). OwnList marks are not countable here
-/// (their list lengths are not in the marks) — the rows that pin exact
-/// edge counts crash before any OwnList.
-fn edge_delta(marks: &[ProbeMark]) -> u64 {
-    marks
+/// The directed-edge delta of a crash prefix under the M6 order (§4.2):
+/// the OWN lists land before any backward edge, so a prefix that reached
+/// the backward-edge phase holds ALL own-list edges. That count equals
+/// the full run's NeighborEdge count — every selected neighbor receives
+/// exactly one backward edge, shrink or not — and comes on top of the
+/// prefix's own backward edges (+1 each, net 0 for a shrank one: the
+/// victim in, one evicted node out). Caller contract: the prefix must
+/// contain every OwnList mark of the full run — one row asserts it
+/// explicitly and the phase separation (step 5 fully precedes step 6)
+/// makes it structural everywhere else; the own-list edge count is not
+/// derivable from a partial prefix (list lengths are not recorded in
+/// OwnList marks). Implicit assumption, stated: a shrank edge's net-0
+/// delta presumes the shrink never evicts the VICTIM itself (it entered
+/// the candidate set by being selected; were it evicted the true delta
+/// would be −1 and the exact edge-count pins would turn RED — loud
+/// direction, never silent).
+fn edge_delta(full_marks: &[ProbeMark], prefix: &[ProbeMark]) -> u64 {
+    let own = full_marks
+        .iter()
+        .filter(|x| matches!(x, ProbeMark::NeighborEdge { .. }))
+        .count() as u64;
+    let backward = prefix
         .iter()
         .filter(|x| matches!(x, ProbeMark::NeighborEdge { shrank: false, .. }))
-        .count() as u64
+        .count() as u64;
+    own + backward
 }
 
 impl Window {
@@ -378,7 +442,7 @@ fn window_before_step1() {
     lab.engine.wal_writer().flush().unwrap();
     let (dir, meta) = crash(lab);
 
-    let (engine, index, report) = recover_twice(&dir, &cfg, meta);
+    let (engine, index, report, _reach) = recover_twice(&dir, &cfg, meta);
     assert_eq!(report.node_count, 64);
     assert_eq!(index.hwm(), 64);
     assert_eq!(report.live_count, 64);
@@ -551,6 +615,7 @@ fn window_orphan_entry() {
 /// Row 4–5: crash after DirAppend — the ghost mapping: published NodeId,
 /// INITIALIZING entry, no edges. Counted by the audit, unreachable by
 /// search (no in-edges), so search is bitwise-identical to baseline.
+/// (Unchanged by the M6 swap: step 5's own lists have not landed either.)
 #[test]
 fn window_ghost_mapping() {
     let cfg = cfg_default();
@@ -577,6 +642,10 @@ fn window_ghost_mapping() {
         w.report.edge_count, w.pre_report.edge_count,
         "the ghost contributed no edges (crash before step 5)"
     );
+    assert_eq!(
+        w.reach.unreachable_initializing_count, 1,
+        "the ghost mapping is unreachable (no in-edges)"
+    );
     let queries = det_queries(3, cfg.dim as usize);
     for (qi, q) in queries.iter().enumerate() {
         let after = bits(
@@ -592,8 +661,11 @@ fn window_ghost_mapping() {
     w.done();
 }
 
-/// Row 5 interleave: crash after the FIRST backward edge — the victim is
-/// reachable through it. Audit passes; every hit is a real node with an
+/// Row 6 interleave (M6 order): crash after the FIRST backward edge — the
+/// victim's own lists are ALL in place (step 5 now precedes step 6), so
+/// the residue is a reachable node with one inbound edge and COMPLETE
+/// out-edges; the M5 "reachable with EMPTY own lists" ghost shape is no
+/// longer constructible. Audit passes; every hit is a real node with an
 /// exact distance.
 #[test]
 fn window_partial_backward_edges() {
@@ -620,9 +692,22 @@ fn window_partial_backward_edges() {
     });
     assert_eq!(w.report.initializing_count, 1);
     assert_eq!(w.report.node_count, w.victim as u64 + 1);
-    // Exact directed-edge pin: the first-edge crash prefix holds exactly
-    // ONE backward edge; its delta is +1, or 0 if that edge shrank.
+    // New-order sanity: the whole step 5 precedes step 6 — the prefix
+    // holds every OwnList mark of the full run (the edge_delta contract).
     let prefix = &w.victim_marks[..w.crash_after];
+    let own_total = w
+        .victim_marks
+        .iter()
+        .filter(|x| matches!(x, ProbeMark::OwnList { .. }))
+        .count();
+    assert_eq!(
+        prefix
+            .iter()
+            .filter(|x| matches!(x, ProbeMark::OwnList { .. }))
+            .count(),
+        own_total,
+        "all own lists must land before the first backward edge"
+    );
     assert_eq!(
         prefix
             .iter()
@@ -631,10 +716,12 @@ fn window_partial_backward_edges() {
         1,
         "first-edge crash: exactly one backward edge in the prefix"
     );
+    // Exact directed-edge pin: ALL own-list edges plus the single
+    // backward edge's delta (+1, or 0 if it shrank).
     assert_eq!(
         w.report.edge_count,
-        w.pre_report.edge_count + edge_delta(prefix),
-        "exact directed-edge delta of the single backward edge"
+        w.pre_report.edge_count + edge_delta(&w.victim_marks, prefix),
+        "exact directed-edge delta: all own lists + the single backward edge"
     );
     let queries = det_queries(3, cfg.dim as usize);
     for q in &queries {
@@ -647,9 +734,11 @@ fn window_partial_backward_edges() {
     w.done();
 }
 
-/// Row 5 shrink interleave: m=2/m_max0=4 makes the shrink heuristic fire
-/// constantly; crash right after a SHRUNK edge that is not the victim's
-/// last record.
+/// Row 6 shrink interleave (M6 order): m=2/m_max0=4 makes the shrink
+/// heuristic fire constantly; crash right after a SHRUNK edge that is not
+/// the victim's last record. The own lists are all in place (step 5
+/// precedes step 6); the residue is partial INBOUND edges over complete
+/// out-edges.
 #[test]
 fn window_shrink_interleave() {
     let cfg = cfg_shrink();
@@ -665,10 +754,27 @@ fn window_shrink_interleave() {
     });
     assert_eq!(w.report.initializing_count, 1);
     assert_eq!(w.report.node_count, w.victim as u64 + 1);
-    // Exact directed-edge pin across the shrink: +1 per backward edge,
-    // net 0 per shrank one (victim in, evicted node out); the pick
-    // guarantees at least one shrink in the prefix.
+    // Exact directed-edge pin across the shrink: ALL own-list edges
+    // (step 5 preceded step 6), +1 per landed backward edge, net 0 per
+    // shrank one (victim in, evicted node out); the pick guarantees at
+    // least one shrink in the prefix.
     let prefix = &w.victim_marks[..w.crash_after];
+    // Same edge_delta contract as the partial-edges row: the prefix must
+    // hold every OwnList mark of the full run (structural under the M6
+    // order — asserted, not assumed).
+    let own_total = w
+        .victim_marks
+        .iter()
+        .filter(|x| matches!(x, ProbeMark::OwnList { .. }))
+        .count();
+    assert_eq!(
+        prefix
+            .iter()
+            .filter(|x| matches!(x, ProbeMark::OwnList { .. }))
+            .count(),
+        own_total,
+        "all own lists must land before the first backward edge"
+    );
     assert!(
         prefix
             .iter()
@@ -677,7 +783,7 @@ fn window_shrink_interleave() {
     );
     assert_eq!(
         w.report.edge_count,
-        w.pre_report.edge_count + edge_delta(prefix),
+        w.pre_report.edge_count + edge_delta(&w.victim_marks, prefix),
         "exact directed-edge delta across the shrink"
     );
     let queries = det_queries(3, cfg.dim as usize);
@@ -691,20 +797,84 @@ fn window_shrink_interleave() {
     w.done();
 }
 
-/// Row 5–6: crash after the LAST backward edge, before the victim's own
-/// lists are written — the victim has in-edges but empty out-lists.
+/// Row 5 interleave (new under the M6 order): crash with only SOME own
+/// lists written — partial out-edges, ZERO in-edges: a pure orphan.
+/// Unreachable by construction, so search is bitwise-identical to the
+/// pre-victim graph. (The exact edge delta is not derivable from the
+/// marks — OwnList carries no count — so the reachability scan is the
+/// pin here.)
 #[test]
-fn window_own_lists_empty() {
+fn window_partial_own_lists() {
     let cfg = cfg_default();
     let vectors = det_vectors(200, cfg.dim as usize);
-    let w = run_window("own-lists-empty", &cfg, &vectors, |marks| {
+    let w = run_window("partial-own-lists", &cfg, &vectors, |marks| {
         pick(marks, 1, |m| {
-            let has_own = m.iter().any(|x| matches!(x, ProbeMark::OwnList { .. }));
-            let last_edge = m
+            let owns = m
                 .iter()
-                .rposition(|x| matches!(x, ProbeMark::NeighborEdge { .. }));
-            if has_own {
-                last_edge.map(|i| i + 1)
+                .filter(|x| matches!(x, ProbeMark::OwnList { .. }))
+                .count();
+            // Crash after the first own list, with at least one more own
+            // list (and every backward edge) still unwritten.
+            if owns >= 2 {
+                m.iter()
+                    .position(|x| matches!(x, ProbeMark::OwnList { .. }))
+                    .map(|i| i + 1)
+            } else {
+                None
+            }
+        })
+    });
+    assert_eq!(w.report.initializing_count, 1, "the orphan is INITIALIZING");
+    assert_eq!(w.report.node_count, w.victim as u64 + 1);
+    let prefix = &w.victim_marks[..w.crash_after];
+    assert!(
+        !prefix
+            .iter()
+            .any(|x| matches!(x, ProbeMark::NeighborEdge { .. })),
+        "zero inbound edges — pure orphan"
+    );
+    assert_eq!(
+        w.reach.unreachable_initializing_count, 1,
+        "partial own lists, no in-edges: unreachable orphan"
+    );
+    let queries = det_queries(3, cfg.dim as usize);
+    for (qi, q) in queries.iter().enumerate() {
+        let after = bits(
+            &w.index
+                .search(w.engine.buffer_pool(), q, 3, Some(10))
+                .unwrap(),
+        );
+        assert_eq!(
+            after, w.baseline[qi],
+            "query {qi}: an unreachable orphan is bitwise-invisible"
+        );
+    }
+    w.done();
+}
+
+/// Row 5–6 (the M6-order swap row): crash after the LAST own-list write,
+/// before ANY backward edge — the victim has complete out-edges but zero
+/// in-edges: a pure orphan. This is the residue the M5 order could never
+/// produce here (its symmetric window was the dangerous ghost — inbound
+/// edges with EMPTY own lists, now unconstructible). Unreachable, so
+/// search is bitwise-identical to the pre-victim graph; the edge delta is
+/// exactly the own lists' contribution.
+#[test]
+fn window_own_lists_complete_no_inbound() {
+    let cfg = cfg_default();
+    let vectors = det_vectors(200, cfg.dim as usize);
+    let w = run_window("own-lists-complete", &cfg, &vectors, |marks| {
+        pick(marks, 1, |m| {
+            // Crash after the last OwnList with at least one backward
+            // edge still unwritten (the window must be mid-connect).
+            let has_edge = m
+                .iter()
+                .any(|x| matches!(x, ProbeMark::NeighborEdge { .. }));
+            let last_own = m
+                .iter()
+                .rposition(|x| matches!(x, ProbeMark::OwnList { .. }));
+            if has_edge {
+                last_own.map(|i| i + 1)
             } else {
                 None
             }
@@ -712,34 +882,44 @@ fn window_own_lists_empty() {
     });
     assert_eq!(w.report.initializing_count, 1);
     assert_eq!(w.report.node_count, w.victim as u64 + 1);
-    // Exact directed-edge pin: all backward edges landed, no own list
-    // did — the delta is exactly the backward edges' contribution.
     let prefix = &w.victim_marks[..w.crash_after];
     assert!(
         !prefix
             .iter()
-            .any(|x| matches!(x, ProbeMark::OwnList { .. })),
-        "crash before any own-list write"
+            .any(|x| matches!(x, ProbeMark::NeighborEdge { .. })),
+        "crash before any backward edge"
     );
+    // Exact directed-edge pin: every own list landed, no backward edge
+    // did — the delta is exactly the own lists' contribution.
     assert_eq!(
         w.report.edge_count,
-        w.pre_report.edge_count + edge_delta(prefix),
-        "exact directed-edge delta of the backward edges"
+        w.pre_report.edge_count + edge_delta(&w.victim_marks, prefix),
+        "exact directed-edge delta of the own lists"
+    );
+    assert_eq!(
+        w.reach.unreachable_initializing_count, 1,
+        "complete own lists, no in-edges: unreachable orphan"
     );
     let queries = det_queries(3, cfg.dim as usize);
-    for q in &queries {
-        let hits = w
-            .index
-            .search(w.engine.buffer_pool(), q, 3, Some(10))
-            .unwrap();
-        assert_hits_legal(&hits, q, &vectors, w.index.hwm());
+    for (qi, q) in queries.iter().enumerate() {
+        let after = bits(
+            &w.index
+                .search(w.engine.buffer_pool(), q, 3, Some(10))
+                .unwrap(),
+        );
+        assert_eq!(
+            after, w.baseline[qi],
+            "query {qi}: an unreachable orphan is bitwise-invisible"
+        );
     }
     w.done();
 }
 
 /// Row 6–7 (non-first victim): crash right BEFORE MetaUpdate — the victim
 /// towers above the published max_level (the weakened §8.3① invariant
-/// tolerates it; the audit COUNTS it).
+/// tolerates it; the audit COUNTS it). The window POSITION is unchanged
+/// by the M6 swap; the prefix content is now all own lists + all backward
+/// edges, so the victim is fully connected and REACHABLE.
 #[test]
 fn window_hidden_high_level() {
     let cfg = cfg_default();
@@ -758,6 +938,10 @@ fn window_hidden_high_level() {
     assert_eq!(w.report.entry_point, pre_ep, "meta was never updated");
     assert_eq!(w.report.max_level, pre_ml);
     assert_eq!(w.report.initializing_count, 1);
+    assert_eq!(
+        w.reach.unreachable_initializing_count, 0,
+        "fully connected: the towering victim is reachable"
+    );
     let queries = det_queries(3, cfg.dim as usize);
     for q in &queries {
         let hits = w
@@ -787,6 +971,10 @@ fn window_first_node_entry_repair() {
     assert_eq!(w.report.entry_point, 0);
     assert_eq!(w.report.max_level, w.index.max_level());
     assert_eq!(w.report.initializing_count, 1, "PublishLive never landed");
+    assert_eq!(
+        w.reach.unreachable_initializing_count, 0,
+        "the repaired entry point is reachable by construction"
+    );
     // The repaired entry point is reachable (INITIALIZING is recallable,
     // §8.1③): the vector recalls itself at distance 0.
     let hits = w
@@ -811,6 +999,10 @@ fn window_meta_before_publish() {
     assert_eq!(w.report.initializing_count, 1);
     assert_eq!(w.report.entry_point, w.victim as u32);
     assert_eq!(w.report.max_level, w.index.max_level());
+    assert_eq!(
+        w.reach.unreachable_initializing_count, 0,
+        "the entry point itself is trivially reachable"
+    );
     let queries = det_queries(3, cfg.dim as usize);
     for q in &queries {
         let hits = w
@@ -858,18 +1050,19 @@ fn probe_log_shape() {
         ]
     );
     // Insert 1 (seed 0xC0FFEE's second draw is level 0 — pinned by the
-    // exact sequence): no page work, one level-0 backward edge to node 0,
-    // the own list, no MetaUpdate (level 0 does not exceed max_level 0).
+    // exact sequence): no page work; the M6 order writes the own level-0
+    // list FIRST (step 5), then the one backward edge to node 0 (step 6);
+    // no MetaUpdate (level 0 does not exceed max_level 0).
     assert_eq!(
         a[1],
         vec![
             ProbeMark::NodeInit,
             ProbeMark::DirAppend,
+            ProbeMark::OwnList { level: 0 },
             ProbeMark::NeighborEdge {
                 level: 0,
                 shrank: false,
             },
-            ProbeMark::OwnList { level: 0 },
             ProbeMark::PublishLive,
         ]
     );

@@ -29,16 +29,19 @@
 //!   at most one INITIALIZING / one orphan / one hidden-high-level entry,
 //!   and the reachable-residue consistency pins (ghost ⟹ hwm == n+1,
 //!   orphan ⟹ hwm == n, hidden ⟹ ghost). With zero residue the bitwise
-//!   twin comparison still runs; with a residue the ghost's half-written
-//!   edges legitimately diverge from any clean replay, so the assertion is
-//!   the slice-2 legality floor (queries answer; every hit names a real
-//!   node < hwm and carries EXACTLY its recomputed stored-vector distance)
-//!   — NOT an exact hit count: a kill inside §8.1 step 5 (others' lists, before
-//!   the own lists) leaves a ghost with inbound edges and EMPTY own lists,
-//!   and a query whose descent moves into it can be trapped with fewer
-//!   than k hits (round 521 of the 1000-round acceptance; a legal residue
-//!   shape, registered for M6's ghost-recycle protocol — see the module
-//!   trail in docs/stage_spec.md).
+//!   twin comparison still runs; with a residue the in-flight insert's
+//!   half-written edges legitimately diverge from any clean replay, so the
+//!   assertion is the slice-2 legality floor (queries answer; every hit
+//!   names a real node < hwm and carries EXACTLY its recomputed
+//!   stored-vector distance). Under the M6 order (Stage A: own lists
+//!   before backward edges) a mid-connect residue is either an
+//!   unreachable ORPHAN (complete own lists, zero inbound edges — it
+//!   never enters the search path) or a reachable node whose own lists
+//!   are complete (reachable ⟹ own lists complete, M6 §4.2); the M5
+//!   trapped-ghost shape (inbound edges, EMPTY own lists — round 521 of
+//!   the 1000-round acceptance, 1 hit for k = 5) is no longer
+//!   constructible (m5_ghost_trap.rs pins the inversion on the same
+//!   geometry).
 //!
 //! Timing note (same accepted shape as m2b): the mid-mode kill lands within
 //! one parent poll (2 ms) of the expectation reaching the target. Each child
@@ -555,19 +558,17 @@ fn verify_round(round: u64, data_dir: &Path) {
             // (m = live ∈ {n, n+1}).
             assert_bitwise_twin(&engine, &index, round, live);
         } else {
-            // The ghost's half-written edges legitimately diverge from any
-            // clean replay — the slice-2 legality floor, not a bitwise twin
-            // (module header note). The reachable floor is NOT k: a kill
-            // inside §8.1 step 5 (others' lists, before the own lists are
-            // written) leaves the ghost with inbound edges and EMPTY own
-            // lists; a query whose greedy descent moves into that ghost is
-            // trapped there and may return just the ghost itself
-            // (1000-round acceptance, round 521: hits = 1 for k = 5 with
-            // live = 71 — diagnosed by the window probe, a LEGAL residue
-            // shape, not corruption). Sanity = the query path answers and
-            // every hit is a real node carrying EXACTLY its recomputed
-            // stored-vector distance — the same floor as the slice-2
-            // matrix's `assert_hits_legal` (node i's vector is
+            // The in-flight insert's half-written edges legitimately
+            // diverge from any clean replay — the slice-2 legality floor,
+            // not a bitwise twin (module header note). Under the M6 order
+            // the residue is an unreachable orphan (zero inbound edges) or
+            // a reachable node with COMPLETE own lists; the M5 trap
+            // (reachable, EMPTY own lists — 1000-round acceptance round
+            // 521: hits = 1 for k = 5 with live = 71) is unconstructible,
+            // so the floor below stays meaningful: sanity = the query path
+            // answers and every hit is a real node carrying EXACTLY its
+            // recomputed stored-vector distance — the same floor as the
+            // slice-2 matrix's `assert_hits_legal` (node i's vector is
             // vector_at(round, i) by construction, so the parent can
             // recompute; restored after the round-521 fix narrowed the
             // check to existence-only).

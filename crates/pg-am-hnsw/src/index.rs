@@ -1,7 +1,11 @@
 //! HNSW index lifecycle: creation, open, and the insert write path —
 //! Phase 2 M5 Stage B slice 3a (tech-selection §10.3 creation/open
 //! protocol, §7.2 creation geometry, §5 rng skip-ahead) and Stage C slice 3
-//! (§8.1 eight-step insert, §10.2 write path).
+//! (§8.1 eight-step insert, §10.2 write path), with the M6 Stage A order
+//! (M6 tech-selection §4.2/§8.2: the own level lists land BEFORE the
+//! backward edges — the §8.1 steps 5↔6 swap; the connect-window crash
+//! residue becomes an unreachable orphan, and reachable ⟹ own lists
+//! complete).
 //!
 //! [`HnswIndex`] is the handle pg-engine (slice 3b) and the Stage C write
 //! path consume: it carries the meta-page locator, the directory chain
@@ -428,13 +432,23 @@ impl HnswIndex {
         }
         self.set_hwm(self.hwm + 1);
 
-        // Step 6 (§8.1 step 5): search + connect, only when the graph was
-        // non-empty BEFORE this insert (an empty graph has nothing to
-        // connect to — the first node skips the whole phase, like
-        // graph.rs's early return).
+        // Steps 5–6 (M6 §4.2 order — the §8.2 swap of the M5 §8.1 steps
+        // 5↔6): search + connect, only when the graph was non-empty BEFORE
+        // this insert (an empty graph has nothing to connect to — the
+        // first node skips the whole phase, like graph.rs's early return).
+        // The node's OWN level lists land FIRST (step 5), the backward
+        // edges into OTHER nodes' lists SECOND (step 6). The swap turns
+        // the connect-window crash residue from a ghost (inbound edges,
+        // EMPTY own lists — a directed dead end that could trap a
+        // descending query; M5 1000-round acceptance, round 521) into an
+        // orphan (complete own lists, no inbound edges yet — unreachable,
+        // hence harmless). Structural dividend (the M6 §4.2 invariant):
+        // **reachable ⟹ own lists complete** — a node's first inbound edge
+        // can only come from step 6 of its own insert, which runs strictly
+        // after its step 5.
         let was_empty = self.params.entry_point == NodeId::INVALID.0;
         let old_max_level = self.params.max_level;
-        // The new node's own per-level selections, kept for step 7. Levels
+        // The new node's own per-level selections, kept for step 5. Levels
         // above the searched range stay empty and need NO record — NodeInit
         // already reserved them with count = 0, so an empty list is the
         // zero content (2026-09-20, slice 3 note: no record for empties).
@@ -469,12 +483,66 @@ impl HnswIndex {
                     ep = crate::graph::search_layer(&g, vector, &[ep], 1, l)[0].id;
                 }
 
-                // Phase 2: beam-search, select, connect both sides, shrink
-                // over-capacity lists through the same heuristic (§4.3).
+                // Phase 2 (search half): beam-search + select per level
+                // and STASH the selections — no page writes in this loop,
+                // so every level's selection observes the identical
+                // pre-insert graph. (The M5 order interleaved the
+                // backward-edge writes here; they never influenced later
+                // levels' searches — a level-l search walks level-l edges
+                // only — so the selections are bit-identical across the
+                // swap. Same for the shrink inputs in step 6: each
+                // neighbor's list is read once and sees only pre-insert
+                // content, and the step-5 own-list writes touch only the
+                // NEW node's page.)
                 for l in (0..=searched_top).rev() {
                     let w = crate::graph::search_layer(&g, vector, &[ep], ef_construction, l);
                     let neighbors = crate::graph::select_neighbors(&g, selection, &w, m);
-                    for &nb in &neighbors {
+                    own_lists[usize::from(l)] = neighbors.iter().map(|n| n.0).collect();
+                    ep = w[0].id; // nearest result carries the descent
+                }
+
+                // Step 5 (M6 §4.2): the new node's own level lists —
+                // BEFORE any backward edge lands (the swap, see the
+                // steps-5–6 comment above).
+                for (l, list) in own_lists
+                    .iter()
+                    .enumerate()
+                    .take(usize::from(searched_top) + 1)
+                {
+                    if list.is_empty() {
+                        continue; // empty list == the NodeInit zero content
+                    }
+                    let mut guard = buffer_pool.pin_mut(node_page_id).map_err(|e| {
+                        crate::page::storage_err("insert: pin_mut own node page", e)
+                    })?;
+                    let record = WalRecord::hnsw_set_neighbors(
+                        self.meta_page_id,
+                        node_page_id,
+                        slot,
+                        node_id.0,
+                        l as u8,
+                        list.clone(),
+                    )
+                    .map_err(|e| crate::page::storage_err("insert: encode own SetNeighbors", e))?;
+                    let lsn = wal_writer.append(record).map_err(|e| {
+                        crate::page::storage_err("insert: WAL append own SetNeighbors", e)
+                    })?;
+                    let page: &mut [u8; PAGE_SIZE] = guard
+                        .page_mut()
+                        .try_into()
+                        .expect("a buffer frame is exactly PAGE_SIZE");
+                    crate::apply::set_neighbors(page, slot, geometry, l as u8, list)?;
+                    pg_storage::page::set_page_pd_lsn(page, lsn);
+                    self.barrier(wal_writer, ProbeMark::OwnList { level: l as u8 })?;
+                }
+
+                // Step 6 (M6 §4.2): backward edges into the neighbors'
+                // lists. The per-level (descending) and per-neighbor order
+                // matches the M5 interleaved loop exactly, so this half of
+                // the record stream is unchanged by the swap.
+                for l in (0..=searched_top).rev() {
+                    for &nb_raw in &own_lists[usize::from(l)] {
+                        let nb = NodeId(nb_raw);
                         let (nb_page, nb_slot) = g.resolve(nb)?;
                         // Collect-then-pin_mut (paged.rs deadlock
                         // discipline): the read guard is dropped before the
@@ -547,48 +615,12 @@ impl HnswIndex {
                         pg_storage::page::set_page_pd_lsn(page, lsn);
                         self.barrier(wal_writer, ProbeMark::NeighborEdge { level: l, shrank })?;
                     }
-                    own_lists[usize::from(l)] = neighbors.iter().map(|n| n.0).collect();
-                    ep = w[0].id; // nearest result carries the descent
                 }
-            }
-
-            // Step 7 (§8.1 step 6): the new node's own lists, AFTER every
-            // backward edge is in place (the §8.1 literal order — nothing
-            // in the loop above reads them).
-            for (l, list) in own_lists
-                .iter()
-                .enumerate()
-                .take(usize::from(searched_top) + 1)
-            {
-                if list.is_empty() {
-                    continue; // empty list == the NodeInit zero content
-                }
-                let mut guard = buffer_pool
-                    .pin_mut(node_page_id)
-                    .map_err(|e| crate::page::storage_err("insert: pin_mut own node page", e))?;
-                let record = WalRecord::hnsw_set_neighbors(
-                    self.meta_page_id,
-                    node_page_id,
-                    slot,
-                    node_id.0,
-                    l as u8,
-                    list.clone(),
-                )
-                .map_err(|e| crate::page::storage_err("insert: encode own SetNeighbors", e))?;
-                let lsn = wal_writer.append(record).map_err(|e| {
-                    crate::page::storage_err("insert: WAL append own SetNeighbors", e)
-                })?;
-                let page: &mut [u8; PAGE_SIZE] = guard
-                    .page_mut()
-                    .try_into()
-                    .expect("a buffer frame is exactly PAGE_SIZE");
-                crate::apply::set_neighbors(page, slot, geometry, l as u8, list)?;
-                pg_storage::page::set_page_pd_lsn(page, lsn);
-                self.barrier(wal_writer, ProbeMark::OwnList { level: l as u8 })?;
             }
         }
 
-        // Step 8 (§8.1 step 7): MetaUpdate — a new top-level node becomes
+        // Step 8 (M5 §8.1 step 7; unchanged by the 5↔6 swap — M6 §4.2
+        // step 7): MetaUpdate — a new top-level node becomes
         // the entry point; the first node of an empty graph always does.
         // (Non-empty graph with level <= max_level: no record at all.)
         if was_empty || level > old_max_level {
@@ -611,7 +643,8 @@ impl HnswIndex {
             self.set_entry_point(node_id.0, level);
         }
 
-        // Step 9 (§8.1 step 8): PublishLive — the state post-image lands
+        // Step 9 (M5 §8.1 step 8 = M6 §4.2 step 8): PublishLive — the
+        // state post-image lands
         // only after all of the node's own level lists are written (v1.7).
         {
             let mut guard = buffer_pool

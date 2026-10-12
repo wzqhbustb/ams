@@ -1587,3 +1587,47 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **可达性扫描不进 redo/搜索热路径**:只读 + quiesce 前提;24h 验收的调用点归 Stage F
 
 **本 stage 顺手修复的 HEAD 预存项(出口 doc 门禁所迫,登记)**:buffer_pool.rs `flush_all_dirty` rustdoc 对私有 `PendingFlush` 的 `[...]` 链接(M5 Stage E 终审 P1 修复补段时引入,此后未跑 doc 档)——`cargo doc -D warnings` 在 HEAD 必红;去链接括号(私项不链,一行)
+
+## Stage A(M6):insert 5↔6 对调(单写者形态)——幽灵陷阱消除
+
+**状态**:✅ 完成(2026-10-09 落码,一轮对抗审查闭环:主线自查 + agent-23 verdict **PASS**,零 P1/P2/P3,3 nano 当轮闭合,回流段见末节):pg-am-hnsw lib **176** 绿(debug+release)、m5_insert_crash **14** 绿(+1 新孤儿行)、m5_ghost_trap **3** 绿(反转实证)、25 轮 crash rounds 复跑绿(**76.13s**;agent-23 release 复证 123.68s)、recall 双门绿(siftsmall recall@10 = **0.9990** 与 M5 冻结基线逐位同值;m5_recall_after_recovery 双测 PASS,release 109.89s)、pg-am-hnsw release 全套件绿、**workspace debug 全套件 100 target exit 0**、fmt/clippy -D warnings/doc -D warnings 三档绿;未 commit——等用户确认,message 前缀 `PHASE2-M6-StageA`
+**归属**:幽灵陷阱消除(选型 §8.2 裁决落地;coding-plan 阶段 A,前置 = tech-selection v1.4 终审)
+**验收**:`cargo test -p pg-am-hnsw`(+ `--release`)/ `cargo test -p pg-am-hnsw --test m5_insert_crash` / `cargo test -p pg-engine --test m5_hnsw_crash_rounds --test m5_ghost_trap` / `M4_REQUIRE_DATASET=1 cargo test -p pg-am-hnsw --release --test recall_siftsmall --test m5_recall_after_recovery` / `cargo test --workspace` 全绿
+
+### 交付内容
+
+1. **写入序对调(选型 §8.2,pg-am-hnsw `index.rs` insert)**:旧序"逐层:搜索→选择→立即连该层反向边(他人邻表),全部层完成后才写自身各层邻表"重排为三段——**2a 纯搜索选择**(逐层 search_layer→select_neighbors→暂存,零页写,每层选择观察同一 pre-insert 图)→ **步骤 5 = 自身各层邻表全部落 WAL+应用** → **步骤 6 = 反向边**(层序保持 rev、层内邻居序不变,与旧序逐位同序)。**位级一致性论证(注释立文)**:旧序中层 l 搜索时高层反向边已写,但 level-l 搜索只走 level-l 边、从不读高层列表,且每个邻居的每层列表在一次 insert 中被读-改-写恰好一次(读到即 pre-insert 内容;同一邻居跨多层被选时逐层各一次,层序不变),自身邻表只写新节点自己的页——故两序下每层选择、每次 shrink 输入、最终图位级一致;实证 = lib 位级对拍(`paged_insert_matches_in_memory_topology`/`paged_search_matches_in_memory_bitwise`)零改动直接绿。**不变量落成注释**:M6 §4.2"可达 ⟹ 出边完整"——节点的首个入边只能由其自身 insert 的步骤 6 产生,而步骤 6 严格排在其步骤 5 之后;M5 幽灵形态(有入边、空出边,round 521 被困实证)自此不可构造。
+2. **窗口矩阵重编号 + 审计断言挂钩(m5_insert_crash.rs,13 → 14 枚)**:十行窗口按新序重编号(对账表见下);`edge_delta` 重写为新序双参钉法——**前缀含全部 OwnList ⟹ own 边数 = 全量 NeighborEdge 计数**(每个被选邻居恰好收一条反向边,shrink 与否不改此恒等式),反向边前缀仍 +1/条(shrank 净 0);调用行钉"前缀含全量 OwnList" sanity。审计断言挂钩 = Stage 0 的 `audit_reachability` 进窗口行:幽灵映射/两个孤儿行钉 `unreachable_initializing_count == 1`(不可达),hidden-high-level/meta-before-publish/首节点修复行钉 `== 0`(可达)。**审计负例结论(同批复核)**:audit.rs 负例矩阵为手工合成残态(build_residue/build_live),不经 insert 路径、与写入序无关;新序残态形态(部分/完整出边零入边孤儿)已被 `reachability_counts_unreachable_residue` 等覆盖——零代码变更。
+3. **m5_ghost_trap 语义反转(3 枚)**:模块头改写为"M5 陷阱钉 → M6 反转实证";`ghost_without_inbound_edges_is_unreachable_and_harmless`(crash_after=2,DirAppend 后零边窗)不变保留;新增两枚反转钉,均在 **round 521 原 geometry**(同种子同向量流)上实证——`orphan_after_own_lists_never_traps_a_query`(崩在最后一个 OwnList 后:纯孤儿,hits == [5,5])与 `first_backward_edge_no_longer_traps_a_query`(崩在第一个 NeighborEdge 后 = M5 陷阱的精确对应窗口:M5 同窗口实测 hits=[1,5],新序 **hits == [5,5]**——陷阱形态不可构造的实证)。发现辅助 `discover_victim_marks` 钉死 insert #72 的新序 mark 形状(NodeInit→DirAppend→OwnList×n→NeighborEdge×m→PublishLive,无 MetaUpdate)。顺带修复:OID 经 build_prefix 返回值传递,不再硬编码。
+4. **位级对拍孪生重跑 + recall 门**:内存孪生(Hnsw)无写入序概念、最终图位级一致(交付 1 论证),对拍测试零改动全绿;**recall@10 = 0.9990(≥0.98 门),与 M5 冻结基线逐位同值**——选型 §8.2"理论近似中性"预测的实测钉;`m5_recall_after_recovery` 双测 PASS。
+5. **crash rounds 残态期望表更新(m5_hnsw_crash_rounds.rs)**:数值断言无需变更(残态上界 ≤1 各计数对新旧形态同成立);模块头与 verify_round 注释立文新序残态语义——mid 残态 = 不可达孤儿(零入边,不进搜索路径)或可达但出边完整的部分入边节点,M5 被困幽灵形态不再产生(指向 m5_ghost_trap 的反转钉);25 轮复跑结果见状态行回填。
+
+### 窗口矩阵对账表(M5 旧序 → M6 新序)
+
+| M5 行(旧序) | M6 行(新序) | 测试 | 变化 |
+|---|---|---|---|
+| before 1 | before 1 | window_before_step1 | 不变 |
+| 1–2 NodePageInit 后 | 同 | window_orphan_node_page | 不变 |
+| 1–2 DirPageInit 后 | 同 | window_orphan_dir_page | 不变 |
+| 2–3 DirLink 后 | 同 | window_empty_linked_tail | 不变 |
+| 3–4 NodeInit 后(孤儿条目) | 同 | window_orphan_entry | 不变 |
+| 4–5 DirAppend 后(幽灵映射:零出边零入边) | 同 | window_ghost_mapping | 语义不变 + reachability 钉 |
+| —(旧序无此窗:own lists 在最后) | 5 中:部分出边、零入边孤儿 | **window_partial_own_lists(新)** | 新增 |
+| 5 后 6 前:**有入边空出边幽灵(危险,round 521 被困形态)** | 5–6:**完整出边零入边孤儿(无害)** | **window_own_lists_complete_no_inbound(反转)** | 语义反转:搜索从 assert_hits_legal 宽松钉升为位级 == baseline(不可达) |
+| 5 中交错(部分入边空出边) | 6 中:部分入边 + 完整出边 | window_partial_backward_edges | 钉法换 edge_delta 双参 + OwnList 全量 sanity |
+| 5 中 shrink | 6 中 shrink | window_shrink_interleave | 同上 |
+| 6–7 MetaUpdate 前(hidden) | 同(位置不变;前缀内容 = 全部 own + 全部反向边) | window_hidden_high_level | 注释 + reachability 钉(==0) |
+| 6–7 首节点(entry repair) | 同 | window_first_node_entry_repair | + reachability 钉(==0) |
+| 7–8 MetaUpdate 后 | 同 | window_meta_before_publish | + reachability 钉(==0) |
+
+### 已知残留与后续归队
+
+- **存量幽灵**(M5 时代崩溃遗留的有入边空出边节点):新序不再新产生;存量清理归 vacuum 通道(选型 §8.3 立文),审计对 INITIALIZING 各形态保持容忍(只计数不拒绝)。
+- **probe cfg(test) 剥离施工**仍归 Stage B(Stage 0 落锤不变):本 stage 窗口矩阵继续依赖 ProbeMark 插桩,Stage B 句柄 &self 化时同批重接线。
+- **own lists 边数恒等式**(= 全量 NeighborEdge 计数)成立前提:每层选择非空列表才写 OwnList(空列表 = NodeInit 零内容,无记录);该前提由 probe_log_shape 与各行 sanity 钉住。
+- **既有 flaky 登记(非本 stage 引入)**:snapshot_roundtrip 的 `concurrent_save_same_target_with_concurrent_load` 在多测试二进制并发、CPU 饱和时偶红("reader never overlapped a save in 10_000 attempts"——并发交错探测撞不上窗口);单跑 40/40 绿(debug+release)。该文件零 insert 路径依赖,与 5↔6 换序无因果关系;工作树相对 HEAD 仅 index.rs/两个测试文件/stage_spec 改动,未碰快照编码路径。
+- **m5_recall_after_recovery 具体 recall 值未单独打印**:门 PASS(≥0.98 断言),M5 基线 0.9990;siftsmall 门已独立钉 0.9990 逐位同值,恢复路径的 recall 由双测试位级钉(100 查询逐位等)承载,数值打印非必须。
+
+**对抗审查回流(2026-10-09,主线自查 + agent-23 一轮,verdict **PASS**——零 P1/P2/P3,3 nano 当轮闭合)**:主线自查攻击面(选择位级一致性/层间读隔离/shrink 输入不变/edge_delta 恒等式/残态上界/pick 确定性)全部查实无问题;agent-23 逐项裁定六大主攻面(换序正确性深层、edge_delta 边界、窗口完备性、ghost_trap 反转严密性、对账表一致性、跨 crate 影响面)全净,并亲跑复证(14+3 绿、25 轮 release 123.68s 绿、recall 双门绿、位级对拍绿)。**nano×3 闭合**:①edge_delta rustdoc "the rows assert it" 过述(实际只有 partial_backward_edges 一行显式 sanity)——措辞改"one row asserts it; the phase separation makes it structural"并给 shrink_interleave 补同款 OwnList 全量 sanity;②stage_spec 交付 1 "每个邻居页恰一次"措辞不精确(同邻居跨多层时页级多次)——改"每邻居每层列表恰一次";③"shrank 净 0"隐含假设(victim 不被自己的反向 shrink 驱逐,若发生则 edge 钉转红=响亮方向)在 edge_delta rustdoc 立文。复跑:m5_insert_crash 14 绿、fmt/clippy 绿。workspace debug 全套件(100 target exit 0)跑于 nano 修复前快照,nano 改动为注释 + 一处测试 sanity 断言(lib 零触碰),已单独复跑覆盖。
+
+**二轮对抗审查回流(2026-10-09,主线逐行终审 + agent-23 二轮,双 verdict **PASS**——零新 P1/P2/P3,3 nano 当轮闭合)**:二轮主攻一轮未系统覆盖的面——①redo × 新序(SetNeighborsRedo 前提"NodeInit 先于 SetNeighbors"在 own/反向边两序下均可求值,handler 零序假设,recover_twice 全形状实证);②自环/多写结构性证明(victim 零入边 ⟹ 不可达 ⟹ 不进 beam;visited bitset + 构造器/validate 双重拒绝兜底);③PagedGraph 零页内容缓存(字段级实证,Step 5 写入不可能使 g 过期);④reachability 挂载(replay post-image + pd_lsn 跳过 ⟹ 两次 recover 字节级一致,单次挂载充分);⑤全部 § 交叉引用逐字核对(:435/:622/:645/:916/:1162/:1190);⑥barrier flush-then-Err 时序与 mem::forget 模型等价性。**nano×3 闭合**:①recover_twice 幂等钉补 reachability 双算双等(原只比 AuditReport);②run_window 的 pre_report 基线补显式干净钉(initializing/orphan/hidden 三计数 == 0,原靠"全部 insert unwrap 成功"的结构前提);③index.rs:622/:645 的 "(§8.1 step 7/8)" 补 "M5" 限定与 M6 §4.2 交叉引用(同文件 :435 已有 M5 前缀,标记对齐)。复跑:m5_insert_crash 14 绿、fmt/clippy 绿。
