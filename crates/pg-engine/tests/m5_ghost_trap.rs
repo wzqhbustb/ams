@@ -82,12 +82,12 @@ fn build_prefix() -> (
         )
         .unwrap();
     let outcome = engine.open_hnsw_index(meta, &expected_params()).unwrap();
-    let mut index = outcome.index;
+    let index = outcome.index;
     for i in 0..N_COMMITTED {
         if i > 0 && i % 47 == 0 {
             engine.checkpoint().unwrap();
         }
-        let id = engine.hnsw_insert(&mut index, &vector_at(SEED, i)).unwrap();
+        let id = engine.hnsw_insert(&index, &vector_at(SEED, i)).unwrap();
         assert_eq!(id, NodeId(i as u32));
     }
     (tmp, engine, index, oid)
@@ -98,11 +98,11 @@ fn build_prefix() -> (
 /// backward edges SECOND (step 6), PublishLive. (No MetaUpdate: node 72's
 /// drawn level does not exceed the running max on this stream.)
 fn discover_victim_marks() -> Vec<ProbeMark> {
-    let (_tmp, engine, mut index, _oid) = build_prefix();
+    let (_tmp, engine, index, _oid) = build_prefix();
     index.probe_clear_marks();
     index.probe_set_logging(true);
     engine
-        .hnsw_insert(&mut index, &vector_at(SEED, N_COMMITTED))
+        .hnsw_insert(&index, &vector_at(SEED, N_COMMITTED))
         .unwrap();
     let marks = index.probe_marks();
     engine.shutdown();
@@ -139,12 +139,12 @@ fn discover_victim_marks() -> Vec<ProbeMark> {
 /// `crash_after` append-boundary marks, crash, recover, and return the hit
 /// counts of the harness's two sanity queries plus the audit residue.
 fn replay_window(crash_after: usize) -> (Vec<usize>, pg_am_hnsw::AuditReport, u64) {
-    let (tmp, engine, mut index, oid) = build_prefix();
+    let (tmp, engine, index, oid) = build_prefix();
     let dir = tmp.path().to_path_buf();
 
     index.probe_clear_marks();
     index.probe_set_crash_after(Some(crash_after));
-    let r = engine.hnsw_insert(&mut index, &vector_at(SEED, N_COMMITTED));
+    let r = engine.hnsw_insert(&index, &vector_at(SEED, N_COMMITTED));
     assert!(
         r.is_err(),
         "window {crash_after}: the probe must fail the insert"

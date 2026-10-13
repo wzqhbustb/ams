@@ -787,10 +787,33 @@ pub(crate) fn search_layer<G: GraphAccess>(
         if c.dist > worst.dist {
             break; // nearest candidate is beyond the worst kept result
         }
-        g.for_each_neighbor(c.id, level, |e| {
+        // M6 Stage B (concurrency fix): collect the neighbors under the
+        // page read guard FIRST, then take their distances — calling
+        // dist_to_query INSIDE the iteration would nest a second read pin
+        // on the SAME frame while a writer's pin_mut is queued
+        // (writer-preference RwLock: the nested read blocks behind the
+        // waiting writer, and the writer blocks on our held read — an
+        // ABBA deadlock proven by the m6_concurrent_insert hang). The
+        // collected Vec preserves the visitation order exactly, so the
+        // visited-marking order and the beam contents are bit-identical.
+        let mut pending: Vec<NodeId> = Vec::new();
+        g.for_each_neighbor(c.id, level, |e| pending.push(e));
+        for e in pending {
+            // M6 Stage B (review P1-1): a neighbor list can name a node
+            // allocated AFTER this view's hwm snapshot — a concurrent
+            // inserter's backward edge into an existing list names it
+            // before this search's bitset can cover it. Such nodes are
+            // INVISIBLE to this search by contract (the index's search
+            // docs); the bitset is sized by the snapshot, so skip them
+            // rather than indexing out of bounds. Single-writer paths
+            // never take this arm (snapshot == live), so the M5 bitwise
+            // semantics are untouched.
+            if e.index() >= n {
+                continue;
+            }
             let (word, bit) = (e.index() / 64, 1u64 << (e.index() % 64));
             if visited[word] & bit != 0 {
-                return;
+                continue;
             }
             visited[word] |= bit;
             let cand = Cand {
@@ -812,7 +835,7 @@ pub(crate) fn search_layer<G: GraphAccess>(
                     results.pop(); // evict the worst
                 }
             }
-        });
+        }
     }
     // into_sorted_vec yields ascending (distance, NodeId) — the frozen
     // output order.

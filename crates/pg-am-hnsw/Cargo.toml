@@ -13,6 +13,21 @@ description = "pg_rust in-memory HNSW vector index — Phase 2 M4 (Stage A: enco
 [lib]
 bench = false
 
+[features]
+# M6 Stage B (Stage 0's cfg ruling): the crash-window probe (ProbeMark
+# barriers in the insert path) exists only under this feature (or `test` for
+# the crate's own unit tests). Production builds carry zero probe field and
+# a compile-time no-op barrier. Integration tests (tests/) link the crate
+# WITH this feature via the dev-dependency self-reference below; pg-engine's
+# crash tests enable it through their own dev-dependency.
+test-harness = []
+
+# M6 Stage B loom model (hnsw_loom.rs): swap the sync primitives for loom's
+# instrumented ones (pg-storage/loom sets --cfg loom for pg-storage; the
+# crate's own primitives switch through `pg_storage::sync`). Mirrors
+# pg-am-btree's loom feature (Cargo.toml:38).
+loom = ["pg-storage/loom", "dep:loom"]
+
 [dependencies]
 # error types
 thiserror = "2"
@@ -31,6 +46,10 @@ crc32fast = "1.3"
 # redo.rs now, and by the Stage B/C write path next.
 pg-storage = { path = "../pg-storage" }
 
+# loom runtime for the Stage B model tests (enabled by the `loom` feature;
+# test-only). Mirrors pg-am-btree.
+loom = { version = "0.7", optional = true }
+
 [dev-dependencies]
 # benchmarks (Stage E, coding plan "criterion bench" row). The §2 freeze
 # above covers RUNTIME dependencies; criterion is dev-only. Version 0.5
@@ -39,6 +58,15 @@ pg-storage = { path = "../pg-storage" }
 # job (2026-09-08).
 criterion = "0.5"
 
+# Self-reference WITH the test-harness feature so the tests/ binaries
+# (m5_insert_crash's probe matrix) link the probe-carrying build.
+pg-am-hnsw = { path = ".", features = ["test-harness"] }
+
 [[bench]]
 name = "hnsw_build_search"
 harness = false
+
+[[test]]
+name = "hnsw_loom"
+path = "tests/hnsw_loom.rs"
+required-features = ["loom"]

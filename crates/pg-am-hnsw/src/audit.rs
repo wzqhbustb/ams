@@ -192,7 +192,8 @@ pub fn audit_index(buffer_pool: &BufferPool, meta_page_id: PageId) -> Result<Aud
     let hwm = chain.hwm;
     let graph = PagedGraph::new(
         buffer_pool,
-        &chain.pages,
+        chain.pages.clone(),
+        None,
         hwm,
         params.dim,
         params.m,
@@ -472,7 +473,8 @@ pub fn audit_reachability(
     let hwm = chain.hwm;
     let graph = PagedGraph::new(
         buffer_pool,
-        &chain.pages,
+        chain.pages.clone(),
+        None,
         hwm,
         params.dim,
         params.m,
@@ -818,7 +820,7 @@ mod tests {
         let config = StorageConfig::new(&dir);
         let engine = StorageEngine::open(&dir, &config).unwrap();
         let params = HnswParams::new(4, 8, 16, 4).unwrap();
-        let mut index = create(
+        let index = create(
             engine.buffer_pool(),
             engine.wal_writer(),
             params,
@@ -1509,7 +1511,7 @@ mod tests {
         let dir = fresh_dir("reach-cost");
         let config = StorageConfig::new(&dir);
         let engine = StorageEngine::open(&dir, &config).unwrap();
-        let mut index = create(
+        let index = create(
             engine.buffer_pool(),
             engine.wal_writer(),
             HnswParams::default(),

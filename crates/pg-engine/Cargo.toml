@@ -46,6 +46,11 @@ serde = { version = "1", features = ["derive"] }
 # integration tests drive a real engine on a temp data dir
 tempfile = "3"
 
+# The HNSW crash tests (m5_ghost_trap / m5_hnsw_crash_rounds) arm the
+# crash-window probe — enable the test-harness feature (unified with the
+# plain dependency above on dev builds).
+pg-am-hnsw = { path = "../pg-am-hnsw", features = ["test-harness"] }
+
 
 # benchmarks
 criterion = "0.5"

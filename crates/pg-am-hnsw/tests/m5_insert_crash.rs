@@ -476,10 +476,7 @@ fn window_orphan_node_page() {
     // The unpublished NodeId is reissued.
     let victim = w.victim;
     let Window {
-        dir,
-        engine,
-        mut index,
-        ..
+        dir, engine, index, ..
     } = w;
     let id = index
         .insert(engine.buffer_pool(), engine.wal_writer(), &vectors[victim])
@@ -511,10 +508,7 @@ fn window_orphan_dir_page() {
     assert_eq!(w.index.hwm(), 813);
     let victim = w.victim;
     let Window {
-        dir,
-        engine,
-        mut index,
-        ..
+        dir, engine, index, ..
     } = w;
     let id = index
         .insert(engine.buffer_pool(), engine.wal_writer(), &vectors[victim])
@@ -545,10 +539,7 @@ fn window_empty_linked_tail() {
     assert_eq!(w.index.hwm(), 813);
     let victim = w.victim;
     let Window {
-        dir,
-        engine,
-        mut index,
-        ..
+        dir, engine, index, ..
     } = w;
     let id = index
         .insert(engine.buffer_pool(), engine.wal_writer(), &vectors[victim])
@@ -592,10 +583,7 @@ fn window_orphan_entry() {
     }
     let victim = w.victim;
     let Window {
-        dir,
-        engine,
-        mut index,
-        ..
+        dir, engine, index, ..
     } = w;
     let id = index
         .insert(engine.buffer_pool(), engine.wal_writer(), &vectors[victim])

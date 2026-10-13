@@ -85,6 +85,15 @@ jobs:
       - run: cargo test -p pg-am-btree --features loom --test btree_loom
         env:
           LOOM_MAX_PREEMPTIONS: 2
+      # M6 Stage B: the HNSW concurrent-insert choreography (alloc critical
+      # section, node-latch connect discipline, meta first-insert race and
+      # backfill, reader × PublishLive interleaving). Bound 2 for all three
+      # models — HNSW's search makes per-insert scheduling points an order
+      # of magnitude denser than btree's; bound 3 did not finish in 76 min
+      # locally. Budget ~12 min release on a runner.
+      - run: cargo test -p pg-am-hnsw --features loom --release --test hnsw_loom
+        env:
+          LOOM_MAX_PREEMPTIONS: 2
       # Guard the sync-alias rule (crates/pg-storage/src/sync.rs docs): any
       # lock in the buffer-pool/WAL latch choreography must go through the
       # crate::sync aliases so loom can schedule it; direct parking_lot

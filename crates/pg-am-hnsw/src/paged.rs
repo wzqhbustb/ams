@@ -46,6 +46,8 @@
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::types::{PageId, PAGE_SIZE};
 
+use pg_storage::sync::RwLock;
+
 use crate::apply;
 use crate::dir::{self, DIR_ENTRIES_PER_PAGE};
 use crate::error::{HnswError, Result};
@@ -55,14 +57,29 @@ use crate::page::{page_type, storage_err, PAGE_TYPE_DIR, PAGE_TYPE_NODE};
 use crate::params::NodeId;
 
 /// A read-only view of the page-resident graph behind the insert/search
-/// algorithm cores. Borrows the pool and the index's resolution cache; the
-/// geometry (`dim`/`m`/`m_max0`) and metric come from the validated meta
-/// page (the struct carries m/m_max0 beyond the minimal slice-3 sketch
-/// because `neighbor_iter` needs the full [`NodeGeometry`]).
+/// algorithm cores. Borrows the pool and carries a SNAPSHOT of the index's
+/// directory resolution cache; the geometry (`dim`/`m`/`m_max0`) and
+/// metric come from the validated meta page (the struct carries m/m_max0
+/// beyond the minimal slice-3 sketch because `neighbor_iter` needs the
+/// full [`NodeGeometry`]).
+///
+/// **Snapshot self-healing (M6 §4.1, Stage B slice 3)**: the snapshot may
+/// lag a concurrent DirLink (another inserter extended the chain after
+/// this view was built). A resolution that maps past the snapshot is NOT
+/// corruption yet: the view refreshes from the live `dir_source` once and
+/// retries; only a still-out-of-range id after the refresh is loud
+/// `Corrupted`. Views without a live source (tests, audit) keep the pure
+/// snapshot semantics.
 pub(crate) struct PagedGraph<'a> {
     pool: &'a BufferPool,
-    /// Directory chain pages in ordinal order (`DirChainInfo::pages`).
-    dir_pages: &'a [PageId],
+    /// The directory-chain snapshot (ordinal order). Refreshable through
+    /// `dir_source` when a resolution maps past it. Interior mutability
+    /// is fine here: the view is used by a single thread (RefCell, not
+    /// shared).
+    dir_cache: std::cell::RefCell<Vec<PageId>>,
+    /// The handle's live directory cache (refresh source), when the view
+    /// serves an online path (insert/search). `None` = pure snapshot.
+    dir_source: Option<&'a RwLock<Vec<PageId>>>,
     /// Chain high-water mark == node count (dense NodeId space, §3).
     hwm: u64,
     /// Vector dimension (meta page, creation-pinned).
@@ -76,10 +93,14 @@ pub(crate) struct PagedGraph<'a> {
 }
 
 impl<'a> PagedGraph<'a> {
-    /// Assemble the view from the index's open-time state.
+    /// Assemble the view from the index's open-time state: `dir_snapshot`
+    /// is the starting chain image; `dir_source` (online paths) is the
+    /// live cache the resolve self-heals from.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pool: &'a BufferPool,
-        dir_pages: &'a [PageId],
+        dir_snapshot: Vec<PageId>,
+        dir_source: Option<&'a RwLock<Vec<PageId>>>,
         hwm: u64,
         dim: u16,
         m: u16,
@@ -88,7 +109,8 @@ impl<'a> PagedGraph<'a> {
     ) -> Self {
         Self {
             pool,
-            dir_pages,
+            dir_cache: std::cell::RefCell::new(dir_snapshot),
+            dir_source,
             hwm,
             dim,
             m,
@@ -107,19 +129,46 @@ impl<'a> PagedGraph<'a> {
     }
 
     /// Resolve a NodeId to its `(node page, slot)` through the directory
-    /// resolution cache. Loud `Corrupted` on an out-of-chain id or an
-    /// out-of-range/empty directory slot (§8.1③: resolution past the
-    /// published mapping must fail loudly, never fabricate).
+    /// resolution cache. A resolution past the SNAPSHOT refreshes from the
+    /// live source once (M6 §4.1 self-healing: a concurrent DirLink is a
+    /// legal race, not corruption); a resolution still past the chain after
+    /// the refresh — or any out-of-range/empty directory slot — is loud
+    /// `Corrupted` (§8.1③: resolution past the published mapping must fail
+    /// loudly, never fabricate).
     pub(crate) fn resolve(&self, node_id: NodeId) -> Result<(PageId, u16)> {
         let id = u64::from(node_id.0);
         let per_page = u64::from(DIR_ENTRIES_PER_PAGE);
         let page_idx = (id / per_page) as usize;
-        let Some(&dir_page_id) = self.dir_pages.get(page_idx) else {
-            return Err(HnswError::Corrupted(format!(
-                "resolve: node {} maps past the directory chain ({} pages)",
-                node_id.0,
-                self.dir_pages.len()
-            )));
+        let dir_page_id = {
+            let cache = self.dir_cache.borrow();
+            cache.get(page_idx).copied()
+        };
+        let dir_page_id = match dir_page_id {
+            Some(p) => p,
+            None => {
+                // Snapshot lag: refresh from the live source once, then
+                // re-check. Without a source, the snapshot is authoritative.
+                let Some(source) = self.dir_source else {
+                    return Err(HnswError::Corrupted(format!(
+                        "resolve: node {} maps past the directory chain ({} pages)",
+                        node_id.0,
+                        self.dir_cache.borrow().len()
+                    )));
+                };
+                let fresh = source.read().clone();
+                let found = fresh.get(page_idx).copied();
+                let fresh_len = fresh.len();
+                *self.dir_cache.borrow_mut() = fresh;
+                match found {
+                    Some(p) => p,
+                    None => {
+                        return Err(HnswError::Corrupted(format!(
+                        "resolve: node {} maps past the directory chain ({} pages, after refresh)",
+                        node_id.0, fresh_len
+                    )))
+                    }
+                }
+            }
         };
         let guard = self
             .pool
@@ -259,7 +308,7 @@ mod tests {
     }
 
     fn graph<'a>(pool: &'a BufferPool, dir_pages: &'a [PageId]) -> PagedGraph<'a> {
-        PagedGraph::new(pool, dir_pages, 1, 4, 4, 8, Metric::L2)
+        PagedGraph::new(pool, dir_pages.to_vec(), None, 1, 4, 4, 8, Metric::L2)
     }
 
     #[test]
@@ -276,6 +325,86 @@ mod tests {
         // Cleanup discipline: the graph borrows the pool, so its scope ends
         // first, and the dir is removed only AFTER the engine is down —
         // with a loud failure, not a swallowed `let _ =` (Stage E review).
+        drop(engine);
+        std::fs::remove_dir_all(&dir).expect("temp dir cleanup");
+    }
+
+    /// Snapshot self-healing (M6 §4.1, Stage B slice 3): a view whose
+    /// snapshot lags the live chain (a concurrent inserter's DirLink landed
+    /// after the view was built) refreshes from the live source ONCE and
+    /// resolves; without a source the same id is loud Corrupted; an id past
+    /// even the refreshed chain stays loud (real corruption).
+    #[test]
+    fn resolve_self_heals_a_stale_snapshot() {
+        let (engine, dir) = test_engine("self-heal");
+        let head = alloc_page(&engine, |p| init_dir_page(p, 0));
+        let second = alloc_page(&engine, |p| init_dir_page(p, 1));
+        // Link head → second, then publish entry 813 on the second page
+        // (ordinal 813 = page idx 1, slot 0).
+        {
+            let mut guard = engine.buffer_pool().pin_mut(head).unwrap();
+            let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+            crate::apply::dir_link(page, second);
+        }
+        let node_page = alloc_page(&engine, crate::page::init_node_page);
+        {
+            let mut guard = engine.buffer_pool().pin_mut(second).unwrap();
+            let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+            crate::apply::dir_append(page, 813, node_page, 0).unwrap();
+        }
+        let live = RwLock::new(vec![head, second]);
+
+        // 1. Stale snapshot + live source: refresh-once heals the resolve.
+        {
+            let g = PagedGraph::new(
+                engine.buffer_pool(),
+                vec![head],
+                Some(&live),
+                814,
+                4,
+                4,
+                8,
+                Metric::L2,
+            );
+            let (page, slot) = g.resolve(NodeId(813)).expect("refresh must heal");
+            assert_eq!(page, node_page);
+            assert_eq!(slot, 0);
+        }
+        // 2. Stale snapshot, no source: loud (the pure-snapshot semantics).
+        {
+            let g = PagedGraph::new(
+                engine.buffer_pool(),
+                vec![head],
+                None,
+                814,
+                4,
+                4,
+                8,
+                Metric::L2,
+            );
+            let err = g.resolve(NodeId(813)).expect_err("no source = loud");
+            assert!(
+                err.to_string().contains("maps past the directory chain"),
+                "{err}"
+            );
+        }
+        // 3. Past the REFRESHED chain too: still loud (real corruption).
+        {
+            let g = PagedGraph::new(
+                engine.buffer_pool(),
+                vec![head],
+                Some(&live),
+                814,
+                4,
+                4,
+                8,
+                Metric::L2,
+            );
+            let err = g
+                .resolve(NodeId(5000))
+                .expect_err("past the refreshed chain = loud");
+            assert!(err.to_string().contains("after refresh"), "{err}");
+        }
         drop(engine);
         std::fs::remove_dir_all(&dir).expect("temp dir cleanup");
     }

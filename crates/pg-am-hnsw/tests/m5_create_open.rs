@@ -84,7 +84,7 @@ fn create_then_open_roundtrip() {
     assert_eq!(idx.hwm(), 0);
     assert_eq!(idx.entry_point(), u32::MAX); // NodeId::INVALID, empty graph
     assert_eq!(idx.max_level(), 0);
-    let p = *idx.params();
+    let p = idx.params();
     assert_eq!(
         (
             p.dim,

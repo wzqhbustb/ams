@@ -17,6 +17,12 @@
 //! Creation is a UTILITY operation (§8.1: no transactional DML; index
 //! records carry `txn_id = INVALID` and there is no abort window).
 
+// The lock/atomic primitives come from pg-storage's `sync` alias layer:
+// parking_lot in production, loom's instrumented ones under `--cfg loom`
+// (the hnsw_loom model tests). Same discipline as pg-storage/pg-am-btree.
+use pg_storage::sync::atomic::{AtomicU64, Ordering};
+use pg_storage::sync::{Mutex, RwLock};
+
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::types::{Lsn, PageId, PAGE_SIZE};
 use pg_storage::wal::record::WalRecord;
@@ -69,14 +75,16 @@ pub enum ProbeMark {
 /// Test-only crash-probe state (Stage D slice 2): the append-boundary mark
 /// log plus an optional crash point (`crash_after` = the number of marks
 /// after which the next `barrier` fails the insert as a simulated crash).
-/// A `RefCell` because the connect phase holds a `&self`-borrowing
-/// `PagedGraph` while barrier calls fire (single-threaded premise, §8.4).
+/// A `Mutex` so test-harness builds keep the handle `Sync` (the Stage B
+/// concurrent tests share it); production builds carry no probe field at
+/// all and their `barrier` is a compile-time no-op.
 ///
 /// NOTE: the mark log grows with the insert count (a few entries per
 /// insert) — diagnostic plumbing for the test matrix. Production handles
 /// never arm the probe and never enable logging, so their `barrier` calls
 /// return before any push (the log stays empty); tests bound the log with
 /// `probe_clear_marks`.
+#[cfg(any(test, feature = "test-harness"))]
 #[derive(Debug, Default)]
 struct ProbeState {
     /// Append-boundary marks, in order. Filled only while `logging` is on
@@ -94,29 +102,85 @@ struct ProbeState {
 /// A live handle on one HNSW index (meta page + directory chain + runtime
 /// graph state).
 ///
-/// Single-threaded premise (§8.4): one writer per handle — and the probe's
-/// `RefCell` makes the handle `!Sync` outright (it stays `Send`).
+/// **Shared-handle form (M6 Stage B, tech-selection §4.1)**: `insert` takes
+/// `&self` — the handle is `Sync` and may be shared across writer threads.
+/// The runtime state lives behind synchronization: `hwm` is an atomic and
+/// the (`entry_point`, `max_level`) pair is ONE packed atomic (a torn read
+/// is impossible, review P1-2), the allocation-critical state (rng stream,
+/// current node page) sits in the `alloc` mutex (the §4.2 step 0–4 hwm
+/// critical section), and `dir_pages` is an `RwLock` (readers clone a
+/// snapshot; the DirLink push is the only writer). Latch order (§4.3):
+/// alloc mutex → dir_pages → frame pins → WAL writer; the search path
+/// never touches the alloc mutex. Declared exception (review P3-1): step
+/// 6's resolve self-heal may take `dir_pages.read()` while holding a node
+/// latch — no cycle, because dir_pages's only writer (the alloc section)
+/// never takes a node latch. The single-writer path is bit-identical to
+/// the M5/Stage-A one (the Stage B gate).
+///
+/// The crash probe exists only in `test-harness` builds (Stage 0's cfg
+/// ruling — production builds carry zero probe field and a no-op barrier);
+/// there it is a `Mutex` so the TEST build stays `Sync` too (the
+/// concurrent smoke tests share `&HnswIndex` across threads).
 pub struct HnswIndex {
     meta_page_id: PageId,
     dir_head: PageId,
+    /// The creation-pinned parameters (dim/m/ef/metric/selection/rng_seed).
+    /// The two RUNTIME fields (`entry_point`/`max_level`) are stale here —
+    /// their authoritative values live in the atomics below; `params()`
+    /// returns a synthesized copy with the live values filled in.
     params: MetaParams,
-    hwm: u64,
+    /// The chain-derived high-water mark: the next unallocated NodeId.
+    /// Revealed to readers only after the owning DirAppend landed
+    /// (position-is-identity; single-store inside the alloc critical
+    /// section, §4.2 step 1).
+    hwm: AtomicU64,
+    /// Runtime meta (mirrors an applied `HnswMetaUpdate`): entry point and
+    /// max level PACKED into one AtomicU64 — a single load yields a
+    /// consistent pair (Stage B review P1-2: two independent atomics could
+    /// tear under Relaxed — a reader could see the OLD entry point with the
+    /// NEW max level and drive the greedy descent above the entry's top
+    /// level). Layout: high 32 bits = entry_point, low 8 = max_level.
+    meta_rt: AtomicU64,
+    /// The allocation critical section's state (§4.2 step 0–4): the
+    /// level-draw PRNG (stream position == hwm) and the insert-side node
+    /// page cache. Readers never touch this.
+    alloc: Mutex<AllocInner>,
+    /// The directory chain's pages in ordinal order (the NodeId →
+    /// `(page, slot)` resolution cache): readers take a snapshot (Stage B
+    /// slice 3 adds the self-healing refresh); the DirLink push is the
+    /// only writer and happens inside the alloc critical section.
+    dir_pages: RwLock<Vec<PageId>>,
+    /// The node latch table (M6 §4.1): a process-lifetime, FIXED 4096-shard
+    /// `Vec<RwLock<()>>`, NodeId modulo the shard count. The shard count
+    /// must stay a compile-time constant — mutual exclusion requires every
+    /// writer to map the same NodeId to the same latch, and a resizing
+    /// table would break that mapping. One-shot preallocation (~KBs),
+    /// zero resize; latches are never destroyed with their nodes (§4.1).
+    /// Discipline (§4.3): at most ONE node latch held at a time, taken in
+    /// ascending NodeId order — that is the structural deadlock-freedom
+    /// argument, loom-verified (slice 4).
+    latches: Vec<RwLock<()>>,
+    /// Stage D slice-2 crash probe — test-harness builds only (Stage 0's
+    /// cfg ruling). A Mutex (not RefCell) so the TEST build stays `Sync`
+    /// too — the Stage B concurrent smoke tests share `&HnswIndex` across
+    /// threads; the lock cost exists only in test builds (production has
+    /// no probe field at all). See [`ProbeMark`]/`ProbeState`.
+    #[cfg(any(test, feature = "test-harness"))]
+    probe: Mutex<ProbeState>,
+}
+
+/// The node latch table's shard count (M6 §4.1): fixed, compile-time —
+/// NEVER a function of hwm (a resizing shard count breaks the
+/// same-NodeId-same-latch mapping and with it mutual exclusion).
+pub(crate) const NODE_LATCH_SHARDS: usize = 4096;
+
+/// The allocation critical section's shared state (§4.2 step 0–4).
+struct AllocInner {
+    /// The graph's level-draw PRNG (stream position = hwm; drawn exactly
+    /// once per validated insert, inside the critical section).
     rng: Xoshiro256StarStar,
-    /// The directory chain's pages in ordinal order (2026-09-20, Stage C
-    /// slice 3 — from `DirChainInfo::pages` at open, `vec![dir_head]` at
-    /// create): the NodeId → `(page, slot)` resolution cache; insert/search
-    /// never re-walk the chain.
-    dir_pages: Vec<PageId>,
-    /// The node page insert appends to (2026-09-20, Stage C slice 3): the
-    /// page holding the most recent node entry at open/create (`None` on an
-    /// empty graph); insert re-selects when it has no room for the next
-    /// entry.
+    /// The node page insert appends to (re-selected when full).
     current_node_page: Option<PageId>,
-    /// Stage D slice-2 crash probe (test-only; see [`ProbeMark`] /
-    /// [`ProbeState`]). Production handles never arm it and never enable
-    /// logging, so their `barrier` calls are one no-op branch — zero
-    /// behavior change on the production path (§8.4).
-    probe: std::cell::RefCell<ProbeState>,
 }
 
 impl HnswIndex {
@@ -130,79 +194,107 @@ impl HnswIndex {
         self.dir_head
     }
 
-    /// The validated meta parameters (creation-pinned + runtime
-    /// entry_point/max_level).
-    pub fn params(&self) -> &MetaParams {
-        &self.params
+    /// The validated meta parameters (creation-pinned + the LIVE runtime
+    /// entry_point/max_level read back from the atomics — a synthesized
+    /// snapshot, same value semantics as the M5 plain-field version).
+    pub fn params(&self) -> MetaParams {
+        let mut p = self.params;
+        let (ep, ml) = self.meta_pair();
+        p.entry_point = ep;
+        p.max_level = ml;
+        p
     }
 
     /// The chain-derived high-water mark: the next unallocated NodeId.
     pub fn hwm(&self) -> u64 {
-        self.hwm
+        self.hwm.load(Ordering::Relaxed)
+    }
+
+    /// The packed runtime meta — one load yields the consistent
+    /// (entry_point, max_level) pair (P1-2).
+    fn meta_pair(&self) -> (u32, u8) {
+        let packed = self.meta_rt.load(Ordering::Relaxed);
+        ((packed >> 8) as u32, packed as u8)
     }
 
     /// Entry-point NodeId (`NodeId::INVALID.0` for an empty graph).
     pub fn entry_point(&self) -> u32 {
-        self.params.entry_point
+        self.meta_pair().0
     }
 
     /// Top level of the entry-point node (0 for an empty graph).
     pub fn max_level(&self) -> u8 {
-        self.params.max_level
+        self.meta_pair().1
+    }
+
+    /// The latch serializing writers of one node's entries (M6 §4.1):
+    /// `NodeId modulo 4096` — a compile-time-constant shard count, so every
+    /// writer maps the same NodeId to the same latch. Readers never take
+    /// this (the frame pin covers read exclusion; §4.3).
+    fn node_latch(&self, node_id: u32) -> &RwLock<()> {
+        &self.latches[(node_id as usize) & (NODE_LATCH_SHARDS - 1)]
     }
 
     /// Draw the next node level from the graph's PRNG (controlled rng
     /// access — no mutable alias of the rng escapes; Stage C's insert path
-    /// consumes this). The draw uses the meta's `m`, §4.1.
-    pub fn next_level(&mut self) -> u8 {
-        self.rng.next_level(self.params.m)
+    /// consumes this). The draw uses the meta's `m`, §4.1. Shared-handle
+    /// form (Stage B): the draw happens inside the alloc critical section.
+    pub fn next_level(&self) -> u8 {
+        self.alloc.lock().rng.next_level(self.params.m)
     }
 
     /// Controlled high-water-mark write (Stage C's insert advances it
     /// after each DirAppend; not exposed to pg-engine directly — the write
-    /// path inside this crate drives it).
-    pub(crate) fn set_hwm(&mut self, hwm: u64) {
-        self.hwm = hwm;
+    /// path inside this crate drives it). Single store: readers observe
+    /// the increment only after the DirAppend landed (§4.2 step 1).
+    pub(crate) fn set_hwm(&self, hwm: u64) {
+        self.hwm.store(hwm, Ordering::Relaxed);
     }
 
     /// Controlled runtime meta update (open-repair and Stage C's
     /// entry-point promotion share this; mirrors an applied
     /// `HnswMetaUpdate`).
-    pub(crate) fn set_entry_point(&mut self, entry_point: u32, max_level: u8) {
-        self.params.entry_point = entry_point;
-        self.params.max_level = max_level;
+    pub(crate) fn set_entry_point(&self, entry_point: u32, max_level: u8) {
+        self.meta_rt.store(
+            ((entry_point as u64) << 8) | max_level as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// TEST-ONLY (Stage D slice-2 crash-window matrix): a copy of the
     /// probe mark log — every WAL-append boundary the inserts on this
     /// handle have passed, in order.
+    #[cfg(any(test, feature = "test-harness"))]
     #[doc(hidden)]
     pub fn probe_marks(&self) -> Vec<ProbeMark> {
-        self.probe.borrow().marks.clone()
+        self.probe.lock().marks.clone()
     }
 
     /// TEST-ONLY: clear the probe mark log (bounds it between the inserts
     /// a test dissects).
+    #[cfg(any(test, feature = "test-harness"))]
     #[doc(hidden)]
     pub fn probe_clear_marks(&self) {
-        self.probe.borrow_mut().marks.clear();
+        self.probe.lock().marks.clear();
     }
 
     /// TEST-ONLY: set the simulated crash point — the `barrier` fails the
     /// insert with a fixed "crash probe" error once `crash_after` marks
     /// have been logged (the just-appended record is flushed first: a real
     /// crash's visibility is the durable-record prefix).
+    #[cfg(any(test, feature = "test-harness"))]
     #[doc(hidden)]
     pub fn probe_set_crash_after(&self, crash_after: Option<usize>) {
-        self.probe.borrow_mut().crash_after = crash_after;
+        self.probe.lock().crash_after = crash_after;
     }
 
     /// TEST-ONLY: switch mark logging on/off (the discovery mode of the
     /// window-matrix tests). Off by default: with no crash point armed a
     /// production handle's `barrier` returns without touching the log.
+    #[cfg(any(test, feature = "test-harness"))]
     #[doc(hidden)]
     pub fn probe_set_logging(&self, logging: bool) {
-        self.probe.borrow_mut().logging = logging;
+        self.probe.lock().logging = logging;
     }
 
     /// The crash-probe barrier (Stage D slice 2): log the append-boundary
@@ -210,11 +302,12 @@ impl HnswIndex {
     /// through the current END boundary — `current_lsn()` covers the
     /// just-appended record (flush_to's prefix semantics, its rustdoc) —
     /// and fail the insert as a simulated kill -9 (crash visibility = the
-    /// durable prefix). With no crash point armed AND logging off (every
-    /// production handle) this is one no-op branch.
+    /// durable prefix). Production builds (no probe field) get the no-op
+    /// version below — zero branches, zero cost (Stage 0's cfg ruling).
+    #[cfg(any(test, feature = "test-harness"))]
     fn barrier(&self, wal_writer: &WalWriter, mark: ProbeMark) -> Result<()> {
         let crash_after = {
-            let mut probe = self.probe.borrow_mut();
+            let mut probe = self.probe.lock();
             if probe.crash_after.is_none() && !probe.logging {
                 return Ok(());
             }
@@ -229,6 +322,13 @@ impl HnswIndex {
                 "stage-d crash probe: simulated crash after mark #{n} ({mark:?})"
             )));
         }
+        Ok(())
+    }
+
+    /// The production barrier: no probe, no log — a compile-time no-op.
+    #[cfg(not(any(test, feature = "test-harness")))]
+    #[inline(always)]
+    fn barrier(&self, _wal_writer: &WalWriter, _mark: ProbeMark) -> Result<()> {
         Ok(())
     }
 
@@ -271,14 +371,24 @@ impl HnswIndex {
     /// **Single-threaded premise**: one writer per index handle; the buffer
     /// pool's latches make the page touches safe, but the eight steps are
     /// not isolated against a concurrent inserter.
+    /// **Concurrency** (M6 Stage B, tech-selection §4.2): `&self` shared
+    /// handle. Steps 1–5 (level draw, page prep, NodeInit, DirAppend, hwm
+    /// reveal) run inside the alloc critical section (`self.alloc`) —
+    /// NodeId allocation is serialized globally (the known §13 serial
+    /// point; batching relief is a Stage-F tuning item). The connect phase
+    /// (steps 5–6 lists) runs OUTSIDE the section (node latches arrive
+    /// with slice 2); the single-writer path is bit-identical to Stage A.
     pub fn insert(
-        &mut self,
+        &self,
         buffer_pool: &BufferPool,
         wal_writer: &WalWriter,
         vector: &[f32],
     ) -> Result<NodeId> {
         // Step 0: entry validation (§5) + NodeId space (mirrors
-        // graph.rs:472 — the INVALID sentinel stays unallocated).
+        // graph.rs:472 — the INVALID sentinel stays unallocated). The
+        // vector checks touch no shared state; the hwm bound is re-checked
+        // inside the critical section below (the allocation itself is
+        // there).
         if vector.len() != usize::from(self.params.dim) {
             return Err(HnswError::InvalidArgument(format!(
                 "insert: vector has {} components, index dim is {} (§3: same index never mixes dimensions)",
@@ -287,7 +397,14 @@ impl HnswIndex {
             )));
         }
         self.params.metric.distance(vector, vector)?;
-        if self.hwm == u64::from(u32::MAX) {
+
+        // Steps 1–5: the alloc critical section (§4.2 step 0–4) — one
+        // insert at a time draws a level, prepares pages, initializes the
+        // entry, and publishes the directory mapping; hwm is revealed to
+        // readers only after the DirAppend landed (position-is-identity).
+        let mut alloc = self.alloc.lock();
+        let hwm = self.hwm.load(Ordering::Relaxed);
+        if hwm == u64::from(u32::MAX) {
             return Err(HnswError::InvalidOperation(
                 "NodeId space (u32) exhausted; NodeId::INVALID must stay unallocated (§3)"
                     .to_string(),
@@ -295,9 +412,11 @@ impl HnswIndex {
         }
 
         // Step 1 (level draw) — the rng's stream position is the hwm, so
-        // the draw must happen exactly once per successful validation.
-        let level = self.next_level();
-        let node_id = NodeId(self.hwm as u32);
+        // the draw must happen exactly once per successful validation
+        // (inside the critical section: the draw and the NodeId allocation
+        // are one atomic decision).
+        let level = alloc.rng.next_level(self.params.m);
+        let node_id = NodeId(hwm as u32);
         let geometry = NodeGeometry {
             dim: self.params.dim,
             m: self.params.m,
@@ -308,7 +427,7 @@ impl HnswIndex {
         // Step 2 (§8.1 step 1): the current node page must have room for
         // this entry — otherwise allocate a fresh one through the init
         // chain (new_page → init → log_page_init; no exceptions, page.rs).
-        let node_page_id = match self.current_node_page {
+        let node_page_id = match alloc.current_node_page {
             Some(p) => {
                 let fits = {
                     let guard = buffer_pool
@@ -324,14 +443,14 @@ impl HnswIndex {
                     p
                 } else {
                     let fresh = alloc_node_page(buffer_pool, wal_writer)?;
-                    self.current_node_page = Some(fresh);
+                    alloc.current_node_page = Some(fresh);
                     self.barrier(wal_writer, ProbeMark::NodePageInit)?;
                     fresh
                 }
             }
             None => {
                 let fresh = alloc_node_page(buffer_pool, wal_writer)?;
-                self.current_node_page = Some(fresh);
+                alloc.current_node_page = Some(fresh);
                 self.barrier(wal_writer, ProbeMark::NodePageInit)?;
                 fresh
             }
@@ -340,9 +459,12 @@ impl HnswIndex {
         // Step 3 (§8.1 step 2): the directory tail must have room for the
         // mapping — otherwise link a fresh chain page (its init FPI lands
         // BEFORE the DirLink record, so redo's ordinal/type checks see a
-        // real directory page).
+        // real directory page). Inside the alloc critical section, so the
+        // DirLink push into the shared dir_pages cache is serialized with
+        // every other allocation (latch order §4.3: alloc → dir_pages).
         let mut dir_tail = *self
             .dir_pages
+            .read()
             .last()
             .expect("the chain always has a head page");
         {
@@ -357,7 +479,8 @@ impl HnswIndex {
                 crate::page::dir_count(page) == crate::dir::DIR_ENTRIES_PER_PAGE
             };
             if tail_full {
-                let new_dir = alloc_dir_page(buffer_pool, wal_writer, self.dir_pages.len() as u64)?;
+                let dir_pages_len = self.dir_pages.read().len() as u64;
+                let new_dir = alloc_dir_page(buffer_pool, wal_writer, dir_pages_len)?;
                 self.barrier(wal_writer, ProbeMark::DirPageInit)?;
                 let mut guard = buffer_pool
                     .pin_mut(dir_tail)
@@ -375,14 +498,15 @@ impl HnswIndex {
                 pg_storage::page::set_page_pd_lsn(page, lsn);
                 drop(guard);
                 self.barrier(wal_writer, ProbeMark::DirLink)?;
-                self.dir_pages.push(new_dir);
+                self.dir_pages.write().push(new_dir);
                 dir_tail = new_dir;
             }
         }
 
         // Step 4 (§8.1 step 3): NodeInit — the slot is selected on the same
-        // guard that applies the entry (single-threaded premise: the
-        // selection cannot go stale between the two).
+        // guard that applies the entry (the alloc critical section
+        // guarantees the selection cannot go stale between the two: no
+        // other inserter can be preparing an entry on this page).
         let slot = {
             let mut guard = buffer_pool
                 .pin_mut(node_page_id)
@@ -430,7 +554,10 @@ impl HnswIndex {
             pg_storage::page::set_page_pd_lsn(page, lsn);
             self.barrier(wal_writer, ProbeMark::DirAppend)?;
         }
-        self.set_hwm(self.hwm + 1);
+        // Reveal the allocation, then leave the critical section: readers
+        // may resolve NodeIds below hwm only after the mapping landed.
+        self.set_hwm(hwm + 1);
+        drop(alloc);
 
         // Steps 5–6 (M6 §4.2 order — the §8.2 swap of the M5 §8.1 steps
         // 5↔6): search + connect, only when the graph was non-empty BEFORE
@@ -446,207 +573,101 @@ impl HnswIndex {
         // **reachable ⟹ own lists complete** — a node's first inbound edge
         // can only come from step 6 of its own insert, which runs strictly
         // after its step 5.
-        let was_empty = self.params.entry_point == NodeId::INVALID.0;
-        let old_max_level = self.params.max_level;
-        // The new node's own per-level selections, kept for step 5. Levels
-        // above the searched range stay empty and need NO record — NodeInit
-        // already reserved them with count = 0, so an empty list is the
-        // zero content (2026-09-20, slice 3 note: no record for empties).
-        let mut own_lists: Vec<Vec<u32>> = vec![Vec::new(); usize::from(level) + 1];
-        if !was_empty {
-            let searched_top = level.min(old_max_level);
-            {
-                let g = PagedGraph::new(
-                    buffer_pool,
-                    &self.dir_pages,
-                    self.hwm,
-                    self.params.dim,
-                    self.params.m,
-                    self.params.m_max0,
-                    self.params.metric,
-                );
-                let selection = self.params.selection;
-                let ef_construction = self.params.ef_construction as usize;
-                let m = usize::from(self.params.m);
-                let m_max = |l: u8| {
-                    if l == 0 {
-                        usize::from(self.params.m_max0)
-                    } else {
-                        m
-                    }
-                };
+        // Steps 6–8 (M6 §4.2): the connect phase + the meta critical
+        // section. Concurrency protocol (§4.2 step 4): the meta decision
+        // re-reads the meta state INSIDE the critical section (the alloc
+        // latch is reused — it already serializes every insert's steps
+        // 0–4). A racing first insert on an EMPTY graph can lose the race
+        // (it read `entry_point == INVALID` before the winner's MetaUpdate
+        // landed); the loser BACKFILLS the connect phase so its node
+        // becomes reachable, then re-enters the meta decision under the
+        // non-empty rules. max_level only ever rises, never falls (two
+        // concurrent promotions take the higher one).
+        let mut ran_connect = false;
+        if self.entry_point() != NodeId::INVALID.0 {
+            self.connect_phases(
+                buffer_pool,
+                wal_writer,
+                vector,
+                node_id,
+                level,
+                node_page_id,
+                slot,
+                geometry,
+            )?;
+            ran_connect = true;
+        }
 
-                // Phase 1: greedy descent (ef = 1) from the entry point
-                // down to the new node's own top level (Algorithm 1).
-                let mut ep = NodeId(self.params.entry_point);
-                for l in ((level + 1)..=old_max_level).rev() {
-                    ep = crate::graph::search_layer(&g, vector, &[ep], 1, l)[0].id;
-                }
-
-                // Phase 2 (search half): beam-search + select per level
-                // and STASH the selections — no page writes in this loop,
-                // so every level's selection observes the identical
-                // pre-insert graph. (The M5 order interleaved the
-                // backward-edge writes here; they never influenced later
-                // levels' searches — a level-l search walks level-l edges
-                // only — so the selections are bit-identical across the
-                // swap. Same for the shrink inputs in step 6: each
-                // neighbor's list is read once and sees only pre-insert
-                // content, and the step-5 own-list writes touch only the
-                // NEW node's page.)
-                for l in (0..=searched_top).rev() {
-                    let w = crate::graph::search_layer(&g, vector, &[ep], ef_construction, l);
-                    let neighbors = crate::graph::select_neighbors(&g, selection, &w, m);
-                    own_lists[usize::from(l)] = neighbors.iter().map(|n| n.0).collect();
-                    ep = w[0].id; // nearest result carries the descent
-                }
-
-                // Step 5 (M6 §4.2): the new node's own level lists —
-                // BEFORE any backward edge lands (the swap, see the
-                // steps-5–6 comment above).
-                for (l, list) in own_lists
-                    .iter()
-                    .enumerate()
-                    .take(usize::from(searched_top) + 1)
-                {
-                    if list.is_empty() {
-                        continue; // empty list == the NodeInit zero content
-                    }
-                    let mut guard = buffer_pool.pin_mut(node_page_id).map_err(|e| {
-                        crate::page::storage_err("insert: pin_mut own node page", e)
-                    })?;
-                    let record = WalRecord::hnsw_set_neighbors(
-                        self.meta_page_id,
-                        node_page_id,
-                        slot,
-                        node_id.0,
-                        l as u8,
-                        list.clone(),
-                    )
-                    .map_err(|e| crate::page::storage_err("insert: encode own SetNeighbors", e))?;
-                    let lsn = wal_writer.append(record).map_err(|e| {
-                        crate::page::storage_err("insert: WAL append own SetNeighbors", e)
-                    })?;
-                    let page: &mut [u8; PAGE_SIZE] = guard
-                        .page_mut()
-                        .try_into()
-                        .expect("a buffer frame is exactly PAGE_SIZE");
-                    crate::apply::set_neighbors(page, slot, geometry, l as u8, list)?;
-                    pg_storage::page::set_page_pd_lsn(page, lsn);
-                    self.barrier(wal_writer, ProbeMark::OwnList { level: l as u8 })?;
-                }
-
-                // Step 6 (M6 §4.2): backward edges into the neighbors'
-                // lists. The per-level (descending) and per-neighbor order
-                // matches the M5 interleaved loop exactly, so this half of
-                // the record stream is unchanged by the swap.
-                for l in (0..=searched_top).rev() {
-                    for &nb_raw in &own_lists[usize::from(l)] {
-                        let nb = NodeId(nb_raw);
-                        let (nb_page, nb_slot) = g.resolve(nb)?;
-                        // Collect-then-pin_mut (paged.rs deadlock
-                        // discipline): the read guard is dropped before the
-                        // write guard exists.
-                        let mut list: Vec<u32> = {
-                            let guard = buffer_pool.pin(nb_page).map_err(|e| {
-                                crate::page::storage_err("insert: pin neighbor page", e)
-                            })?;
-                            let page: &[u8; PAGE_SIZE] = guard
-                                .page()
-                                .try_into()
-                                .expect("a buffer frame is exactly PAGE_SIZE");
-                            crate::apply::neighbor_iter(page, nb_slot, geometry, l)?.collect()
-                        };
-                        // push_edge semantics: sorted insertion, a duplicate
-                        // would mean algorithm divergence — loud, never
-                        // silently absorbed (graph.rs debug_asserts the
-                        // same invariant on the in-memory side).
-                        match list.binary_search(&node_id.0) {
-                            Ok(_) => {
-                                return Err(HnswError::Corrupted(format!(
-                                    "insert: duplicate edge {} -> {} on level {l}",
-                                    nb.0, node_id.0
-                                )))
-                            }
-                            Err(pos) => list.insert(pos, node_id.0),
-                        }
-                        // Shrink through the SAME heuristic (§4.3 "both
-                        // sides"): the neighbor's own vector is the
-                        // reference, distances recomputed against it.
-                        let shrank = list.len() > m_max(l);
-                        let final_list = if shrank {
-                            let cands: Vec<crate::graph::Cand> = list
-                                .iter()
-                                .map(|&c| crate::graph::Cand {
-                                    dist: g.dist_between(nb, NodeId(c)),
-                                    id: NodeId(c),
-                                })
-                                .collect();
-                            crate::graph::select_neighbors(&g, selection, &cands, m_max(l))
-                                .iter()
-                                .map(|n| n.0)
-                                .collect()
-                        } else {
-                            list
-                        };
-                        // ONE SetNeighbors record settles the layer's
-                        // post-image (collect → pin_mut → append → apply →
-                        // stamp).
-                        let mut guard = buffer_pool.pin_mut(nb_page).map_err(|e| {
-                            crate::page::storage_err("insert: pin_mut neighbor page", e)
+        // Step 8 (M5 §8.1 step 7; unchanged by the 5↔6 swap — M6 §4.2
+        // step 7): MetaUpdate — a new top-level node becomes the entry
+        // point; the first node of an empty graph always does.
+        // (Non-empty graph with level <= max_level: no record at all.)
+        // The decision AND the record live inside the critical section.
+        loop {
+            enum MetaDecision {
+                Done,
+                Backfill,
+            }
+            let decision = {
+                let _meta = self.alloc.lock();
+                // One packed load — the pair must be consistent (P1-2).
+                let (cur_ep, cur_max) = self.meta_pair();
+                if cur_ep != NodeId::INVALID.0 && !ran_connect {
+                    // Lost the first-insert race: the winner published the
+                    // entry point while this insert was deciding — backfill
+                    // the connect phase, then re-decide.
+                    MetaDecision::Backfill
+                } else {
+                    if cur_ep == NodeId::INVALID.0 || level > cur_max {
+                        let mut guard = buffer_pool.pin_mut(self.meta_page_id).map_err(|e| {
+                            crate::page::storage_err("insert: pin_mut meta page", e)
                         })?;
-                        let record = WalRecord::hnsw_set_neighbors(
-                            self.meta_page_id,
-                            nb_page,
-                            nb_slot,
-                            nb.0,
-                            l,
-                            final_list.clone(),
-                        )
-                        .map_err(|e| crate::page::storage_err("insert: encode SetNeighbors", e))?;
+                        let record =
+                            WalRecord::hnsw_meta_update(self.meta_page_id, node_id.0, level)
+                                .map_err(|e| {
+                                    crate::page::storage_err("insert: encode MetaUpdate", e)
+                                })?;
                         let lsn = wal_writer.append(record).map_err(|e| {
-                            crate::page::storage_err("insert: WAL append SetNeighbors", e)
+                            crate::page::storage_err("insert: WAL append MetaUpdate", e)
                         })?;
                         let page: &mut [u8; PAGE_SIZE] = guard
                             .page_mut()
                             .try_into()
                             .expect("a buffer frame is exactly PAGE_SIZE");
-                        crate::apply::set_neighbors(page, nb_slot, geometry, l, &final_list)?;
+                        crate::apply::apply_meta(page, node_id.0, level);
                         pg_storage::page::set_page_pd_lsn(page, lsn);
-                        self.barrier(wal_writer, ProbeMark::NeighborEdge { level: l, shrank })?;
+                        drop(guard);
+                        self.barrier(wal_writer, ProbeMark::MetaUpdate)?;
+                        self.set_entry_point(node_id.0, level);
                     }
+                    MetaDecision::Done
+                }
+            };
+            match decision {
+                MetaDecision::Done => break,
+                MetaDecision::Backfill => {
+                    self.connect_phases(
+                        buffer_pool,
+                        wal_writer,
+                        vector,
+                        node_id,
+                        level,
+                        node_page_id,
+                        slot,
+                        geometry,
+                    )?;
+                    ran_connect = true;
                 }
             }
-        }
-
-        // Step 8 (M5 §8.1 step 7; unchanged by the 5↔6 swap — M6 §4.2
-        // step 7): MetaUpdate — a new top-level node becomes
-        // the entry point; the first node of an empty graph always does.
-        // (Non-empty graph with level <= max_level: no record at all.)
-        if was_empty || level > old_max_level {
-            let mut guard = buffer_pool
-                .pin_mut(self.meta_page_id)
-                .map_err(|e| crate::page::storage_err("insert: pin_mut meta page", e))?;
-            let record = WalRecord::hnsw_meta_update(self.meta_page_id, node_id.0, level)
-                .map_err(|e| crate::page::storage_err("insert: encode MetaUpdate", e))?;
-            let lsn = wal_writer
-                .append(record)
-                .map_err(|e| crate::page::storage_err("insert: WAL append MetaUpdate", e))?;
-            let page: &mut [u8; PAGE_SIZE] = guard
-                .page_mut()
-                .try_into()
-                .expect("a buffer frame is exactly PAGE_SIZE");
-            crate::apply::apply_meta(page, node_id.0, level);
-            pg_storage::page::set_page_pd_lsn(page, lsn);
-            drop(guard);
-            self.barrier(wal_writer, ProbeMark::MetaUpdate)?;
-            self.set_entry_point(node_id.0, level);
         }
 
         // Step 9 (M5 §8.1 step 8 = M6 §4.2 step 8): PublishLive — the
         // state post-image lands
         // only after all of the node's own level lists are written (v1.7).
+        // Under the victim's node latch (§4.3): a concurrent delete's
+        // tombstone on this entry serializes against this flip.
         {
+            let _node_guard = self.node_latch(node_id.0).write();
             let mut guard = buffer_pool
                 .pin_mut(node_page_id)
                 .map_err(|e| crate::page::storage_err("insert: pin_mut node page", e))?;
@@ -679,6 +700,305 @@ impl HnswIndex {
             .flush_to(wal_writer.current_lsn())
             .map_err(|e| crate::page::storage_err("insert: success-boundary flush", e))?;
         Ok(node_id)
+    }
+
+    /// The connect phase (M6 §4.2 steps 5–6), extracted so the
+    /// first-insert backfill path can run it after the meta re-check:
+    /// beam-search each level, write the node's OWN lists (step 5), then
+    /// the backward edges into the neighbors' lists (step 6). Reads the
+    /// CURRENT entry point / max level (the backfill caller invokes it
+    /// after a meta race, when both may have moved). Runs OUTSIDE the
+    /// alloc critical section; the node-latch discipline inside is §4.3.
+    #[allow(clippy::too_many_arguments)]
+    fn connect_phases(
+        &self,
+        buffer_pool: &BufferPool,
+        wal_writer: &WalWriter,
+        vector: &[f32],
+        node_id: NodeId,
+        level: u8,
+        node_page_id: PageId,
+        slot: u16,
+        geometry: NodeGeometry,
+    ) -> Result<()> {
+        // The new node's own per-level selections, written in step 5. Levels
+        // above the searched range stay empty and need NO record — NodeInit
+        // already reserved them with count = 0, so an empty list is the
+        // zero content (2026-09-20, slice 3 note: no record for empties).
+        let mut own_lists: Vec<Vec<u32>> = vec![Vec::new(); usize::from(level) + 1];
+        // One packed load — searched_top and the descent must read the
+        // SAME meta generation (P1-2).
+        let (connect_ep, connect_max) = self.meta_pair();
+        let searched_top = level.min(connect_max);
+        {
+            // The connect phase runs OUTSIDE the alloc critical
+            // section; the graph view uses a directory snapshot
+            // (self-healing refresh is Stage B slice 3 — beneath the
+            // swap the snapshot can only lag a DirLink, and the search
+            // below touches only nodes < hwm whose entries predate it).
+            let dir_snapshot = self.dir_pages.read().clone();
+            let g = PagedGraph::new(
+                buffer_pool,
+                dir_snapshot,
+                Some(&self.dir_pages),
+                self.hwm(),
+                self.params.dim,
+                self.params.m,
+                self.params.m_max0,
+                self.params.metric,
+            );
+            let selection = self.params.selection;
+            let ef_construction = self.params.ef_construction as usize;
+            let m = usize::from(self.params.m);
+            let m_max = |l: u8| {
+                if l == 0 {
+                    usize::from(self.params.m_max0)
+                } else {
+                    m
+                }
+            };
+
+            // Phase 1: greedy descent (ef = 1) from the entry point
+            // down to the new node's own top level (Algorithm 1).
+            // The entry point is RUNTIME state — read the atomic, not
+            // the creation-time params snapshot.
+            let mut ep = NodeId(connect_ep);
+            for l in ((level + 1)..=connect_max).rev() {
+                ep = crate::graph::search_layer(&g, vector, &[ep], 1, l)[0].id;
+            }
+
+            // Phase 2 (search half): beam-search + select per level
+            // and STASH the selections — no page writes in this loop,
+            // so every level's selection observes the identical
+            // pre-insert graph. (The M5 order interleaved the
+            // backward-edge writes here; they never influenced later
+            // levels' searches — a level-l search walks level-l edges
+            // only — so the selections are bit-identical across the
+            // swap. Same for the shrink inputs in step 6: each
+            // neighbor's list is read once and sees only pre-insert
+            // content, and the step-5 own-list writes touch only the
+            // NEW node's page.)
+            for l in (0..=searched_top).rev() {
+                let w = crate::graph::search_layer(&g, vector, &[ep], ef_construction, l);
+                let neighbors = crate::graph::select_neighbors(&g, selection, &w, m);
+                own_lists[usize::from(l)] = neighbors.iter().map(|n| n.0).collect();
+                ep = w[0].id; // nearest result carries the descent
+            }
+
+            // Step 5 (M6 §4.2): the new node's own level lists —
+            // BEFORE any backward edge lands (the swap, see the
+            // steps-5–6 comment above). The victim's own node latch
+            // serializes writers of THIS node (a concurrent insert
+            // connecting TO it takes the same latch in step 6); at
+            // most one node latch held at a time (§4.3).
+            for (l, list) in own_lists
+                .iter()
+                .enumerate()
+                .take(usize::from(searched_top) + 1)
+            {
+                if list.is_empty() {
+                    continue; // empty list == the NodeInit zero content
+                }
+                let _node_guard = self.node_latch(node_id.0).write();
+                let mut guard = buffer_pool
+                    .pin_mut(node_page_id)
+                    .map_err(|e| crate::page::storage_err("insert: pin_mut own node page", e))?;
+                let record = WalRecord::hnsw_set_neighbors(
+                    self.meta_page_id,
+                    node_page_id,
+                    slot,
+                    node_id.0,
+                    l as u8,
+                    list.clone(),
+                )
+                .map_err(|e| crate::page::storage_err("insert: encode own SetNeighbors", e))?;
+                let lsn = wal_writer.append(record).map_err(|e| {
+                    crate::page::storage_err("insert: WAL append own SetNeighbors", e)
+                })?;
+                let page: &mut [u8; PAGE_SIZE] = guard
+                    .page_mut()
+                    .try_into()
+                    .expect("a buffer frame is exactly PAGE_SIZE");
+                crate::apply::set_neighbors(page, slot, geometry, l as u8, list)?;
+                pg_storage::page::set_page_pd_lsn(page, lsn);
+                self.barrier(wal_writer, ProbeMark::OwnList { level: l as u8 })?;
+            }
+
+            // Step 6 (M6 §4.2): backward edges into the neighbors'
+            // lists. The per-level (descending) and per-neighbor order
+            // matches the M5 interleaved loop exactly, so this half of
+            // the record stream is unchanged by the swap.
+            for l in (0..=searched_top).rev() {
+                for &nb_raw in &own_lists[usize::from(l)] {
+                    let nb = NodeId(nb_raw);
+                    let (nb_page, nb_slot) = g.resolve(nb)?;
+                    // The neighbor's node latch covers the whole
+                    // read-modify-write of its level-l list (§4.3: one
+                    // node latch at a time; readers are excluded by the
+                    // frame pins inside).
+                    let _node_guard = self.node_latch(nb.0).write();
+                    // Collect-then-pin_mut (paged.rs deadlock
+                    // discipline): the read guard is dropped before the
+                    // write guard exists.
+                    let mut list: Vec<u32> = {
+                        let guard = buffer_pool.pin(nb_page).map_err(|e| {
+                            crate::page::storage_err("insert: pin neighbor page", e)
+                        })?;
+                        let page: &[u8; PAGE_SIZE] = guard
+                            .page()
+                            .try_into()
+                            .expect("a buffer frame is exactly PAGE_SIZE");
+                        crate::apply::neighbor_iter(page, nb_slot, geometry, l)?.collect()
+                    };
+                    // push_edge semantics: sorted insertion, a duplicate
+                    // would mean algorithm divergence — loud, never
+                    // silently absorbed (graph.rs debug_asserts the
+                    // same invariant on the in-memory side).
+                    match list.binary_search(&node_id.0) {
+                        Ok(_) => {
+                            return Err(HnswError::Corrupted(format!(
+                                "insert: duplicate edge {} -> {} on level {l}",
+                                nb.0, node_id.0
+                            )))
+                        }
+                        Err(pos) => list.insert(pos, node_id.0),
+                    }
+                    // Shrink through the SAME heuristic (§4.3 "both
+                    // sides"): the neighbor's own vector is the
+                    // reference, distances recomputed against it.
+                    let shrank = list.len() > m_max(l);
+                    let final_list = if shrank {
+                        let cands: Vec<crate::graph::Cand> = list
+                            .iter()
+                            .map(|&c| crate::graph::Cand {
+                                dist: g.dist_between(nb, NodeId(c)),
+                                id: NodeId(c),
+                            })
+                            .collect();
+                        crate::graph::select_neighbors(&g, selection, &cands, m_max(l))
+                            .iter()
+                            .map(|n| n.0)
+                            .collect()
+                    } else {
+                        list
+                    };
+                    // ONE SetNeighbors record settles the layer's
+                    // post-image (collect → pin_mut → append → apply →
+                    // stamp).
+                    let mut guard = buffer_pool.pin_mut(nb_page).map_err(|e| {
+                        crate::page::storage_err("insert: pin_mut neighbor page", e)
+                    })?;
+                    let record = WalRecord::hnsw_set_neighbors(
+                        self.meta_page_id,
+                        nb_page,
+                        nb_slot,
+                        nb.0,
+                        l,
+                        final_list.clone(),
+                    )
+                    .map_err(|e| crate::page::storage_err("insert: encode SetNeighbors", e))?;
+                    let lsn = wal_writer.append(record).map_err(|e| {
+                        crate::page::storage_err("insert: WAL append SetNeighbors", e)
+                    })?;
+                    let page: &mut [u8; PAGE_SIZE] = guard
+                        .page_mut()
+                        .try_into()
+                        .expect("a buffer frame is exactly PAGE_SIZE");
+                    crate::apply::set_neighbors(page, nb_slot, geometry, l, &final_list)?;
+                    pg_storage::page::set_page_pd_lsn(page, lsn);
+                    self.barrier(wal_writer, ProbeMark::NeighborEdge { level: l, shrank })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete (tombstone) a LIVE node — M6 Stage B (tech-selection §8.1):
+    /// the graph-side delete primitive, one `HnswNodeTombstone` record +
+    /// the in-place state-bit flip under the node's latch (§4.3: same
+    /// discipline as insert's step 5/6/9 — one node latch at a time).
+    ///
+    /// **Idempotent re-entry** (M6 §6.2's post-commit cleanup is retryable):
+    /// deleting an already-tombstoned node is a no-op Ok (no record).
+    /// Deleting an INITIALIZING node is loud — it is a crash residue (the
+    /// vacuum channel owns it), never a user-visible row. A NodeId at or
+    /// above the hwm is InvalidArgument.
+    ///
+    /// The success boundary mirrors insert's: the tombstone record is
+    /// durable (flush through the end boundary) before Ok escapes. The
+    /// tombstone bit is NOT a search-time visibility filter (§8.1③/M6 §4.2:
+    /// state bits never gate traversal); row-level visibility filtering is
+    /// the heap/MVCC layer's job (Stage C/D).
+    pub fn delete(
+        &self,
+        buffer_pool: &BufferPool,
+        wal_writer: &WalWriter,
+        node_id: NodeId,
+    ) -> Result<()> {
+        if u64::from(node_id.0) >= self.hwm() {
+            return Err(HnswError::InvalidArgument(format!(
+                "delete: node {} is at/above the high-water mark {} — never allocated",
+                node_id.0,
+                self.hwm()
+            )));
+        }
+        let dir_snapshot = self.dir_pages.read().clone();
+        let g = PagedGraph::new(
+            buffer_pool,
+            dir_snapshot,
+            Some(&self.dir_pages),
+            self.hwm(),
+            self.params.dim,
+            self.params.m,
+            self.params.m_max0,
+            self.params.metric,
+        );
+        let (page_id, slot) = g.resolve(node_id)?;
+
+        // One node latch, one page touch (§4.3).
+        let _node_guard = self.node_latch(node_id.0).write();
+        let mut guard = buffer_pool
+            .pin_mut(page_id)
+            .map_err(|e| crate::page::storage_err("delete: pin_mut node page", e))?;
+        {
+            let page: &[u8; PAGE_SIZE] = guard
+                .page()
+                .try_into()
+                .expect("a buffer frame is exactly PAGE_SIZE");
+            if crate::apply::entry_is_tombstoned(page, slot, self.params.dim)? {
+                return Ok(()); // already tombstoned — idempotent no-op
+            }
+            if !crate::apply::entry_is_live(page, slot, self.params.dim)? {
+                return Err(HnswError::InvalidOperation(format!(
+                    "delete: node {node_id:?} is INITIALIZING (a crash residue — the vacuum channel owns it, not the delete path)"
+                )));
+            }
+        }
+        let record = WalRecord::hnsw_node_tombstone(
+            self.meta_page_id,
+            page_id,
+            slot,
+            node_id.0,
+            self.params.dim,
+        )
+        .map_err(|e| crate::page::storage_err("delete: encode Tombstone", e))?;
+        let lsn = wal_writer
+            .append(record)
+            .map_err(|e| crate::page::storage_err("delete: WAL append Tombstone", e))?;
+        let page: &mut [u8; PAGE_SIZE] = guard
+            .page_mut()
+            .try_into()
+            .expect("a buffer frame is exactly PAGE_SIZE");
+        crate::apply::apply_tombstone(page, slot, self.params.dim)?;
+        pg_storage::page::set_page_pd_lsn(page, lsn);
+        drop(guard);
+        drop(_node_guard);
+
+        // Success boundary (same shape as insert's): durable before Ok.
+        wal_writer
+            .flush_to(wal_writer.current_lsn())
+            .map_err(|e| crate::page::storage_err("delete: success-boundary flush", e))?;
+        Ok(())
     }
 
     /// k-nearest-neighbor search on the page-resident graph (paper
@@ -727,17 +1047,28 @@ impl HnswIndex {
                 "ef = {ef} < k = {k} (§4.4: the beam must fit the result set; this is the only per-query invariant)"
             )));
         }
-        if self.params.entry_point == NodeId::INVALID.0 {
+        // One packed load for the whole descent — the entry point and
+        // max level must come from the SAME meta generation (P1-2).
+        let (search_ep, search_max) = self.meta_pair();
+        if search_ep == NodeId::INVALID.0 {
             return Ok(Vec::new()); // empty graph
         }
         if k == 0 {
             return Ok(Vec::new());
         }
 
+        // Directory snapshot + hwm: the reader's graph view (Stage B slice
+        // 3 adds the self-healing refresh for a snapshot that lags a
+        // concurrent DirLink — NodeIds below the hwm READ HERE resolve
+        // within this snapshot, since their DirAppends precede the hwm
+        // store; ids allocated concurrently are above this hwm and
+        // invisible to this search).
+        let dir_snapshot = self.dir_pages.read().clone();
         let g = PagedGraph::new(
             buffer_pool,
-            &self.dir_pages,
-            self.hwm,
+            dir_snapshot,
+            Some(&self.dir_pages),
+            self.hwm(),
             self.params.dim,
             self.params.m,
             self.params.m_max0,
@@ -745,8 +1076,8 @@ impl HnswIndex {
         );
         // Greedy descent (ef = 1) through the upper layers, then a beam
         // search of width ef on level 0 (Algorithm 5).
-        let mut ep = NodeId(self.params.entry_point);
-        for l in (1..=self.params.max_level).rev() {
+        let mut ep = NodeId(search_ep);
+        for l in (1..=search_max).rev() {
             ep = crate::graph::search_layer(&g, query, &[ep], 1, l)[0].id;
         }
         let w = crate::graph::search_layer(&g, query, &[ep], ef, 0);
@@ -848,11 +1179,16 @@ pub fn create(
         meta_page_id,
         dir_head,
         params,
-        hwm: 0,
-        rng: Xoshiro256StarStar::new(rng_seed),
-        dir_pages: vec![dir_head],
-        current_node_page: None,
-        probe: std::cell::RefCell::new(ProbeState::default()),
+        hwm: AtomicU64::new(0),
+        meta_rt: AtomicU64::new(((params.entry_point as u64) << 8) | params.max_level as u64),
+        alloc: Mutex::new(AllocInner {
+            rng: Xoshiro256StarStar::new(rng_seed),
+            current_node_page: None,
+        }),
+        dir_pages: RwLock::new(vec![dir_head]),
+        latches: (0..NODE_LATCH_SHARDS).map(|_| RwLock::new(())).collect(),
+        #[cfg(any(test, feature = "test-harness"))]
+        probe: Mutex::new(ProbeState::default()),
     })
 }
 
@@ -1102,11 +1438,16 @@ pub fn open(
             meta_page_id,
             dir_head,
             params,
-            hwm: chain.hwm,
-            rng,
-            dir_pages: chain.pages,
-            current_node_page,
-            probe: std::cell::RefCell::new(ProbeState::default()),
+            hwm: AtomicU64::new(chain.hwm),
+            meta_rt: AtomicU64::new(((params.entry_point as u64) << 8) | params.max_level as u64),
+            alloc: Mutex::new(AllocInner {
+                rng,
+                current_node_page,
+            }),
+            dir_pages: RwLock::new(chain.pages),
+            latches: (0..NODE_LATCH_SHARDS).map(|_| RwLock::new(())).collect(),
+            #[cfg(any(test, feature = "test-harness"))]
+            probe: Mutex::new(ProbeState::default()),
         },
         warnings,
     })
@@ -1243,7 +1584,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let mut outcome = open(
+        let outcome = open(
             engine.buffer_pool(),
             engine.wal_writer(),
             meta_page_id,
@@ -1696,16 +2037,18 @@ mod tests {
             m: index.params.m,
             m_max0: index.params.m_max0,
         };
+        let dir_snapshot = index.dir_pages.read().clone();
         let g = PagedGraph::new(
             pool,
-            &index.dir_pages,
-            index.hwm,
+            dir_snapshot,
+            None,
+            index.hwm(),
             index.params.dim,
             index.params.m,
             index.params.m_max0,
             index.params.metric,
         );
-        (0..index.hwm)
+        (0..index.hwm())
             .map(|i| {
                 let (page_id, slot) = g.resolve(NodeId(i as u32)).unwrap();
                 let guard = pool.pin(page_id).unwrap();
@@ -1746,7 +2089,7 @@ mod tests {
         let config = StorageConfig::new(&dir);
         let engine = StorageEngine::open(&dir, &config).unwrap();
         let params = HnswParams::new(4, 8, 16, 4).unwrap();
-        let mut index = create(
+        let index = create(
             engine.buffer_pool(),
             engine.wal_writer(),
             params,
@@ -1776,6 +2119,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// M6 Stage B: the delete (tombstone) primitive — state flip, audit
+    /// counters, idempotent re-entry, and the INITIALIZING/unallocated
+    /// rejections. The tombstone bit is NOT a search filter (§8.1③/M6
+    /// §4.2): a tombstoned node still recalls itself.
+    #[test]
+    fn delete_tombstones_live_nodes_and_is_idempotent() {
+        let dir = fresh_dir("delete-basic");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            HnswParams::new(4, 8, 16, 4).unwrap(),
+            4,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            0xC0FFEE,
+        )
+        .unwrap();
+        let vectors = det_vectors(0xDEC0DE, 10, 4);
+        for v in &vectors {
+            index
+                .insert(engine.buffer_pool(), engine.wal_writer(), v)
+                .unwrap();
+        }
+
+        index
+            .delete(engine.buffer_pool(), engine.wal_writer(), NodeId(3))
+            .unwrap();
+        let report = index.audit(engine.buffer_pool()).unwrap();
+        assert_eq!(report.tombstoned_count, 1, "one tombstone");
+        // Idempotent re-entry (M6 §6.2's post-commit cleanup is retryable):
+        // the second delete is a no-op Ok, no new tombstone.
+        index
+            .delete(engine.buffer_pool(), engine.wal_writer(), NodeId(3))
+            .unwrap();
+        let report2 = index.audit(engine.buffer_pool()).unwrap();
+        assert_eq!(report2.tombstoned_count, 1, "idempotent: still one");
+
+        // Unallocated NodeId is loud.
+        let err = index
+            .delete(engine.buffer_pool(), engine.wal_writer(), NodeId(10))
+            .unwrap_err();
+        assert!(err.to_string().contains("high-water mark"), "{err}");
+
+        // The state bit is not a search predicate: node 3 still recalls
+        // itself at distance 0.
+        let hits = index
+            .search(engine.buffer_pool(), &vectors[3], 1, Some(10))
+            .unwrap();
+        assert_eq!(hits[0].0, NodeId(3));
+        assert_eq!(hits[0].1, 0.0);
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting an INITIALIZING node (a crash residue) is loud — the
+    /// vacuum channel owns it, never the delete path. The residue is built
+    /// with the crash probe: the insert dies right before PublishLive.
+    #[test]
+    fn delete_rejects_initializing_nodes() {
+        let dir = fresh_dir("delete-initializing");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            HnswParams::new(4, 8, 16, 4).unwrap(),
+            4,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            0xBEEF,
+        )
+        .unwrap();
+        let meta_page_id = index.meta_page_id();
+        let vectors = det_vectors(0x1234, 1, 4);
+        // Crash the FIRST insert right after DirAppend — the
+        // probe_log_shape-pinned sequence is [NodePageInit, NodeInit,
+        // DirAppend, MetaUpdate, PublishLive], so crash_after = 3 leaves
+        // node 0 published on the page and INITIALIZING (no MetaUpdate,
+        // no PublishLive). The in-memory hwm only advances AFTER the
+        // DirAppend barrier, so the handle still reads hwm = 0 — reopen
+        // re-derives it from the chain (hwm = 1, entry point repaired).
+        index.probe_set_crash_after(Some(3));
+        let r = index.insert(engine.buffer_pool(), engine.wal_writer(), &vectors[0]);
+        assert!(r.is_err(), "the crash probe must fail the insert");
+        drop(index);
+        let outcome = open(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            meta_page_id,
+            &ExpectedParams {
+                dim: 4,
+                m: 4,
+                m_max0: 8,
+                ef_construction: 16,
+                ef_search_default: 4,
+                metric: Metric::L2,
+                selection: NeighborSelection::Heuristic,
+            },
+        )
+        .unwrap();
+        let index = outcome.index;
+        assert_eq!(index.hwm(), 1, "reopen re-derives the published mapping");
+
+        // The victim is INITIALIZING on the page; delete must refuse it.
+        let err = index
+            .delete(engine.buffer_pool(), engine.wal_writer(), NodeId(0))
+            .unwrap_err();
+        assert!(err.to_string().contains("INITIALIZING"), "{err}");
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M6 Stage B review P1-2: the packed meta atomic — a reader must
+    /// NEVER observe a torn (entry_point, max_level) pair. One writer
+    /// stores strictly-matching pairs; concurrent readers must always read
+    /// a matching pair.
+    #[test]
+    fn meta_pair_never_reads_torn() {
+        let dir = fresh_dir("meta-pair");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            HnswParams::default(),
+            DIM,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            SEED,
+        )
+        .unwrap();
+        let index = std::sync::Arc::new(index);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|s| {
+            let writer_index = std::sync::Arc::clone(&index);
+            let writer_stop = std::sync::Arc::clone(&stop);
+            s.spawn(move || {
+                for i in 1..2000u32 {
+                    writer_index.set_entry_point(i, (i % 60) as u8);
+                }
+                writer_stop.store(true, Ordering::Relaxed);
+            });
+            let reader_index = std::sync::Arc::clone(&index);
+            s.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let (ep, ml) = reader_index.meta_pair();
+                    assert_eq!(
+                        ml,
+                        (ep % 60) as u8,
+                        "torn pair: entry_point {ep} with max_level {ml}"
+                    );
+                }
+            });
+        });
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// First insert into an empty graph: hwm = 1, entry_point = 0, the
     /// entry is LIVE with top_level == max_level, and the WAL carries the
     /// §8.1 prefix NodeInit → DirAppend → MetaUpdate → PublishLive in
@@ -1785,7 +2290,7 @@ mod tests {
         let dir = fresh_dir("first-insert");
         let config = StorageConfig::new(&dir);
         let engine = StorageEngine::open(&dir, &config).unwrap();
-        let mut index = create(
+        let index = create(
             engine.buffer_pool(),
             engine.wal_writer(),
             HnswParams::default(),
@@ -1806,10 +2311,12 @@ mod tests {
         assert_eq!(index.hwm(), 1);
         assert_eq!(index.entry_point(), 0);
 
+        let dir_snapshot = index.dir_pages.read().clone();
         let g = PagedGraph::new(
             engine.buffer_pool(),
-            &index.dir_pages,
-            index.hwm,
+            dir_snapshot,
+            None,
+            index.hwm(),
             DIM,
             16,
             32,
@@ -1878,7 +2385,7 @@ mod tests {
         let config = StorageConfig::new(&dir);
         let engine = StorageEngine::open(&dir, &config).unwrap();
         let params = HnswParams::new(2, 2, 4, 2).unwrap();
-        let mut index = create(
+        let index = create(
             engine.buffer_pool(),
             engine.wal_writer(),
             params,
@@ -1898,7 +2405,7 @@ mod tests {
         }
         assert_eq!(index.hwm(), 900);
         assert_eq!(
-            index.dir_pages.len(),
+            index.dir_pages.read().len(),
             2,
             "900 entries overflow the 813-entry head page"
         );
@@ -1923,7 +2430,7 @@ mod tests {
         let vectors = det_vectors(0x1234, (K + J) as usize, DIM as usize);
         let meta_page_id = {
             let engine = StorageEngine::open(&dir, &config).unwrap();
-            let mut index = create(
+            let index = create(
                 engine.buffer_pool(),
                 engine.wal_writer(),
                 HnswParams::default(),
@@ -1950,7 +2457,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let mut index = open(
+        let index = open(
             engine.buffer_pool(),
             engine.wal_writer(),
             meta_page_id,
@@ -1967,10 +2474,12 @@ mod tests {
         assert_eq!(index.hwm(), K + J);
 
         // The continuation's level stream, read back off the pages…
+        let dir_snapshot = index.dir_pages.read().clone();
         let g = PagedGraph::new(
             engine.buffer_pool(),
-            &index.dir_pages,
-            index.hwm,
+            dir_snapshot,
+            None,
+            index.hwm(),
             DIM,
             16,
             32,
@@ -2007,7 +2516,7 @@ mod tests {
         let config = StorageConfig::new(&dir);
         let engine = StorageEngine::open(&dir, &config).unwrap();
         let params = HnswParams::new(4, 8, 16, 4).unwrap();
-        let mut index = create(
+        let index = create(
             engine.buffer_pool(),
             engine.wal_writer(),
             params,
@@ -2027,7 +2536,7 @@ mod tests {
         ));
         assert_eq!(index.hwm(), 0, "a rejected insert must not allocate");
 
-        let mut cosine = create(
+        let cosine = create(
             engine.buffer_pool(),
             engine.wal_writer(),
             params,
@@ -2071,7 +2580,7 @@ mod tests {
         let dir = fresh_dir(tag);
         let config = StorageConfig::new(&dir);
         let engine = StorageEngine::open(&dir, &config).unwrap();
-        let mut index = create(
+        let index = create(
             engine.buffer_pool(),
             engine.wal_writer(),
             params,
@@ -2316,10 +2825,12 @@ mod tests {
         assert_eq!(index.hwm(), 2);
 
         // Premise: node 1 is INITIALIZING on disk.
+        let dir_snapshot = index.dir_pages.read().clone();
         let g = PagedGraph::new(
             engine.buffer_pool(),
-            &index.dir_pages,
-            index.hwm,
+            dir_snapshot,
+            None,
+            index.hwm(),
             DIM,
             16,
             32,
@@ -2352,7 +2863,7 @@ mod tests {
         let dir = fresh_dir("search-early-exit");
         let config = StorageConfig::new(&dir);
         let engine = StorageEngine::open(&dir, &config).unwrap();
-        let mut index = create(
+        let index = create(
             engine.buffer_pool(),
             engine.wal_writer(),
             HnswParams::default(),

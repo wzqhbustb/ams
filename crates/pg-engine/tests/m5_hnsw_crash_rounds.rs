@@ -192,7 +192,7 @@ fn run_child(data_dir: &Path, seed: u64) -> ! {
         outcome.warnings.is_empty(),
         "open warnings must be empty on the creation-matched parameters"
     );
-    let mut index = outcome.index;
+    let index = outcome.index;
 
     let mut rng = Rng(seed | 0x9E37_79B9_7F4A_7C15);
     let op_count = 120 + rng.below(60);
@@ -203,7 +203,7 @@ fn run_child(data_dir: &Path, seed: u64) -> ! {
         if i > 0 && i % 47 == 0 {
             engine.checkpoint().unwrap();
         }
-        let id = engine.hnsw_insert(&mut index, &vector_at(seed, i)).unwrap();
+        let id = engine.hnsw_insert(&index, &vector_at(seed, i)).unwrap();
         // Dense allocation pinned: the i-th insert MUST get NodeId(i).
         assert_eq!(id, NodeId(i as u32), "dense NodeId allocation");
         write_expectation(data_dir, mid, i + 1, oid);

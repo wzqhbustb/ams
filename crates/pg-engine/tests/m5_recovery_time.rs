@@ -189,14 +189,14 @@ fn run_child(data_dir: &Path, base: u64, incr: u64) -> ! {
         outcome.warnings.is_empty(),
         "open warnings must be empty on the creation-matched parameters"
     );
-    let mut index = outcome.index;
+    let index = outcome.index;
 
     // Phase 1: the bulk load. Progress is reported coarsely (plain write,
     // no fsync — it is a liveness signal for the parent's log, not part of
     // the durability contract).
     for i in 0..base {
         let id = engine
-            .hnsw_insert(&mut index, &vector_at(VECTOR_SEED, i))
+            .hnsw_insert(&index, &vector_at(VECTOR_SEED, i))
             .unwrap();
         assert_eq!(id, NodeId(i as u32), "dense NodeId allocation");
         if i > 0 && i % 10_000 == 0 {
@@ -229,7 +229,7 @@ fn run_child(data_dir: &Path, base: u64, incr: u64) -> ! {
     // redo will replay after the kill.
     for i in base..base + incr {
         let id = engine
-            .hnsw_insert(&mut index, &vector_at(VECTOR_SEED, i))
+            .hnsw_insert(&index, &vector_at(VECTOR_SEED, i))
             .unwrap();
         assert_eq!(id, NodeId(i as u32), "dense NodeId allocation");
         if i > 0 && i % 10_000 == 0 {

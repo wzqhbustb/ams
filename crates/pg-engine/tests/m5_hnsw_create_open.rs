@@ -61,7 +61,7 @@ fn create_register_reopen_open_roundtrip() {
     // entry point.
     let outcome = engine.open_hnsw_index(meta_page, &expected()).unwrap();
     assert!(outcome.warnings.is_empty());
-    let p = *outcome.index.params();
+    let p = outcome.index.params();
     assert_eq!(outcome.index.hwm(), 0);
     assert_eq!(outcome.index.entry_point(), u32::MAX); // NodeId::INVALID
     assert_eq!(outcome.index.max_level(), 0);
@@ -218,13 +218,13 @@ fn hnsw_insert_survives_a_checkpointless_crash() {
                 SEED,
             )
             .unwrap();
-        let mut index = engine
+        let index = engine
             .open_hnsw_index(meta_page, &expected())
             .unwrap()
             .index;
         for i in 0..5u32 {
             let id = engine
-                .hnsw_insert(&mut index, &vec![i as f32; DIM as usize])
+                .hnsw_insert(&index, &vec![i as f32; DIM as usize])
                 .unwrap();
             assert_eq!(id, pg_am_hnsw::NodeId(i));
         }
@@ -239,7 +239,7 @@ fn hnsw_insert_survives_a_checkpointless_crash() {
     // runtime state.
     let engine = Engine::open(dir, EngineConfig::new(dir)).unwrap();
     assert_eq!(engine.hnsw_index_first_page(oid).unwrap(), Some(meta_page));
-    let mut index = engine
+    let index = engine
         .open_hnsw_index(meta_page, &expected())
         .unwrap()
         .index;
@@ -249,7 +249,7 @@ fn hnsw_insert_survives_a_checkpointless_crash() {
     // Continuation inserts pick up the exact NodeId stream.
     for i in 5..7u32 {
         let id = engine
-            .hnsw_insert(&mut index, &vec![i as f32; DIM as usize])
+            .hnsw_insert(&index, &vec![i as f32; DIM as usize])
             .unwrap();
         assert_eq!(id, pg_am_hnsw::NodeId(i));
     }
@@ -290,12 +290,12 @@ fn hnsw_search_is_bitwise_stable_across_a_crash() {
                 SEED,
             )
             .unwrap();
-        let mut index = engine
+        let index = engine
             .open_hnsw_index(meta_page, &expected())
             .unwrap()
             .index;
         for v in &vectors {
-            engine.hnsw_insert(&mut index, v).unwrap();
+            engine.hnsw_insert(&index, v).unwrap();
         }
         // Every vector recalls itself as the nearest hit at distance 0.
         let mut before = Vec::new();

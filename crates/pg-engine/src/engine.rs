@@ -1436,19 +1436,20 @@ impl Engine {
     /// slice 3).
     ///
     /// Utility/auto-commit shape, aligned with [`Self::create_hnsw_index`] /
-    /// [`Self::open_hnsw_index`]: single-threaded per index handle, and the
-    /// §8.1 boundary-① success flush (`flush_to` the PublishLive LSN) is
-    /// already executed inside the crate before `Ok` escapes — the caller
-    /// owes no further flush. A mid-sequence `Err` or crash leaves a §8.2
-    /// crash-window residue that slice-1 redo replays and the open protocol
-    /// repairs.
+    /// [`Self::open_hnsw_index`]: the handle is a SHARED `&` reference (M6
+    /// Stage B — the crate-internal latch protocol serializes concurrent
+    /// writers), and the §8.1 boundary-① success flush (`flush_to` the
+    /// PublishLive LSN) is already executed inside the crate before `Ok`
+    /// escapes — the caller owes no further flush. A mid-sequence `Err` or
+    /// crash leaves a §8.2 crash-window residue that slice-1 redo replays
+    /// and the open protocol repairs.
     ///
     /// `index` must be a handle opened against THIS engine's storage
     /// (handles do not cross engines: the page ids inside name frames of
     /// the originating data directory — same premise as `BTreeIndex`).
     pub fn hnsw_insert(
         &self,
-        index: &mut pg_am_hnsw::HnswIndex,
+        index: &pg_am_hnsw::HnswIndex,
         vector: &[f32],
     ) -> Result<pg_am_hnsw::NodeId> {
         Ok(index.insert(
