@@ -212,8 +212,17 @@ impl HnswIndex {
 
     /// The packed runtime meta — one load yields the consistent
     /// (entry_point, max_level) pair (P1-2).
+    ///
+    /// ACQUIRE (Stage B review round 3 P1-1): the writer publishes the
+    /// entry point with a RELEASE store AFTER the hwm reveal
+    /// (`set_hwm(hwm+1)` precedes `set_entry_point` in program order), so
+    /// a reader that acquires ANY entry-point value is guaranteed to see
+    /// hwm ≥ that entry point + 1 afterwards — the search/connect paths
+    /// read hwm after meta_pair, hence `entry_point < hwm` always holds
+    /// on the view they assemble (no torn "new entry point above the
+    /// hwm" — that shape would index the visited bitset out of bounds).
     fn meta_pair(&self) -> (u32, u8) {
-        let packed = self.meta_rt.load(Ordering::Relaxed);
+        let packed = self.meta_rt.load(Ordering::Acquire);
         ((packed >> 8) as u32, packed as u8)
     }
 
@@ -235,10 +244,18 @@ impl HnswIndex {
         &self.latches[(node_id as usize) & (NODE_LATCH_SHARDS - 1)]
     }
 
-    /// Draw the next node level from the graph's PRNG (controlled rng
-    /// access — no mutable alias of the rng escapes; Stage C's insert path
-    /// consumes this). The draw uses the meta's `m`, §4.1. Shared-handle
-    /// form (Stage B): the draw happens inside the alloc critical section.
+    /// TEST-HARNESS ONLY: draw the next node level from the graph's PRNG.
+    ///
+    /// **Footgun warning** (Stage B review): on a LIVE handle this advances
+    /// the shared rng stream WITHOUT allocating a node, breaking the
+    /// "stream position == hwm" invariant (§11.1's cross-restart
+    /// reproducibility leans on it; reopen re-syncs by skip-ahead, so the
+    /// damage heals, but the window in between is wrong). The insert path
+    /// does NOT use this (it draws inside the alloc critical section
+    /// directly); the only consumers are the rng-lineage verification
+    /// tests. Hence the cfg gate.
+    #[cfg(any(test, feature = "test-harness"))]
+    #[doc(hidden)]
     pub fn next_level(&self) -> u8 {
         self.alloc.lock().rng.next_level(self.params.m)
     }
@@ -255,9 +272,13 @@ impl HnswIndex {
     /// entry-point promotion share this; mirrors an applied
     /// `HnswMetaUpdate`).
     pub(crate) fn set_entry_point(&self, entry_point: u32, max_level: u8) {
+        // RELEASE (review round 3 P1-1): pairs with meta_pair's Acquire —
+        // everything this insert wrote before the promotion (the hwm
+        // reveal included) is visible to any reader that observes this
+        // entry point.
         self.meta_rt.store(
             ((entry_point as u64) << 8) | max_level as u64,
-            Ordering::Relaxed,
+            Ordering::Release,
         );
     }
 
@@ -368,9 +389,6 @@ impl HnswIndex {
     /// failure points and never diverges this way). Reopening re-syncs the
     /// stream via skip-ahead (exactly `hwm` draws).
     ///
-    /// **Single-threaded premise**: one writer per index handle; the buffer
-    /// pool's latches make the page touches safe, but the eight steps are
-    /// not isolated against a concurrent inserter.
     /// **Concurrency** (M6 Stage B, tech-selection §4.2): `&self` shared
     /// handle. Steps 1–5 (level draw, page prep, NodeInit, DirAppend, hwm
     /// reveal) run inside the alloc critical section (`self.alloc`) —
@@ -1019,10 +1037,12 @@ impl HnswIndex {
     /// (the bit is a recovery-progress marker, not a visibility filter);
     /// the `search_recalls_initializing_nodes` test pins it.
     ///
-    /// **Premises** (paged.rs module header): single-threaded serving;
-    /// directory corruption beneath the open protocol's validation is
-    /// fail-stop (panic with the premise in the message), never a wrong
-    /// answer.
+    /// **Premises** (paged.rs module header): directory corruption beneath
+    /// the open protocol's validation is fail-stop (panic with the premise
+    /// in the message), never a wrong answer. (M6 Stage B: the serving path
+    /// is shared — `&self` readers and writers interleave freely; the
+    /// crash-probe instrumentation and the single-writer bitwise pin are
+    /// unaffected.)
     pub fn search(
         &self,
         buffer_pool: &BufferPool,
@@ -2238,7 +2258,10 @@ mod tests {
     /// M6 Stage B review P1-2: the packed meta atomic — a reader must
     /// NEVER observe a torn (entry_point, max_level) pair. One writer
     /// stores strictly-matching pairs; concurrent readers must always read
-    /// a matching pair.
+    /// a matching pair. (Sentinel caveat: on x86/TSO this stays green even
+    /// if the packing regresses — its discriminating power is on weakly
+    /// ordered hardware; the real guarantee is the single-atomic
+    /// structure.)
     #[test]
     fn meta_pair_never_reads_torn() {
         let dir = fresh_dir("meta-pair");
@@ -2274,6 +2297,60 @@ mod tests {
                         (ep % 60) as u8,
                         "torn pair: entry_point {ep} with max_level {ml}"
                     );
+                }
+            });
+        });
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-3 P1-1 extension: the writer follows the REAL publication
+    /// order (hwm reveal first, entry point last — insert's program
+    /// order); a reader acquiring the entry point must observe
+    /// `hwm > entry_point` on the hwm read it does afterwards (the
+    /// search/connect view assembly order). A torn view the other way
+    /// (new entry point above the hwm) would index the search bitset out
+    /// of bounds. (Sentinel caveat: x86/TSO keeps this green even without
+    /// the Acquire/Release pair — its discriminating power is on weakly
+    /// ordered hardware; the real guarantee is the release-sequence
+    /// structure.)
+    #[test]
+    fn entry_point_never_ahead_of_hwm() {
+        let dir = fresh_dir("ep-hwm-pair");
+        let config = StorageConfig::new(&dir);
+        let engine = StorageEngine::open(&dir, &config).unwrap();
+        let index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            HnswParams::default(),
+            DIM,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            SEED,
+        )
+        .unwrap();
+        let index = std::sync::Arc::new(index);
+        std::thread::scope(|s| {
+            let writer = std::sync::Arc::clone(&index);
+            s.spawn(move || {
+                for i in 0..2000u64 {
+                    // The real publication order: hwm reveal, then the
+                    // entry point (insert's step 5 boundary → step 8).
+                    writer.set_hwm(i + 1);
+                    writer.set_entry_point(i as u32, 0);
+                }
+            });
+            let reader = std::sync::Arc::clone(&index);
+            s.spawn(move || {
+                for _ in 0..50_000 {
+                    let (ep, _ml) = reader.meta_pair();
+                    let hwm = reader.hwm();
+                    if ep != NodeId::INVALID.0 {
+                        assert!(
+                            u64::from(ep) < hwm,
+                            "torn view: entry_point {ep} at/above hwm {hwm}"
+                        );
+                    }
                 }
             });
         });

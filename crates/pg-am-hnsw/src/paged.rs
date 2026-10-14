@@ -27,7 +27,8 @@
 //! §11.3 audit (assertion f: every entry resolves to a NODE page, Stage D).
 //! A resolution failure on the search/insert path is therefore fail-stop
 //! (panic with the premise spelled out in the message), never a wrong
-//! answer — accepted for M5's single-threaded utility scope. Making the
+//! answer — the M5 single-threaded scope accepted it; M6 Stage B keeps the
+//! same fail-stop contract under the shared handle. Making the
 //! serving path error-instead-of-panic means `GraphAccess` returning
 //! `Result` (a slice-2 design rollback touching both algorithm cores and
 //! the in-memory reference) — registered as a Phase-4 hardening option,

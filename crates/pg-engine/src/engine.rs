@@ -1465,8 +1465,9 @@ impl Engine {
     ///
     /// Read-only: no WAL records, no page mutations, no flush owed by the
     /// caller. `ef = None` uses the meta-pinned `ef_search_default`; the
-    /// only per-query invariant is `ef >= k`. Same single-threaded serving
-    /// premise as the crate-level search (paged.rs module header). The
+    /// only per-query invariant is `ef >= k`. Same fail-stop corruption
+    /// premise as the crate-level search (paged.rs module header); the
+    /// handle is a shared `&` reference (M6 Stage B). The
     /// INITIALIZING state bit is deliberately NOT a visibility filter
     /// (§8.1③): a crash-window residue node is recallable.
     ///

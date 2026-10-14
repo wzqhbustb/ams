@@ -8,7 +8,7 @@
 //! Run with bounded preemptions (same tier discipline as btree_loom):
 //!
 //! ```sh
-//! LOOM_MAX_PREEMPTIONS=3 cargo test -p pg-am-hnsw --features loom --release --test hnsw_loom
+//! LOOM_MAX_PREEMPTIONS=2 cargo test -p pg-am-hnsw --features loom --release --test hnsw_loom
 //! ```
 //!
 //! # How the model stays inside loom
@@ -17,23 +17,36 @@
 //! that participates in the choreography for loom's instrumented
 //! primitives (`pg_storage::sync`); the crate's OWN synchronization
 //! (alloc mutex, dir_pages RwLock, the 4096-shard latch table, the
-//! hwm/entry_point/max_level atomics) aliases the same layer
-//! (`pg_storage::sync::{Mutex, RwLock, atomic}` in index.rs), so every
-//! §4.2/§4.3 scheduling point is a loom point. The WAL group-commit worker
-//! and `flush_frame`'s data-file I/O are stubbed by pg-storage's loom build
-//! (see its sync module docs). The crash-window probe does NOT exist in
-//! this build (no `test-harness` feature here): the barrier is the
-//! compile-time no-op, which is exactly the production shape under test.
+//! hwm/meta_rt atomics) aliases the same layer (`pg_storage::sync::{Mutex,
+//! RwLock, atomic}` in index.rs), so every §4.2/§4.3 scheduling point is a
+//! loom point. The WAL group-commit worker and `flush_frame`'s data-file
+//! I/O are stubbed by pg-storage's loom build (see its sync module docs).
+//!
+//! **Build-shape disclosure** (review round 3 P2-2): the dev-dependency
+//! self-reference enables `test-harness` in ALL test builds INCLUDING this
+//! one, so the probe Mutex exists here and `barrier` takes it at every WAL
+//! boundary — extra scheduling points the production build (no probe field,
+//! no-op barrier) does not have. The probe is never armed and logging is
+//! off, so the barrier's behavior is the production no-op branch; the
+//! choreography under test (alloc/dir_pages/node-latch/meta) is unchanged.
+//! (An AtomicBool fast path that skips the probe lock is registered as a
+//! Stage C顺带 item.)
 //!
 //! # Sizing (loom state space explodes — keep models TINY)
 //!
 //! - One insert per writer thread; the connect phase on a 1-3 node graph.
-//! - `LOOM_MAX_PREEMPTIONS=3` acceptance bound; the first-insert-race model
-//!   self-clamps to 2 if its space blows up (print loudly, like btree).
+//! - Acceptance bound: `LOOM_MAX_PREEMPTIONS=2` for all models (bound 3 on
+//!   HNSW's per-insert scheduling density did not finish in 76 min locally;
+//!   btree's linearizable model self-clamps to 2 for the same reason).
 //! - Pool sized at 16 frames so the tiny graph never evicts (an evicted
 //!   page would reload as zeros — the flush stub writes nothing).
 //! - The model closure re-runs per interleaving, including setup (fresh
 //!   temp dir + WAL/pool open); setup runs on the big-stack driver thread.
+//! - **DirLink branch**: NOT modeled here — loom's internal path counter
+//!   overflows on the 812-insert pre-fill needed to reach a directory page
+//!   boundary. Coverage of that branch under concurrency lives in
+//!   `m6_concurrent_insert.rs::concurrent_insert_across_dir_page_boundary`
+//!   (non-loom); the narrowing is registered in stage_spec/tech-selection.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,7 +59,7 @@ use loom::thread;
 use std::sync::atomic::AtomicUsize;
 
 use pg_am_hnsw::graph::{Metric, NeighborSelection};
-use pg_am_hnsw::{HnswIndex, HnswParams, NodeId};
+use pg_am_hnsw::{HnswIndex, HnswParams};
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::config::StorageConfig;
 use pg_storage::page_allocator::PageAllocator;
@@ -205,6 +218,11 @@ fn loom_racing_first_insert() {
             u32::MAX,
             "exactly one first-insert winner published the entry point"
         );
+        // max_level monotone holds structurally (the meta critical section
+        // re-reads and only writes when `level > cur_max`); the direct
+        // per-node comparison needs the winner's top level, which the test
+        // surface doesn't expose — the packed-pair invariant is pinned by
+        // lib test `meta_pair_never_reads_torn`.
         // Both nodes must be reachable: search for each vector recalls it.
         for t in 1..=2u32 {
             let hits = index.search(&pool, &vec_for(t * 10), 1, Some(4)).unwrap();
@@ -242,10 +260,13 @@ fn loom_reader_writer_interleave() {
                 for _ in 0..3 {
                     let hits = index.search(&pool, &vec_for(0), 2, Some(4)).unwrap();
                     assert!(!hits.is_empty(), "a non-empty graph must answer");
+                    // Hits must name nodes allocated at/before the hwm
+                    // observed by THIS read (never a future allocation).
+                    let hwm_now = index.hwm();
                     for (id, _) in &hits {
                         assert!(
-                            (id.0 as u64) < 3,
-                            "a hit must name a real allocated node (hwm bound)"
+                            (id.0 as u64) < hwm_now,
+                            "a hit must name a real allocated node (< observed hwm)"
                         );
                     }
                 }

@@ -180,7 +180,7 @@ cargo test --workspace
 | 临界区化写入路径(选型 §4.2) | 步骤 0–4 整段进 hwm 临界区(含 DirLink 分支);meta 临界区重查(空图首插回补 + 只升不降);步骤 5/6 节点 latch 升序单持;PublishLive 原位翻转 |
 | 读者目录快照自愈(选型 §4.1) | 解析命中"maps past the directory chain"时沿 next 链刷新快照重试一次,仍越界才 Corrupted;M5 目录解析错误文案同步调整;并发增长下的自愈测试(读者持旧快照 × 写者 DirLink) |
 | 锁序立文 + loom 模型(选型 §4.3/§12.1) | **脚手架先行**:pg-am-hnsw Cargo.toml 加 `loom = ["pg-storage/loom", "dep:loom"]`(参照 pg-am-btree Cargo.toml:38 先例)+ 测试 required-features 门(ci.yml:83-85 同型);`hnsw_loom`(参照 btree_loom 形态):hwm 临界区全段交错、meta 首插竞争与只升不降、连边升序单持、PublishLive × 读者交错;preemption bound 纪律同既有 loom job;**遍历期不持节点 latch** 进 loom 断言面;**vacuum 重定向 × 并发 insert 面归 Stage E 扩展**(机制在 E 才存在,选型 §12.1 第三面) |
-| delete 并发原语(选型 §8.1) | tombstone 的并发形态(节点 latch + 原位写);与 insert 的 latch 纪律同型;tombstone × 读者交错进 loom 清单 |
+| delete 并发原语(选型 §8.1) | tombstone 的并发形态(节点 latch + 原位写);与 insert 的 latch 纪律同型;~~tombstone × 读者交错进 loom 清单~~ **(Stage B 实施登记:不单独建模——与 PublishLive×读者同型,同为原位状态位写、读者不查状态位;读者模型的状态位覆盖已由 PublishLive 交错承载)** |
 
 **关键约束**:
 - 锁序违反 = P1;loom 模型即回归门(选型 §13)

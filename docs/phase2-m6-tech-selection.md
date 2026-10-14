@@ -495,6 +495,11 @@ M5 1000 轮验收实证(round 521):先改他人邻表(旧步骤 5)再写自身�
    NodeInit → DirAppend 含 DirLink 分支)、**meta 临界区首插竞争与
    只升不降**、**vacuum 重定向 × 并发 insert**;tier 参照
    btree_loom(2 变体,preemption bound 纪律同 ci.yml:75-83)。
+   **(Stage B 实施登记:DirLink 分支的 loom 覆盖实证不可行——预填
+   812 条目的 driver 段超出 loom 内部路径计数上限(execution.rs
+   overflow);DirLink 全段在 alloc 临界区内(锁内串行),其并发覆盖
+   走非-loom 压力形态 m6_concurrent_insert 的跨页界测试;hwm/meta/
+   连边/读者的交错面由三模型穷举,不缩水。)**
 2. **stress 验收**:100 并发 INSERT+DELETE 24h(ROADMAP :294);
    harness 复用 m2c_100_conn.rs 形态(pg-engine benches 既有先例)。
    24h 是验收口径;CI 跑缩短版(轮次参数化,m5_hnsw_crash_rounds

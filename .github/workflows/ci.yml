@@ -58,18 +58,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Stage Q: pg-storage's `loom` feature swaps sync primitives for loom's
-      # instrumented ones, which PANIC outside `loom::model` — so the two
+      # instrumented ones, which PANIC outside `loom::model` — so the
       # loom-aware crates must be tested with default features. Running their
       # test suites with --all-features makes every non-model test panic.
       # (M3 Stage F: pg-wire declares NO features, so it rides the
-      # all-features branch below unchanged. Phase 2 M4 Stage A: pg-am-hnsw
-      # has no loom model and declares no features either — same
-      # classification, non-loom branch.)
+      # all-features branch below unchanged. Phase 2 M6 Stage B: pg-am-hnsw
+      # now declares `loom` (hnsw_loom) — same class, non-loom branch; its
+      # `test-harness` probe feature stays ON in the default test build via
+      # the dev-dependency self-reference, so the exclusion loses nothing.)
       - name: Test (default features — loom-gated crates)
-        if: matrix.crate == 'pg-storage' || matrix.crate == 'pg-am-btree'
+        if: matrix.crate == 'pg-storage' || matrix.crate == 'pg-am-btree' || matrix.crate == 'pg-am-hnsw'
         run: cargo test -p ${{ matrix.crate }}
       - name: Test (all features)
-        if: matrix.crate != 'pg-storage' && matrix.crate != 'pg-am-btree'
+        if: matrix.crate != 'pg-storage' && matrix.crate != 'pg-am-btree' && matrix.crate != 'pg-am-hnsw'
         run: cargo test -p ${{ matrix.crate }} --all-features
 
   loom:

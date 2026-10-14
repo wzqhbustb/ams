@@ -24,11 +24,13 @@ const DIM: u16 = 8;
 const THREADS: usize = 8;
 const PER_THREAD: usize = 50;
 
+static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 fn fresh_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "pg_am_hnsw_m6_concurrent-{}-{}-{tag}",
         std::process::id(),
-        std::sync::atomic::AtomicUsize::new(0).fetch_add(1, Ordering::Relaxed)
+        DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -240,6 +242,114 @@ fn search_concurrent_with_insert_burst_never_panics() {
         }
     });
 
+    // Post-burst: exact state — 70 seeded + 80 burst = 150, all LIVE,
+    // audit clean, and a recall sweep over a sample recalls each at
+    // distance 0.
+    assert_eq!(index.hwm(), 150, "70 seeded + 80 burst");
+    let report = index.audit(engine.buffer_pool()).unwrap();
+    assert_eq!(report.node_count, 150);
+    assert_eq!(report.live_count, 150);
+    assert_eq!(report.initializing_count, 0);
+    assert_eq!(report.orphan_entry_count, 0);
+    assert_eq!(report.tombstoned_count, 0);
+    for i in (0..70).step_by(17) {
+        let q = vector_for(500, i);
+        let hits = index
+            .search(engine.buffer_pool(), &q, 1, Some(150))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, 0.0);
+    }
+
+    engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// DirLink under concurrency (non-loom; M6 §12.1's "hwm critical section
+/// in full incl. the DirLink branch" is covered HERE, not in loom — loom's
+/// internal path counter overflows on an 812-insert pre-fill, registered
+/// in stage_spec/tech-selection): the chain crosses a directory page
+/// boundary while writers race and readers search. Asserts: exact hwm,
+/// clean audit, no "maps past the directory chain" (the slice-3
+/// self-healing covers a reader whose snapshot lags the DirLink).
+#[test]
+fn concurrent_insert_across_dir_page_boundary() {
+    let dir = fresh_dir("dirlink-race");
+    let engine = StorageEngine::open(&dir, &StorageConfig::new(&dir)).unwrap();
+    let index = pg_am_hnsw::index::create(
+        engine.buffer_pool(),
+        engine.wal_writer(),
+        HnswParams::new(4, 8, 16, 4).unwrap(),
+        DIM,
+        Metric::L2,
+        NeighborSelection::Heuristic,
+        0x1A1C,
+    )
+    .unwrap();
+    let index = Arc::new(index);
+
+    // Pre-fill to 810 single-threaded — the page boundary (813 entries)
+    // falls INSIDE the concurrent burst below, so the DirLink for node 813
+    // genuinely races the readers' stale snapshots (review round 3: at 815
+    // the crossing happened in the single-threaded prefix and the race was
+    // never exercised).
+    for i in 0..810usize {
+        index
+            .insert(
+                engine.buffer_pool(),
+                engine.wal_writer(),
+                &vector_for(700, i),
+            )
+            .unwrap();
+    }
+    assert_eq!(index.hwm(), 810);
+
+    let errors = Arc::new(AtomicUsize::new(0));
+    let writers_done = Arc::new(AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        for t in 0..2usize {
+            let index = Arc::clone(&index);
+            let errors = Arc::clone(&errors);
+            let writers_done = Arc::clone(&writers_done);
+            let engine = &engine;
+            scope.spawn(move || {
+                for i in 0..20 {
+                    if index
+                        .insert(
+                            engine.buffer_pool(),
+                            engine.wal_writer(),
+                            &vector_for(800 + t, i),
+                        )
+                        .is_err()
+                    {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                writers_done.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        // A reader searching continuously THROUGH the boundary crossings.
+        let index = Arc::clone(&index);
+        let writers_done = Arc::clone(&writers_done);
+        let engine = &engine;
+        scope.spawn(move || {
+            while writers_done.load(Ordering::Relaxed) < 2 {
+                let hits = index
+                    .search(engine.buffer_pool(), &vector_for(700, 0), 3, Some(16))
+                    .unwrap();
+                assert!(!hits.is_empty());
+            }
+        });
+    });
+    assert_eq!(errors.load(Ordering::Relaxed), 0);
+    assert_eq!(index.hwm(), 850);
+
+    let report = index.audit(engine.buffer_pool()).unwrap();
+    assert_eq!(report.node_count, 850);
+    assert_eq!(report.live_count, 850);
+    assert_eq!(report.initializing_count, 0);
+    assert_eq!(report.orphan_entry_count, 0);
+
     engine.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -337,7 +447,7 @@ fn concurrent_delete_and_insert() {
     assert_eq!(report.node_count, 80);
     assert_eq!(
         report.tombstoned_count, 21,
-        "nodes 0..20 plus the double-deleted 29"
+        "nodes 0..19 (the two deleter threads) plus 29 (double-deleted, idempotent)"
     );
     assert_eq!(report.initializing_count, 0);
     assert_eq!(report.orphan_entry_count, 0);
