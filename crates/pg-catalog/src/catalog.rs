@@ -350,9 +350,23 @@ fn validate_content(
             )));
         }
     }
+    // M6 Stage C: the vector type row is required too (typlen is always
+    // -1; the dim is per-column in pg_attribute.len).
+    let vrow = types
+        .iter()
+        .find(|t| t.oid == crate::builtin_types::VECTOR_OID)
+        .ok_or_else(|| {
+            CatalogError::Corrupted("catalog is missing builtin type vector".to_string())
+        })?;
+    if vrow.name != "vector" || vrow.len != -1 {
+        return Err(CatalogError::Corrupted(
+            "pg_type row for vector does not match builtin definition".to_string(),
+        ));
+    }
     for am_oid in [
         crate::system_tables::HEAP_AM_OID,
         crate::system_tables::BTREE_AM_OID,
+        crate::system_tables::HNSW_AM_OID,
     ] {
         if !access_methods.iter().any(|a| a.oid == am_oid) {
             return Err(CatalogError::Corrupted(format!(

@@ -46,6 +46,9 @@ pub const PG_RELPAGES_OID: TableOid = TableOid(Oid(9021));
 pub const HEAP_AM_OID: Oid = Oid(2);
 /// `pg_am` OID of the B+Tree access method (PostgreSQL conventional value).
 pub const BTREE_AM_OID: Oid = Oid(403);
+/// `pg_am` OID of the HNSW vector access method (M6 Stage C — engine-side
+/// registration; the `CREATE INDEX ... USING hnsw` SQL form is Phase 4b).
+pub const HNSW_AM_OID: Oid = Oid(9878);
 
 /// `pg_class.relkind` for an ordinary table.
 pub const RELKIND_TABLE: &str = "r";

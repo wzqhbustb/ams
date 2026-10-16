@@ -80,6 +80,13 @@ pub const HEAP_KEYS_UPDATED: u16 = 0x2000;
 pub const HEAP_HOT_UPDATED: u16 = 0x4000;
 /// Tuple is the only version in its chain.
 pub const HEAP_ONLY_TUPLE: u16 = 0x8000;
+/// This tuple carries a trailing 4-byte NodeId after all user columns
+/// (M6 Stage C, tech-selection §7): the row's authoritative link to its
+/// HNSW graph node. Present only on tables with an HNSW index (a DDL-time
+/// property); the codec reads/writes it purely by this bit, so tables
+/// without one pay zero bytes. The trailing placement keeps every user
+/// column offset and the 64-byte header untouched.
+pub const HEAP_HAS_NODEID: u16 = 0x0800;
 
 // `t_flags` (§三): low 4 bits hold the tuple encoding version.
 /// Mask for the tuple encoding version in `t_flags` (low 4 bits).
@@ -336,9 +343,32 @@ impl Datum {
 /// as a 4-byte inline varlena header (total length, tag bits 00) plus
 /// payload; [`Datum::External`] writes its 20-byte TOAST pointer as-is.
 pub fn encode_tuple(
+    header: TupleHeader,
+    columns: &[ColumnType],
+    values: &[Option<Datum>],
+) -> Result<Vec<u8>> {
+    encode_tuple_impl(header, columns, values, None)
+}
+
+/// Encode a tuple carrying the row's HNSW NodeId as a trailing system
+/// column (M6 Stage C, tech-selection §7 — the row is the authoritative
+/// NodeId carrier): 4 LE bytes after the last user column, signalled by
+/// [`HEAP_HAS_NODEID`] in `t_infomask2`. No user-column offset moves; the
+/// 64-byte header and null bitmap are untouched.
+pub fn encode_tuple_with_node_id(
+    header: TupleHeader,
+    columns: &[ColumnType],
+    values: &[Option<Datum>],
+    node_id: u32,
+) -> Result<Vec<u8>> {
+    encode_tuple_impl(header, columns, values, Some(node_id))
+}
+
+fn encode_tuple_impl(
     mut header: TupleHeader,
     columns: &[ColumnType],
     values: &[Option<Datum>],
+    node_id: Option<u32>,
 ) -> Result<Vec<u8>> {
     if columns.len() != values.len() {
         return Err(HeapError::InvalidArgument(format!(
@@ -400,6 +430,15 @@ pub fn encode_tuple(
         | (if has_varwidth { HEAP_HASVARWIDTH } else { 0 })
         | (if has_external { HEAP_HASEXTERNAL } else { 0 });
     header.t_infomask2 = (header.t_infomask2 & !HEAP_NATTS_MASK) | natts as u16;
+    // The trailing-NodeId signal is driven by the argument, never by a
+    // caller-set bit (defense in depth: a stale bit without the payload —
+    // or vice versa — would mis-size every later read).
+    header.t_infomask2 = (header.t_infomask2 & !HEAP_HAS_NODEID)
+        | if node_id.is_some() {
+            HEAP_HAS_NODEID
+        } else {
+            0
+        };
     header.t_hoff = t_hoff as u16;
     header.t_flags = (header.t_flags & !TUPLE_VERSION_MASK) | TUPLE_VERSION_M2;
 
@@ -438,6 +477,10 @@ pub fn encode_tuple(
             }
             Datum::External(ptr) => out.extend_from_slice(&ptr.encode()),
         }
+    }
+    // The trailing system column: 4 LE bytes after the last user column.
+    if let Some(id) = node_id {
+        out.extend_from_slice(&id.to_le_bytes());
     }
     Ok(out)
 }
@@ -576,13 +619,38 @@ pub fn decode_tuple(
         };
         values.push(Some(datum));
     }
-    if pos != bytes.len() {
+    // Trailing bytes: exactly 4 when HEAP_HAS_NODEID is set (the system
+    // column), exactly 0 otherwise — a mis-sized tail is corruption either
+    // way (M6 Stage C).
+    let trailing = bytes.len() - pos;
+    let has_nodeid = header.t_infomask2 & HEAP_HAS_NODEID != 0;
+    if has_nodeid {
+        if trailing != 4 {
+            return Err(HeapError::Corrupted(format!(
+                "tuple with HEAP_HAS_NODEID has {trailing} trailing bytes, expected exactly 4 (the NodeId)"
+            )));
+        }
+    } else if trailing != 0 {
         return Err(HeapError::Corrupted(format!(
-            "tuple has {} trailing bytes after the last column",
-            bytes.len() - pos
+            "tuple has {trailing} trailing bytes after the last column"
         )));
     }
     Ok((header, values))
+}
+
+/// Read a tuple's trailing NodeId (the M6 Stage C system column), or
+/// `None` when the tuple doesn't carry one. Structure (including the
+/// exact-4-byte tail) is validated by `decode_tuple`; this reads the last
+/// 4 bytes only after that validation passes.
+pub fn tuple_node_id(bytes: &[u8], columns: &[ColumnType]) -> Result<Option<u32>> {
+    let (header, _values) = decode_tuple(bytes, columns)?;
+    if header.t_infomask2 & HEAP_HAS_NODEID == 0 {
+        return Ok(None);
+    }
+    let n = bytes.len();
+    Ok(Some(u32::from_le_bytes(
+        bytes[n - 4..n].try_into().expect("validated 4-byte tail"),
+    )))
 }
 
 /// Copy `n` bytes out of `bytes` at `pos`, advancing `pos`.
@@ -835,5 +903,80 @@ mod tests {
             decode_tuple(&bytes[..bytes.len() - 1], &columns),
             Err(HeapError::Corrupted(_))
         ));
+    }
+
+    /// M6 Stage C: the trailing NodeId system column — roundtrip through
+    /// encode_tuple_with_node_id / tuple_node_id, user columns decode
+    /// unchanged, and the bit is driven by the encode argument (never by a
+    /// caller-set flag).
+    #[test]
+    fn node_id_trailing_column_roundtrip() {
+        let columns = [
+            ColumnType::Int4,
+            ColumnType::Text,
+            ColumnType::vector(3).unwrap(),
+        ];
+        let values = vec![
+            Some(Datum::Int4(42)),
+            Some(Datum::Text("hello".to_string())),
+            Some(Datum::Vector(vec![1.0, 2.5, -3.0])),
+        ];
+        let bytes = encode_tuple_with_node_id(sample_header(), &columns, &values, 0xCAFE).unwrap();
+        // User columns decode unchanged.
+        let (header, decoded) = decode_tuple(&bytes, &columns).unwrap();
+        assert_eq!(decoded, values);
+        assert_ne!(header.t_infomask2 & HEAP_HAS_NODEID, 0);
+        assert_eq!(tuple_node_id(&bytes, &columns).unwrap(), Some(0xCAFE));
+        // A tuple without the system column reads back None.
+        let plain = encode_tuple(sample_header(), &columns, &values).unwrap();
+        assert_eq!(plain.len(), bytes.len() - 4);
+        assert_eq!(tuple_node_id(&plain, &columns).unwrap(), None);
+    }
+
+    /// The trailing NodeId participates in the strict tail check: a
+    /// tuple with the bit set but a short/long tail is corruption; a NULL
+    /// user column in the mix keeps the walk honest.
+    #[test]
+    fn node_id_tail_is_strictly_checked() {
+        let columns = [ColumnType::Int4, ColumnType::Text, ColumnType::Int8];
+        let values = vec![
+            None, // NULL first column: the bitmap path must not shift the tail
+            Some(Datum::Text("x".repeat(20))),
+            Some(Datum::Int8(-9)),
+        ];
+        let bytes = encode_tuple_with_node_id(sample_header(), &columns, &values, 7).unwrap();
+        assert_eq!(tuple_node_id(&bytes, &columns).unwrap(), Some(7));
+        let (h, decoded) = decode_tuple(&bytes, &columns).unwrap();
+        assert_eq!(decoded, values);
+        assert_ne!(h.t_infomask & HEAP_HASNULL, 0);
+
+        // Short tail (3 bytes) → loud.
+        let short = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            decode_tuple(short, &columns),
+            Err(HeapError::Corrupted(_))
+        ));
+        // The bit survives but the tail is missing entirely → loud.
+        let notail = &bytes[..bytes.len() - 4];
+        assert!(matches!(
+            decode_tuple(notail, &columns),
+            Err(HeapError::Corrupted(_))
+        ));
+        // Bit set by hand on a tuple WITHOUT the payload → loud.
+        let mut forged = encode_tuple(sample_header(), &columns, &values).unwrap();
+        let im2 = u16::from_le_bytes(forged[54..56].try_into().unwrap()) | HEAP_HAS_NODEID;
+        forged[54..56].copy_from_slice(&im2.to_le_bytes());
+        assert!(matches!(
+            decode_tuple(&forged, &columns),
+            Err(HeapError::Corrupted(_))
+        ));
+        // And the reverse defense: a caller-set bit on encode_tuple (no
+        // payload argument) is CLEARED, not trusted.
+        let mut h = sample_header();
+        h.t_infomask2 |= HEAP_HAS_NODEID;
+        let clean = encode_tuple(h, &columns, &values).unwrap();
+        let (h2, _) = decode_tuple(&clean, &columns).unwrap();
+        assert_eq!(h2.t_infomask2 & HEAP_HAS_NODEID, 0);
+        assert_eq!(tuple_node_id(&clean, &columns).unwrap(), None);
     }
 }

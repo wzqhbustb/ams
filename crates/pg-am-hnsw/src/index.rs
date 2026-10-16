@@ -402,6 +402,29 @@ impl HnswIndex {
         wal_writer: &WalWriter,
         vector: &[f32],
     ) -> Result<NodeId> {
+        self.insert_impl(buffer_pool, wal_writer, vector, true)
+    }
+
+    /// Insert WITHOUT the success-boundary flush (M6 Stage C, tech-selection
+    /// §6.2/§10): the transactional form — the caller's commit flush covers
+    /// every record of this sequence (WAL prefix property). Utility callers
+    /// keep using [`Self::insert`] (the M5 boundary-① shape).
+    pub fn insert_unflushed(
+        &self,
+        buffer_pool: &BufferPool,
+        wal_writer: &WalWriter,
+        vector: &[f32],
+    ) -> Result<NodeId> {
+        self.insert_impl(buffer_pool, wal_writer, vector, false)
+    }
+
+    fn insert_impl(
+        &self,
+        buffer_pool: &BufferPool,
+        wal_writer: &WalWriter,
+        vector: &[f32],
+        flush: bool,
+    ) -> Result<NodeId> {
         // Step 0: entry validation (§5) + NodeId space (mirrors
         // graph.rs:472 — the INVALID sentinel stays unallocated). The
         // vector checks touch no shared state; the hwm bound is re-checked
@@ -714,9 +737,13 @@ impl HnswIndex {
         // current END boundary (`current_lsn()` covers the PublishLive
         // record): flush_to's prefix semantics early-exit on a record's
         // own start LSN right after a group-commit wave (its rustdoc).
-        wal_writer
-            .flush_to(wal_writer.current_lsn())
-            .map_err(|e| crate::page::storage_err("insert: success-boundary flush", e))?;
+        // Skipped in the transactional form (insert_unflushed): the
+        // caller's commit flush covers the whole prefix (M6 §6.2/§10).
+        if flush {
+            wal_writer
+                .flush_to(wal_writer.current_lsn())
+                .map_err(|e| crate::page::storage_err("insert: success-boundary flush", e))?;
+        }
         Ok(node_id)
     }
 
@@ -953,6 +980,28 @@ impl HnswIndex {
         wal_writer: &WalWriter,
         node_id: NodeId,
     ) -> Result<()> {
+        self.delete_impl(buffer_pool, wal_writer, node_id, true)
+    }
+
+    /// Delete WITHOUT the success-boundary flush (M6 Stage C, §6.2/§10):
+    /// the transactional form — the caller's commit flush covers the
+    /// tombstone record (WAL prefix property).
+    pub fn delete_unflushed(
+        &self,
+        buffer_pool: &BufferPool,
+        wal_writer: &WalWriter,
+        node_id: NodeId,
+    ) -> Result<()> {
+        self.delete_impl(buffer_pool, wal_writer, node_id, false)
+    }
+
+    fn delete_impl(
+        &self,
+        buffer_pool: &BufferPool,
+        wal_writer: &WalWriter,
+        node_id: NodeId,
+        flush: bool,
+    ) -> Result<()> {
         if u64::from(node_id.0) >= self.hwm() {
             return Err(HnswError::InvalidArgument(format!(
                 "delete: node {} is at/above the high-water mark {} — never allocated",
@@ -1013,9 +1062,12 @@ impl HnswIndex {
         drop(_node_guard);
 
         // Success boundary (same shape as insert's): durable before Ok.
-        wal_writer
-            .flush_to(wal_writer.current_lsn())
-            .map_err(|e| crate::page::storage_err("delete: success-boundary flush", e))?;
+        // Skipped in the transactional form (the commit flush covers it).
+        if flush {
+            wal_writer
+                .flush_to(wal_writer.current_lsn())
+                .map_err(|e| crate::page::storage_err("delete: success-boundary flush", e))?;
+        }
         Ok(())
     }
 
@@ -1470,6 +1522,35 @@ pub fn open(
             probe: Mutex::new(ProbeState::default()),
         },
         warnings,
+    })
+}
+
+/// Read an index's creation-pinned parameters off its meta page into an
+/// [`ExpectedParams`] (M6 Stage C): the self-evidencing form for engine
+/// callers that need to open a handle without carrying the parameters
+/// themselves (the DML hook's lazy open). The expectation check against
+/// these params is trivially satisfied; structural validation still runs
+/// inside [`open`].
+pub fn expected_params_of(
+    buffer_pool: &BufferPool,
+    meta_page_id: PageId,
+) -> Result<ExpectedParams> {
+    let guard = buffer_pool
+        .pin(meta_page_id)
+        .map_err(|e| crate::page::storage_err("expected_params_of: pin meta page", e))?;
+    let page: &[u8; PAGE_SIZE] = guard
+        .page()
+        .try_into()
+        .expect("a buffer frame is exactly PAGE_SIZE");
+    let p = crate::meta::read_meta(page)?;
+    Ok(ExpectedParams {
+        dim: p.dim,
+        m: p.m,
+        m_max0: p.m_max0,
+        ef_construction: p.ef_construction,
+        ef_search_default: p.ef_search_default,
+        metric: p.metric,
+        selection: p.selection,
     })
 }
 

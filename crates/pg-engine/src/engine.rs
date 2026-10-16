@@ -137,7 +137,7 @@ use pg_am_heap::tuple::{decode_tuple, encode_tuple, ColumnType, Datum, TupleHead
 use pg_am_heap::{
     heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM,
 };
-use pg_catalog::builtin_types::{builtin_type, BUILTIN_TYPES};
+use pg_catalog::builtin_types::{column_type_of_attr, BUILTIN_TYPES, VECTOR_OID};
 use pg_catalog::system_tables::{
     SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, PG_ATTRIBUTE, PG_CLASS, PG_INDEX, PG_RELPAGES,
     RELKIND_INDEX, RELKIND_TABLE,
@@ -190,6 +190,12 @@ enum IndexUndoOp {
     Inserted,
     /// The transaction deleted `(key, tid)`; abort re-inserts it.
     Deleted,
+    /// The transaction inserted a graph node (M6 Stage C, tech-selection
+    /// §6.2): abort tombstones it — the node id travels in `key` (4 LE
+    /// bytes), and the entry locates through the index's own meta page.
+    /// There is NO HnswDeleted arm: a delete never touches the graph
+    /// (statement time is heap-xmax only), so there is nothing to undo.
+    HnswInserted,
 }
 
 /// One reversible index maintenance op performed inside a transaction.
@@ -374,10 +380,15 @@ pub struct IndexEntry {
     pub table_oid: Oid,
     /// The indexed column's name (from the index's `pg_attribute` row).
     pub column: String,
-    /// The indexed column's codec type (the B+Tree key type).
+    /// The indexed column's codec type (the B+Tree key type). An HNSW index
+    /// is marked by `ColumnType::Vector(dim)` (M6 Stage C).
     pub key_type: ColumnType,
     /// The index's meta page (`pg_rust_relpages.first_page` of the index).
     pub meta_page: PageId,
+    /// The sidecar NodeId→ctid map B+Tree's meta page (`last_page` of the
+    /// relpages row; M6 Stage C). `None` for B+Tree indexes and for M5-shape
+    /// HNSW registrations (`last == first`).
+    pub map_page: Option<PageId>,
 }
 
 /// The outcome of one [`Engine::vacuum`] pass (M3 Stage D).
@@ -441,6 +452,19 @@ pub struct Engine {
     /// the `pg_index` heap chain; `create_index` appends. Indexes on dropped
     /// tables linger harmlessly: `index_lookup` resolves the table first.
     indexes: RwLock<Vec<IndexEntry>>,
+    /// Live HNSW index handles, keyed by index OID (M6 Stage C): filled at
+    /// `create_hnsw_index*`/`open_hnsw_index` time, lazily opened from the
+    /// meta page on a DML-hook cache miss (self-evidencing parameters via
+    /// [`pg_am_hnsw::index::expected_params_of`]). Shared `&self` handles
+    /// (M6 Stage B), so one per index is enough for all writers.
+    hnsw_handles: Arc<Mutex<std::collections::HashMap<Oid, Arc<pg_am_hnsw::HnswIndex>>>>,
+    /// Post-commit graph actions deferred from statement time, keyed by
+    /// the owning transaction (M6 Stage C, tech-selection §6.2/§8.1: the
+    /// graph is never touched by an UNCOMMITTED delete — the row's xmax IS
+    /// the delete until the commit is durable; tombstones and map removals
+    /// run only after the commit record lands). Discarded untouched on
+    /// abort; replayed idempotently on the commit success path.
+    pending_hnsw: Arc<Mutex<PendingHnswLog>>,
     /// Serializes `create_table` / `drop_table` (see the module docs for the
     /// DDL-vs-DML concurrency scope).
     ddl_lock: Mutex<()>,
@@ -503,6 +527,12 @@ pub struct TxnHandle {
     /// B+Tree construction pieces for applying the undo log.
     buffer_pool: Arc<BufferPool>,
     wal_writer: Arc<WalWriter>,
+    /// Shared with the engine: live HNSW handles (M6 Stage C).
+    hnsw_handles: Arc<Mutex<std::collections::HashMap<Oid, Arc<pg_am_hnsw::HnswIndex>>>>,
+    /// Shared with the engine: post-commit graph actions, replayed on
+    /// commit and DISCARDED on abort (the graph is never touched by an
+    /// uncommitted delete, §6.2/§8.1).
+    pending_hnsw: Arc<Mutex<PendingHnswLog>>,
 }
 
 impl TxnHandle {
@@ -538,7 +568,13 @@ impl TxnHandle {
             // gone), then flip the CLOG bit. If the WAL is broken badly
             // enough that even the abort record cannot append, the process
             // is tearing down anyway; the failure must still be loud.
-            apply_index_undo(&self.index_undo, &self.buffer_pool, &self.wal_writer, xid);
+            apply_index_undo(
+                &self.index_undo,
+                &self.buffer_pool,
+                &self.wal_writer,
+                &self.hnsw_handles,
+                xid,
+            );
             if let Err(e) = self.txn.abort_txn(xid) {
                 tracing::warn!(error = %e, xid = xid.0, "commit failure fallback abort failed");
             }
@@ -550,7 +586,19 @@ impl TxnHandle {
         // Discard the undo log on success only: on failure it was replayed
         // above. On success the entries are durable with the commit.
         if result.is_ok() {
+            // M6 Stage C: the commit record is durable — NOW the deferred
+            // graph actions (tombstone + map removal) may run (never at
+            // statement time, §6.2/§8.1).
+            run_pending_hnsw(
+                xid,
+                &self.pending_hnsw,
+                &self.hnsw_handles,
+                &self.buffer_pool,
+                &self.wal_writer,
+            );
             self.index_undo.lock().remove(&xid);
+        } else {
+            self.pending_hnsw.lock().remove(&xid);
         }
         result?;
         Ok(())
@@ -561,11 +609,20 @@ impl TxnHandle {
     ///
     /// The transaction's index maintenance is reverse-applied from the undo
     /// log BEFORE the CLOG abort lands, so no snapshot can observe a heap
-    /// row whose index entry is already gone (or vice versa).
+    /// row whose index entry is already gone (or vice versa). Deferred
+    /// post-commit graph actions are DISCARDED untouched — the graph was
+    /// never touched by this transaction's deletes (§6.2/§8.1).
     pub fn abort(mut self) -> Result<()> {
         let xid = self.xid.take().expect("abort called twice");
-        apply_index_undo(&self.index_undo, &self.buffer_pool, &self.wal_writer, xid);
+        apply_index_undo(
+            &self.index_undo,
+            &self.buffer_pool,
+            &self.wal_writer,
+            &self.hnsw_handles,
+            xid,
+        );
         let result = self.txn.abort_txn(xid);
+        self.pending_hnsw.lock().remove(&xid);
         self.lock_manager.release_all(xid);
         result?;
         Ok(())
@@ -583,7 +640,13 @@ impl Drop for TxnHandle {
             // No commit-barrier guard is needed here anymore (M2c Stage P):
             // `abort_txn` takes the read guard internally, so the abort's
             // `set_state` cannot race a checkpoint's CLOG flush.
-            apply_index_undo(&self.index_undo, &self.buffer_pool, &self.wal_writer, xid);
+            apply_index_undo(
+                &self.index_undo,
+                &self.buffer_pool,
+                &self.wal_writer,
+                &self.hnsw_handles,
+                xid,
+            );
             if let Err(e) = self.txn.abort_txn(xid) {
                 // Same reporting level as the auto-commit error path: a
                 // failed abort leaks the XID into the active set (its
@@ -591,6 +654,9 @@ impl Drop for TxnHandle {
                 // must be loud even though Drop cannot propagate.
                 tracing::warn!(error = %e, xid = xid.0, "txn handle drop auto-abort failed");
             }
+            // Discard any deferred post-commit graph actions (M6 Stage C:
+            // the graph was never touched by this transaction's deletes).
+            self.pending_hnsw.lock().remove(&xid);
             // Release table locks even when the abort failed: a leaked
             // lock would wedge DDL on the table forever, and the XID is
             // gone from this handle either way.
@@ -630,23 +696,45 @@ fn apply_index_undo(
     log: &Mutex<HashMap<TxnId, Vec<IndexUndo>>>,
     buffer_pool: &Arc<BufferPool>,
     wal_writer: &Arc<WalWriter>,
+    hnsw_handles: &Mutex<std::collections::HashMap<Oid, Arc<pg_am_hnsw::HnswIndex>>>,
     xid: TxnId,
 ) {
     let entries = log.lock().remove(&xid).unwrap_or_default();
     let btree = BTreeAM::new(Arc::clone(buffer_pool), Arc::clone(wal_writer));
     for undo in entries.into_iter().rev() {
-        let result = btree
-            .open_index(
-                undo.index.index_oid,
-                undo.index.meta_page,
-                undo.index.key_type,
-            )
-            .and_then(|mut index| match undo.op {
-                IndexUndoOp::Inserted => index.delete(&undo.key, undo.tid),
-                IndexUndoOp::Deleted => {
-                    index.insert_with_budget(&undo.key, undo.tid, UNDO_INSERT_RESTART_BUDGET)
-                }
-            });
+        let result = match undo.op {
+            // M6 Stage C: an insert's graph node is tombstoned on abort —
+            // the NodeId rides in `key` (4 LE bytes).
+            IndexUndoOp::HnswInserted => {
+                pending_hnsw_handle(hnsw_handles, &undo.index, buffer_pool, wal_writer)
+                    .map_err(|e| e.to_string())
+                    .and_then(|handle| {
+                        let node_id = u32::from_le_bytes(
+                            undo.key
+                                .as_slice()
+                                .try_into()
+                                .expect("HnswInserted key is 4 bytes"),
+                        );
+                        handle
+                            .delete(buffer_pool, wal_writer, pg_am_hnsw::NodeId(node_id))
+                            .map_err(|e| format!("hnsw abort tombstone: {e}"))
+                    })
+            }
+            IndexUndoOp::Inserted | IndexUndoOp::Deleted => btree
+                .open_index(
+                    undo.index.index_oid,
+                    undo.index.meta_page,
+                    undo.index.key_type,
+                )
+                .and_then(|mut index| match undo.op {
+                    IndexUndoOp::Inserted => index.delete(&undo.key, undo.tid),
+                    IndexUndoOp::Deleted => {
+                        index.insert_with_budget(&undo.key, undo.tid, UNDO_INSERT_RESTART_BUDGET)
+                    }
+                    IndexUndoOp::HnswInserted => unreachable!(),
+                })
+                .map_err(|e| e.to_string()),
+        };
         if let Err(e) = result {
             tracing::error!(
                 error = %e,
@@ -666,6 +754,101 @@ fn apply_index_undo(
 /// bounds the abort path at seconds, while a genuinely wedged tree still
 /// terminates and is logged at ERROR level.
 const UNDO_INSERT_RESTART_BUDGET: usize = 1 << 20;
+
+/// The deferred-action log's entry type (clarity for the field
+/// declarations; clippy type_complexity).
+type PendingHnswLog = HashMap<TxnId, Vec<(IndexEntry, PendingHnswAction)>>;
+
+/// A post-commit graph action deferred from statement time (M6 Stage C,
+/// tech-selection §6.2/§8.1: the graph is never touched by an uncommitted
+/// delete — the row's xmax IS the delete until the commit is durable).
+/// Idempotent: replay after a crash is a no-op against the same state.
+#[derive(Debug, Clone, Copy)]
+enum PendingHnswAction {
+    /// Tombstone the node AND remove its map entry (row delete, or a
+    /// vector-column update where the old vector leaves the graph).
+    Tombstone { node_id: u32, tid: Tid },
+    /// Remove the map entry only (a non-HOT non-vector-column update: the
+    /// node lives on under the new row version; only its ctid moves).
+    MapRemove { node_id: u32, tid: Tid },
+}
+
+/// Replay the deferred post-commit graph actions of a committed
+/// transaction (M6 Stage C): tombstones and map removals. Idempotent and
+/// best-effort-after-durability: a failure leaves a residue the Stage E
+/// dead-row channel reclaims (the row IS dead either way) and is loud in
+/// the log, never silently swallowed.
+fn run_pending_hnsw(
+    xid: TxnId,
+    pending_hnsw: &Mutex<PendingHnswLog>,
+    hnsw_handles: &Mutex<std::collections::HashMap<Oid, Arc<pg_am_hnsw::HnswIndex>>>,
+    buffer_pool: &Arc<BufferPool>,
+    wal_writer: &Arc<WalWriter>,
+) {
+    let actions = pending_hnsw.lock().remove(&xid).unwrap_or_default();
+    for (idx, action) in actions {
+        if let Err(e) = pending_hnsw_one(&idx, action, hnsw_handles, buffer_pool, wal_writer) {
+            tracing::warn!(error = %e, index_oid = idx.index_oid.0, node = ?action, "post-commit hnsw cleanup failed; the Stage E dead-row channel reclaims the residue");
+        }
+    }
+}
+
+fn pending_hnsw_one(
+    idx: &IndexEntry,
+    action: PendingHnswAction,
+    hnsw_handles: &Mutex<std::collections::HashMap<Oid, Arc<pg_am_hnsw::HnswIndex>>>,
+    buffer_pool: &Arc<BufferPool>,
+    wal_writer: &Arc<WalWriter>,
+) -> Result<()> {
+    match action {
+        PendingHnswAction::Tombstone { node_id, tid } => {
+            // Graph tombstone first, then the map entry.
+            let handle = pending_hnsw_handle(hnsw_handles, idx, buffer_pool, wal_writer)?;
+            handle.delete(buffer_pool, wal_writer, pg_am_hnsw::NodeId(node_id))?;
+            pending_map_remove(idx, node_id, tid, buffer_pool, wal_writer)?;
+        }
+        PendingHnswAction::MapRemove { node_id, tid } => {
+            pending_map_remove(idx, node_id, tid, buffer_pool, wal_writer)?;
+        }
+    }
+    Ok(())
+}
+
+fn pending_hnsw_handle(
+    handles: &Mutex<std::collections::HashMap<Oid, Arc<pg_am_hnsw::HnswIndex>>>,
+    idx: &IndexEntry,
+    buffer_pool: &Arc<BufferPool>,
+    wal_writer: &Arc<WalWriter>,
+) -> Result<Arc<pg_am_hnsw::HnswIndex>> {
+    if let Some(h) = handles.lock().get(&idx.index_oid) {
+        return Ok(Arc::clone(h));
+    }
+    let expected = pg_am_hnsw::index::expected_params_of(buffer_pool, idx.meta_page)?;
+    let outcome = pg_am_hnsw::index::open(buffer_pool, wal_writer, idx.meta_page, &expected)?;
+    let h = Arc::new(outcome.index);
+    handles.lock().insert(idx.index_oid, Arc::clone(&h));
+    Ok(h)
+}
+
+fn pending_map_remove(
+    idx: &IndexEntry,
+    node_id: u32,
+    tid: Tid,
+    buffer_pool: &Arc<BufferPool>,
+    wal_writer: &Arc<WalWriter>,
+) -> Result<()> {
+    let map_page = idx.map_page.expect("hnsw index carries map_page");
+    let mut map = pg_am_btree::BTreeIndex::open(
+        Arc::clone(buffer_pool),
+        Arc::clone(wal_writer),
+        idx.index_oid,
+        map_page,
+        ColumnType::Int8,
+    )?;
+    let key = encode_key(&Datum::Int8(i64::from(node_id)))?;
+    map.delete(&key, tid)?;
+    Ok(())
+}
 
 impl Engine {
     /// Open (or create) a database at `data_dir`, assembling all layers.
@@ -796,6 +979,8 @@ impl Engine {
             deadlock_detector,
             registry: RwLock::new(registry),
             indexes: RwLock::new(indexes),
+            hnsw_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending_hnsw: Arc::new(Mutex::new(HashMap::new())),
             ddl_lock: Mutex::new(()),
             instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             index_undo: Arc::new(Mutex::new(HashMap::new())),
@@ -865,15 +1050,15 @@ impl Engine {
             };
             let mut columns = Vec::with_capacity(row.natts as usize);
             for attr in catalog.attributes_of(row.oid) {
-                let ty = builtin_type(attr.type_oid).ok_or_else(|| {
+                let col_type = column_type_of_attr(attr.type_oid, attr.len).ok_or_else(|| {
                     EngineError::Corrupted(format!(
-                        "{}.{}: unknown type OID {:?}",
-                        row.name, attr.name, attr.type_oid
+                        "{}.{}: unknown type OID {:?} or malformed vector len {}",
+                        row.name, attr.name, attr.type_oid, attr.len
                     ))
                 })?;
                 columns.push(ColumnDef {
                     name: attr.name.clone(),
-                    col_type: ty.column_type,
+                    col_type,
                 });
             }
             if registry
@@ -941,18 +1126,19 @@ impl Engine {
                 );
                 continue;
             };
-            let ty = builtin_type(attr.type_oid).ok_or_else(|| {
+            let key_type = column_type_of_attr(attr.type_oid, attr.len).ok_or_else(|| {
                 EngineError::Corrupted(format!(
-                    "index {index_oid}: unknown type OID {:?}",
-                    attr.type_oid
+                    "index {index_oid}: unknown type OID {:?} or malformed vector len {}",
+                    attr.type_oid, attr.len
                 ))
             })?;
             indexes.push(IndexEntry {
                 index_oid,
                 table_oid: Oid(*indrelid as u64),
                 column: attr.name.clone(),
-                key_type: ty.column_type,
+                key_type,
                 meta_page: relpages.first_page,
+                map_page: (relpages.last_page != relpages.first_page).then_some(relpages.last_page),
             });
         }
         Ok(indexes)
@@ -1312,8 +1498,182 @@ impl Engine {
             column: column.to_string(),
             key_type,
             meta_page,
+            map_page: None,
         });
         Ok(index_oid)
+    }
+
+    /// Create an HNSW index ON a table column (M6 Stage C, tech-selection
+    /// §7/§11): the table-linked form of [`Self::create_hnsw_index`].
+    /// Validates the column is `VECTOR(dim)` with the same dim, creates the
+    /// graph and the sidecar NodeId→ctid map, registers the catalog rows
+    /// (pg_class/pg_attribute/pg_index/relpages with `last_page` = map),
+    /// and pushes the registry entry so DML hooks see the index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_hnsw_index_on(
+        &self,
+        table: &str,
+        column: &str,
+        params: pg_am_hnsw::HnswParams,
+        dim: u16,
+        metric: pg_am_hnsw::Metric,
+        selection: pg_am_hnsw::NeighborSelection,
+        rng_seed: u64,
+    ) -> Result<(Oid, PageId)> {
+        let _ddl = self.ddl_lock.lock();
+        let entry = self.table_entry(table)?;
+        let col_index = entry
+            .columns
+            .iter()
+            .position(|c| c.name == column)
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("table {table:?} has no column {column:?}"))
+            })?;
+        let col_type = entry.columns[col_index].col_type;
+        let ColumnType::Vector(col_dim) = col_type else {
+            return Err(EngineError::InvalidArgument(format!(
+                "hnsw index requires a VECTOR column; {table}({column}) is {col_type:?}"
+            )));
+        };
+        if col_dim != u32::from(dim) {
+            return Err(EngineError::InvalidArgument(format!(
+                "hnsw index dim {dim} does not match column {table}({column}) VECTOR({col_dim})"
+            )));
+        }
+        if self
+            .indexes
+            .read()
+            .iter()
+            .any(|e| e.table_oid == entry.oid && e.column == column)
+        {
+            return Err(EngineError::IndexExists(format!("{table}({column})")));
+        }
+        // M6 Stage C review P2-2: at most ONE HNSW index per table — the
+        // row carries a single trailing NodeId (§7 (b)), so a second
+        // vector index would never be maintained by the DML hooks (they
+        // take the first match). Refuse loudly.
+        if self
+            .indexes
+            .read()
+            .iter()
+            .any(|e| e.table_oid == entry.oid && matches!(e.key_type, ColumnType::Vector(_)))
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "table {table:?} already has an HNSW index (one per table: the row carries a single NodeId)"
+            )));
+        }
+        // M6 Stage C review P2-1: index creation does NOT backfill
+        // existing rows (a creation-time scan + bulk load is out of the M6
+        // scope) — creating on a NON-EMPTY table is loudly refused, so no
+        // pre-existing row can silently escape the graph. The emptiness
+        // check runs under the table's EXCLUSIVE lock with a re-taken
+        // snapshot (btree create_index's exact shape, :1447): an in-flight
+        // writer's uncommitted row would be invisible to a bare SI scan —
+        // the lock waits it out, so committed rows are seen (refused) and
+        // aborted rows vanish (allowed).
+        let nonempty = self.auto_commit(|snap| {
+            let _locked = self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
+            // Re-take the snapshot AFTER the lock wait (the auto-commit
+            // snapshot predates it — btree create_index's precedent).
+            let (mut snap, _re_guard) = self.txn.snapshot(snap.current_xid());
+            snap.advance_curcid();
+            Ok(!self.scan_inner(&snap, table, None)?.is_empty())
+        })?;
+        if nonempty {
+            return Err(EngineError::InvalidArgument(format!(
+                "create_hnsw_index_on: table {table:?} is not empty (M6 creates indexes on empty tables only — no backfill)"
+            )));
+        }
+
+        let index = pg_am_hnsw::index::create(
+            self.storage.buffer_pool(),
+            self.storage.wal_writer(),
+            params,
+            dim,
+            metric,
+            selection,
+            rng_seed,
+        )?;
+        let meta_page = index.meta_page_id();
+        let index_oid = self.catalog.oid_allocator().alloc();
+        let map = pg_am_btree::BTreeIndex::create(
+            std::sync::Arc::clone(self.storage.buffer_pool()),
+            std::sync::Arc::clone(self.storage.wal_writer()),
+            self.catalog.oid_allocator().alloc(),
+            ColumnType::Int8,
+        )?;
+        let map_page = map.meta_page();
+        self.auto_commit(|snap| {
+            self.create_hnsw_index_catalog_rows(
+                snap, &entry, column, index_oid, meta_page, map_page, dim,
+            )
+        })?;
+        self.hnsw_handles.lock().insert(index_oid, Arc::new(index));
+        self.indexes.write().push(IndexEntry {
+            index_oid,
+            table_oid: entry.oid,
+            column: column.to_string(),
+            key_type: ColumnType::Vector(u32::from(dim)),
+            meta_page,
+            map_page: Some(map_page),
+        });
+        Ok((index_oid, meta_page))
+    }
+
+    /// The catalog rows of a table-linked HNSW index (M6 Stage C): same
+    /// four-row shape as [`Self::create_index_catalog_rows`] but the AM row
+    /// is HNSW_AM_OID, the attribute carries VECTOR_OID with len = dim × 4,
+    /// and the relpages row's `last_page` records the sidecar map's meta
+    /// page. Runs inside the caller's auto-commit.
+    #[allow(clippy::too_many_arguments)]
+    fn create_hnsw_index_catalog_rows(
+        &self,
+        snap: &Snapshot,
+        entry: &TableEntry,
+        column: &str,
+        index_oid: Oid,
+        meta_page: PageId,
+        map_page: PageId,
+        dim: u16,
+    ) -> Result<()> {
+        let class_row = vec![
+            Some(Datum::Int8(index_oid.0 as i64)),
+            Some(Datum::Text(format!("{}_{column}_hnsw_idx", entry.oid.0))),
+            Some(Datum::Text(RELKIND_INDEX.to_string())),
+            Some(Datum::Int4(1)),
+            Some(Datum::Int8(0)),
+            Some(Datum::Int8(pg_catalog::system_tables::HNSW_AM_OID.0 as i64)),
+        ];
+        self.insert_catalog_row(snap, &PG_CLASS, &class_row)?;
+
+        let attr_row = vec![
+            Some(Datum::Int8(index_oid.0 as i64)),
+            Some(Datum::Text(column.to_string())),
+            Some(Datum::Int8(VECTOR_OID.raw().0 as i64)),
+            Some(Datum::Int4(dim as i32 * 4)),
+            Some(Datum::Int4(1)),
+            Some(Datum::Int4(0)),
+            Some(Datum::Int4(1)),
+        ];
+        self.insert_catalog_row(snap, &PG_ATTRIBUTE, &attr_row)?;
+
+        let index_row = vec![
+            Some(Datum::Int8(index_oid.0 as i64)),
+            Some(Datum::Int8(entry.oid.0 as i64)),
+            Some(Datum::Int4(1)),
+            Some(Datum::Int4(0)),
+            Some(Datum::Int4(0)),
+        ];
+        self.insert_catalog_row(snap, &PG_INDEX, &index_row)?;
+
+        let relpages_row = vec![
+            Some(Datum::Int8(index_oid.0 as i64)),
+            Some(Datum::Int8(meta_page.0 as i64)),
+            Some(Datum::Int8(map_page.0 as i64)),
+            Some(Datum::Int8(1)),
+        ];
+        self.insert_catalog_row(snap, &PG_RELPAGES, &relpages_row)?;
+        Ok(())
     }
 
     /// Create an HNSW vector index and register its meta page in
@@ -1365,19 +1725,40 @@ impl Engine {
         )?;
         let meta_page_id = index.meta_page_id();
         let index_oid = self.catalog.oid_allocator().alloc();
+        // M6 Stage C: the sidecar NodeId→ctid map B+Tree is created with the
+        // index (tech-selection §7 (c)). Its meta page is recorded in the
+        // relpages row's `last_page` (the row's `first_page` stays the HNSW
+        // meta page; `last_page == first_page` means "no map" — the M5
+        // registration shape).
+        let map = pg_am_btree::BTreeIndex::create(
+            std::sync::Arc::clone(self.storage.buffer_pool()),
+            std::sync::Arc::clone(self.storage.wal_writer()),
+            self.catalog.oid_allocator().alloc(),
+            pg_am_heap::tuple::ColumnType::Int8,
+        )?;
+        let map_page = map.meta_page();
         self.auto_commit(|snap| {
             let relpages_row = vec![
                 Some(Datum::Int8(index_oid.0 as i64)),
                 Some(Datum::Int8(meta_page_id.0 as i64)),
-                Some(Datum::Int8(meta_page_id.0 as i64)),
+                Some(Datum::Int8(map_page.0 as i64)),
                 Some(Datum::Int8(1)),
             ];
             self.insert_catalog_row(snap, &PG_RELPAGES, &relpages_row)
         })?;
         Ok((index_oid, meta_page_id))
     }
+}
 
-    /// Look up an HNSW index's meta page by its catalog OID (the
+/// Which relpages field an HNSW lookup reads (M6 Stage C: `last_page`
+/// carries the sidecar map B+Tree's meta page; `last == first` means
+/// "no map", the M5 registration shape).
+enum RelpagesField {
+    FirstPage,
+    MapPage,
+}
+
+impl Engine {
     /// `pg_rust_relpages.first_page` of the minimal registration). Returns
     /// `Ok(None)` when no such row exists. The lookup SCANS `pg_rust_relpages`
     /// through the heap AM (same read path the registry rebuild uses at
@@ -1386,6 +1767,18 @@ impl Engine {
     /// function used the cache and returned `None` right after
     /// `create_hnsw_index`; the heap scan is always fresh).
     pub fn hnsw_index_first_page(&self, oid: Oid) -> Result<Option<PageId>> {
+        self.hnsw_relpages_field(oid, RelpagesField::FirstPage)
+    }
+
+    /// The sidecar map B+Tree's meta page for an HNSW index (M6 Stage C):
+    /// the relpages row's `last_page`. Returns `Ok(None)` when no row
+    /// exists OR the row is an M5-shape registration (last == first = the
+    /// HNSW meta page = "no sidecar map").
+    pub fn hnsw_index_map_page(&self, oid: Oid) -> Result<Option<PageId>> {
+        self.hnsw_relpages_field(oid, RelpagesField::MapPage)
+    }
+
+    fn hnsw_relpages_field(&self, oid: Oid, field: RelpagesField) -> Result<Option<PageId>> {
         let columns = PG_RELPAGES.column_types();
         let rows = self.heap.scan(ScanContext {
             rel: RelationDesc {
@@ -1406,10 +1799,116 @@ impl Engine {
                         "pg_rust_relpages row with non-int8 first_page".to_string(),
                     ));
                 };
-                return Ok(Some(PageId(*first_page as u64)));
+                let Some(Datum::Int8(last_page)) = &values[2] else {
+                    return Err(EngineError::Corrupted(
+                        "pg_rust_relpages row with non-int8 last_page".to_string(),
+                    ));
+                };
+                return Ok(match field {
+                    RelpagesField::FirstPage => Some(PageId(*first_page as u64)),
+                    RelpagesField::MapPage => {
+                        if *last_page == *first_page {
+                            None
+                        } else {
+                            Some(PageId(*last_page as u64))
+                        }
+                    }
+                });
             }
         }
         Ok(None)
+    }
+
+    /// Put a NodeId → ctid entry into the index's sidecar map (M6 Stage C
+    /// §7). The B+Tree's IndexUndo pair carries transactional semantics
+    /// (insert-abort removes the entry); the map lives and dies with the
+    /// index's relpages registration.
+    pub fn hnsw_map_put(&self, index_oid: Oid, node_id: u32, ctid: Tid) -> Result<()> {
+        let mut map = self.open_hnsw_map(index_oid)?.ok_or_else(|| {
+            EngineError::InvalidArgument(format!("hnsw index {index_oid:?} has no sidecar map"))
+        })?;
+        let key = pg_am_btree::encode_key(&Datum::Int8(i64::from(node_id)))?;
+        Ok(map.insert(&key, ctid)?)
+    }
+
+    /// Point-lookup a NodeId in the sidecar map.
+    pub fn hnsw_map_get(&self, index_oid: Oid, node_id: u32) -> Result<Option<Tid>> {
+        let Some(map) = self.open_hnsw_map(index_oid)? else {
+            return Ok(None);
+        };
+        let key = pg_am_btree::encode_key(&Datum::Int8(i64::from(node_id)))?;
+        Ok(map.lookup(&key)?)
+    }
+
+    /// Remove a NodeId → ctid entry (post-commit delete cleanup).
+    pub fn hnsw_map_remove(&self, index_oid: Oid, node_id: u32, ctid: Tid) -> Result<()> {
+        let mut map = self.open_hnsw_map(index_oid)?.ok_or_else(|| {
+            EngineError::InvalidArgument(format!("hnsw index {index_oid:?} has no sidecar map"))
+        })?;
+        let key = pg_am_btree::encode_key(&Datum::Int8(i64::from(node_id)))?;
+        Ok(map.delete(&key, ctid)?)
+    }
+
+    /// Put a map entry into an HNSW index's sidecar map AND record the
+    /// insert-undo pair (M6 Stage C). The map B+Tree shares the index
+    /// family's rel_oid (WAL-record identity only).
+    fn hnsw_map_put_txn(&self, xid: TxnId, idx: &IndexEntry, node_id: u32, tid: Tid) -> Result<()> {
+        let map_page = idx.map_page.expect("hnsw index carries map_page");
+        let mut map = pg_am_btree::BTreeIndex::open(
+            Arc::clone(self.storage.buffer_pool()),
+            Arc::clone(self.storage.wal_writer()),
+            idx.index_oid,
+            map_page,
+            ColumnType::Int8,
+        )?;
+        let key = encode_key(&Datum::Int8(i64::from(node_id)))?;
+        map.insert(&key, tid)?;
+        let map_entry = IndexEntry {
+            index_oid: idx.index_oid,
+            table_oid: idx.table_oid,
+            column: idx.column.clone(),
+            key_type: ColumnType::Int8,
+            meta_page: map_page,
+            map_page: None,
+        };
+        self.record_index_undo(xid, &map_entry, key, tid, IndexUndoOp::Inserted);
+        Ok(())
+    }
+
+    fn open_hnsw_map(&self, index_oid: Oid) -> Result<Option<pg_am_btree::BTreeIndex>> {
+        let Some(meta_page) = self.hnsw_index_map_page(index_oid)? else {
+            return Ok(None);
+        };
+        Ok(Some(pg_am_btree::BTreeIndex::open(
+            std::sync::Arc::clone(self.storage.buffer_pool()),
+            std::sync::Arc::clone(self.storage.wal_writer()),
+            index_oid,
+            meta_page,
+            pg_am_heap::tuple::ColumnType::Int8,
+        )?))
+    }
+
+    /// The shared HNSW handle for an index OID (M6 Stage C): cache-hit
+    /// returns it; a miss opens the index from its meta page with
+    /// self-evidencing parameters ([`pg_am_hnsw::index::expected_params_of`])
+    /// and caches the handle.
+    fn hnsw_handle(&self, idx: &IndexEntry) -> Result<Arc<pg_am_hnsw::HnswIndex>> {
+        if let Some(h) = self.hnsw_handles.lock().get(&idx.index_oid) {
+            return Ok(Arc::clone(h));
+        }
+        let expected =
+            pg_am_hnsw::index::expected_params_of(self.storage.buffer_pool(), idx.meta_page)?;
+        let outcome = pg_am_hnsw::index::open(
+            self.storage.buffer_pool(),
+            self.storage.wal_writer(),
+            idx.meta_page,
+            &expected,
+        )?;
+        let handle = Arc::new(outcome.index);
+        self.hnsw_handles
+            .lock()
+            .insert(idx.index_oid, Arc::clone(&handle));
+        Ok(handle)
     }
 
     /// Open an HNSW index by its meta page (thin wrapper over the
@@ -1765,8 +2264,58 @@ impl Engine {
     /// redundant recursive `registry.read()` per row.
     fn insert_inner(&self, snap: &Snapshot, entry: &TableEntry, values: &[Value]) -> Result<Tid> {
         let col_types = column_types(entry);
-        let tuple = encode_row(entry, &col_types, values, snap.curcid())?;
         let indexes = self.indexes_of(entry);
+
+        // M6 Stage C (tech-selection §7/§11): at most ONE hnsw index per
+        // table (the row carries a single trailing NodeId, §7 (b)). The
+        // graph insert runs BEFORE the row encoding so the NodeId travels
+        // inside the tuple (encode_tuple_with_node_id); a NULL vector
+        // column skips the graph entirely (no node, no trailing id, no map
+        // entry).
+        let hnsw = indexes
+            .iter()
+            .find(|(idx, _)| matches!(idx.key_type, ColumnType::Vector(_)));
+        let mut node_id: Option<u32> = None;
+        if let Some((idx, col_index)) = hnsw {
+            if let Some(Datum::Vector(v)) = &values[*col_index] {
+                let handle = self.hnsw_handle(idx)?;
+                // Transactional form (M6 §6.2/§10): NO per-insert flush —
+                // the commit record's flush covers this sequence (WAL
+                // prefix property). The utility form (`hnsw_insert`)
+                // keeps the M5 success boundary.
+                let id = handle.insert_unflushed(
+                    self.storage.buffer_pool(),
+                    self.storage.wal_writer(),
+                    v,
+                )?;
+                node_id = Some(id.0);
+                // Abort pairing (M6 Stage C §6.2): if this transaction
+                // aborts, the node is tombstoned — the NodeId is the key.
+                self.index_undo
+                    .lock()
+                    .entry(snap.current_xid())
+                    .or_default()
+                    .push(IndexUndo {
+                        index: (*idx).clone(),
+                        key: id.0.to_le_bytes().to_vec(),
+                        tid: Tid {
+                            page_id: PageId::INVALID,
+                            slot_id: 0,
+                        },
+                        op: IndexUndoOp::HnswInserted,
+                    });
+            }
+        }
+
+        let tuple = match node_id {
+            Some(nid) => pg_am_heap::tuple::encode_tuple_with_node_id(
+                tuple_header(snap.curcid()),
+                &col_types,
+                values,
+                nid,
+            )?,
+            None => encode_row(entry, &col_types, values, snap.curcid())?,
+        };
         let mut out_tid = Tid {
             page_id: PageId::INVALID,
             slot_id: 0,
@@ -1777,7 +2326,13 @@ impl Engine {
             tuple: &tuple,
             out_tid: Some(&mut out_tid),
         })?;
+
+        // B+Tree index maintenance (skip the HNSW index — it is not a
+        // B+Tree key type; its maintenance is the graph insert + map put).
         for (idx, col_index) in &indexes {
+            if matches!(idx.key_type, ColumnType::Vector(_)) {
+                continue;
+            }
             if let Some(datum) = &values[*col_index] {
                 let key = encode_key(datum)?;
                 self.open_btree(idx)?.insert(&key, out_tid)?;
@@ -1789,6 +2344,12 @@ impl Engine {
                     IndexUndoOp::Inserted,
                 );
             }
+        }
+
+        // The sidecar map entry, transactional via the map B+Tree's own
+        // IndexUndo pair (insert-abort removes it).
+        if let (Some((idx, _)), Some(nid)) = (hnsw, node_id) {
+            self.hnsw_map_put_txn(snap.current_xid(), idx, nid, out_tid)?;
         }
         Ok(out_tid)
     }
@@ -1857,12 +2418,57 @@ impl Engine {
     ) -> Result<Tid> {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
-        let tuple = encode_row(&entry, &col_types, values, snap.curcid())?;
         let indexes = self.indexes_of(&entry);
-        let old_values = if indexes.is_empty() {
-            Vec::new()
+
+        // M6 Stage C: with an HNSW index on the table, read back the old
+        // row's trailing NodeId alongside its values.
+        let hnsw = indexes
+            .iter()
+            .find(|(idx, _)| matches!(idx.key_type, ColumnType::Vector(_)));
+        let (old_values, old_node_id) = if !indexes.is_empty() {
+            self.read_row_by_tid_with_node_id(&entry, &col_types, tid)?
         } else {
-            self.read_row_by_tid(&entry, &col_types, tid)?
+            (Vec::new(), None)
+        };
+
+        // Did the vector column change? (HOT eligibility below compares
+        // values per indexed column; the vector column participates.)
+        let vector_changed = match hnsw {
+            Some((_, ci)) => values.get(*ci) != old_values.get(*ci),
+            None => false,
+        };
+
+        // The new row's NodeId: a vector-column change draws a fresh graph
+        // node; an unchanged vector keeps the old one (and NULL on either
+        // side carries none).
+        let mut new_node_id: Option<u32> = None;
+        if let Some((idx, ci)) = hnsw {
+            match (vector_changed, values.get(*ci)) {
+                (true, Some(Some(Datum::Vector(v)))) => {
+                    let handle = self.hnsw_handle(idx)?;
+                    new_node_id = Some(
+                        handle
+                            .insert_unflushed(
+                                self.storage.buffer_pool(),
+                                self.storage.wal_writer(),
+                                v,
+                            )?
+                            .0,
+                    );
+                }
+                (true, _) => {} // became NULL: no node
+                (false, _) => new_node_id = old_node_id,
+            }
+        }
+
+        let tuple = match new_node_id {
+            Some(nid) => pg_am_heap::tuple::encode_tuple_with_node_id(
+                tuple_header(snap.curcid()),
+                &col_types,
+                values,
+                nid,
+            )?,
+            None => encode_row(&entry, &col_types, values, snap.curcid())?,
         };
         let hot_eligible = !indexes.is_empty()
             && indexes
@@ -1884,7 +2490,9 @@ impl Engine {
         // Skip index maintenance when HOT was actually applied (same-page
         // update with unchanged key columns): the old index entry still
         // points to the chain root, and scan follows t_ctid to the new
-        // version. Cross-page fallback reverts to the non-HOT path.
+        // version. For HNSW the same holds: the row keeps its NodeId, the
+        // map entry keeps pointing at the chain root. Cross-page fallback
+        // reverts to the non-HOT path.
         let hot_applied = hot_eligible && out_tid.page_id == tid.page_id;
         if !hot_applied {
             // The entry to remove belongs to the chain root: `tid` itself may
@@ -1895,6 +2503,9 @@ impl Engine {
                 self.hot_chain_root(tid)?
             };
             for (idx, col_index) in &indexes {
+                if matches!(idx.key_type, ColumnType::Vector(_)) {
+                    continue;
+                }
                 let mut index = self.open_btree(idx)?;
                 if let Some(old_datum) = &old_values[*col_index] {
                     let key = encode_key(old_datum)?;
@@ -1917,6 +2528,34 @@ impl Engine {
                         out_tid,
                         IndexUndoOp::Inserted,
                     );
+                }
+            }
+            // HNSW maintenance (M6 Stage C):
+            // - The NEW map entry goes in-transaction (insert undo pair).
+            // - The OLD node's removal is DEFERRED to post-commit
+            //   (pending_hnsw): tombstone for a vector change, map-only for
+            //   a plain ctid move.
+            if let Some((idx, _)) = hnsw {
+                if let Some(nid) = new_node_id {
+                    self.hnsw_map_put_txn(snap.current_xid(), idx, nid, out_tid)?;
+                }
+                if let Some(old_nid) = old_node_id {
+                    let action = if vector_changed {
+                        PendingHnswAction::Tombstone {
+                            node_id: old_nid,
+                            tid: index_tid,
+                        }
+                    } else {
+                        PendingHnswAction::MapRemove {
+                            node_id: old_nid,
+                            tid: index_tid,
+                        }
+                    };
+                    self.pending_hnsw
+                        .lock()
+                        .entry(snap.current_xid())
+                        .or_default()
+                        .push(((*idx).clone(), action));
                 }
             }
         }
@@ -1943,10 +2582,15 @@ impl Engine {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
         let indexes = self.indexes_of(&entry);
-        let old_values = if indexes.is_empty() {
-            Vec::new()
+        let hnsw = indexes
+            .iter()
+            .find(|(idx, _)| matches!(idx.key_type, ColumnType::Vector(_)));
+        // M6 Stage C: with an HNSW index the old row's trailing NodeId is
+        // read back alongside its values.
+        let (old_values, old_node_id) = if !indexes.is_empty() {
+            self.read_row_by_tid_with_node_id(&entry, &col_types, tid)?
         } else {
-            self.read_row_by_tid(&entry, &col_types, tid)?
+            (Vec::new(), None)
         };
         // The entry to remove belongs to the chain root: `tid` itself may be a
         // HOT descendant, which never got an entry of its own.
@@ -1962,6 +2606,9 @@ impl Engine {
             clog: self.clog.as_ref(),
         })?;
         for (idx, col_index) in &indexes {
+            if matches!(idx.key_type, ColumnType::Vector(_)) {
+                continue;
+            }
             if let Some(old_datum) = &old_values[*col_index] {
                 let key = encode_key(old_datum)?;
                 self.open_btree(idx)?.delete(&key, index_tid)?;
@@ -1973,6 +2620,22 @@ impl Engine {
                     IndexUndoOp::Deleted,
                 );
             }
+        }
+        // M6 Stage C: the graph is NEVER touched at statement time (the
+        // row's xmax IS the delete until the commit is durable). The
+        // tombstone + map removal are deferred to post-commit.
+        if let (Some((idx, _)), Some(old_nid)) = (hnsw, old_node_id) {
+            self.pending_hnsw
+                .lock()
+                .entry(snap.current_xid())
+                .or_default()
+                .push((
+                    (*idx).clone(),
+                    PendingHnswAction::Tombstone {
+                        node_id: old_nid,
+                        tid: index_tid,
+                    },
+                ));
         }
         Ok(())
     }
@@ -2143,14 +2806,28 @@ impl Engine {
         col_types: &[ColumnType],
         tid: Tid,
     ) -> Result<Vec<Value>> {
+        let (values, _) = self.read_row_by_tid_with_node_id(entry, col_types, tid)?;
+        Ok(values)
+    }
+
+    /// Read back a row's values AND its trailing NodeId (M6 Stage C):
+    /// `None` for a row without the system column (no HNSW index, or a
+    /// NULL vector at insert time).
+    fn read_row_by_tid_with_node_id(
+        &self,
+        entry: &TableEntry,
+        col_types: &[ColumnType],
+        tid: Tid,
+    ) -> Result<(Vec<Value>, Option<u32>)> {
         let guard = self.storage.buffer_pool().pin(tid.page_id)?;
         let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
         let bytes = SlottedPage::tuple(page, tid.slot_id)?.ok_or_else(|| {
             EngineError::Corrupted(format!("no tuple at {tid} for index key readback"))
         })?;
+        let node_id = pg_am_heap::tuple::tuple_node_id(bytes, col_types)?;
         let (_header, values) = decode_tuple(bytes, col_types)?;
         debug_assert_eq!(values.len(), entry.columns.len());
-        Ok(values)
+        Ok((values, node_id))
     }
 
     /// Find the first WAL record whose start lies inside segment `segment_id`
@@ -2344,6 +3021,13 @@ impl Engine {
             let old_values = self.read_row_by_tid(entry, col_types, tid)?;
             let index_tid = self.hot_chain_root(tid)?;
             for (idx, col_index) in &indexes {
+                // M6 Stage C: an HNSW index is not a B+Tree key shape — its
+                // graph/sidecar compensation is the C-logic of its own
+                // (loser inserts are replayed by redo and hidden by the
+                // row filter; loser deletes never touched the graph). Skip.
+                if matches!(idx.key_type, ColumnType::Vector(_)) {
+                    continue;
+                }
                 let Some(old_datum) = &old_values[*col_index] else {
                     continue; // NULL keys carry no entry (online rule)
                 };
@@ -2392,6 +3076,8 @@ impl Engine {
             index_undo: Arc::clone(&self.index_undo),
             buffer_pool: Arc::clone(self.storage.buffer_pool()),
             wal_writer: Arc::clone(self.storage.wal_writer()),
+            hnsw_handles: Arc::clone(&self.hnsw_handles),
+            pending_hnsw: Arc::clone(&self.pending_hnsw),
         })
     }
 
@@ -2844,6 +3530,7 @@ impl Engine {
                         &self.index_undo,
                         self.storage.buffer_pool(),
                         self.storage.wal_writer(),
+                        &self.hnsw_handles,
                         xid,
                     );
                     if let Err(abort_err) = self.txn.abort_txn(xid) {
@@ -2854,7 +3541,18 @@ impl Engine {
                 // Discard the undo log on success only — on failure it was
                 // replayed above (see TxnHandle::commit).
                 if result.is_ok() {
+                    // M6 Stage C: deferred post-commit graph actions run
+                    // only after the commit is durable.
+                    run_pending_hnsw(
+                        xid,
+                        &self.pending_hnsw,
+                        &self.hnsw_handles,
+                        self.storage.buffer_pool(),
+                        self.storage.wal_writer(),
+                    );
                     self.index_undo.lock().remove(&xid);
+                } else {
+                    self.pending_hnsw.lock().remove(&xid);
                 }
                 result?;
                 Ok(v)
@@ -2864,6 +3562,7 @@ impl Engine {
                     &self.index_undo,
                     self.storage.buffer_pool(),
                     self.storage.wal_writer(),
+                    &self.hnsw_handles,
                     xid,
                 );
                 if let Err(abort_err) = self.txn.abort_txn(xid) {
@@ -3216,6 +3915,12 @@ fn apply_predicate(rows: &mut Vec<(Tid, Vec<Value>)>, predicate: Option<&Predica
 /// Map a codec column type to its built-in `pg_type` OID and `attlen`
 /// (§5.1; the built-in set has exactly one type per codec type).
 fn type_oid_of(col_type: ColumnType) -> Result<(TypeOid, i32)> {
+    // M6 Stage C: a vector column's type OID is the dedicated VECTOR_OID
+    // and its per-column dim travels in pg_attribute.len (= dim × 4, the
+    // inline width) — the dynamic dim cannot ride the static builtin table.
+    if let ColumnType::Vector(dim) = col_type {
+        return Ok((VECTOR_OID, dim as i32 * 4));
+    }
     BUILTIN_TYPES
         .iter()
         .find(|t| t.column_type == col_type)
@@ -3236,6 +3941,18 @@ fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
         (Literal::Int(n), ColumnType::Timestamptz) => Ok(Some(Datum::Timestamptz(*n))),
         (Literal::Str(s), ColumnType::Text) => Ok(Some(Datum::Text(s.clone()))),
         (Literal::Str(s), ColumnType::Bytea) => Ok(Some(Datum::Bytea(s.clone().into_bytes()))),
+        // M6 Stage C: a vector literal must match the column's dim exactly
+        // (encode_tuple's Vector arm re-checks, but the dim error is
+        // clearer here).
+        (Literal::Vector(v), ColumnType::Vector(dim)) => {
+            if v.len() != dim as usize {
+                return Err(EngineError::InvalidArgument(format!(
+                    "vector literal has {} components, column is VECTOR({dim})",
+                    v.len()
+                )));
+            }
+            Ok(Some(Datum::Vector(v.clone())))
+        }
         (Literal::Null, _) => Ok(None),
         (l, t) => Err(EngineError::InvalidArgument(format!(
             "literal {l:?} is not compatible with column type {t:?}"
@@ -3300,6 +4017,14 @@ fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate>
         })?;
     let col_type = entry.columns[col_index].col_type;
     let value = match &filter.value {
+        // M6 Stage C: vectors carry no ordering — a WHERE comparison on a
+        // vector literal is rejected loudly (ANN predicates are Phase 4b).
+        Literal::Vector(_) => {
+            return Err(EngineError::InvalidPredicate(format!(
+                "column {:?}: vector literals are not comparable in WHERE",
+                filter.column
+            )))
+        }
         Literal::Int(n) => match col_type {
             ColumnType::Int4 => Datum::Int4(i32::try_from(*n).map_err(|_| {
                 EngineError::InvalidArgument("integer literal out of range for INT4".to_string())
