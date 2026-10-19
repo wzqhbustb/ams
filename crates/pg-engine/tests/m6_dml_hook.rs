@@ -437,3 +437,35 @@ fn update_vector_tombstones_old_node_graph_side() {
     assert_eq!(report.live_count, 2, "both carry the LIVE bit");
     engine.shutdown();
 }
+
+/// Round-3 P1-1 regression: an aborted vector-column update must tombstone
+/// the NEW graph node (the vector change is an insert-direction write).
+/// Without the undo record the aborted update leaked a LIVE node per abort.
+#[test]
+fn update_vector_abort_tombstones_new_node() {
+    let tmp = TempDir::new().unwrap();
+    let (engine, oid) = setup(tmp.path());
+    let tid = insert(&engine, 1, Some(vec![1.0, 2.0, 3.0]));
+
+    let txn = engine.begin_txn().unwrap();
+    engine
+        .exec(Some(&txn), "UPDATE t SET v = [9.0, 9.0, 9.0] WHERE id = 1")
+        .unwrap();
+    txn.abort().unwrap();
+
+    let expected = expected_params();
+    let meta = engine.hnsw_index_first_page(oid).unwrap().unwrap();
+    let outcome = engine.open_hnsw_index(meta, &expected).unwrap();
+    let report = outcome.index.audit(engine.storage().buffer_pool()).unwrap();
+    assert_eq!(report.node_count, 2, "the new node was allocated");
+    assert_eq!(
+        report.tombstoned_count, 1,
+        "the aborted update's new node is tombstoned"
+    );
+    assert_eq!(report.live_count, 2, "both carry the LIVE bit");
+    // The old row is back (visible), its map entry intact.
+    assert_eq!(engine.scan("t", None).unwrap().len(), 1);
+    assert_eq!(engine.hnsw_map_get(oid, 0).unwrap(), Some(tid));
+    assert_eq!(engine.hnsw_map_get(oid, 1).unwrap(), None);
+    engine.shutdown();
+}

@@ -983,18 +983,6 @@ impl HnswIndex {
         self.delete_impl(buffer_pool, wal_writer, node_id, true)
     }
 
-    /// Delete WITHOUT the success-boundary flush (M6 Stage C, §6.2/§10):
-    /// the transactional form — the caller's commit flush covers the
-    /// tombstone record (WAL prefix property).
-    pub fn delete_unflushed(
-        &self,
-        buffer_pool: &BufferPool,
-        wal_writer: &WalWriter,
-        node_id: NodeId,
-    ) -> Result<()> {
-        self.delete_impl(buffer_pool, wal_writer, node_id, false)
-    }
-
     fn delete_impl(
         &self,
         buffer_pool: &BufferPool,

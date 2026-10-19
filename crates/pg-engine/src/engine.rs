@@ -582,13 +582,12 @@ impl TxnHandle {
         // 2PL release point (M2c Stage P): table locks go AFTER the CLOG
         // bit flips, so a woken row-lock waiter that then needs this
         // transaction's table locks never observes the reverse order.
-        self.lock_manager.release_all(xid);
-        // Discard the undo log on success only: on failure it was replayed
-        // above. On success the entries are durable with the commit.
         if result.is_ok() {
             // M6 Stage C: the commit record is durable — NOW the deferred
-            // graph actions (tombstone + map removal) may run (never at
-            // statement time, §6.2/§8.1).
+            // graph actions (tombstone + map removal) run BEFORE the table
+            // locks release (review round 3 P3-1: a drop_table/DROP INDEX in
+            // the gap could otherwise change the cleanup's target structure;
+            // run_pending_hnsw takes no lock-manager locks, so no deadlock).
             run_pending_hnsw(
                 xid,
                 &self.pending_hnsw,
@@ -600,6 +599,9 @@ impl TxnHandle {
         } else {
             self.pending_hnsw.lock().remove(&xid);
         }
+        // 2PL release point (M2c Stage P): table locks go AFTER the CLOG
+        // bit flips AND after the deferred graph cleanup ran.
+        self.lock_manager.release_all(xid);
         result?;
         Ok(())
     }
@@ -1562,52 +1564,50 @@ impl Engine {
                 "table {table:?} already has an HNSW index (one per table: the row carries a single NodeId)"
             )));
         }
-        // M6 Stage C review P2-1: index creation does NOT backfill
-        // existing rows (a creation-time scan + bulk load is out of the M6
-        // scope) — creating on a NON-EMPTY table is loudly refused, so no
-        // pre-existing row can silently escape the graph. The emptiness
-        // check runs under the table's EXCLUSIVE lock with a re-taken
-        // snapshot (btree create_index's exact shape, :1447): an in-flight
-        // writer's uncommitted row would be invisible to a bare SI scan —
-        // the lock waits it out, so committed rows are seen (refused) and
-        // aborted rows vanish (allowed).
-        let nonempty = self.auto_commit(|snap| {
+        // M6 Stage C review P2-1 (+ round-3 P2-1): index creation does NOT
+        // backfill existing rows — non-empty tables are refused loudly. The
+        // WHOLE creation (emptiness check + graph + map + catalog rows) runs
+        // in ONE auto-commit holding the table's Exclusive lock (btree
+        // create_index's exact precedent): without this, a concurrent insert
+        // in the window between the check and the registry push would
+        // encode rows with no NodeId, permanently invisible to ANN search.
+        // The registry push happens right after the lock releases (the
+        // registry is in-memory; a crash rebuilds it from the catalog).
+        let index_oid = self.catalog.oid_allocator().alloc();
+        let (index, map_page) = self.auto_commit(|snap| {
             let _locked = self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
             // Re-take the snapshot AFTER the lock wait (the auto-commit
             // snapshot predates it — btree create_index's precedent).
             let (mut snap, _re_guard) = self.txn.snapshot(snap.current_xid());
             snap.advance_curcid();
-            Ok(!self.scan_inner(&snap, table, None)?.is_empty())
-        })?;
-        if nonempty {
-            return Err(EngineError::InvalidArgument(format!(
-                "create_hnsw_index_on: table {table:?} is not empty (M6 creates indexes on empty tables only — no backfill)"
-            )));
-        }
-
-        let index = pg_am_hnsw::index::create(
-            self.storage.buffer_pool(),
-            self.storage.wal_writer(),
-            params,
-            dim,
-            metric,
-            selection,
-            rng_seed,
-        )?;
-        let meta_page = index.meta_page_id();
-        let index_oid = self.catalog.oid_allocator().alloc();
-        let map = pg_am_btree::BTreeIndex::create(
-            std::sync::Arc::clone(self.storage.buffer_pool()),
-            std::sync::Arc::clone(self.storage.wal_writer()),
-            self.catalog.oid_allocator().alloc(),
-            ColumnType::Int8,
-        )?;
-        let map_page = map.meta_page();
-        self.auto_commit(|snap| {
+            if !self.scan_inner(&snap, table, None)?.is_empty() {
+                return Err(EngineError::InvalidArgument(format!(
+                    "create_hnsw_index_on: table {table:?} is not empty (M6 creates indexes on empty tables only — no backfill)"
+                )));
+            }
+            let index = pg_am_hnsw::index::create(
+                self.storage.buffer_pool(),
+                self.storage.wal_writer(),
+                params,
+                dim,
+                metric,
+                selection,
+                rng_seed,
+            )?;
+            let meta_page = index.meta_page_id();
+            let map = pg_am_btree::BTreeIndex::create(
+                std::sync::Arc::clone(self.storage.buffer_pool()),
+                std::sync::Arc::clone(self.storage.wal_writer()),
+                self.catalog.oid_allocator().alloc(),
+                ColumnType::Int8,
+            )?;
+            let map_page = map.meta_page();
             self.create_hnsw_index_catalog_rows(
-                snap, &entry, column, index_oid, meta_page, map_page, dim,
-            )
+                &snap, &entry, column, index_oid, meta_page, map_page, dim,
+            )?;
+            Ok((index, map_page))
         })?;
+        let meta_page = index.meta_page_id();
         self.hnsw_handles.lock().insert(index_oid, Arc::new(index));
         self.indexes.write().push(IndexEntry {
             index_oid,
@@ -2446,15 +2446,27 @@ impl Engine {
             match (vector_changed, values.get(*ci)) {
                 (true, Some(Some(Datum::Vector(v)))) => {
                     let handle = self.hnsw_handle(idx)?;
-                    new_node_id = Some(
-                        handle
-                            .insert_unflushed(
-                                self.storage.buffer_pool(),
-                                self.storage.wal_writer(),
-                                v,
-                            )?
-                            .0,
-                    );
+                    let id = handle
+                        .insert_unflushed(self.storage.buffer_pool(), self.storage.wal_writer(), v)?
+                        .0;
+                    new_node_id = Some(id);
+                    // Abort pairing (review round 3 P1-1): the vector-change
+                    // arm's fresh graph node is an insert-direction write —
+                    // without this undo, every aborted vector update leaks
+                    // a LIVE graph node (linear in aborts, unbounded).
+                    self.index_undo
+                        .lock()
+                        .entry(snap.current_xid())
+                        .or_default()
+                        .push(IndexUndo {
+                            index: (*idx).clone(),
+                            key: id.to_le_bytes().to_vec(),
+                            tid: Tid {
+                                page_id: PageId::INVALID,
+                                slot_id: 0,
+                            },
+                            op: IndexUndoOp::HnswInserted,
+                        });
                 }
                 (true, _) => {} // became NULL: no node
                 (false, _) => new_node_id = old_node_id,
@@ -3537,12 +3549,10 @@ impl Engine {
                         tracing::warn!(error = %abort_err, xid = xid.0, "auto-commit commit-failure fallback abort failed");
                     }
                 }
-                self.lock_manager.release_all(xid);
-                // Discard the undo log on success only — on failure it was
-                // replayed above (see TxnHandle::commit).
                 if result.is_ok() {
                     // M6 Stage C: deferred post-commit graph actions run
-                    // only after the commit is durable.
+                    // after the commit is durable AND before the table
+                    // locks release (round-3 P3-1).
                     run_pending_hnsw(
                         xid,
                         &self.pending_hnsw,
@@ -3554,6 +3564,7 @@ impl Engine {
                 } else {
                     self.pending_hnsw.lock().remove(&xid);
                 }
+                self.lock_manager.release_all(xid);
                 result?;
                 Ok(v)
             }
