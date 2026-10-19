@@ -378,9 +378,16 @@ impl<'a> Tokenizer<'a> {
             // Unquoted identifiers fold to lowercase (PostgreSQL semantics;
             // this subset has no quoted identifiers).
             // M6 Stage C: `VECTOR(n)` declares a vector column of dim n.
-            // A bare `VECTOR` (no parenthesis) stays a plain identifier —
-            // nothing breaks if someone names a column "vector".
-            "VECTOR" if self.peek == Some('(') => {
+            // Whitespace between the keyword and the parenthesis is
+            // tolerated (PG's habit); a bare `VECTOR` stays a plain
+            // identifier — nothing breaks if someone names a column
+            // "vector".
+            "VECTOR"
+                if {
+                    self.skip_whitespace();
+                    self.peek == Some('(')
+                } =>
+            {
                 self.bump(); // (
                 let dim = match self.number_literal()? {
                     Token::Int(n) if (1..=2000).contains(&n) => n as u32,

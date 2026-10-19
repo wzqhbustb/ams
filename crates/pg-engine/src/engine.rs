@@ -1446,7 +1446,7 @@ impl Engine {
         // transaction, leaving only unreachable pages — the documented
         // "leak, never corruption" policy.
         let col_types = column_types(&entry);
-        let meta_page = self.auto_commit(|snap| {
+        self.auto_commit(|snap| {
             let entry = self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
             // Re-take the snapshot AFTER the lock wait (M2c Stage P
             // review): `auto_commit`'s snapshot was taken before we queued
@@ -1492,16 +1492,21 @@ impl Engine {
             let meta_page = index.meta_page();
 
             self.create_index_catalog_rows(&snap, &entry, column, index_oid, meta_page)?;
-            Ok(meta_page)
+            // Registry push INSIDE the lock-holding transaction (round-4
+            // P3-C): pushing after the lock released left a residual window
+            // where a concurrent INSERT saw no index and wrote rows without
+            // index maintenance. The registry is in-memory (crash-rebuilt
+            // from the catalog), so the in-transaction push is safe.
+            self.indexes.write().push(IndexEntry {
+                index_oid,
+                table_oid: entry.oid,
+                column: column.to_string(),
+                key_type,
+                meta_page,
+                map_page: None,
+            });
+            Ok(())
         })?;
-        self.indexes.write().push(IndexEntry {
-            index_oid,
-            table_oid: entry.oid,
-            column: column.to_string(),
-            key_type,
-            meta_page,
-            map_page: None,
-        });
         Ok(index_oid)
     }
 
@@ -1574,7 +1579,7 @@ impl Engine {
         // The registry push happens right after the lock releases (the
         // registry is in-memory; a crash rebuilds it from the catalog).
         let index_oid = self.catalog.oid_allocator().alloc();
-        let (index, map_page) = self.auto_commit(|snap| {
+        let meta_page = self.auto_commit(|snap| {
             let _locked = self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
             // Re-take the snapshot AFTER the lock wait (the auto-commit
             // snapshot predates it — btree create_index's precedent).
@@ -1605,18 +1610,23 @@ impl Engine {
             self.create_hnsw_index_catalog_rows(
                 &snap, &entry, column, index_oid, meta_page, map_page, dim,
             )?;
-            Ok((index, map_page))
+            // Registry push + handle cache INSIDE the lock-holding
+            // transaction (round-4 P3-C): pushing outside left a residual
+            // window where a concurrent INSERT wrote rows with no NodeId,
+            // permanently invisible to ANN search. `meta_page` is captured
+            // before the handle moves into the cache.
+            let meta_page = index.meta_page_id();
+            self.hnsw_handles.lock().insert(index_oid, Arc::new(index));
+            self.indexes.write().push(IndexEntry {
+                index_oid,
+                table_oid: entry.oid,
+                column: column.to_string(),
+                key_type: ColumnType::Vector(u32::from(dim)),
+                meta_page,
+                map_page: Some(map_page),
+            });
+            Ok(meta_page)
         })?;
-        let meta_page = index.meta_page_id();
-        self.hnsw_handles.lock().insert(index_oid, Arc::new(index));
-        self.indexes.write().push(IndexEntry {
-            index_oid,
-            table_oid: entry.oid,
-            column: column.to_string(),
-            key_type: ColumnType::Vector(u32::from(dim)),
-            meta_page,
-            map_page: Some(map_page),
-        });
         Ok((index_oid, meta_page))
     }
 
@@ -2277,7 +2287,10 @@ impl Engine {
             .find(|(idx, _)| matches!(idx.key_type, ColumnType::Vector(_)));
         let mut node_id: Option<u32> = None;
         if let Some((idx, col_index)) = hnsw {
-            if let Some(Datum::Vector(v)) = &values[*col_index] {
+            // `get` (not a raw index) mirrors update_inner: a short `values`
+            // slice must fall through to encode_row's length check with a
+            // loud InvalidArgument, never panic (round-4 P3-A).
+            if let Some(Some(Datum::Vector(v))) = values.get(*col_index) {
                 let handle = self.hnsw_handle(idx)?;
                 // Transactional form (M6 §6.2/§10): NO per-insert flush —
                 // the commit record's flush covers this sequence (WAL
