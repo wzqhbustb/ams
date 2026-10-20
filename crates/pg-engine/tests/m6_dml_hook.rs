@@ -469,3 +469,29 @@ fn update_vector_abort_tombstones_new_node() {
     assert_eq!(engine.hnsw_map_get(oid, 1).unwrap(), None);
     engine.shutdown();
 }
+
+/// Round-5 P1 regression: vacuum on a table WITH an HNSW index must not
+/// open the graph's meta page as a B+Tree (it used to hard-fail with a
+/// fake "no root record" corruption). The graph is untouched by vacuum.
+#[test]
+fn vacuum_on_hnsw_table_skips_the_graph_index() {
+    let tmp = TempDir::new().unwrap();
+    let (engine, oid) = setup(tmp.path());
+    let t1 = insert(&engine, 1, Some(vec![1.0, 2.0, 3.0]));
+    insert(&engine, 2, Some(vec![4.0, 5.0, 6.0]));
+    engine.delete("t", t1).unwrap();
+
+    // Must NOT fail (round-5 P1: it opened the HNSW meta as a btree).
+    let stats = engine.vacuum("t").unwrap();
+
+    // The graph is untouched: both nodes still present, the deleted one
+    // tombstoned (post-commit), and vacuum's reclaim did not touch them.
+    let expected = expected_params();
+    let meta = engine.hnsw_index_first_page(oid).unwrap().unwrap();
+    let outcome = engine.open_hnsw_index(meta, &expected).unwrap();
+    let report = outcome.index.audit(engine.storage().buffer_pool()).unwrap();
+    assert_eq!(report.node_count, 2);
+    assert_eq!(report.tombstoned_count, 1, "delete's tombstone intact");
+    let _ = stats;
+    engine.shutdown();
+}

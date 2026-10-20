@@ -2745,6 +2745,14 @@ impl Engine {
             // Phase 4: push-mode index cleanup, one descent per (key, tid)
             // per index (batch interfaces are Phase 5b, §4.3).
             for (idx, col_index) in &self.indexes_of(&entry) {
+                // M6 Stage C (round-5 P1): an HNSW index is not a B+Tree —
+                // opening its meta page as one yields a fake "no root
+                // record" corruption. The graph's reclamation channel is
+                // Stage E's vacuum work (orphan nodes, dead-row mapping
+                // entries), not this loop.
+                if matches!(idx.key_type, ColumnType::Vector(_)) {
+                    continue;
+                }
                 let mut index = self.open_btree(idx)?;
                 for (tid, values) in &keys {
                     // NULL keys carry no entry (the online convention).
