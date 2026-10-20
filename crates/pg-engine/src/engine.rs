@@ -1982,6 +1982,21 @@ impl Engine {
     ///
     /// `index` must be a handle opened against THIS engine's storage —
     /// same premise as [`Self::hnsw_insert`].
+    /// k-nearest-neighbor search on an open HNSW index (thin wrapper over
+    /// [`pg_am_hnsw::HnswIndex::search`], tech-selection §4.4/§8.1; M5
+    /// Stage C slice 4).
+    ///
+    /// Read-only: no WAL records, no page mutations, no flush owed by the
+    /// caller. `ef = None` uses the meta-pinned `ef_search_default`; the
+    /// only per-query invariant is `ef >= k`. Same fail-stop corruption
+    /// premise as the crate-level search (paged.rs module header); the
+    /// handle is a shared `&` reference (M6 Stage B). The INITIALIZING
+    /// state bit is deliberately NOT a visibility filter (§8.1③): a
+    /// crash-window residue node is recallable. Transactional visibility
+    /// filtering is [`Self::hnsw_search_visible`] (M6 Stage D).
+    ///
+    /// `index` must be a handle opened against THIS engine's storage —
+    /// same premise as [`Self::hnsw_insert`].
     pub fn hnsw_search(
         &self,
         index: &pg_am_hnsw::HnswIndex,
@@ -1990,6 +2005,86 @@ impl Engine {
         ef: Option<usize>,
     ) -> Result<Vec<(pg_am_hnsw::NodeId, f64)>> {
         Ok(index.search(self.storage.buffer_pool(), query, k, ef)?)
+    }
+
+    /// Visibility-filtered ANN search (M6 Stage D, tech-selection §7): the
+    /// transactional `hnsw_search`. Five-step pipeline, all in pg-engine
+    /// (pg-am-hnsw stays MVCC-free):
+    ///
+    /// 1. Candidate pull at 2k (initial 2x factor; ef grows on retries).
+    /// 2. Sidecar map forward lookup (NodeId → ctid) — a miss means the
+    ///    node was deleted (the tombstone path) or never committed.
+    /// 3. Heap visibility check (`heap_tuple_visible`, HOT-chain aware,
+    ///    read-only, no row locks).
+    /// 4. In-row NodeId re-check — the row MUST carry the candidate's
+    ///    NodeId; a mismatch means slot reuse (discard, never a wrong row).
+    /// 5. Fewer than k survivors → ef doubles and re-search, at most 3
+    ///    rounds; the visible subset is returned as-is (fewer than k is a
+    ///    legal answer).
+    ///
+    /// `snap` is the caller's transaction snapshot (visibility is judged
+    /// against it). Returns `(tid, distance)` of visible rows, ascending.
+    pub fn hnsw_search_visible(
+        &self,
+        table: &str,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+        snap: &Snapshot,
+    ) -> Result<Vec<(Tid, f64)>> {
+        let entry = self.table_entry(table)?;
+        let col_types = column_types(&entry);
+        let (idx, _col_index) = self
+            .indexes_of(&entry)
+            .into_iter()
+            .find(|(i, _)| matches!(i.key_type, ColumnType::Vector(_)))
+            .ok_or_else(|| EngineError::IndexNotFound(format!("{table}: no HNSW index")))?;
+        let handle = self.hnsw_handle(&idx)?;
+        let map = self
+            .open_hnsw_map(idx.index_oid)?
+            .expect("hnsw index carries a sidecar map");
+
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let ef_base = ef.unwrap_or(handle.params().ef_search_default as usize);
+        for round in 0..3u32 {
+            // Round 0: 2k candidates (§7 initial 2x); each retry WIDENS
+            // the candidate pool (round-3 review nano: saturating shift —
+            // a pathological k must clamp, never wrap). The ef passed is
+            // max(ef_base, want): when ef_base already exceeds the want the
+            // beam stays put while the pool still doubles.
+            let want = k.saturating_mul(2usize.saturating_pow(round + 1));
+            let ef_round = ef_base.max(want);
+            let candidates =
+                handle.search(self.storage.buffer_pool(), query, want, Some(ef_round))?;
+            let mut results: Vec<(Tid, f64)> = Vec::with_capacity(k);
+            for (node_id, dist) in candidates {
+                // 2. Map forward lookup — a miss IS the tombstone path.
+                let key = pg_am_btree::encode_key(&Datum::Int8(i64::from(node_id.0)))?;
+                let Some(ctid) = map.lookup(&key)? else {
+                    continue;
+                };
+                // 3. Heap visibility (HOT-chain aware).
+                let Some(vis_tid) = self.heap_tuple_visible(snap, ctid)? else {
+                    continue;
+                };
+                // 4. In-row NodeId re-check — slot reuse ⇒ discard.
+                let (_values, row_nid) =
+                    self.read_row_by_tid_with_node_id(&entry, &col_types, vis_tid)?;
+                if row_nid != Some(node_id.0) {
+                    continue;
+                }
+                results.push((vis_tid, dist));
+                if results.len() == k {
+                    break;
+                }
+            }
+            if results.len() == k || round == 2 {
+                return Ok(results);
+            }
+        }
+        unreachable!("the loop returns on the last round")
     }
 
     /// The catalog-writing half of `create_index`, inside transaction `snap`.
