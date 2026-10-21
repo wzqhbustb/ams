@@ -2093,20 +2093,34 @@ impl Engine {
             let mut results: Vec<(Tid, f64)> = Vec::with_capacity(k);
             for (node_id, dist) in candidates {
                 // 2. Map forward lookup — a miss IS the tombstone path.
+                //    lookup_ALL (round-7 P1): a non-HOT non-vector update
+                //    can leave TWO entries for one node while an old
+                //    snapshot is alive (the old entry waits out the
+                //    watermark): the old tid is dead for a fresh snapshot
+                //    and a single `lookup` would return it and discard the
+                //    node deterministically. Judge each returned ctid for
+                //    visibility; at most one version is visible per
+                //    snapshot (no duplicates).
                 let key = pg_am_btree::encode_key(&Datum::Int8(i64::from(node_id.0)))?;
-                let Some(ctid) = map.lookup(&key)? else {
-                    continue;
-                };
-                // 3. Heap visibility (HOT-chain aware).
-                let Some(vis_tid) = self.heap_tuple_visible(snap, ctid)? else {
-                    continue;
-                };
-                // 4. In-row NodeId re-check — slot reuse ⇒ discard.
-                let (_values, row_nid) =
-                    self.read_row_by_tid_with_node_id(&entry, &col_types, vis_tid)?;
-                if row_nid != Some(node_id.0) {
-                    continue;
+                let ctids = map.lookup_all(&key)?;
+                let mut found: Option<Tid> = None;
+                for ctid in ctids {
+                    // 3. Heap visibility (HOT-chain aware).
+                    let Some(vis_tid) = self.heap_tuple_visible(snap, ctid)? else {
+                        continue;
+                    };
+                    // 4. In-row NodeId re-check — slot reuse ⇒ discard.
+                    let (_values, row_nid) =
+                        self.read_row_by_tid_with_node_id(&entry, &col_types, vis_tid)?;
+                    if row_nid != Some(node_id.0) {
+                        continue;
+                    }
+                    found = Some(vis_tid);
+                    break;
                 }
+                let Some(vis_tid) = found else {
+                    continue;
+                };
                 results.push((vis_tid, dist));
                 if results.len() == k {
                     break;

@@ -473,3 +473,41 @@ fn explicit_txn_delete_removes_map_entry() {
     );
     engine.shutdown();
 }
+
+/// Round-7 P1 regression: a non-HOT, non-vector-column UPDATE with an old
+/// snapshot alive leaves TWO map entries for the node (old tid waits out
+/// the watermark). A FRESH snapshot must still find the row — the pipeline
+/// judges each map entry for visibility, never just the first.
+#[test]
+fn update_with_old_snapshot_both_readers_see_the_row() {
+    let tmp = TempDir::new().unwrap();
+    let (engine, _oid) = setup(tmp.path());
+    // A secondary index on id forces the update non-HOT (an indexed column
+    // changes).
+    engine.create_index("t", "id").unwrap();
+    insert(&engine, 1, vec![1.0, 0.0, 0.0]);
+
+    // Old snapshot opens BEFORE the update.
+    let reader = engine.begin_txn().unwrap();
+    let old_snap = reader.snapshot();
+
+    // Non-vector, non-HOT update (id is indexed → non-HOT by definition).
+    engine
+        .exec(None, "UPDATE t SET id = 100 WHERE id = 1")
+        .unwrap();
+
+    // Fresh snapshot: must see the row (the new version).
+    let fresh = q(&engine, &[1.0, 0.0, 0.0], 1);
+    assert_eq!(fresh.len(), 1, "fresh snapshot must find the updated row");
+    // Old snapshot: must see it too (the old version).
+    let old = engine
+        .hnsw_search_visible("t", &[1.0, 0.0, 0.0], 1, None, &old_snap)
+        .unwrap();
+    assert_eq!(old.len(), 1, "old snapshot must still find the row");
+    assert_ne!(
+        fresh[0].0, old[0].0,
+        "different versions for the two snapshots"
+    );
+    reader.abort().unwrap();
+    engine.shutdown();
+}
