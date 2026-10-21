@@ -514,8 +514,11 @@ pub struct TxnHandle {
     /// — and thus unregistered — when the handle is consumed by
     /// `commit`/`abort` or auto-aborted by `Drop` (field drops run after
     /// `Drop::drop`, so the best-effort abort still sees the registration;
-    /// either order would be correct). Never read — RAII only.
-    _snapshot_guard: SnapshotGuard,
+    /// either order would be correct). `Option` so `commit` can drop it
+    /// EARLY — the post-commit cleanup's watermark read must not see this
+    /// transaction's own registration (Stage D review: otherwise every
+    /// explicit-transaction delete's map removal is deferred forever).
+    _snapshot_guard: Option<SnapshotGuard>,
     /// Identity of the creating engine (see `NEXT_ENGINE_INSTANCE_ID`).
     instance_id: u64,
     /// Shared with the engine: table locks are keyed by XID, so commit /
@@ -590,6 +593,13 @@ impl TxnHandle {
         // bit flips, so a woken row-lock waiter that then needs this
         // transaction's table locks never observes the reverse order.
         if result.is_ok() {
+            // Drop OUR snapshot registration BEFORE the watermark read —
+            // the cleanup's `oldest_snapshot_xmin()` must not count this
+            // transaction's own snapshot (otherwise it concludes "someone
+            // older is still reading" and defers every map removal
+            // forever). The guard lives in an Option exactly so it can be
+            // dropped here (a Drop type can't be partially moved).
+            drop(self._snapshot_guard.take());
             // M6 Stage C: the commit record is durable — NOW the deferred
             // graph actions (tombstone + map removal) run BEFORE the table
             // locks release (review round 3 P3-1: a drop_table/DROP INDEX in
@@ -2007,20 +2017,6 @@ impl Engine {
     /// caller. `ef = None` uses the meta-pinned `ef_search_default`; the
     /// only per-query invariant is `ef >= k`. Same fail-stop corruption
     /// premise as the crate-level search (paged.rs module header); the
-    /// handle is a shared `&` reference (M6 Stage B). The
-    /// INITIALIZING state bit is deliberately NOT a visibility filter
-    /// (§8.1③): a crash-window residue node is recallable.
-    ///
-    /// `index` must be a handle opened against THIS engine's storage —
-    /// same premise as [`Self::hnsw_insert`].
-    /// k-nearest-neighbor search on an open HNSW index (thin wrapper over
-    /// [`pg_am_hnsw::HnswIndex::search`], tech-selection §4.4/§8.1; M5
-    /// Stage C slice 4).
-    ///
-    /// Read-only: no WAL records, no page mutations, no flush owed by the
-    /// caller. `ef = None` uses the meta-pinned `ef_search_default`; the
-    /// only per-query invariant is `ef >= k`. Same fail-stop corruption
-    /// premise as the crate-level search (paged.rs module header); the
     /// handle is a shared `&` reference (M6 Stage B). The INITIALIZING
     /// state bit is deliberately NOT a visibility filter (§8.1③): a
     /// crash-window residue node is recallable. Transactional visibility
@@ -2071,9 +2067,14 @@ impl Engine {
             .find(|(i, _)| matches!(i.key_type, ColumnType::Vector(_)))
             .ok_or_else(|| EngineError::IndexNotFound(format!("{table}: no HNSW index")))?;
         let handle = self.hnsw_handle(&idx)?;
-        let map = self
-            .open_hnsw_map(idx.index_oid)?
-            .expect("hnsw index carries a sidecar map");
+        // Loud Err (not panic) on a corrupted registration: an M5-shape or
+        // hand-forged relpages row (last == first) means no sidecar map.
+        let map = self.open_hnsw_map(idx.index_oid)?.ok_or_else(|| {
+            EngineError::Corrupted(format!(
+                "hnsw index {:?} has no sidecar map (relpages row is M5-shape or corrupt)",
+                idx.index_oid
+            ))
+        })?;
 
         if k == 0 {
             return Ok(Vec::new());
@@ -3229,7 +3230,7 @@ impl Engine {
             txn: Arc::clone(&self.txn),
             xid: Some(xid),
             snapshot: RefCell::new(snapshot),
-            _snapshot_guard: snapshot_guard,
+            _snapshot_guard: Some(snapshot_guard),
             instance_id: self.instance_id,
             lock_manager: Arc::clone(&self.lock_manager),
             index_undo: Arc::clone(&self.index_undo),

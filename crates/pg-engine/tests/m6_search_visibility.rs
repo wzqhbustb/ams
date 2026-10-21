@@ -448,3 +448,28 @@ fn old_snapshot_keeps_seeing_deleted_row_until_watermark() {
     );
     engine.shutdown();
 }
+
+/// Round-6 P3 regression: an EXPLICIT-transaction delete's post-commit map
+/// removal must also land (the watermark read inside TxnHandle::commit
+/// must not see the committing transaction's own snapshot registration —
+/// otherwise every explicit delete's map entry is deferred forever).
+#[test]
+fn explicit_txn_delete_removes_map_entry() {
+    let tmp = TempDir::new().unwrap();
+    let (engine, oid) = setup(tmp.path());
+    insert(&engine, 1, vec![1.0, 0.0, 0.0]);
+
+    let txn = engine.begin_txn().unwrap();
+    engine
+        .exec(Some(&txn), "DELETE FROM t WHERE id = 1")
+        .unwrap();
+    txn.commit().unwrap();
+
+    // The map entry must be GONE (no reader was holding a snapshot).
+    assert_eq!(
+        engine.hnsw_map_get(oid, 0).unwrap(),
+        None,
+        "explicit-txn delete: the map removal must land (not deferred by our own snapshot)"
+    );
+    engine.shutdown();
+}
