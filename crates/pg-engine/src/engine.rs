@@ -541,6 +541,13 @@ impl TxnHandle {
         self.xid.expect("xid accessed after commit/abort")
     }
 
+    /// A copy of the transaction's SI snapshot (M6 Stage D review P2 — the
+    /// visibility-filtered ANN path takes the caller's snapshot; this
+    /// accessor lets a transaction supply its own).
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot.borrow().clone()
+    }
+
     /// Advance the command counter before executing a new SQL statement
     /// (Halloween protection, §7.2 / v2.3-Q4).
     pub fn advance_curcid(&self) {
@@ -594,6 +601,7 @@ impl TxnHandle {
                 &self.hnsw_handles,
                 &self.buffer_pool,
                 &self.wal_writer,
+                self.txn.oldest_snapshot_xmin(),
             );
             self.index_undo.lock().remove(&xid);
         } else {
@@ -786,10 +794,19 @@ fn run_pending_hnsw(
     hnsw_handles: &Mutex<std::collections::HashMap<Oid, Arc<pg_am_hnsw::HnswIndex>>>,
     buffer_pool: &Arc<BufferPool>,
     wal_writer: &Arc<WalWriter>,
+    oldest_xmin: TxnId,
 ) {
     let actions = pending_hnsw.lock().remove(&xid).unwrap_or_default();
     for (idx, action) in actions {
-        if let Err(e) = pending_hnsw_one(&idx, action, hnsw_handles, buffer_pool, wal_writer) {
+        if let Err(e) = pending_hnsw_one(
+            &idx,
+            action,
+            hnsw_handles,
+            buffer_pool,
+            wal_writer,
+            oldest_xmin,
+            xid,
+        ) {
             tracing::warn!(error = %e, index_oid = idx.index_oid.0, node = ?action, "post-commit hnsw cleanup failed; the Stage E dead-row channel reclaims the residue");
         }
     }
@@ -801,16 +818,30 @@ fn pending_hnsw_one(
     hnsw_handles: &Mutex<std::collections::HashMap<Oid, Arc<pg_am_hnsw::HnswIndex>>>,
     buffer_pool: &Arc<BufferPool>,
     wal_writer: &Arc<WalWriter>,
+    oldest_xmin: TxnId,
+    xid: TxnId,
 ) -> Result<()> {
+    // The map entry's removal waits for the snapshot watermark (Stage D
+    // review P2): a reader holding a snapshot older than this delete must
+    // still resolve the row through the map — deleting the entry early
+    // would make a repeatable-read ANN query lose the row while the row
+    // itself is still visible. The tombstone itself is harmless to land
+    // early (the state bit is never a traversal predicate).
+    // Deferred removals are reclaimed by the Stage E dead-row channel.
+    let map_removable = oldest_xmin > xid;
     match action {
         PendingHnswAction::Tombstone { node_id, tid } => {
             // Graph tombstone first, then the map entry.
             let handle = pending_hnsw_handle(hnsw_handles, idx, buffer_pool, wal_writer)?;
             handle.delete(buffer_pool, wal_writer, pg_am_hnsw::NodeId(node_id))?;
-            pending_map_remove(idx, node_id, tid, buffer_pool, wal_writer)?;
+            if map_removable {
+                pending_map_remove(idx, node_id, tid, buffer_pool, wal_writer)?;
+            }
         }
         PendingHnswAction::MapRemove { node_id, tid } => {
-            pending_map_remove(idx, node_id, tid, buffer_pool, wal_writer)?;
+            if map_removable {
+                pending_map_remove(idx, node_id, tid, buffer_pool, wal_writer)?;
+            }
         }
     }
     Ok(())
@@ -3634,16 +3665,17 @@ impl Engine {
     /// applies rather than a best-effort cleanup that might make it worse.
     fn auto_commit<T>(&self, op: impl FnOnce(&Snapshot) -> Result<T>) -> Result<T> {
         let xid = self.txn.begin_txn();
-        // `_snap_guard` unregisters the snapshot at the end of this frame
-        // on BOTH the success and the failure path (M3 Stage A, §3.3). A
-        // panic in `op` still runs the guard's Drop during unwinding (the
-        // default panic policy), so the snapshot unregisters normally; only
-        // panic=abort or mem::forget would skip it — the documented O1
-        // semantics (horizon pinned low, vacuum degrades to no-reclaim,
-        // safe), matching this function's existing panic policy below.
-        let (mut snap, _snap_guard) = self.txn.snapshot(xid);
-        snap.advance_curcid();
-        match op(&snap) {
+        // The snapshot's registry entry is dropped when `op` returns — the
+        // post-commit cleanup's watermark read (oldest_snapshot_xmin) must
+        // NOT see this transaction's own snapshot, or it would conclude
+        // "someone older is still reading" and defer every map removal
+        // forever (Stage D review P2).
+        let op_result = {
+            let (mut snap, _snap_guard) = self.txn.snapshot(xid);
+            snap.advance_curcid();
+            op(&snap)
+        };
+        match op_result {
             Ok(v) => {
                 let result = self.txn.commit_txn(xid);
                 if result.is_err() {
@@ -3675,6 +3707,7 @@ impl Engine {
                         &self.hnsw_handles,
                         self.storage.buffer_pool(),
                         self.storage.wal_writer(),
+                        self.txn.oldest_snapshot_xmin(),
                     );
                     self.index_undo.lock().remove(&xid);
                 } else {

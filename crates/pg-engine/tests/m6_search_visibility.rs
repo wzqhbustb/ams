@@ -400,3 +400,51 @@ fn concurrent_dml_and_search_return_only_visible_rows() {
     engine.shutdown();
     let _ = dir;
 }
+
+/// Stage D review P2: the map entry's removal waits for the snapshot
+/// watermark — a reader holding a snapshot OLDER than the delete must
+/// still resolve the row through the map (repeatable-read on the ANN
+/// path).
+#[test]
+fn old_snapshot_keeps_seeing_deleted_row_until_watermark() {
+    let tmp = TempDir::new().unwrap();
+    let (engine, oid) = setup(tmp.path());
+    let ta = insert(&engine, 1, vec![1.0, 0.0, 0.0]);
+
+    // A reader transaction opens its snapshot BEFORE the delete commits.
+    let reader = engine.begin_txn().unwrap();
+    let snap = reader.snapshot();
+
+    // Delete + commit: post-commit cleanup runs, but the watermark holds
+    // the map entry back (the reader's snapshot is older than the delete).
+    engine.delete("t", ta).unwrap();
+
+    // The OLD snapshot must still see the row (repeatable read on ANN).
+    let hits = engine
+        .hnsw_search_visible("t", &[1.0, 0.0, 0.0], 1, None, &snap)
+        .unwrap();
+    assert_eq!(hits.len(), 1, "the old snapshot must still resolve the row");
+    assert_eq!(hits[0].0, ta);
+
+    // A FRESH (everything) snapshot must NOT see it.
+    let fresh = engine
+        .hnsw_search_visible("t", &[1.0, 0.0, 0.0], 1, None, &Snapshot::everything())
+        .unwrap();
+    assert!(
+        fresh.is_empty(),
+        "the delete is committed — fresh snapshots don't see it"
+    );
+
+    // After the reader ends, a later delete's cleanup runs under a clear
+    // watermark (the deferred entry itself is reclaimed by the Stage E
+    // dead-row channel — registered).
+    reader.abort().unwrap();
+    let t2 = insert(&engine, 2, vec![0.0, 1.0, 0.0]);
+    engine.delete("t", t2).unwrap();
+    assert_eq!(
+        engine.hnsw_map_get(oid, 1).unwrap(),
+        None,
+        "watermark clear: this removal lands"
+    );
+    engine.shutdown();
+}
