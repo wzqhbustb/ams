@@ -401,9 +401,11 @@ pub struct VacuumStats {
     /// `(tid, values)` work items `collect_index_keys` produced: standalone
     /// dead tuples plus the roots of fully-dead HOT chains.
     pub index_keys: usize,
-    /// Index entries physically removed by this pass (`BTreeDelete` WAL).
+    /// Index entries physically removed by this pass (`BTreeDelete` WAL;
+    /// HNSW sidecar-map entries included — the map IS a btree, M6 Stage D).
     /// Under eager online index maintenance this is essentially only
-    /// crash-loser dangling entries (§4.3).
+    /// crash-loser dangling entries and watermark-deferred map residue
+    /// (§4.3).
     pub index_entries_removed: usize,
     /// Phase-4 delete attempts that found the entry already gone
     /// (`EntryNotFound` → Ok at the vacuum call site): eager online index
@@ -2831,12 +2833,20 @@ impl Engine {
     /// 4. Push-mode index cleanup: per `(tid, values)` × per registered
     ///    index on the table, encode the indexed column (NULL skipped, the
     ///    `delete_inner` convention) and `BTreeIndex::delete(key, tid)`
-    ///    (the Stage Q online path, `BTreeDelete` WAL included).
+    ///    (the Stage Q online path, `BTreeDelete` WAL included). An HNSW
+    ///    index is not opened as a btree — its graph is untouched here —
+    ///    but its sidecar NodeId→ctid map IS cleaned in this phase: each
+    ///    dead chain root's trailing NodeId keys the map entry to delete
+    ///    (M6 Stage D round-8 P1: the map must not outlive the page its
+    ///    entries point at — phase 5 hands freed pages to ANY relation,
+    ///    and a cross-tenant row with a colliding NodeId passes the search
+    ///    pipeline's in-row re-check).
     ///    **`EntryNotFound` is Ok here and only here** (§4.3): eager
     ///    online maintenance already removed the entries of ordinary
     ///    committed deletes/updates, so the entries this phase actually
-    ///    removes are essentially crash-loser dangling ones. The btree's
-    ///    own delete contract is NOT weakened. Vacuum records no index
+    ///    removes are essentially crash-loser dangling ones (plus
+    ///    watermark-deferred map residue). The btree's own delete contract
+    ///    is NOT weakened. Vacuum records no index
     ///    undo: its btree deletes are physical, idempotent
     ///    (EntryNotFound-tolerant) maintenance, never to be reverse-applied
     ///    even when a later phase fails.
@@ -2888,10 +2898,53 @@ impl Engine {
             for (idx, col_index) in &self.indexes_of(&entry) {
                 // M6 Stage C (round-5 P1): an HNSW index is not a B+Tree —
                 // opening its meta page as one yields a fake "no root
-                // record" corruption. The graph's reclamation channel is
-                // Stage E's vacuum work (orphan nodes, dead-row mapping
-                // entries), not this loop.
+                // record" corruption. The graph's orphan-node reclamation
+                // is Stage E's audit-driven channel, not this loop.
                 if matches!(idx.key_type, ColumnType::Vector(_)) {
+                    // M6 Stage D (round-8 P1): the sidecar NodeId→ctid map
+                    // obeys the SAME §4.1 phase order as every btree index
+                    // — each dead chain root still carries its trailing
+                    // NodeId, so its map entry is deleted HERE, before
+                    // phase 5 frees the page. A residual entry outliving
+                    // its page resolves to whatever row the global freelist
+                    // hands the page to next — possibly ANOTHER TABLE's row
+                    // with a colliding NodeId, which the in-row NodeId
+                    // re-check cannot tell apart (round-8 probe: table a's
+                    // ANN search returned table b's row). What remains for
+                    // this pass is watermark-deferred or crash-skipped
+                    // residue — eager post-commit cleanup took the ordinary
+                    // entries — so `EntryNotFound` is tolerated exactly like
+                    // the btree path below (§4.3).
+                    //
+                    // The graph NODE is deliberately NOT tombstoned here:
+                    // the committed-delete path already tombstoned it at
+                    // post-commit, and a non-HOT non-vector UPDATE reuses
+                    // the SAME NodeId for the live new version — blind
+                    // tombstoning would flip a live row's node. Removing
+                    // the map entry is the correctness-sufficient half: the
+                    // search pipeline's map-lookup step discards a
+                    // candidate whose node has no entry.
+                    if let Some(mut map) = self.open_hnsw_map(idx.index_oid)? {
+                        for (tid, _) in &keys {
+                            // The chain root still lies unread on its page
+                            // (phase 5 has not run); re-read it for just
+                            // the trailing NodeId. `None` (no system column,
+                            // e.g. a NULL vector at insert) means no map
+                            // entry exists.
+                            let Some(node_id) = self.read_node_id_by_tid(&col_types, *tid)? else {
+                                continue;
+                            };
+                            let key = encode_key(&Datum::Int8(i64::from(node_id)))?;
+                            match map.delete(&key, *tid) {
+                                Ok(()) => stats.index_entries_removed += 1,
+                                // §4.3: eager maintenance removed it long ago.
+                                Err(BTreeError::EntryNotFound) => {
+                                    stats.index_entries_already_gone += 1;
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                        }
+                    }
                     continue;
                 }
                 let mut index = self.open_btree(idx)?;
@@ -2998,10 +3051,37 @@ impl Engine {
         let bytes = SlottedPage::tuple(page, tid.slot_id)?.ok_or_else(|| {
             EngineError::Corrupted(format!("no tuple at {tid} for index key readback"))
         })?;
-        let node_id = pg_am_heap::tuple::tuple_node_id(bytes, col_types)?;
-        let (_header, values) = decode_tuple(bytes, col_types)?;
+        let (header, values) = decode_tuple(bytes, col_types)?;
+        // `decode_tuple` already validated the exact-4-byte tail — read the
+        // NodeId directly rather than paying a SECOND full decode through
+        // `tuple_node_id` (round-8 nano; this sits on the search hot path).
+        let node_id = if header.t_infomask2 & pg_am_heap::tuple::HEAP_HAS_NODEID != 0 {
+            let n = bytes.len();
+            Some(u32::from_le_bytes(
+                bytes[n - 4..n]
+                    .try_into()
+                    .expect("decode_tuple validated the 4-byte tail"),
+            ))
+        } else {
+            None
+        };
         debug_assert_eq!(values.len(), entry.columns.len());
         Ok((values, node_id))
+    }
+
+    /// Read ONLY the trailing NodeId of the row at `tid` — vacuum's dead-row
+    /// channel (M6 Stage D round-8): phase 3's `collect_index_keys` decoded
+    /// the tuple's VALUES for the btree path, but the sidecar map's key is
+    /// the system column, so the dead chain root is re-read once here. Runs
+    /// in vacuum phase 4, strictly before `reclaim` makes the bytes
+    /// unreadable.
+    fn read_node_id_by_tid(&self, col_types: &[ColumnType], tid: Tid) -> Result<Option<u32>> {
+        let guard = self.storage.buffer_pool().pin(tid.page_id)?;
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        let bytes = SlottedPage::tuple(page, tid.slot_id)?.ok_or_else(|| {
+            EngineError::Corrupted(format!("no tuple at {tid} for hnsw map key readback"))
+        })?;
+        Ok(pg_am_heap::tuple::tuple_node_id(bytes, col_types)?)
     }
 
     /// Find the first WAL record whose start lies inside segment `segment_id`

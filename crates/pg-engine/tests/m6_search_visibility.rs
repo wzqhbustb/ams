@@ -6,7 +6,7 @@ use pg_am_heap::ColumnType;
 use pg_am_hnsw::graph::NeighborSelection;
 use pg_am_hnsw::{HnswParams, Metric};
 use pg_engine::{ColumnDef, Engine, EngineConfig};
-use pg_storage::types::Tid;
+use pg_storage::types::{PageId, Tid};
 use pg_txn::Snapshot;
 use tempfile::TempDir;
 
@@ -509,5 +509,287 @@ fn update_with_old_snapshot_both_readers_see_the_row() {
         "different versions for the two snapshots"
     );
     reader.abort().unwrap();
+    engine.shutdown();
+}
+
+// ---------------------------------------------------------------------
+// Round-8 P1: deferred map entries must not survive vacuum (the map
+// obeys the §4.1 phase order like every other index).
+// ---------------------------------------------------------------------
+
+/// The direct pin: a watermark-deferred map entry is reclaimed by the
+/// NEXT vacuum pass over the dead row — before the row's page can be
+/// freed and rehanded.
+#[test]
+fn vacuum_removes_watermark_deferred_map_entries() {
+    let tmp = TempDir::new().unwrap();
+    let (engine, oid) = setup(tmp.path());
+    let t0 = insert(&engine, 1, vec![1.0, 0.0, 0.0]);
+    let _t1 = insert(&engine, 2, vec![0.0, 1.0, 0.0]);
+
+    // An old snapshot forces the delete's post-commit map removal to defer.
+    let reader = engine.begin_txn().unwrap();
+    let _old_snap = reader.snapshot();
+    engine.delete("t", t0).unwrap();
+    assert_eq!(
+        engine.hnsw_map_get(oid, 0).unwrap(),
+        Some(t0),
+        "the watermark defers the removal while the reader is alive"
+    );
+    reader.abort().unwrap();
+
+    engine.vacuum("t").unwrap();
+    assert_eq!(
+        engine.hnsw_map_get(oid, 0).unwrap(),
+        None,
+        "vacuum's dead-row channel removes the deferred entry (the dead row still carried its NodeId)"
+    );
+    // And the search never returns the deleted row.
+    let hits = q(&engine, &[1.0, 0.0, 0.0], 2);
+    assert_eq!(hits.len(), 1, "only the surviving row remains");
+    engine.shutdown();
+}
+
+/// The discriminating pin for the same fix: vacuum must remove ONLY the
+/// dead version's entry. A non-HOT non-vector UPDATE reuses the same
+/// NodeId for the live new version; its map entry must survive vacuum
+/// untouched (the map delete is keyed by the exact dead tid).
+#[test]
+fn vacuum_keeps_live_entry_of_reused_node_id() {
+    let tmp = TempDir::new().unwrap();
+    let (engine, oid) = setup(tmp.path());
+    // A secondary index on id forces the update non-HOT.
+    engine.create_index("t", "id").unwrap();
+    let t_old = insert(&engine, 1, vec![1.0, 0.0, 0.0]);
+
+    // Old snapshot alive ⟹ the update's old-version map removal defers.
+    let reader = engine.begin_txn().unwrap();
+    let _old_snap = reader.snapshot();
+    engine
+        .exec(None, "UPDATE t SET id = 100 WHERE id = 1")
+        .unwrap();
+    let t_new = engine
+        .scan("t", None)
+        .unwrap()
+        .into_iter()
+        .find(|(_, vals)| matches!(&vals[0], Some(pg_am_heap::Datum::Int4(100))))
+        .unwrap()
+        .0;
+    assert_ne!(t_old, t_new, "non-HOT update lands a new version");
+    assert_eq!(
+        engine.hnsw_map_get(oid, 0).unwrap(),
+        Some(t_old),
+        "pre-vacuum: the deferred old-version entry sorts first"
+    );
+    reader.abort().unwrap();
+
+    engine.vacuum("t").unwrap();
+    assert_eq!(
+        engine.hnsw_map_get(oid, 0).unwrap(),
+        Some(t_new),
+        "vacuum removed the dead version's entry and ONLY that one"
+    );
+    // The live row stays searchable through the same NodeId.
+    let hits = q(&engine, &[1.0, 0.0, 0.0], 1);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, t_new);
+    engine.shutdown();
+}
+
+/// Round-8 P1 regression (the probe-proven chain): a watermark-deferred
+/// map entry that survives vacuum + the freed heap page handed to ANOTHER
+/// table by the global freelist + a colliding node id made table a's ANN
+/// search return table b's row. Vacuum must delete the map entries of
+/// dead rows (phase 4, before phase 5 frees the page), closing the chain.
+///
+/// The construction is layout-exact. a's heap spans head + 7 non-head
+/// pages; the 7 non-head pages all go fully dead, so vacuum frees them in
+/// ascending order and the global LIFO freelist hands them out in
+/// reverse: b's head, b's HNSW dir/meta/map pages, b's first node page,
+/// one catalog spill page — and b's first heap SPILL page is a's SECOND
+/// page (the first freed). Identical row sizes give both tables the same
+/// rows-per-page, so b's spill rows carry exactly the node ids of a's
+/// deleted rows at the exact same slots — the collision the pre-fix
+/// pipeline could not tell apart.
+#[test]
+fn vacuum_closes_deferred_entries_before_cross_table_page_reuse() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let engine = Engine::open(dir, EngineConfig::new(dir)).unwrap();
+    let wide_schema = || {
+        vec![
+            ColumnDef {
+                name: "id".to_string(),
+                col_type: ColumnType::Int4,
+            },
+            // The pad column keeps rows-per-page small so the layout below
+            // needs only a handful of rows.
+            ColumnDef {
+                name: "pad".to_string(),
+                col_type: ColumnType::Text,
+            },
+            ColumnDef {
+                name: "v".to_string(),
+                col_type: ColumnType::vector(u32::from(DIM)).unwrap(),
+            },
+        ]
+    };
+    let row = |id: i32, pad: &str| {
+        vec![
+            pg_engine::Value::from(Some(pg_am_heap::Datum::Int4(id))),
+            pg_engine::Value::from(Some(pg_am_heap::Datum::Text(pad.to_string()))),
+            pg_engine::Value::from(Some(pg_am_heap::Datum::Vector(vec![id as f32, 0.0, 0.0]))),
+        ]
+    };
+    engine.create_table("a", &wide_schema()).unwrap();
+    let (a_oid, _) = engine
+        .create_hnsw_index_on(
+            "a",
+            "v",
+            HnswParams::default(),
+            DIM,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            0x5EED,
+        )
+        .unwrap();
+
+    // Fill a until its heap spans head + 7 non-head pages.
+    let pad = "x".repeat(2000);
+    let mut a_rows: Vec<(u32, Tid)> = Vec::new();
+    let mut chain: Vec<PageId> = Vec::new();
+    for i in 0..10_000i32 {
+        let tid = engine.insert("a", &row(i, &pad)).unwrap();
+        a_rows.push((i as u32, tid));
+        if !chain.contains(&tid.page_id) {
+            chain.push(tid.page_id);
+        }
+        if chain.len() == 8 {
+            break;
+        }
+    }
+    assert_eq!(chain.len(), 8, "a must span head + 7 non-head pages");
+    let head = chain[0];
+    let mut freed = chain[1..].to_vec();
+    freed.sort();
+    let first_freed = freed[0];
+
+    // Hold an old snapshot so every delete's map removal defers.
+    let reader = engine.begin_txn().unwrap();
+    let _old_snap = reader.snapshot();
+    let deleted: Vec<(u32, Tid)> = a_rows
+        .iter()
+        .filter(|(_, t)| t.page_id != head)
+        .copied()
+        .collect();
+    for (_, tid) in &deleted {
+        engine.delete("a", *tid).unwrap();
+    }
+    for (node, tid) in &deleted {
+        assert_eq!(
+            engine.hnsw_map_get(a_oid, *node).unwrap(),
+            Some(*tid),
+            "node {node}'s entry must be watermark-deferred, not lost"
+        );
+    }
+    reader.abort().unwrap();
+
+    // THE FIX UNDER TEST: vacuum's phase 4 removes the deferred entries
+    // (the dead rows still carry their NodeIds), BEFORE phase 5 frees the
+    // pages.
+    engine.vacuum("a").unwrap();
+    for (node, _) in &deleted {
+        assert_eq!(
+            engine.hnsw_map_get(a_oid, *node).unwrap(),
+            None,
+            "vacuum must not let node {node}'s deferred entry outlive its page"
+        );
+    }
+
+    // Cross-table reuse: b inherits a's freed pages via the global LIFO
+    // freelist.
+    engine.create_table("b", &wide_schema()).unwrap();
+    engine
+        .create_hnsw_index_on(
+            "b",
+            "v",
+            HnswParams::default(),
+            DIM,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            0xB,
+        )
+        .unwrap();
+    let mut b_on_first_freed: Vec<(u32, Tid)> = Vec::new();
+    for j in 0..12i32 {
+        let tid = engine.insert("b", &row(1000 + j, &pad)).unwrap();
+        if tid.page_id == first_freed {
+            b_on_first_freed.push((j as u32, tid));
+            if b_on_first_freed.len() == 3 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        b_on_first_freed.len(),
+        3,
+        "b's spill rows must land on a's first-freed page {first_freed:?}"
+    );
+
+    // a's deleted rows on that page carried nodes `a_nodes`; b's rows now
+    // occupying the same slots carry the same node ids (identical row
+    // sizes ⟹ identical head capacities ⟹ identical numbering offsets).
+    let a_on_first_freed: Vec<(u32, Tid)> = deleted
+        .iter()
+        .filter(|(_, t)| t.page_id == first_freed)
+        .copied()
+        .collect();
+    assert_eq!(
+        a_on_first_freed.len(),
+        3,
+        "a filled that page before it died"
+    );
+    for ((a_node, a_tid), (b_node, b_tid)) in a_on_first_freed.iter().zip(b_on_first_freed.iter()) {
+        assert_eq!(
+            a_tid, b_tid,
+            "same slots: a's residual entries point exactly at b's rows"
+        );
+        assert_eq!(a_node, b_node, "the exact node-id collision at {a_tid:?}");
+    }
+
+    // a's ANN search for a deleted row's own vector: the tombstoned node
+    // still self-recalls, but with the map entry gone the candidate is
+    // discarded — pre-fix it resolved through the residual entry to b's
+    // row and passed the in-row NodeId re-check (the leak).
+    let (probe_node, _) = a_on_first_freed[0];
+    let hits = engine
+        .hnsw_search_visible(
+            "a",
+            &[probe_node as f32, 0.0, 0.0],
+            5,
+            None,
+            &Snapshot::everything(),
+        )
+        .unwrap();
+    let live_a: std::collections::HashSet<Tid> = engine
+        .scan("a", None)
+        .unwrap()
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    assert!(
+        !live_a.is_empty(),
+        "a's surviving head rows stay searchable (sanity)"
+    );
+    assert!(
+        !hits.is_empty(),
+        "the fix must not over-discard: a's live rows still match the query"
+    );
+    for (tid, _) in &hits {
+        assert!(
+            live_a.contains(tid),
+            "cross-table leak: a's search returned {tid:?}, which is not a live row of a"
+        );
+    }
     engine.shutdown();
 }
