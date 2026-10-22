@@ -1700,7 +1700,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 
 ## Stage D(M6):可见性过滤管线 + tombstone 读侧生效
 
-**状态**:🚧 落码完成、收口验证中(2026-10-19/20;coding-plan 阶段 D,前置 = Stage C 已收口)
+**状态**:✅ 完成(2026-10-19/20 落码,八轮对抗审查闭环:一轮 agent-23 PASS 带 1 P3 + 5 nano 当轮闭合;二轮 PASS 带 1 P2(post-commit 映射删除无快照水位线——按用户终审 stage 内闭合:水位门推迟 + auto_commit/TxnHandle 双调用点快照作用域修复);六轮外部深审 1 P3(TxnHandle::commit 孪生快照污染水位);七轮外部深审 1 P1(map.lookup 单条 → lookup_all 逐条可见性裁决);八轮外部深审 1 P1(推迟残留 map 条目 × vacuum 整页释放 × freelist 跨表转手 → 跨表数据泄漏;修复 = vacuum Phase 4 死行通道删映射,§4.1 相位序对 map 与 btree 同等成立)+ 1 nano(双重 decode),全部闭合):m6_search_visibility **16** 绿、pg-engine 全套件 0 FAILED、workspace debug 全套件 **EXIT=0 零失败**(siftsmall 在场,recall 门真实执行非跳过)、recall@10 = **0.9990** 逐位同值、fmt/clippy(默认 + --all-features 双口径)/doc -D warnings 三档绿、护栏 pg-am-hnsw 零 pg_txn 依赖(Cargo.toml + src 双向 grep)通过;已 commit——`20eb732`(主体)+ `d381b1a`(二轮 P2)+ `44c9b57`(六轮 P3)+ `5d7c7d6`(七轮 P1)+ `0e56034`(八轮 P1)
 **验收**:`cargo test -p pg-engine` / `cargo test --workspace` 全绿;护栏:pg-am-hnsw 零 pg_txn 依赖(源码 + Cargo.toml 双向核对)
 
 ### 交付内容
