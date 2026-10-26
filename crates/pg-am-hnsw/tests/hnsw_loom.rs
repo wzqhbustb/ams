@@ -3,7 +3,10 @@
 //! connect discipline, the meta critical section's first-insert race and
 //! backfill, and a reader's PublishLive × search interleaving) — the
 //! tech-selection §4.2/§4.3 choreography, verified by loom instead of by
-//! argument.
+//! argument. M6 Stage E adds the fourth model: vacuum-redirect ×
+//! concurrent insert (§12.1's third face) — the holder-latch RMW
+//! discipline shared by insert step 6 and the redirect's SetNeighbors
+//! rewrite is proven to lose no edge under any interleaving.
 //!
 //! Run with bounded preemptions (same tier discipline as btree_loom):
 //!
@@ -85,6 +88,19 @@ fn run_model<F>(max_preemptions: usize, body: F)
 where
     F: Fn() + Send + Sync + 'static,
 {
+    run_model_with_branches(max_preemptions, None, body);
+}
+
+/// `max_branches` overrides loom's per-execution branch budget (default
+/// 1000) for models whose single execution is scheduling-point dense —
+/// the redirect pass adds a full graph scan + per-edge latch RMW on top of
+/// the seed inserts (Stage E); raising the budget does NOT widen the
+/// explored interleaving set (the preemption bound governs that), it only
+/// lets one execution finish.
+fn run_model_with_branches<F>(max_preemptions: usize, max_branches: Option<usize>, body: F)
+where
+    F: Fn() + Send + Sync + 'static,
+{
     let body = Arc::new(body);
     let mut builder = loom::model::Builder::new();
     if builder.preemption_bound.unwrap_or(usize::MAX) > max_preemptions {
@@ -93,6 +109,15 @@ where
             builder.preemption_bound
         );
         builder.preemption_bound = Some(max_preemptions);
+    }
+    if let Some(b) = max_branches {
+        if builder.max_branches < b {
+            eprintln!(
+                "hnsw_loom: raising max branches {} -> {b} (dense single execution)",
+                builder.max_branches
+            );
+            builder.max_branches = b;
+        }
     }
     builder.check(move || {
         let body = Arc::clone(&body);
@@ -275,5 +300,68 @@ fn loom_reader_writer_interleave() {
         writer.join().unwrap();
         reader.join().unwrap();
         assert_eq!(index.hwm(), 3);
+    });
+}
+
+/// Redirect × concurrent insert (M6 Stage E, tech-selection §12.1's
+/// vacuum-redirect × insert face): a redirect pass over a
+/// tombstone-carrying graph interleaves with an in-flight insert. Both
+/// sides cover their neighbor-list read-modify-write with the HOLDER's
+/// node latch (insert's step 6; the redirect's SetNeighbors rewrite), so
+/// no interleaving can lose an edge: the post-race audit must be green
+/// and every LIVE node must stay reachable — a lost reciprocal edge
+/// would strand the newcomer. (The engine's `AccessExclusive` lock makes
+/// this race operationally impossible in production; the model proves the
+/// latch discipline underneath is a mechanism, not an assumption.)
+#[test]
+fn loom_redirect_insert_interleave() {
+    // 3 seeded inserts + a delete + a racing insert + the full redirect
+    // scan/rewrite pass make a single execution branch-dense — loom's
+    // default 1000-branch budget overflows instantly (measured); 10k
+    // leaves headroom without touching the interleaving set (bound 2).
+    run_model_with_branches(2, Some(10_000), || {
+        let (_dir, pool, wal, index) = setup("redirect-insert");
+        // Seed a tombstone-carrying graph on the driver (hoisted out of
+        // the racing section).
+        index.insert(&pool, &wal, &vec_for(0)).unwrap();
+        index.insert(&pool, &wal, &vec_for(1)).unwrap();
+        index.insert(&pool, &wal, &vec_for(2)).unwrap();
+        index.delete(&pool, &wal, pg_am_hnsw::NodeId(2)).unwrap();
+        let index = Arc::new(index);
+
+        let writer = {
+            let index = Arc::clone(&index);
+            let pool = Arc::clone(&pool);
+            let wal = Arc::clone(&wal);
+            spawn_big(move || {
+                index.insert(&pool, &wal, &vec_for(3)).unwrap();
+            })
+        };
+        let rebuilder = {
+            let index = Arc::clone(&index);
+            let pool = Arc::clone(&pool);
+            let wal = Arc::clone(&wal);
+            spawn_big(move || {
+                index.redirect_tombstoned_in_edges(&pool, &wal).unwrap();
+            })
+        };
+        writer.join().unwrap();
+        rebuilder.join().unwrap();
+
+        assert_eq!(index.hwm(), 4, "the insert landed exactly once");
+        // Quiesce: structural audit green, and no LIVE node is stranded
+        // (a lost reciprocal edge would show up here).
+        pg_am_hnsw::audit::audit_index(&pool, index.meta_page_id()).unwrap();
+        let reach = pg_am_hnsw::audit::audit_reachability(&pool, index.meta_page_id()).unwrap();
+        assert!(
+            reach.unreachable_live.is_empty(),
+            "no interleaving may strand a LIVE node: {:?}",
+            reach.unreachable_live
+        );
+        for t in [0u32, 1, 3] {
+            let hits = index.search(&pool, &vec_for(t), 1, Some(4)).unwrap();
+            assert_eq!(hits.len(), 1, "node {t} must be reachable");
+            assert_eq!(hits[0].1, 0.0, "node {t} must recall itself");
+        }
     });
 }

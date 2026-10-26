@@ -413,6 +413,61 @@ pub struct VacuumStats {
     pub index_entries_already_gone: usize,
 }
 
+/// The default leak-ratio threshold for [`Engine::hnsw_leak_report`] (M6
+/// Stage E, tech-selection §9: "比例阈值（默认 10%，可配）触发局部重建建议").
+pub const DEFAULT_HNSW_LEAK_THRESHOLD: f64 = 0.10;
+
+/// The leak ledger for one table's HNSW index (M6 Stage E, tech-selection
+/// §8.3/§9): the three-term residue accounting — tombstoned nodes +
+/// crash-window residue (INITIALIZING/orphan entries) + orphan sidecar-map
+/// entries — against the graph's node count, plus the reachability
+/// diagnostics. Read-only; the §12.5 quiesce premise applies to the
+/// reachability fields (a concurrent writer's legal intermediate states
+/// would be misread).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HnswLeakReport {
+    /// Directory-mapped node count (the chain high-water mark).
+    pub node_count: u64,
+    /// Mapped entries with the LIVE bit set.
+    pub live_count: u64,
+    /// Mapped entries with the tombstone bit set.
+    pub tombstoned_count: u64,
+    /// Mapped entries still INITIALIZING (crash-window ghost stock).
+    pub initializing_count: u64,
+    /// Occupied node-entry slots no directory entry names (crash-window
+    /// orphan stock; `audit_index`'s referenced-pages scope applies).
+    pub orphan_entry_count: u64,
+    /// Sidecar-map entries whose row is gone or will never be visible
+    /// again (the horizon-free deadness rule: slot empty, inserter
+    /// aborted, or deleter committed — in-flight rows are NOT orphans).
+    pub orphan_map_entries: u64,
+    /// LIVE, non-tombstoned nodes no legal search can reach (diagnostic;
+    /// NOT part of the leak ratio — §14.1's verdict reads this).
+    pub unreachable_live_count: u64,
+    /// Unreachable INITIALIZING nodes (diagnostic).
+    pub unreachable_initializing_count: u64,
+    /// Unreachable tombstoned nodes (diagnostic).
+    pub unreachable_tombstoned_count: u64,
+    /// `tombstoned + initializing + orphan_entry + orphan_map_entries`
+    /// divided by `node_count` (0.0 on an empty graph).
+    pub leak_ratio: f64,
+    /// The threshold in effect (default [`DEFAULT_HNSW_LEAK_THRESHOLD`]).
+    pub threshold: f64,
+    /// `leak_ratio > threshold` — the §9 trigger for a local-rebuild
+    /// recommendation (the recommendation only; the rebuild itself is
+    /// Stage E's `hnsw_vacuum` work).
+    pub rebuild_recommended: bool,
+}
+
+/// The outcome of one [`Engine::hnsw_vacuum`] pass (M6 Stage E).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HnswVacuumStats {
+    /// The redirect pass's own counters.
+    pub redirect: pg_am_hnsw::RedirectStats,
+    /// The leak ledger re-taken after the pass.
+    pub leak_after: HnswLeakReport,
+}
+
 /// The assembled engine: storage + catalog + heap AM + txn manager + disk
 /// CLOG + in-memory table registry. Assembly order is documented at the
 /// module level.
@@ -2135,6 +2190,144 @@ impl Engine {
         unreachable!("the loop returns on the last round")
     }
 
+    /// The leak ledger for the table's HNSW index (M6 Stage E,
+    /// tech-selection §8.3/§9 监控): read-only accounting, never mutates.
+    /// Combines the graph-side audit counters (`audit_index` +
+    /// `audit_reachability` — the §12.5 quiesce premise applies to the
+    /// reachability fields) with the engine-side orphan-map count (every
+    /// sidecar entry range-scanned and probed against its heap tuple).
+    ///
+    /// `threshold` overrides [`DEFAULT_HNSW_LEAK_THRESHOLD`]; it must be
+    /// finite and within `[0, 1]`. Fails with
+    /// [`EngineError::IndexNotFound`] when the table has no HNSW index.
+    pub fn hnsw_leak_report(&self, table: &str, threshold: Option<f64>) -> Result<HnswLeakReport> {
+        let threshold = threshold.unwrap_or(DEFAULT_HNSW_LEAK_THRESHOLD);
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+            return Err(EngineError::InvalidArgument(format!(
+                "hnsw leak threshold {threshold} is not finite or outside [0, 1]"
+            )));
+        }
+        let entry = self.table_entry(table)?;
+        let (idx, _) = self
+            .indexes_of(&entry)
+            .into_iter()
+            .find(|(i, _)| matches!(i.key_type, ColumnType::Vector(_)))
+            .ok_or_else(|| EngineError::IndexNotFound(format!("{table}: no HNSW index")))?;
+        let handle = self.hnsw_handle(&idx)?;
+        let audit = handle.audit(self.storage.buffer_pool())?;
+        let reach =
+            pg_am_hnsw::audit::audit_reachability(self.storage.buffer_pool(), idx.meta_page)?;
+        let orphan_map_entries = match self.open_hnsw_map(idx.index_oid)? {
+            Some(map) => self.count_orphan_map_entries(&map)?,
+            None => 0,
+        };
+        let residue = audit.tombstoned_count
+            + audit.initializing_count
+            + audit.orphan_entry_count
+            + orphan_map_entries;
+        let leak_ratio = if audit.node_count == 0 {
+            0.0
+        } else {
+            residue as f64 / audit.node_count as f64
+        };
+        Ok(HnswLeakReport {
+            node_count: audit.node_count,
+            live_count: audit.live_count,
+            tombstoned_count: audit.tombstoned_count,
+            initializing_count: audit.initializing_count,
+            orphan_entry_count: audit.orphan_entry_count,
+            orphan_map_entries,
+            unreachable_live_count: reach.unreachable_live.len() as u64,
+            unreachable_initializing_count: reach.unreachable_initializing_count,
+            unreachable_tombstoned_count: reach.unreachable_tombstoned_count,
+            leak_ratio,
+            threshold,
+            rebuild_recommended: leak_ratio > threshold,
+        })
+    }
+
+    /// The local rebuild for the table's HNSW index (M6 Stage E,
+    /// tech-selection §9 局部重建): one redirect pass over the LIVE nodes'
+    /// in-edges that point at tombstoned nodes, then a fresh leak ledger.
+    ///
+    /// **独占执行 (§9)**: the pass runs under the table's
+    /// `AccessExclusive` lock (the `vacuum` precedent) — concurrent DML
+    /// queues; lock-free SEARCHES proceed (the read path takes no table
+    /// lock; a reader sees either the old or the rewritten neighbor list,
+    /// both valid graphs). Relationship to heap vacuum (§9 各管各的): the
+    /// two channels are independent — neither touches the other's
+    /// internals; taking the same table lock only serializes them.
+    ///
+    /// **What it does NOT do** (the §9 format-freeze boundary): no
+    /// physical reclamation — tombstoned nodes stay mapped
+    /// (`leak_after.tombstoned_count` is unchanged by the pass), no slot
+    /// reuse, no page freeing. The edge semantics are approximate by
+    /// design ("次近邻") with the recall gate as the backstop.
+    ///
+    /// Drive it from [`Self::hnsw_leak_report`]'s `rebuild_recommended`.
+    /// Fails with [`EngineError::IndexNotFound`] when the table has no
+    /// HNSW index.
+    pub fn hnsw_vacuum(&self, table: &str) -> Result<HnswVacuumStats> {
+        let redirect = self.auto_commit(|snap| {
+            let entry =
+                self.lock_table_entry(snap.current_xid(), table, LockMode::AccessExclusive)?;
+            let (idx, _) = self
+                .indexes_of(&entry)
+                .into_iter()
+                .find(|(i, _)| matches!(i.key_type, ColumnType::Vector(_)))
+                .ok_or_else(|| EngineError::IndexNotFound(format!("{table}: no HNSW index")))?;
+            let handle = self.hnsw_handle(&idx)?;
+            Ok(handle.redirect_tombstoned_in_edges(
+                self.storage.buffer_pool(),
+                self.storage.wal_writer(),
+            )?)
+        })?;
+        let leak_after = self.hnsw_leak_report(table, None)?;
+        Ok(HnswVacuumStats {
+            redirect,
+            leak_after,
+        })
+    }
+
+    /// Every sidecar-map entry whose row is gone or will never be visible
+    /// again, counted by a full range scan + per-entry heap probe (cold
+    /// path — the §9 leak accounting, not a query path).
+    fn count_orphan_map_entries(&self, map: &pg_am_btree::BTreeIndex) -> Result<u64> {
+        let mut orphans = 0u64;
+        for (_key, tid) in map.range_scan(None, None)? {
+            if self.map_entry_is_orphan(tid)? {
+                orphans += 1;
+            }
+        }
+        Ok(orphans)
+    }
+
+    /// The horizon-free deadness rule for the leak ledger (M6 Stage E):
+    /// an entry is an orphan iff its row is gone or will never be visible
+    /// again — slot empty, inserter aborted, or deleter committed.
+    /// In-flight rows (xmin/xmax still InProgress) are NOT orphans: their
+    /// transaction will decide, and counting them would false-positive on
+    /// ordinary concurrent traffic.
+    fn map_entry_is_orphan(&self, tid: Tid) -> Result<bool> {
+        let guard = self.storage.buffer_pool().pin(tid.page_id)?;
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        let Some(bytes) = SlottedPage::tuple(page, tid.slot_id)? else {
+            return Ok(true);
+        };
+        let header = TupleHeader::read_from(&bytes[..pg_am_heap::tuple::TUPLE_HEADER_SIZE])?;
+        if self.clog.get_state(header.t_xmin) == pg_storage::clog::TxnState::Aborted {
+            return Ok(true);
+        }
+        // A HEAP_XMAX_LOCK_ONLY stamp is a row lock, not a delete (§9.1).
+        let xmax = if header.t_infomask & pg_am_heap::tuple::HEAP_XMAX_LOCK_ONLY != 0 {
+            TxnId::INVALID
+        } else {
+            header.t_xmax
+        };
+        Ok(xmax != TxnId::INVALID
+            && self.clog.get_state(xmax) == pg_storage::clog::TxnState::Committed)
+    }
+
     /// The catalog-writing half of `create_index`, inside transaction `snap`.
     fn create_index_catalog_rows(
         &self,
@@ -2916,15 +3109,19 @@ impl Engine {
                     // entries — so `EntryNotFound` is tolerated exactly like
                     // the btree path below (§4.3).
                     //
-                    // The graph NODE is deliberately NOT tombstoned here:
-                    // the committed-delete path already tombstoned it at
-                    // post-commit, and a non-HOT non-vector UPDATE reuses
-                    // the SAME NodeId for the live new version — blind
-                    // tombstoning would flip a live row's node. Removing
-                    // the map entry is the correctness-sufficient half: the
-                    // search pipeline's map-lookup step discards a
-                    // candidate whose node has no entry.
+                    // M6 Stage E (slice E-2, §9 死行驱动补刀): the tombstone
+                    // half of the same channel — commit-crash / failure-
+                    // skipped post-commit cleanup converges here. The
+                    // discrimination (round-8's registered discipline): a
+                    // non-HOT non-vector UPDATE reuses the SAME NodeId for
+                    // the live new version, so tombstone ONLY when no map
+                    // entry names a version live at this pass's horizon.
+                    // Order mirrors post-commit (tombstone first, then the
+                    // map entry): a crash between them converges on the
+                    // next pass — both operations are idempotent /
+                    // EntryNotFound-tolerant.
                     if let Some(mut map) = self.open_hnsw_map(idx.index_oid)? {
+                        let handle = self.hnsw_handle(idx)?;
                         for (tid, _) in &keys {
                             // The chain root still lies unread on its page
                             // (phase 5 has not run); re-read it for just
@@ -2935,6 +3132,31 @@ impl Engine {
                                 continue;
                             };
                             let key = encode_key(&Datum::Int8(i64::from(node_id)))?;
+                            let mut live_version = false;
+                            for ctid in map.lookup_all(&key)? {
+                                if ctid == *tid {
+                                    continue; // the dead chain root itself
+                                }
+                                if !self.tuple_dead_at_horizon(ctid, horizon)? {
+                                    live_version = true;
+                                    break;
+                                }
+                            }
+                            if !live_version {
+                                match handle.delete(
+                                    self.storage.buffer_pool(),
+                                    self.storage.wal_writer(),
+                                    pg_am_hnsw::NodeId(node_id),
+                                ) {
+                                    Ok(()) => {}
+                                    // INITIALIZING crash residue — `delete`
+                                    // refuses it by contract; the §8.3
+                                    // orphan accounting owns it, not this
+                                    // pass. Never loud.
+                                    Err(pg_am_hnsw::HnswError::InvalidOperation(_)) => {}
+                                    Err(e) => return Err(e.into()),
+                                }
+                            }
                             match map.delete(&key, *tid) {
                                 Ok(()) => stats.index_entries_removed += 1,
                                 // §4.3: eager maintenance removed it long ago.
@@ -3082,6 +3304,36 @@ impl Engine {
             EngineError::Corrupted(format!("no tuple at {tid} for hnsw map key readback"))
         })?;
         Ok(pg_am_heap::tuple::tuple_node_id(bytes, col_types)?)
+    }
+
+    /// Whether the row at `tid` is reclaimable-dead at `horizon` — the
+    /// exact rule `scan_dead_tuples` applies (M3 §3.2): an aborted
+    /// inserter, or a committed deleter older than the horizon (the
+    /// `HEAP_XMAX_LOCK_ONLY` mask included — a row lock is not a delete).
+    /// Vacuum's HNSW dead-row channel uses it for the Stage E tombstone
+    /// discrimination: "no live version carries this NodeId" vs "an UPDATE
+    /// reused the NodeId for a live version". An in-flight row reads as
+    /// NOT dead — its transaction will decide, and this pass must not
+    /// tombstone under it.
+    fn tuple_dead_at_horizon(&self, tid: Tid, horizon: TxnId) -> Result<bool> {
+        let guard = self.storage.buffer_pool().pin(tid.page_id)?;
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        // A reclaimed/empty slot is as dead as it gets.
+        let Some(bytes) = SlottedPage::tuple(page, tid.slot_id)? else {
+            return Ok(true);
+        };
+        let header = TupleHeader::read_from(&bytes[..pg_am_heap::tuple::TUPLE_HEADER_SIZE])?;
+        if self.clog.get_state(header.t_xmin) == pg_storage::clog::TxnState::Aborted {
+            return Ok(true);
+        }
+        let xmax = if header.t_infomask & pg_am_heap::tuple::HEAP_XMAX_LOCK_ONLY != 0 {
+            TxnId::INVALID
+        } else {
+            header.t_xmax
+        };
+        Ok(xmax != TxnId::INVALID
+            && xmax.0 < horizon.0
+            && self.clog.get_state(xmax) == pg_storage::clog::TxnState::Committed)
     }
 
     /// Find the first WAL record whose start lies inside segment `segment_id`

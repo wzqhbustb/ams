@@ -648,6 +648,170 @@ pub fn audit_reachability(
     })
 }
 
+/// Outcome of [`audit_symmetry`] (M6 Stage E, tech-selection §9/§12.3
+/// 不对称率口径).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SymmetryReport {
+    /// Every directed edge on every level between two LIVE nodes.
+    pub directed_edges: u64,
+    /// Edges `u → v` whose reverse `v → u` is absent on the same level
+    /// (LIVE–LIVE pairs only).
+    pub single_sided: u64,
+    /// `single_sided / directed_edges` (0.0 on an edgeless graph).
+    pub asymmetry_rate: f64,
+}
+
+/// Bidirectional-edge asymmetry over the page-resident graph — the paged
+/// twin of the in-memory `asymmetry_stats` (tests/common §9 ② 口径), over
+/// **LIVE–LIVE edge pairs only**: the M4 15.35% baseline (stage_spec:1076)
+/// was measured on a graph without tombstones, so its edges were all
+/// live-live by construction — this口径 is what keeps the budget
+/// apples-to-apples across deletes. Edges touching tombstoned or
+/// INITIALIZING nodes are residue under the §8.3/§9 leak ledger's
+/// jurisdiction, NOT graph-quality signal: a drop's unpaired `T → X`
+/// (tombstoned out-edge) would otherwise swamp the measurement (+2.1pp at
+/// a 2% tombstone ratio, measured), drowning the actual quality term —
+/// the swap-introduced single-sided LIVE–LIVE edges, which is what the
+/// §12.3 <1pp increment budget constrains.
+///
+/// **Premise: quiesce, after `open`** (§12.5, same as the other audits).
+/// Cold path with the redirect pass's memory shape (all adjacency
+/// materialized — the Stage F scale-evaluation registration applies).
+pub fn audit_symmetry(buffer_pool: &BufferPool, meta_page_id: PageId) -> Result<SymmetryReport> {
+    // 1. Meta page: type tag + full structural validation (the shared
+    // audit idiom — trust nothing cached).
+    let params = {
+        let guard = buffer_pool
+            .pin(meta_page_id)
+            .map_err(|e| storage_err("symmetry: pin meta page", e))?;
+        let page: &[u8; PAGE_SIZE] = guard
+            .page()
+            .try_into()
+            .expect("a buffer frame is exactly PAGE_SIZE");
+        if page_type(page) != PAGE_TYPE_META {
+            return Err(HnswError::Corrupted(format!(
+                "symmetry: page {} is not a meta page (page_type {})",
+                meta_page_id.0,
+                page_type(page)
+            )));
+        }
+        meta::read_meta(page)?
+    };
+    let geometry = NodeGeometry {
+        dim: params.dim,
+        m: params.m,
+        m_max0: params.m_max0,
+    };
+
+    // 2. Directory chain walk (the open protocol's single implementation).
+    let fetch = |page_id: PageId| -> Result<[u8; PAGE_SIZE]> {
+        let guard = buffer_pool
+            .pin(page_id)
+            .map_err(|e| storage_err("symmetry: pin directory page", e))?;
+        let page: &[u8; PAGE_SIZE] = guard
+            .page()
+            .try_into()
+            .expect("a buffer frame is exactly PAGE_SIZE");
+        Ok(*page)
+    };
+    let chain = dir::check_dir_chain(params.dir_head, fetch)?;
+    let hwm = chain.hwm;
+    let graph = PagedGraph::new(
+        buffer_pool,
+        chain.pages.clone(),
+        None,
+        hwm,
+        params.dim,
+        params.m,
+        params.m_max0,
+        params.metric,
+    );
+
+    // 3. Per-node pass: adjacency + state (the LIVE–LIVE filter needs
+    // both). A directory-mapped but unoccupied slot is a shape no legal
+    // record stream produces — loud, same as the redirect pass.
+    let mut live: Vec<bool> = Vec::with_capacity(hwm as usize);
+    let mut adjs: Vec<Vec<Vec<u32>>> = Vec::with_capacity(hwm as usize);
+    for id in 0..hwm {
+        let (page_id, slot) = graph.resolve(NodeId(id as u32))?;
+        let guard = buffer_pool
+            .pin(page_id)
+            .map_err(|e| storage_err("symmetry: pin node page", e))?;
+        let page: &[u8; PAGE_SIZE] = guard
+            .page()
+            .try_into()
+            .expect("a buffer frame is exactly PAGE_SIZE");
+        if page_type(page) != PAGE_TYPE_NODE {
+            return Err(HnswError::Corrupted(format!(
+                "symmetry: directory entry {id} points at page {} of page_type {}, not a node page",
+                page_id.0,
+                page_type(page)
+            )));
+        }
+        if !apply::slot_is_occupied(page, slot) {
+            return Err(HnswError::Corrupted(format!(
+                "symmetry: directory-mapped node {id} has an unoccupied slot"
+            )));
+        }
+        let is_live = apply::entry_is_live(page, slot, params.dim)?;
+        let is_tombstoned = apply::entry_is_tombstoned(page, slot, params.dim)?;
+        if is_tombstoned && !is_live {
+            return Err(HnswError::Corrupted(format!(
+                "symmetry: node {id} is tombstoned but not LIVE — unreachable via any legal record stream"
+            )));
+        }
+        live.push(is_live && !is_tombstoned);
+        let top = apply::entry_top_level(page, slot, params.dim)?;
+        let mut levels = Vec::with_capacity(usize::from(top) + 1);
+        for l in 0..=top {
+            levels.push(apply::entry_neighbors(page, slot, geometry, l)?);
+        }
+        adjs.push(levels);
+    }
+
+    // 4. Count LIVE–LIVE pairs only: for each u → v at level l with both
+    // endpoints live, the reverse must exist in v's level-l list (v must
+    // reach level l at all — assertion b's shape, loud here too).
+    let mut directed_edges = 0u64;
+    let mut single_sided = 0u64;
+    for (u, levels) in adjs.iter().enumerate() {
+        if !live[u] {
+            continue;
+        }
+        for (l, list) in levels.iter().enumerate() {
+            for &v in list {
+                // A neighbor id at/above the scan's hwm is a concurrent
+                // newcomer (the quiesce premise is caller discipline; the
+                // measurement still must not panic) — this pass skips the
+                // edge; the next run sees it.
+                if live.get(v as usize) != Some(&true) {
+                    continue;
+                }
+                directed_edges += 1;
+                let v_list = adjs[v as usize].get(l).ok_or_else(|| {
+                    HnswError::Corrupted(format!(
+                        "symmetry: level-{l} edge {u} -> {v} but {v}'s top_level is {}",
+                        adjs[v as usize].len() - 1
+                    ))
+                })?;
+                if !v_list.contains(&(u as u32)) {
+                    single_sided += 1;
+                }
+            }
+        }
+    }
+    let asymmetry_rate = if directed_edges == 0 {
+        0.0
+    } else {
+        single_sided as f64 / directed_edges as f64
+    };
+    Ok(SymmetryReport {
+        directed_edges,
+        single_sided,
+        asymmetry_rate,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

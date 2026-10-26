@@ -32,8 +32,9 @@ pub mod query_stats;
 pub mod sql;
 
 pub use engine::{
-    ColumnDef, Engine, EngineConfig, IndexEntry, Predicate, QueryResult, TableEntry, TxnHandle,
-    VacuumStats, Value, DEFAULT_CLOG_BUFFER_FRAMES,
+    ColumnDef, Engine, EngineConfig, HnswLeakReport, HnswVacuumStats, IndexEntry, Predicate,
+    QueryResult, TableEntry, TxnHandle, VacuumStats, Value, DEFAULT_CLOG_BUFFER_FRAMES,
+    DEFAULT_HNSW_LEAK_THRESHOLD,
 };
 pub use error::{EngineError, Result};
 pub use query_stats::{

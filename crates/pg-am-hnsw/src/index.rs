@@ -99,6 +99,35 @@ struct ProbeState {
     logging: bool,
 }
 
+/// The outcome of one [`HnswIndex::redirect_tombstoned_in_edges`] pass (M6
+/// Stage E, tech-selection §9 局部重建).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RedirectStats {
+    /// Tombstoned nodes the pass saw (a size hint only — the rewrite work
+    /// is bounded by the in-edge count, not this).
+    pub tombstoned_nodes: u64,
+    /// LIVE-held edges pointing at tombstoned nodes, across all levels.
+    /// **NOT the convergence criterion** (review round-2 nano): kept-arm
+    /// fixed points (no live substitute) are re-discovered every pass with
+    /// ZERO writes — a consumer looping on `in_edges_found == 0` would
+    /// spin forever. Convergence is "zero writes": `edges_redirected +
+    /// edges_dropped == 0`.
+    pub in_edges_found: u64,
+    /// Edges swapped to the tombstoned node's nearest live neighbor.
+    pub edges_redirected: u64,
+    /// Edges dropped because the substitute was already in the holder's
+    /// list (a duplicate would break the sorted-unique invariant).
+    pub edges_dropped: u64,
+    /// Edges kept: no live substitute exists — the tombstoned node stays
+    /// a routable waypoint (connectivity never degrades). Also counts the
+    /// "edge already gone at write time" arm (a concurrent rewrite or an
+    /// earlier same-pass drop removed it first) — semantically distinct
+    /// from the no-substitute keep, folded here to keep the identity
+    /// `in_edges_found == redirected + dropped + kept` (review nano: split
+    /// the counter if a consumer ever needs the distinction).
+    pub edges_kept: u64,
+}
+
 /// A live handle on one HNSW index (meta page + directory chain + runtime
 /// graph state).
 ///
@@ -1057,6 +1086,238 @@ impl HnswIndex {
                 .map_err(|e| crate::page::storage_err("delete: success-boundary flush", e))?;
         }
         Ok(())
+    }
+
+    /// Redirect every LIVE node's in-edges that point at tombstoned nodes
+    /// (M6 Stage E, tech-selection §9 局部重建): for each edge `X → T` at
+    /// level `l` with `X` LIVE and `T` tombstoned, swap `T` for `T`'s
+    /// nearest LIVE level-`l` neighbor other than `X` (the "次近邻" — when
+    /// `T`'s nearest is the holder itself, the next one wins), drop the
+    /// edge when that substitute is already in `X`'s list (the edge is
+    /// redundant — connectivity already flows through the substitute, and
+    /// a duplicate would break the sorted-unique invariant), or keep it
+    /// when `T` has NO live level-`l` neighbor other than `X` (the
+    /// tombstoned node stays a routable waypoint — connectivity NEVER
+    /// degrades).
+    ///
+    /// **Scope discipline** (all registered, never silent): tombstoned and
+    /// INITIALIZING holders keep their out-edges (a tombstoned chain of
+    /// waypoints is still routable; the orphan stock belongs to the §8.3
+    /// accounting); the entry point / meta is never touched; nothing is
+    /// physically reclaimed (§9's format-freeze boundary — the pass only
+    /// rewrites edges, the tombstoned nodes stay mapped).
+    ///
+    /// **Concurrency**: every list rewrite is a read-modify-write under
+    /// the holder's node latch (insert step 6's exact idiom: collect →
+    /// pin_mut → one `HnswSetNeighbors` post-image → apply → pd_lsn —
+    /// record 122 reused, ZERO new record classes). The engine drives the
+    /// pass under the table's `AccessExclusive` lock (§9's 独占执行); the
+    /// latch discipline makes the pass safe even against a concurrent
+    /// insert (loom, Stage E slice E-4) — a concurrent reader sees either
+    /// list version, both of them valid graphs.
+    ///
+    /// **Idempotent, progressive**: a crash mid-pass leaves a prefix of
+    /// the rewrites durable; redirected edges no longer match the scan
+    /// predicate, so the next pass resumes cleanly. The pass's own
+    /// success boundary flushes the tail before `Ok` escapes.
+    pub fn redirect_tombstoned_in_edges(
+        &self,
+        buffer_pool: &BufferPool,
+        wal_writer: &WalWriter,
+    ) -> Result<RedirectStats> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum State {
+            Initializing,
+            Live,
+            Tombstoned,
+        }
+
+        let hwm = self.hwm();
+        let geometry = NodeGeometry {
+            dim: self.params.dim,
+            m: self.params.m,
+            m_max0: self.params.m_max0,
+        };
+        let g = PagedGraph::new(
+            buffer_pool,
+            self.dir_pages.read().clone(),
+            Some(&self.dir_pages),
+            hwm,
+            self.params.dim,
+            self.params.m,
+            self.params.m_max0,
+            self.params.metric,
+        );
+
+        // Phase A: full scan (cold path, one pin per node — audit's idiom;
+        // no latches, reads only). A directory-mapped but unoccupied slot
+        // is a shape no legal record stream produces (NodeInit precedes
+        // DirAppend inside the alloc critical section) — loud.
+        let mut states: Vec<State> = Vec::with_capacity(hwm as usize);
+        let mut adjs: Vec<Vec<Vec<u32>>> = Vec::with_capacity(hwm as usize);
+        for raw in 0..hwm {
+            let (page_id, slot) = g.resolve(NodeId(raw as u32))?;
+            let guard = buffer_pool
+                .pin(page_id)
+                .map_err(|e| crate::page::storage_err("redirect: pin node page", e))?;
+            let page: &[u8; PAGE_SIZE] = guard
+                .page()
+                .try_into()
+                .expect("a buffer frame is exactly PAGE_SIZE");
+            if !crate::apply::slot_is_occupied(page, slot) {
+                return Err(HnswError::Corrupted(format!(
+                    "redirect: directory-mapped node {raw} has an unoccupied slot"
+                )));
+            }
+            let tombstoned = crate::apply::entry_is_tombstoned(page, slot, self.params.dim)?;
+            let live = crate::apply::entry_is_live(page, slot, self.params.dim)?;
+            states.push(if tombstoned {
+                State::Tombstoned
+            } else if live {
+                State::Live
+            } else {
+                State::Initializing
+            });
+            let top = crate::apply::entry_top_level(page, slot, self.params.dim)?;
+            let mut levels = Vec::with_capacity(usize::from(top) + 1);
+            for l in 0..=top {
+                levels.push(crate::apply::entry_neighbors(page, slot, geometry, l)?);
+            }
+            adjs.push(levels);
+        }
+
+        let mut stats = RedirectStats {
+            tombstoned_nodes: states.iter().filter(|s| **s == State::Tombstoned).count() as u64,
+            ..RedirectStats::default()
+        };
+
+        // Phases B+C (fused per in-edge): candidate from the scan, rewrite
+        // under the holder's latch with the authoritative current list.
+        for x_raw in 0..hwm {
+            let x = x_raw as usize;
+            if states[x] != State::Live {
+                continue;
+            }
+            let top = adjs[x].len() - 1;
+            for l in 0..=(top as u8) {
+                let targets: Vec<u32> = adjs[x][usize::from(l)]
+                    .iter()
+                    .copied()
+                    // A neighbor id at/above the scan's hwm is a CONCURRENT
+                    // NEWCOMER (an insert connected it after this pass
+                    // started — loom model `loom_redirect_insert_interleave`
+                    // caught the OOB here): never a redirect target, it is
+                    // LIVE by construction; the next pass sees it.
+                    .filter(|&nb| {
+                        (nb as usize) < states.len() && states[nb as usize] == State::Tombstoned
+                    })
+                    .collect();
+                for t in targets {
+                    stats.in_edges_found += 1;
+                    let t_idx = t as usize;
+                    // A level-`l` edge to a node whose top_level < l breaks
+                    // the graph invariant (audit assertion b) — loud.
+                    let t_level_list = adjs[t_idx].get(usize::from(l)).ok_or_else(|| {
+                        HnswError::Corrupted(format!(
+                            "redirect: level-{l} edge {x_raw} -> {t} but {t}'s top_level is {}",
+                            adjs[t_idx].len() - 1
+                        ))
+                    })?;
+                    // The substitute: T's nearest LIVE level-`l` neighbor
+                    // other than X (the "次近邻" — nearest wins; ties break
+                    // by id for determinism). List membership is NOT
+                    // filtered here: the write below swaps when the
+                    // substitute is absent from X's current list and DROPS
+                    // the edge when it is already there (the edge is then
+                    // redundant — connectivity flows through the
+                    // substitute).
+                    let substitute = t_level_list
+                        .iter()
+                        .copied()
+                        // A candidate at/above the scan's hwm is a
+                        // concurrent newcomer — possibly still
+                        // INITIALIZING, never an established LIVE
+                        // substitute — excluded conservatively.
+                        .filter(|&c| {
+                            states.get(c as usize) == Some(&State::Live) && c != x_raw as u32
+                        })
+                        .map(|c| (c, g.dist_between(NodeId(t), NodeId(c))))
+                        .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+                        .map(|(c, _)| c);
+
+                    let (x_page, x_slot) = g.resolve(NodeId(x_raw as u32))?;
+                    // The holder's node latch covers the whole
+                    // read-modify-write (§4.3: one latch at a time).
+                    let _x_guard = self.node_latch(x_raw as u32).write();
+                    let mut new_list: Vec<u32> = {
+                        let guard = buffer_pool.pin(x_page).map_err(|e| {
+                            crate::page::storage_err("redirect: pin holder page", e)
+                        })?;
+                        let page: &[u8; PAGE_SIZE] = guard
+                            .page()
+                            .try_into()
+                            .expect("a buffer frame is exactly PAGE_SIZE");
+                        crate::apply::entry_neighbors(page, x_slot, geometry, l)?
+                    };
+                    if !new_list.contains(&t) {
+                        // The edge is already gone (a concurrent rewrite
+                        // under the same latch, or an earlier edge of this
+                        // same pass dropped it) — converge, never fail.
+                        // Counted as `kept` (see RedirectStats::edges_kept's
+                        // doc for the folded口径).
+                        stats.edges_kept += 1;
+                        continue;
+                    }
+                    match substitute {
+                        Some(t_prime) if !new_list.contains(&t_prime) => {
+                            new_list.retain(|&v| v != t);
+                            let pos = new_list.binary_search(&t_prime).unwrap_or_else(|p| p);
+                            new_list.insert(pos, t_prime);
+                            stats.edges_redirected += 1;
+                        }
+                        Some(_) => {
+                            // Substitute already present: drop the edge to
+                            // T (the duplicate would break sorted-unique).
+                            new_list.retain(|&v| v != t);
+                            stats.edges_dropped += 1;
+                        }
+                        None => {
+                            stats.edges_kept += 1;
+                            continue;
+                        }
+                    }
+                    // ONE SetNeighbors post-image settles the rewrite
+                    // (insert step 6's idiom verbatim).
+                    let mut guard = buffer_pool.pin_mut(x_page).map_err(|e| {
+                        crate::page::storage_err("redirect: pin_mut holder page", e)
+                    })?;
+                    let record = WalRecord::hnsw_set_neighbors(
+                        self.meta_page_id,
+                        x_page,
+                        x_slot,
+                        x_raw as u32,
+                        l,
+                        new_list.clone(),
+                    )
+                    .map_err(|e| crate::page::storage_err("redirect: encode SetNeighbors", e))?;
+                    let lsn = wal_writer
+                        .append(record)
+                        .map_err(|e| crate::page::storage_err("redirect: WAL append", e))?;
+                    let page: &mut [u8; PAGE_SIZE] = guard
+                        .page_mut()
+                        .try_into()
+                        .expect("a buffer frame is exactly PAGE_SIZE");
+                    crate::apply::set_neighbors(page, x_slot, geometry, l, &new_list)?;
+                    pg_storage::page::set_page_pd_lsn(page, lsn);
+                }
+            }
+        }
+
+        // The pass's success boundary: durable before Ok escapes.
+        wal_writer
+            .flush_to(wal_writer.current_lsn())
+            .map_err(|e| crate::page::storage_err("redirect: success-boundary flush", e))?;
+        Ok(stats)
     }
 
     /// k-nearest-neighbor search on the page-resident graph (paper
@@ -3045,6 +3306,356 @@ mod tests {
                 .search(engine.buffer_pool(), &vec![1.0; DIM as usize], 0, Some(0))
                 .unwrap(),
             vec![]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------
+    // M6 Stage E (slice E-3): redirect_tombstoned_in_edges (§9 局部重建)
+    // ---------------------------------------------------------------
+
+    const R_DIM: u16 = 2;
+
+    /// Build an index with `n` one-dimensional vectors [i, 0] inserted
+    /// (partial lists: m/m_max0 small enough that NOT every substitute is
+    /// already in every holder's list — the swap arm needs that).
+    fn build_partial_graph(dir: &PathBuf, n: u32) -> (StorageEngine, HnswIndex) {
+        let config = StorageConfig::new(dir);
+        let engine = StorageEngine::open(dir, &config).unwrap();
+        let index = create(
+            engine.buffer_pool(),
+            engine.wal_writer(),
+            HnswParams::new(4, 6, 64, 32).unwrap(),
+            R_DIM,
+            Metric::L2,
+            NeighborSelection::Heuristic,
+            SEED,
+        )
+        .unwrap();
+        for i in 0..n {
+            index
+                .insert(engine.buffer_pool(), engine.wal_writer(), &[i as f32, 0.0])
+                .unwrap();
+        }
+        (engine, index)
+    }
+
+    fn r_geo() -> NodeGeometry {
+        NodeGeometry {
+            dim: R_DIM,
+            m: 4,
+            m_max0: 6,
+        }
+    }
+
+    /// Test-only adjacency read (pub(crate) surface — the integration
+    /// tests assert behavior, the list content is pinned HERE).
+    fn neighbors_at(engine: &StorageEngine, index: &HnswIndex, node: u32, l: u8) -> Vec<u32> {
+        let g = PagedGraph::new(
+            engine.buffer_pool(),
+            index.dir_pages.read().clone(),
+            None,
+            index.hwm(),
+            R_DIM,
+            4,
+            6,
+            Metric::L2,
+        );
+        let (page_id, slot) = g.resolve(NodeId(node)).unwrap();
+        let guard = engine.buffer_pool().pin(page_id).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        crate::apply::entry_neighbors(page, slot, r_geo(), l).unwrap()
+    }
+
+    fn node_state(engine: &StorageEngine, index: &HnswIndex, node: u32) -> (bool, bool) {
+        let g = PagedGraph::new(
+            engine.buffer_pool(),
+            index.dir_pages.read().clone(),
+            None,
+            index.hwm(),
+            R_DIM,
+            4,
+            6,
+            Metric::L2,
+        );
+        let (page_id, slot) = g.resolve(NodeId(node)).unwrap();
+        let guard = engine.buffer_pool().pin(page_id).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        (
+            crate::apply::entry_is_live(page, slot, R_DIM).unwrap(),
+            crate::apply::entry_is_tombstoned(page, slot, R_DIM).unwrap(),
+        )
+    }
+
+    fn top_of(engine: &StorageEngine, index: &HnswIndex, node: u32) -> u8 {
+        let g = PagedGraph::new(
+            engine.buffer_pool(),
+            index.dir_pages.read().clone(),
+            None,
+            index.hwm(),
+            R_DIM,
+            4,
+            6,
+            Metric::L2,
+        );
+        let (page_id, slot) = g.resolve(NodeId(node)).unwrap();
+        let guard = engine.buffer_pool().pin(page_id).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        crate::apply::entry_top_level(page, slot, R_DIM).unwrap()
+    }
+
+    /// The self-computing oracle: tombstone T, run the pass, and every
+    /// outcome is pinned — the swap target for a holder whose substitute
+    /// existed, the kept-condition for every remaining tombstoned entry,
+    /// live reachability, meta untouched, idempotent re-entry.
+    #[test]
+    fn redirect_swaps_to_next_nearest_under_full_oracle() {
+        let dir = fresh_dir("redirect-swap");
+        let (engine, index) = build_partial_graph(&dir, 24);
+        let n = index.hwm() as u32;
+        assert_eq!(n, 24);
+        let victim = 12u32;
+
+        // Pre-pass: audit + reachability baseline (LIVE all reachable).
+        let pre_reach =
+            crate::audit::audit_reachability(engine.buffer_pool(), index.meta_page_id()).unwrap();
+        assert!(pre_reach.unreachable_live.is_empty());
+
+        index
+            .delete(engine.buffer_pool(), engine.wal_writer(), NodeId(victim))
+            .unwrap();
+
+        // Oracle data: the first holder (by node id) whose edge to the
+        // victim fires the SWAP arm — the victim's nearest live neighbor
+        // (the substitute) is NOT already in the holder's list.
+        let mut swap_case: Option<(u32, u8, u32, Vec<u32>)> = None;
+        for x in 0..n {
+            if x == victim {
+                continue;
+            }
+            for l in 0..=top_of(&engine, &index, x) {
+                let list = neighbors_at(&engine, &index, x, l);
+                if !list.contains(&victim) {
+                    continue;
+                }
+                let t_list = neighbors_at(&engine, &index, victim, l);
+                let substitute = t_list
+                    .iter()
+                    .copied()
+                    .filter(|&c| {
+                        c != x && {
+                            let (live, tomb) = node_state(&engine, &index, c);
+                            live && !tomb
+                        }
+                    })
+                    .min_by(|&a, &b| {
+                        let da = (a as f32 - victim as f32).abs();
+                        let db = (b as f32 - victim as f32).abs();
+                        da.total_cmp(&db).then(a.cmp(&b))
+                    });
+                if let Some(t_prime) = substitute {
+                    if !list.contains(&t_prime) {
+                        swap_case = Some((x, l, t_prime, list));
+                        break;
+                    }
+                }
+            }
+            if swap_case.is_some() {
+                break;
+            }
+        }
+        let (sx, sl, st_prime, before_list) =
+            swap_case.expect("a partial graph must yield at least one swappable in-edge");
+
+        let (pre_ep, pre_ml) = index.meta_pair();
+        let stats = index
+            .redirect_tombstoned_in_edges(engine.buffer_pool(), engine.wal_writer())
+            .unwrap();
+
+        // Totals add up; the swap arm fired at least the oracle case.
+        assert!(stats.tombstoned_nodes >= 1);
+        assert!(stats.in_edges_found >= 1);
+        assert_eq!(
+            stats.in_edges_found,
+            stats.edges_redirected + stats.edges_dropped + stats.edges_kept
+        );
+        assert!(stats.edges_redirected >= 1, "stats: {stats:?}");
+
+        // The swap oracle: the holder's list is exactly (before - T + T')
+        // in sorted order.
+        let mut expected: Vec<u32> = before_list
+            .iter()
+            .copied()
+            .filter(|&v| v != victim)
+            .collect();
+        let pos = expected.binary_search(&st_prime).unwrap_or_else(|p| p);
+        expected.insert(pos, st_prime);
+        assert_eq!(
+            neighbors_at(&engine, &index, sx, sl),
+            expected,
+            "holder {sx} level {sl}: swap {victim} -> {st_prime}"
+        );
+
+        // The kept-condition oracle: any tombstoned entry still in a LIVE
+        // list must have had NO live substitute at all — every live
+        // level-`l` neighbor of the tombstoned node is the holder itself
+        // (any other live neighbor would have fired the swap/drop arm).
+        for x in 0..n {
+            let (live, tomb) = node_state(&engine, &index, x);
+            if !live || tomb {
+                continue;
+            }
+            for l in 0..=top_of(&engine, &index, x) {
+                let list = neighbors_at(&engine, &index, x, l);
+                for &nb in &list {
+                    let (nb_live, nb_tomb) = node_state(&engine, &index, nb);
+                    if !(nb_live && nb_tomb) {
+                        continue; // only tombstoned entries are kept-cases
+                    }
+                    for c in neighbors_at(&engine, &index, nb, l) {
+                        let (c_live, c_tomb) = node_state(&engine, &index, c);
+                        if c_live && !c_tomb {
+                            assert_eq!(
+                                c, x,
+                                "kept edge {x} -> {nb} at level {l} but a live substitute {c} exists"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Meta untouched; LIVE reachability unchanged; audit green.
+        assert_eq!(index.meta_pair(), (pre_ep, pre_ml));
+        let post_reach =
+            crate::audit::audit_reachability(engine.buffer_pool(), index.meta_page_id()).unwrap();
+        assert!(
+            post_reach.unreachable_live.is_empty(),
+            "redirect must never strand LIVE nodes"
+        );
+        crate::audit::audit_index(engine.buffer_pool(), index.meta_page_id()).unwrap();
+
+        // Idempotent re-entry: a second pass rewrites nothing.
+        let second = index
+            .redirect_tombstoned_in_edges(engine.buffer_pool(), engine.wal_writer())
+            .unwrap();
+        assert_eq!(second.edges_redirected, 0);
+        assert_eq!(second.edges_dropped, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The kept arm, deterministically: a two-node graph — the tombstoned
+    /// node's ONLY neighbor is the holder itself, so no substitute exists
+    /// and the edge must be kept (the tombstoned node stays a waypoint).
+    #[test]
+    fn redirect_keeps_the_edge_when_no_live_substitute_exists() {
+        let dir = fresh_dir("redirect-keep");
+        let (engine, index) = build_partial_graph(&dir, 2);
+        index
+            .delete(engine.buffer_pool(), engine.wal_writer(), NodeId(1))
+            .unwrap();
+        assert!(neighbors_at(&engine, &index, 0, 0).contains(&1));
+
+        let stats = index
+            .redirect_tombstoned_in_edges(engine.buffer_pool(), engine.wal_writer())
+            .unwrap();
+        assert_eq!(stats.tombstoned_nodes, 1);
+        assert!(stats.in_edges_found >= 1);
+        assert_eq!(stats.edges_redirected, 0);
+        assert_eq!(stats.edges_dropped, 0);
+        assert_eq!(stats.in_edges_found, stats.edges_kept);
+        assert!(
+            neighbors_at(&engine, &index, 0, 0).contains(&1),
+            "no substitute → the edge is kept (connectivity never degrades)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------
+    // M6 Stage E (slice E-4): audit_symmetry (§9/§12.3 不对称率口径)
+    // ---------------------------------------------------------------
+
+    /// Empty graph: no edges at all; a two-node graph: the level-0 pair is
+    /// reciprocal — zero single-sided edges regardless of either node's
+    /// drawn top level (upper lists stay empty when no one shares them).
+    #[test]
+    fn symmetry_empty_and_two_node_baseline() {
+        let dir = fresh_dir("symmetry-baseline");
+        let (engine, index) = build_partial_graph(&dir, 0);
+        let empty =
+            crate::audit::audit_symmetry(engine.buffer_pool(), index.meta_page_id()).unwrap();
+        assert_eq!(empty.directed_edges, 0);
+        assert_eq!(empty.single_sided, 0);
+        assert_eq!(empty.asymmetry_rate, 0.0);
+
+        index
+            .insert(engine.buffer_pool(), engine.wal_writer(), &[0.0, 0.0])
+            .unwrap();
+        index
+            .insert(engine.buffer_pool(), engine.wal_writer(), &[1.0, 0.0])
+            .unwrap();
+        let two = crate::audit::audit_symmetry(engine.buffer_pool(), index.meta_page_id()).unwrap();
+        assert_eq!(two.directed_edges, 2, "the level-0 pair, both ways");
+        assert_eq!(two.single_sided, 0);
+        assert_eq!(two.asymmetry_rate, 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The §12.3 increment budget (LIVE–LIVE口径): a redirect pass over a
+    /// 200-node graph moves the asymmetry rate by less than one percentage
+    /// point, and the directed-edge bookkeeping is exact — the pass adds
+    /// precisely `edges_redirected` new LIVE–LIVE edges (swaps), while
+    /// every edge incident to a tombstoned victim leaves the口径.
+    #[test]
+    fn symmetry_redirect_increment_within_budget() {
+        let dir = fresh_dir("symmetry-budget");
+        let (engine, index) = build_partial_graph(&dir, 200);
+        let before =
+            crate::audit::audit_symmetry(engine.buffer_pool(), index.meta_page_id()).unwrap();
+        assert!(before.directed_edges > 0);
+
+        // Edges incident to the soon-to-be-tombstoned victims (they all
+        // leave the LIVE–LIVE口径 after the deletes).
+        let victims: std::collections::HashSet<u32> = [40, 80, 120, 160, 199].into_iter().collect();
+        let mut victim_incident = 0u64;
+        for u in 0..index.hwm() as u32 {
+            for l in 0..=top_of(&engine, &index, u) {
+                for v in neighbors_at(&engine, &index, u, l) {
+                    if victims.contains(&u) || victims.contains(&v) {
+                        victim_incident += 1;
+                    }
+                }
+            }
+        }
+
+        for &v in &victims {
+            index
+                .delete(engine.buffer_pool(), engine.wal_writer(), NodeId(v))
+                .unwrap();
+        }
+        let stats = index
+            .redirect_tombstoned_in_edges(engine.buffer_pool(), engine.wal_writer())
+            .unwrap();
+        assert!(stats.in_edges_found >= 5);
+
+        let after =
+            crate::audit::audit_symmetry(engine.buffer_pool(), index.meta_page_id()).unwrap();
+        assert_eq!(
+            before.directed_edges - victim_incident + stats.edges_redirected,
+            after.directed_edges,
+            "exact bookkeeping: victim-incident edges leave the口径, swaps add one LIVE–LIVE edge each"
+        );
+        let delta = (after.asymmetry_rate - before.asymmetry_rate).abs();
+        assert!(
+            delta < 0.01,
+            "§12.3 increment budget: |{:.4}% - {:.4}%| = {:.4}% must stay < 1pp ({before:?} -> {after:?})",
+            before.asymmetry_rate * 100.0,
+            after.asymmetry_rate * 100.0,
+            delta * 100.0,
         );
 
         let _ = std::fs::remove_dir_all(&dir);

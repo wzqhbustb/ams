@@ -86,8 +86,8 @@ pub mod snapshot;
 
 pub(crate) mod validate;
 
-pub use audit::{AuditReport, ReachabilityReport};
+pub use audit::{AuditReport, ReachabilityReport, SymmetryReport};
 pub use error::{HnswError, Result};
 pub use graph::{Hnsw, Metric, NeighborSelection};
-pub use index::{ExpectedParams, HnswIndex, OpenOutcome};
+pub use index::{ExpectedParams, HnswIndex, OpenOutcome, RedirectStats};
 pub use params::{HnswParams, NodeId};
