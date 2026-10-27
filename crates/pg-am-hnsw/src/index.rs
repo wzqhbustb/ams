@@ -1238,27 +1238,37 @@ impl HnswIndex {
                     // is also the better redirect semantically (X gains an
                     // out-edge into its existing cluster). Nearest-to-T
                     // wins within the preferred partition; ties break by
-                    // id for determinism.
-                    let substitute = t_level_list
-                        .iter()
-                        .copied()
+                    // id for determinism. Candidate side uses the SAME
+                    // .get() shape as the target side (review nano): a
+                    // corrupt level-l edge to a node without level l must
+                    // fail as structured Corrupted, never OOB-panic.
+                    let mut ranked: Vec<(u8, f64, u32)> = Vec::new();
+                    for &c in t_level_list {
                         // A candidate at/above the scan's hwm is a
                         // concurrent newcomer — possibly still
                         // INITIALIZING, never an established LIVE
                         // substitute — excluded conservatively.
-                        .filter(|&c| {
-                            states.get(c as usize) == Some(&State::Live) && c != x_raw as u32
-                        })
-                        .map(|c| {
-                            // Rank 0 = the reverse edge `c → X` exists
-                            // (swap completes a pair); rank 1 = no reverse
-                            // (swap adds a single-sided edge). Rank first,
-                            // then nearest-to-T, then id (determinism).
-                            let rank = u8::from(
-                                !adjs[c as usize][usize::from(l)].contains(&(x_raw as u32)),
-                            );
-                            (rank, g.dist_between(NodeId(t), NodeId(c)), c)
-                        })
+                        if states.get(c as usize) != Some(&State::Live) || c == x_raw as u32 {
+                            continue;
+                        }
+                        let c_list = match adjs[c as usize].get(usize::from(l)) {
+                            Some(list) => list,
+                            None => {
+                                return Err(HnswError::Corrupted(format!(
+                                    "redirect: level-{l} candidate {c} has no level-{l} adjacency (top_level = {})",
+                                    adjs[c as usize].len() - 1
+                                )));
+                            }
+                        };
+                        // Rank 0 = the reverse edge `c → X` exists (swap
+                        // completes a pair); rank 1 = no reverse (swap adds
+                        // a single-sided edge). Rank first, then
+                        // nearest-to-T, then id (determinism).
+                        let rank = u8::from(!c_list.contains(&(x_raw as u32)));
+                        ranked.push((rank, g.dist_between(NodeId(t), NodeId(c)), c));
+                    }
+                    let substitute = ranked
+                        .into_iter()
                         .min_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)))
                         .map(|(_, _, c)| c);
 
@@ -3670,10 +3680,12 @@ mod tests {
             after.directed_edges,
             "exact bookkeeping: victim-incident edges leave the口径, swaps add one LIVE–LIVE edge each"
         );
-        let delta = (after.asymmetry_rate - before.asymmetry_rate).abs();
+        let delta = after.asymmetry_rate - before.asymmetry_rate;
+        // Signed (review P3-2): the increment cap is one-sided — a >1pp
+        // improvement is a pass, never a failure.
         assert!(
             delta < 0.01,
-            "§12.3 increment budget: |{:.4}% - {:.4}%| = {:.4}% must stay < 1pp ({before:?} -> {after:?})",
+            "§12.3 increment budget: C {:.4}% - B {:.4}% = {:.4}pp must stay < 1pp ({before:?} -> {after:?})",
             before.asymmetry_rate * 100.0,
             after.asymmetry_rate * 100.0,
             delta * 100.0,

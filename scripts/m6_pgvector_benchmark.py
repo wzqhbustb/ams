@@ -173,12 +173,24 @@ def main():
 
         # ANN queries: recall vs ground truth + per-statement latency
         # (\timing on; EXPLAIN alone returns no rows).
-        psql(bin_dir, "postgres", "SET hnsw.ef_search = 64")
+        # One-time proof that the GUC really takes effect in a session
+        # (kept OUT of the per-query files so it can't pollute id parsing).
+        check_sql = WORK / "check-ef.sql"
+        with open(check_sql, "w") as f:
+            f.write("LOAD 'vector';\nSET hnsw.ef_search = 64;\nSHOW hnsw.ef_search;\n")
+        ef_out = psql_file(bin_dir, "postgres", check_sql)
+        assert "64" in ef_out, f"ef_search=64 did not take effect: {ef_out}"
         overlaps = []
         latencies = []
         for qi, q in enumerate(queries):
             sql_path = WORK / f"query-{qi}.sql"
             with open(sql_path, "w") as f:
+                # GUC is per-session (review P3-1): every query file must
+                # LOAD the extension and SET ef_search in ITS OWN session —
+                # a SET in another psql process has no effect here (and an
+                # unloaded session would even reject the parameter).
+                f.write("LOAD 'vector';\n")
+                f.write("SET hnsw.ef_search = 64;\n")
                 f.write("\\timing on\n")
                 f.write(f"SELECT id FROM items ORDER BY embedding <-> '{vec_text(q)}' LIMIT 10;\n")
             out = psql_file(bin_dir, "postgres", sql_path)

@@ -581,10 +581,13 @@ fn m6_concurrent_stress() {
     // Anchor C: post-rebuild, every gate re-measured.
     let gate_c = measure_gate(&engine, oid, &last_inserted);
     assert_gate(&gate_c, "post-rebuild");
-    let delta_repair = (gate_c.asymmetry - gate_b.asymmetry).abs();
+    let delta_repair = gate_c.asymmetry - gate_b.asymmetry;
+    // Signed, NOT absolute (review P3-2): the §12.3 budget is a one-sided
+    // INCREMENT cap — a >1pp IMPROVEMENT must not fail the gate (same
+    // reading as the crash rounds' "lower edge is not a defect signal").
     assert!(
         delta_repair < ASYMMETRY_BUDGET,
-        "§12.3 repair leg: |C {:.4}% - B {:.4}%| = {:.4}% ≥ 1pp",
+        "§12.3 repair leg: C {:.4}% - B {:.4}% = {:.4}pp ≥ 1pp",
         gate_c.asymmetry * 100.0,
         gate_b.asymmetry * 100.0,
         delta_repair * 100.0

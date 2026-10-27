@@ -8,19 +8,20 @@
 
 | 指标 | pg_rust(M6) | pgvector(v0.8.7) |
 |------|-------------|------------------|
-| bulk insert(单事务) | 10000 行 14.40s = **694 rows/s** | 10000 行 2.67s = **3744 rows/s** |
-| HNSW 索引构建(m=16, ef_construction=200) | 含于 bulk insert(增量建图) | **2.17s**(bulk 后一次性建) |
-| auto-commit insert | 1000 行 19.24s = **52 rows/s** | 100 行 0.11s = **872 rows/s** |
+| bulk insert(单事务) | 10000 行 14.40s = **694 rows/s** | 10000 行 2.93s = **3414 rows/s** |
+| HNSW 索引构建(m=16, ef_construction=200) | 含于 bulk insert(增量建图) | **2.37s**(bulk 后一次性建) |
+| auto-commit insert | 1000 行 19.24s = **52 rows/s** | 100 行 0.19s = **527 rows/s** |
 | recall@10(ef=64) | **0.9990**(pre/post_rebuild 同值) | 0.9940 |
-| 查询延迟 mean | **0.222ms**(pre)/ 0.217ms(post) | 2.871ms |
-| 查询延迟 p50 | 0.213ms / 0.213ms | 2.988ms |
-| 查询延迟 p95 | 0.410ms / 0.332ms | 3.561ms |
-| 查询延迟 max | 0.462ms / 0.463ms | 9.045ms |
+| 查询延迟 mean | **0.222ms**(pre)/ 0.217ms(post) | 2.503ms |
+| 查询延迟 p50 | 0.213ms / 0.213ms | 1.165ms |
+| 查询延迟 p95 | 0.410ms / 0.332ms | 1.856ms |
+| 查询延迟 max | 0.462ms / 0.463ms | 128.664ms(单查询离群) |
 
 **读数(如实,不粉饰)**:
 - **recall 我方略优**(0.9990 vs 0.9940,+0.5pp)——图质量同档,无回退。
-- **插入吞吐 pgvector 明显更快**:bulk 3744 vs 694(约 5.4×),auto-commit 872 vs 52(约 17×)。pgvector 的"装载后一次性建索引"也比我的"插入即增量建图"省(bulk+build 合计 4.84s vs 我 14.40s,约 3×)。**这是当前实现的真实差距,主因是每次插入都做全量 WAL + 每行一次提交边界 flush + 增量搜索连接段的成本**。
-- **查询延迟我方便宜一个数量级**(0.222ms vs 2.871ms)——**但口径不同,不可直接归功于引擎**:我方是进程内 `hnsw_search_visible` API 测量(图搜索 + 旁路映射 + 回表可见性),pgvector 是 psql `\\timing` 全 SQL 路径(parse + plan + execute)测量。pgvector 的 2.87ms 含协议与规划器开销及新实例冷缓存效应;两者不是同一层级的延迟对比,仅作方向性参考。
+- **插入吞吐 pgvector 明显更快**:bulk 3414 vs 694(约 4.9×),auto-commit 527 vs 52(约 10×)。pgvector 的"装载后一次性建索引"也比我的"插入即增量建图"省(bulk+build 合计 5.30s vs 我 14.40s,约 2.7×)。**这是当前实现的真实差距,主因是每次插入都做全量 WAL + 每行一次提交边界 flush + 增量搜索连接段的成本**。
+- **查询延迟我方便宜一个数量级**(0.222ms vs 2.503ms)——**但口径不同,不可直接归功于引擎**:我方是进程内 `hnsw_search_visible` API 测量(图搜索 + 旁路映射 + 回表可见性),pgvector 是 psql `\\timing` 全 SQL 路径(parse + plan + execute)测量。pgvector 的 2.503ms 含协议与规划器开销及新实例冷缓存效应(max 128.664ms 为单查询离群,p50=1.165ms 更代表中心水平);两者不是同一层级的延迟对比,仅作方向性参考。
+- **ef 口径修正(本轮 review P3-1)**:pgvector 的 GUC 不跨 psql 会话,初版 `SET hnsw.ef_search` 未作用于查询会话(实际跑在默认 ef=40)。已改为每个查询文件内 `LOAD 'vector' + SET hnsw.ef_search = 64` 并加 `SHOW` 一次性实证,以上为 ef=64 的真实测数。
 
 ## 2. hwm 串行点实测回执(选型 §13)
 
@@ -51,4 +52,4 @@ hwm 临界区(分配 NodeId → 抽层 → 备页 → NodeInit → DirAppend)是
 - fmt / clippy(默认 + --all-features)/ doc 三档绿。
 - 覆盖率:pg-am-hnsw tarpaulin `--fail-under 90` 以 CI(Linux)报告为准(M6 push 时取回)。
 
-(待回填:24h 验收结果、release 全量回归、CI 覆盖率报告、出口 tag。)
+(待回填:24h 验收结果、CI 覆盖率报告、出口 tag。release/debug 全套件均已 EXIT=0。)
