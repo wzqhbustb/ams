@@ -1092,13 +1092,17 @@ impl HnswIndex {
     /// (M6 Stage E, tech-selection §9 局部重建): for each edge `X → T` at
     /// level `l` with `X` LIVE and `T` tombstoned, swap `T` for `T`'s
     /// nearest LIVE level-`l` neighbor other than `X` (the "次近邻" — when
-    /// `T`'s nearest is the holder itself, the next one wins), drop the
-    /// edge when that substitute is already in `X`'s list (the edge is
-    /// redundant — connectivity already flows through the substitute, and
-    /// a duplicate would break the sorted-unique invariant), or keep it
-    /// when `T` has NO live level-`l` neighbor other than `X` (the
-    /// tombstoned node stays a routable waypoint — connectivity NEVER
-    /// degrades).
+    /// `T`'s nearest is the holder itself, the next one wins), **with a
+    /// bidirectional preference (§12.3)**: candidates whose reverse edge
+    /// `c → X` already exists rank FIRST, so the swap completes a pair
+    /// instead of adding a single-sided edge (measured: a nearest-only
+    /// choice structurally breaks the <1pp increment budget at meaningful
+    /// tombstone ratios). Drop the edge when that substitute is already
+    /// in `X`'s list (the edge is redundant — connectivity already flows
+    /// through the substitute, and a duplicate would break the
+    /// sorted-unique invariant), or keep it when `T` has NO live level-`l`
+    /// neighbor other than `X` (the tombstoned node stays a routable
+    /// waypoint — connectivity NEVER degrades).
     ///
     /// **Scope discipline** (all registered, never silent): tombstoned and
     /// INITIALIZING holders keep their out-edges (a tombstoned chain of
@@ -1224,13 +1228,17 @@ impl HnswIndex {
                         ))
                     })?;
                     // The substitute: T's nearest LIVE level-`l` neighbor
-                    // other than X (the "次近邻" — nearest wins; ties break
-                    // by id for determinism). List membership is NOT
-                    // filtered here: the write below swaps when the
-                    // substitute is absent from X's current list and DROPS
-                    // the edge when it is already there (the edge is then
-                    // redundant — connectivity flows through the
-                    // substitute).
+                    // other than X, with a **bidirectional preference**
+                    // (§12.3's <1pp budget — measured: a nearest-only
+                    // choice adds +2.4pp at a ~9% tombstone ratio and
+                    // +4.7pp at 50%, structurally breaking the budget).
+                    // Candidates whose reverse edge `c → X` already exists
+                    // win first: swapping `X → T` to `X → c` then COMPLETES
+                    // a pair instead of adding a single-sided edge, and it
+                    // is also the better redirect semantically (X gains an
+                    // out-edge into its existing cluster). Nearest-to-T
+                    // wins within the preferred partition; ties break by
+                    // id for determinism.
                     let substitute = t_level_list
                         .iter()
                         .copied()
@@ -1241,9 +1249,18 @@ impl HnswIndex {
                         .filter(|&c| {
                             states.get(c as usize) == Some(&State::Live) && c != x_raw as u32
                         })
-                        .map(|c| (c, g.dist_between(NodeId(t), NodeId(c))))
-                        .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
-                        .map(|(c, _)| c);
+                        .map(|c| {
+                            // Rank 0 = the reverse edge `c → X` exists
+                            // (swap completes a pair); rank 1 = no reverse
+                            // (swap adds a single-sided edge). Rank first,
+                            // then nearest-to-T, then id (determinism).
+                            let rank = u8::from(
+                                !adjs[c as usize][usize::from(l)].contains(&(x_raw as u32)),
+                            );
+                            (rank, g.dist_between(NodeId(t), NodeId(c)), c)
+                        })
+                        .min_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)))
+                        .map(|(_, _, c)| c);
 
                     let (x_page, x_slot) = g.resolve(NodeId(x_raw as u32))?;
                     // The holder's node latch covers the whole
@@ -3415,7 +3432,7 @@ mod tests {
         let (engine, index) = build_partial_graph(&dir, 24);
         let n = index.hwm() as u32;
         assert_eq!(n, 24);
-        let victim = 12u32;
+        let victim = 3u32;
 
         // Pre-pass: audit + reachability baseline (LIVE all reachable).
         let pre_reach =
@@ -3449,11 +3466,15 @@ mod tests {
                             live && !tomb
                         }
                     })
-                    .min_by(|&a, &b| {
-                        let da = (a as f32 - victim as f32).abs();
-                        let db = (b as f32 - victim as f32).abs();
-                        da.total_cmp(&db).then(a.cmp(&b))
-                    });
+                    .map(|c| {
+                        // Mirror the primitive's bidirectional preference:
+                        // rank 0 when `c → x` exists, then nearest-to-victim,
+                        // then id.
+                        let rank = u8::from(!neighbors_at(&engine, &index, c, l).contains(&x));
+                        (rank, (c as f32 - victim as f32).abs(), c)
+                    })
+                    .min_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)))
+                    .map(|(_, _, c)| c);
                 if let Some(t_prime) = substitute {
                     if !list.contains(&t_prime) {
                         swap_case = Some((x, l, t_prime, list));

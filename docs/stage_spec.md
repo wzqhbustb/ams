@@ -1755,3 +1755,31 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - fmt / clippy(默认 + --all-features 双口径)/ doc -D warnings 三档绿
 
 **二轮对抗深审回流(2026-10-23,agent-23 verdict PASS,P1/P2/P3 零;1 nano + 2 语义立文闭合)**:换攻击角度,三枚临时探针实证(用完即删,树净)——①**崩溃 × redirect**(24 节点 + 2 tombstone + pass → mem::forget 杀 → 重开):audit 绿、tombstone 计数重放一致、第二趟 `in_edges_found == 0` 完全收敛;②**delete × redirect 竞赛**(loom 未覆盖面,200 节点 × 80 连续 tombstone × 3 趟 pass 并发):零 panic、audit 绿、零搁浅 LIVE——三交错(holder 写前被 tombstone/候选算距后被 tombstone/目标扫描后被 tombstone)全部无害实证;③**E-2 多版本一趟收敛**(update×2 复用同一 NodeId + delete,全程水位推迟):tombstone 恰好一次、推迟条目全清、第二趟报告逐等。**推演闭合面**(勿重复):同 holder 双 tombstone 邻居的 T1'==T2' 撞车(新鲜重读下第二目标走 drop 臂)、victim 互指 T1→T2 三处口径一致、上层边/入口点 tombstoned、E-1 槽复用面证伪(相位序使条目先于复用被删)、hnsw_vacuum 的 auto_commit 形态与 vacuum 同型、对称率新人跳过偏差有界、"在飞不判死"臂结构不可达(AccessExclusive 排他,纵深防御)。**nano(收敛判据立文)**:keep 臂稳定不动点每趟被"发现"但零写入——`in_edges_found == 0` 不是收敛判据(重度 tombstone 图永循环),判据 = 零写入(`edges_redirected + edges_dropped == 0`),已立文于 `RedirectStats::in_edges_found` rustdoc。**语义立文 ×2**:①redirect 收敛后 tombstoned 节点可能**完全不可达**——设计终态(入边全部换/删后的残留形态,物理回收归格式升级窗口),`audit_reachability` 的 `unreachable_tombstoned_count` 即其发现手段;②keep 不动点语义同上。**探针断言修正记录**:审查方两枚初版断言红(`unreachable_tombstoned == 0`、`followup.in_edges_found == 0`)查实均为断言错误而非代码缺陷——两点的语义立文即由此而来。
+
+## Stage F(M6):验收 + 对标 + 收口
+
+**状态**:🚧 进行中(2026-10-26 开工;coding-plan 阶段 F,前置 = Stage E 已收口)
+**归属**:M6 出口(选型 §12/§14):§14 五项验收全绿;对标落盘;归档;出口 tag(经用户确认)
+
+### 交付进度
+
+1. **F-1 `m6_concurrent_stress`(100 并发 INSERT+DELETE+search)**:`crates/pg-engine/tests/m6_concurrent_stress.rs`,m2c_stress 形态(disjoint id ranges + supervisor/watchdog + 后台 checkpoint)。双模式:`M6_STRESS_ROUNDS`(CI 默认 4,**硬下界 ≥1 零值响亮失败**)/ `M6_STRESS_HOURS=24`(手动验收,wall-clock)。每迭代 5 insert + search + 每 4 迭代 1 delete + 1 abort(把 tombstone 比率压到 ~10% 设计工作点——§12.3 预算的标定点)。quiesce 门:扫描逐等合并簿记(count + content)、`initializing/orphan_entry/orphan_map` 三项零(quiesce heap vacuum 死行通道先收推迟残留)、audit 绿 + unreachable_live 空、recall@10 ≥ 0.95(ef=128,实测 1.0000)、**B − M4 baseline(15.35%) < 1pp**(并发腿;corpus 增长固有漂移不算增量)与 **C − B < 1pp**(修复腿,同 corpus)双门;quiesce 后一次 `hnsw_vacuum` 再全量复审(全程 vacuum 不介入)。**施工中抓获两处 harness 缺陷 + 一处生产语义缺陷(见下)**。
+2. **F-2 `m6_crash_rounds`(并发 × SIGKILL 叠加)**:M5 crash-rounds 形态(子进程 + 原子 expectation + RAII reaper)。轮型:full(完工后杀,精确集合)/ mid(进度点杀,**单连接单未记录 op 上界**:|recorded-live \ scan| ≤ conns 与 |scan \ recorded-live| ≤ conns——每连接每次提交后即重写 expectation,未记录至多 1 op;recorded-deleted ∩ scan = ∅)/ **v1.4 P1 特殊轮(r%8==3:in-flight DELETE × checkpoint × SIGKILL → 行可见 + 节点 LIVE + 映射在)**。§14.2 钉:残留上界 `initializing/orphan_entry/hidden_high_level` 各 ≤ 并发度(崩溃窗口 × 并发度,Stage E 三轮延期项在此闭合);恢复 <30s(实测亚秒);heap vacuum 后 orphan_map_entries == 0(committed delete × 清理跳过由死行通道收口);recall@10 ≥ 0.95(恢复后与一次重建后各一遍,实测 1.0000);不对称率上界 30%(下界非缺陷信号,round 8 实测 4.9753% 合法)。CI 默认 25 轮(82s 全绿);`M6_CRASH_ROUNDS=1000` 为手动验收形态。
+3. **F-3 pgvector 对标**:`scripts/m6_pgvector_benchmark.py`(brew postgresql + pgvector 配套,全部在 target/ 隔离;`CREATE EXTENSION vector` 即装即用)。同数据集 siftsmall(10k×128d,100 查询)测 recall@10 / 延迟 / 吞吐,与我方 `m6_benchmark.rs` 同口径。环境坎坷登记:本机 /usr/local/pgsql 19devel 与 pgvector 源码 API 漂移过大(LWLock/table_beginscan/read_stream/mul_size 一串不兼容),v0.8.0 与 master 均不可直接构建;改走 brew 配套安装(用户授权)。
+4. **F-4 覆盖率复核 + 全量回归**:ci.yml 的 coverage job 已带 `--fail-under 90`(M5 Stage E 修复项)与 flaky skip,**判定以 CI(Linux)报告为准**——M6 提交前 push 时取回;全量回归 debug + release 双跑 + bench smoke(criterion `m2c_100_conn` 冒烟)。
+5. **F-5 对抗审查 ×2 + 归档 + 出口 tag**:Stage 0–F 各节三小节;`phase2-m6` tag 经用户确认后打(分支 + PR,tag 打在 main 的 merge commit 上)。
+
+### F-1 施工抓获记录(验收驱动的真实修复)
+
+- **生产语义修复(§12.3 预算反噬)**:初版 redirect 的"最近 live 邻居"替换选择在实测中破预算——50% tombstone 比率下 +4.66pp、~9% 下 +2.36pp(swap 基本只加单边)。修复 = **双向优先替换**:候选中 reverse 边 `c → X` 已存在者优先(rank 0),其次才是最近邻——swap 由"加单边"变"成对",实测修复腿 C − B 转负(增量 -0.2pp)。lib `redirect_swaps_to_next_nearest_under_full_oracle` 预言机同步镜像(rank, dist, id);200 节点对称率预算测试同绿。**这是 Stage F 验收工作反推回 Stage E 原语的一次实质改进**。
+- **harness 缺陷两枚**:①合并簿记漏 seed 行(scanned=500 vs live=300,自摆乌龙,补 seed 初始化);②mid 崩溃轮的 recorded-live 断言误把"committed-but-unrecorded delete"当丢失(改为单连接单未记录 op 上界,严格可证)。
+- **recall 口径加固**:ef 64→128 边 beam(初版贴底 0.9500 无余量);向量从 id%N 周期分量改 splitmix64 伪随机(周期重复曾把 recall 结构性压到贴底)。改后 recall 稳定 1.0000。
+
+### 验证数字(持续回填)
+
+- F-1 CI 缩短版:100 conns × 400 iterations ≈ 4.7s,recall B/C=1.0000,asymmetry B≈6.6% C≈6.4%(修复腿为负),loom/audit 门全绿;**24h 验收跑后台进行中**(M6_STRESS_HOURS=24,日志 /tmp/m6_stress_24h.log)。
+- F-2 CI 25 轮:**82s 全绿**(full/mid/P1 三轮型),恢复亚秒,recall 1.0000/1.0000。
+- F-3 我方 `m6_benchmark`(release):bulk 10000 行 14.40s = **694 rows/s**(单事务);auto-commit 1000 行 19.24s = **52 rows/s**(组提交,§13 hwm 串行点回执——per-transaction 提交延迟主导);recall@10 = **0.9990**;查询延迟 pre mean 0.222ms / p50 0.213ms / p95 0.410ms / max 0.462ms,post mean 0.217ms / p95 0.332ms(ef=64);**pgvector v0.8.7 实测**:bulk 3744 rows/s、index build 2.17s、auto-commit 872 rows/s、recall@10 0.9940、延迟 mean 2.871ms / p50 2.988ms / p95 3.561ms / max 9.045ms。**对照读数**:recall 我方 +0.5pp 略优;插入吞吐 pgvector 明显更快(bulk 约 5.4×、auto-commit 约 17×,提交与增量建图成本是主因,归后续调优项);查询延迟我方便宜一个数量级**但口径不同**(进程内 API vs psql 全 SQL 路径,仅作方向性参考)。环境坎坷登记:本机 19devel 与 pgvector 源码 API 漂移大(v0.8.0/master 均不可直接构建),brew 公式依赖 @17+@18 双版本且 @18 未装,最终用已装的 @17 直接编译 v0.8.7 装入其目录(用户授权)。
+- 全量回归:workspace debug 全套件 EXIT=0 零失败(126 min,受并发负载影响);**release 全套件 EXIT=0 零失败**;criterion m2c_100_conn 冒烟通过(50 conns × 10 ops,~2.25 Kelem/s);coverage 以 CI 报告为准。
+
+**F-5 二轮对抗复核回流(2026-10-26,agent-23 verdict PASS,P1/P2/P3 零;2 nano 闭合)**:一轮 3 nano 修复全部核验正确;新攻击面全闭合——quiesce 介入顺序(checkpoint 线程先停后 vacuum,无死等面)、恢复计时口径(open 含 WAL replay + catalog/registry 重建,<30s 余量大)、双向优先替换二阶效应(候选恒为 T 的活邻居,recall 三处独立实证无退化,loom 断言与排序正交)、benchmark 映射与计分(pre/post 恒等是机制非巧合)、pgvector harness 解析(裸 SELECT,正则不误吞)、24h 运行时形态(watchdog 不误触)、stage_spec 逐句互洽。**nano ①**:mid 轮 expectation 文件存在性竞态(慢首写 panic)——修复 = 文件缺失按空集处理(与"单连接单未记录 op"上界兼容;缺失 = 未提交或首写未落盘,均被 mid 上界覆盖)。**nano ②**:clippy/doc 补票由主线闭合(双口径 + doc 全绿)。
