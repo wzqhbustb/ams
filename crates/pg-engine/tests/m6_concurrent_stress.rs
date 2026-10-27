@@ -247,8 +247,19 @@ impl Worker {
     }
 
     fn run_deadline(mut self, deadline: Instant) -> Result<Outcome, String> {
+        // Progress logging for the 24h watchdog-stall diagnosis (a worker
+        // that never returns is what trips the watchdog).
+        if std::env::var("M6_STRESS_LOG_PROGRESS").is_ok() {
+            eprintln!("worker start (next_insert={})", self.next_insert);
+        }
         while Instant::now() < deadline {
             self.iterate(false)?;
+            if std::env::var("M6_STRESS_LOG_PROGRESS").is_ok() && self.iterations % 100 == 0 {
+                eprintln!("worker progress: iterations={} next_insert={}", self.iterations, self.next_insert);
+            }
+        }
+        if std::env::var("M6_STRESS_LOG_PROGRESS").is_ok() {
+            eprintln!("worker return: iterations={}", self.iterations);
         }
         Ok(Outcome {
             live: self.live,
@@ -552,12 +563,14 @@ fn m6_concurrent_stress() {
     // alone moves the inherent rate (anchor A is a young, mostly-unshrunk
     // graph), and the budget explicitly excludes HNSW's inherent
     // single-sided shrink removals. Gate = B − 15.35% < 1pp, with the M4
-    // properties band [5%, 30%] as the inherited shape sanity check.
+    // band's UPPER edge (30%) as the inherited shape sanity check — the
+    // lower edge is NOT a defect signal after deletes (the LIVE–LIVE
+    // subgraph can legitimately sit below 5%).
     const M4_BASELINE: f64 = 0.1535;
     let delta_concurrency = gate_b.asymmetry - M4_BASELINE;
     assert!(
-        (0.05..=0.30).contains(&gate_b.asymmetry),
-        "quiesce asymmetry {:.4}% outside the M4 properties band [5%, 30%]",
+        gate_b.asymmetry <= 0.30,
+        "quiesce asymmetry {:.4}% above the M4 band's upper edge (30%)",
         gate_b.asymmetry * 100.0
     );
     assert!(
