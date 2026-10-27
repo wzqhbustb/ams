@@ -57,6 +57,12 @@ pub enum EngineError {
     #[error("btree error: {0}")]
     BTree(#[from] pg_am_btree::BTreeError),
 
+    /// An HNSW access-method failure surfaced through the M5 dependency
+    /// edge (Phase 2 M5 Stage B slice 3b — the pg-am-hnsw create/open
+    /// protocol surfaces here; same `#[from]` wiring style as `BTree`).
+    #[error("hnsw error: {0}")]
+    Hnsw(#[from] pg_am_hnsw::HnswError),
+
     /// The table lock manager rejected an acquisition: the deadlock
     /// detector (M2c Stage R, §9.3) chose this transaction as the victim of
     /// a wait-for cycle. The current statement fails with this error; the

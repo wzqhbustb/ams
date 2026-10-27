@@ -68,7 +68,10 @@ use tracing::{debug, info, warn};
 use crate::error::{Result, StorageError};
 use crate::types::{Lsn, PageId, Tid, TxnId};
 use crate::wal::reader::WalReader;
-use crate::wal::record::{bincode_config, CheckpointEndRecord, WalRecord, WalRecordType};
+use crate::wal::record::{
+    bincode_config, CheckpointEndRecord, HnswNodeTombstoneRecord, HnswPublishLiveRecord,
+    HnswSeqHead, WalRecord, WalRecordType,
+};
 
 /// Outcome of the analysis phase: where redo must start, plus the ARIES
 /// tables rebuilt as of the crash (tech-selection §11.1).
@@ -361,6 +364,40 @@ fn for_each_touched_page(record: &WalRecord, f: &mut impl FnMut(PageId)) -> Resu
             if meta != PageId::INVALID {
                 f(meta);
             }
+        }
+        // Phase 2 M5 Stage 0 (tech-selection §4.2): the seven HNSW records.
+        // `meta_page_id` is read-only validation context, never modified —
+        // only the node page is tracked. Decode the records' OWN head type
+        // (2026-09-14, review round 7 P2) instead of hand-stepping two
+        // PageIds — a head-layout change moves this arm in lockstep.
+        HnswNodeInit | HnswSetNeighbors => {
+            let mut off = 0;
+            let head = decode_prefix::<HnswSeqHead>(payload, &mut off)?;
+            f(head.page_id);
+        }
+        HnswMetaUpdate => {
+            let mut off = 0;
+            f(decode_prefix::<PageId>(payload, &mut off)?);
+        }
+        HnswNodeTombstone => {
+            // Versioned decode (2026-09-15, M5 Stage A review round 6 P2):
+            // this payload's layout is flags-versioned (HNSW_STATE_VERSION_*
+            // — v0 = pre-dim development format, v1 = dim + meta_page_id),
+            // so the record's OWN decode gates the version nibble before any
+            // field is read. The old `decode_prefix::<PageId>` happened to
+            // land on `page_id` for both known layouts, but would silently
+            // read a PageId by an unknown layout for any future version.
+            f(HnswNodeTombstoneRecord::decode(payload, record.flags)?.page_id);
+        }
+        HnswPublishLive => {
+            // Same versioned-decode discipline as HnswNodeTombstone above.
+            f(HnswPublishLiveRecord::decode(payload, record.flags)?.page_id);
+        }
+        HnswDirAppend | HnswDirLink => {
+            // Directory chain pages; `target_page`/`next_page` are only
+            // referenced (allocated elsewhere), not modified by the record.
+            let mut off = 0;
+            f(decode_prefix::<PageId>(payload, &mut off)?);
         }
         _ => {}
     }
@@ -770,6 +807,38 @@ mod tests {
                 WalRecord::heap_cleanup(PageId(20), vec![0], PageId(19), PageId(21)).unwrap(),
                 vec![PageId(20), PageId(19)],
             ),
+            // Phase 2 M5 Stage 0: the seven HNSW records. meta_page_id (1) is
+            // validation context, never touched; only the node/meta/directory
+            // page is tracked per record.
+            (
+                WalRecord::hnsw_node_init(PageId(1), PageId(30), 0, 0, 0, 2, vec![1.0, 2.0])
+                    .unwrap(),
+                vec![PageId(30)],
+            ),
+            (
+                WalRecord::hnsw_set_neighbors(PageId(1), PageId(31), 0, 0, 0, vec![3, 4]).unwrap(),
+                vec![PageId(31)],
+            ),
+            (
+                WalRecord::hnsw_meta_update(PageId(32), 0, 0).unwrap(),
+                vec![PageId(32)],
+            ),
+            (
+                WalRecord::hnsw_node_tombstone(PageId(30), PageId(33), 0, 0, 2).unwrap(),
+                vec![PageId(33)],
+            ),
+            (
+                WalRecord::hnsw_dir_append(PageId(34), 0, PageId(35), 0).unwrap(),
+                vec![PageId(34)],
+            ),
+            (
+                WalRecord::hnsw_dir_link(PageId(36), PageId(37)).unwrap(),
+                vec![PageId(36)],
+            ),
+            (
+                WalRecord::hnsw_publish_live(PageId(30), PageId(38), 0, 0, 2).unwrap(),
+                vec![PageId(38)],
+            ),
             // Non-page records touch nothing.
             (WalRecord::checkpoint_begin(), vec![]),
             (WalRecord::txn_commit(TxnId(1)).unwrap(), vec![]),
@@ -781,6 +850,30 @@ mod tests {
             let mut pages = Vec::new();
             for_each_touched_page(&record, &mut |p| pages.push(p)).unwrap();
             assert_eq!(pages, expected, "record type {:?}", record.record_type);
+        }
+    }
+
+    /// 2026-09-15, M5 Stage A review round 6 P2: the DPT arms for the two
+    /// flags-versioned state records (124/127) must gate the version
+    /// nibble through the record's own decode — a pre-versioning
+    /// (`flags = 0`) or unknown-version record is a loud error, never a
+    /// PageId read by an unknown layout.
+    #[test]
+    fn dpt_state_records_reject_unversioned_or_unknown_flags() {
+        for mut rec in [
+            WalRecord::hnsw_node_tombstone(PageId(1), PageId(33), 0, 0, 2).unwrap(),
+            WalRecord::hnsw_publish_live(PageId(1), PageId(38), 0, 0, 2).unwrap(),
+        ] {
+            // Constructor-stamped v1 flags: decode + track the node page.
+            let mut pages = Vec::new();
+            for_each_touched_page(&rec, &mut |p| pages.push(p)).unwrap();
+            assert_eq!(pages.len(), 1, "record type {:?}", rec.record_type);
+            // flags = 0 — the pre-versioning development format: loud.
+            rec.flags = 0;
+            assert!(for_each_touched_page(&rec, &mut |_| {}).is_err());
+            // Unknown future version nibble: loud.
+            rec.flags = 2 << 4;
+            assert!(for_each_touched_page(&rec, &mut |_| {}).is_err());
         }
     }
 
@@ -811,6 +904,16 @@ mod tests {
             BTreeSplitCommit,
             HeapHotUpdate,
             BTreeSplitCLR,
+            // Phase 2 M5 Stage 0: all seven HNSW records are page-modifying
+            // (tech-selection §4.2 — physiological records on node/meta/
+            // directory pages).
+            HnswNodeInit,
+            HnswSetNeighbors,
+            HnswMetaUpdate,
+            HnswNodeTombstone,
+            HnswDirAppend,
+            HnswDirLink,
+            HnswPublishLive,
         ];
         // Transaction and checkpoint markers, and the Phase-2+ logical/
         // segment records: no pages are tracked for them. If any of these

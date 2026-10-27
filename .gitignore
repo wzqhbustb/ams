@@ -16,6 +16,7 @@ Thumbs.db
 # Local test data
 /pg_rust_data/
 /tmp/
+/datasets/
 
 # Reference repositories (not part of pg_rust source tree)
 /supabase/

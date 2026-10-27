@@ -52,7 +52,8 @@ use pg_storage::types::{Tid, TxnId, PAGE_SIZE};
 
 use crate::builtin_types::BUILTIN_TYPES;
 use crate::system_tables::{
-    SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, LAST_SYSTEM_PAGE, RELKIND_TABLE, SYSTEM_TABLES,
+    SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, HNSW_AM_OID, LAST_SYSTEM_PAGE, RELKIND_TABLE,
+    SYSTEM_TABLES,
 };
 use crate::Result;
 
@@ -260,16 +261,26 @@ fn bootstrap_rows(def: &SystemTableDef) -> Vec<Vec<Option<Datum>>> {
                 })
             })
             .collect(),
-        crate::system_tables::PG_TYPE_OID => BUILTIN_TYPES
-            .iter()
-            .map(|ty| {
-                vec![
-                    Some(Datum::Int8(ty.oid.raw().0 as i64)),
-                    Some(Datum::Text(ty.name.to_string())),
-                    Some(Datum::Int4(ty.len)),
-                ]
-            })
-            .collect(),
+        crate::system_tables::PG_TYPE_OID => {
+            let mut rows: Vec<_> = BUILTIN_TYPES
+                .iter()
+                .map(|ty| {
+                    vec![
+                        Some(Datum::Int8(ty.oid.raw().0 as i64)),
+                        Some(Datum::Text(ty.name.to_string())),
+                        Some(Datum::Int4(ty.len)),
+                    ]
+                })
+                .collect();
+            // M6 Stage C: the vector type row (typlen -1 — the dim is
+            // per-column and travels in pg_attribute.len, not here).
+            rows.push(vec![
+                Some(Datum::Int8(crate::builtin_types::VECTOR_OID.raw().0 as i64)),
+                Some(Datum::Text("vector".to_string())),
+                Some(Datum::Int4(-1)),
+            ]);
+            rows
+        }
         crate::system_tables::PG_AM_OID => vec![
             vec![
                 Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
@@ -278,6 +289,10 @@ fn bootstrap_rows(def: &SystemTableDef) -> Vec<Vec<Option<Datum>>> {
             vec![
                 Some(Datum::Int8(BTREE_AM_OID.0 as i64)),
                 Some(Datum::Text("btree".to_string())),
+            ],
+            vec![
+                Some(Datum::Int8(HNSW_AM_OID.0 as i64)),
+                Some(Datum::Text("hnsw".to_string())),
             ],
         ],
         // pg_index / pg_rust_relpages (and any future table): schema only, no
@@ -300,8 +315,8 @@ mod tests {
             bootstrap_rows(&crate::system_tables::PG_ATTRIBUTE).len(),
             6 + 7 + 3 + 2 + 5 + 4
         );
-        assert_eq!(bootstrap_rows(&crate::system_tables::PG_TYPE).len(), 6);
-        assert_eq!(bootstrap_rows(&crate::system_tables::PG_AM).len(), 2);
+        assert_eq!(bootstrap_rows(&crate::system_tables::PG_TYPE).len(), 7);
+        assert_eq!(bootstrap_rows(&crate::system_tables::PG_AM).len(), 3);
         assert!(bootstrap_rows(&crate::system_tables::PG_INDEX).is_empty());
         assert!(bootstrap_rows(&crate::system_tables::PG_RELPAGES).is_empty());
     }

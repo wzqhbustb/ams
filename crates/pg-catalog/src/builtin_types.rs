@@ -22,6 +22,26 @@ pub const BYTEA_OID: TypeOid = TypeOid(Oid(17));
 pub const TIMESTAMPTZ_OID: TypeOid = TypeOid(Oid(1184));
 /// PostgreSQL-conventional OID of `uuid`.
 pub const UUID_OID: TypeOid = TypeOid(Oid(2950));
+/// The HNSW vector column type's OID (M6 Stage C): a system OID, but NOT
+/// a [`BUILTIN_TYPES`] entry — a vector's heap codec type carries its dim
+/// (`ColumnType::Vector(dim)`), which a static table cannot express. The
+/// dim travels in the `pg_attribute` row's `len` (= dim × 4, the inline
+/// width); [`column_type_of_attr`] resolves the codec from that pair.
+pub const VECTOR_OID: TypeOid = TypeOid(Oid(9877));
+
+/// Resolve a column's heap codec type from its catalog `(type_oid, len)`
+/// pair. VECTOR columns resolve from `len` (= dim × 4); everything else
+/// delegates to the static [`BUILTIN_TYPES`] table. `None` for an unknown
+/// OID or a malformed vector len.
+pub fn column_type_of_attr(type_oid: TypeOid, len: i32) -> Option<ColumnType> {
+    if type_oid == VECTOR_OID {
+        if len <= 0 || len % 4 != 0 {
+            return None;
+        }
+        return ColumnType::vector((len / 4) as u32).ok();
+    }
+    builtin_type(type_oid).map(|t| t.column_type)
+}
 
 /// A hardcoded built-in type definition, mirrored into `pg_type` at
 /// bootstrap.

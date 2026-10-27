@@ -7,6 +7,18 @@ authors.workspace = true
 license.workspace = true
 description = "pg_rust PG Wire — minimal PostgreSQL v3 protocol server (Phase 1 M3 Stage F)"
 
+# Only the [[bench]] criterion targets are benchmarks; without this,
+# `cargo bench --workspace -- --quick` also feeds --quick to the lib's
+# bench-profile unittest binary (libtest rejects it — Stage E review).
+[lib]
+bench = false
+
+# Same for the implicit bin bench target (libtest rejects --quick).
+[[bin]]
+name = "pg-server"
+path = "src/bin/pg-server.rs"
+bench = false
+
 [dependencies]
 pg-engine = { path = "../pg-engine" }
 

@@ -105,7 +105,7 @@ fn test_bootstrap_from_empty_dir() {
     }
 
     // pg_type matches builtin_types exactly (OID, name, len).
-    assert_eq!(catalog.types().len(), BUILTIN_TYPES.len());
+    assert_eq!(catalog.types().len(), BUILTIN_TYPES.len() + 1); // + the vector row (M6 Stage C)
     for ty in BUILTIN_TYPES {
         let row = catalog.type_by_oid(ty.oid).unwrap();
         assert_eq!(row.name, ty.name);
@@ -113,7 +113,7 @@ fn test_bootstrap_from_empty_dir() {
     }
 
     // pg_am has exactly heap(2) and btree(403).
-    assert_eq!(catalog.access_methods().len(), 2);
+    assert_eq!(catalog.access_methods().len(), 3); // heap + btree + hnsw (M6 Stage C)
     assert_eq!(catalog.access_methods()[0].oid, Oid(2));
     assert_eq!(catalog.access_methods()[0].name, "heap");
     assert_eq!(catalog.access_methods()[1].oid, Oid(403));
@@ -184,8 +184,8 @@ fn test_second_open_does_not_rebootstrap() {
             catalog.attributes_of(PG_CLASS_OID).len(),
             PG_CLASS.columns.len()
         );
-        assert_eq!(catalog.types().len(), BUILTIN_TYPES.len());
-        assert_eq!(catalog.access_methods().len(), 2);
+        assert_eq!(catalog.types().len(), BUILTIN_TYPES.len() + 1); // + the vector row (M6 Stage C)
+        assert_eq!(catalog.access_methods().len(), 3); // heap + btree + hnsw (M6 Stage C)
     }
 }
 
@@ -285,10 +285,10 @@ fn test_half_state_recovery() {
             catalog.relation(PG_CLASS_OID).unwrap().natts as usize,
             PG_CLASS.columns.len()
         );
-        assert_eq!(catalog.types().len(), BUILTIN_TYPES.len());
-        assert_eq!(catalog.access_methods().len(), 2);
-        // Bootstrap reused the pre-allocated pages rather than allocating new
-        // ones.
+        assert_eq!(catalog.types().len(), BUILTIN_TYPES.len() + 1); // + the vector row (M6 Stage C)
+        assert_eq!(catalog.access_methods().len(), 3); // heap + btree + hnsw (M6 Stage C)
+                                                       // Bootstrap reused the pre-allocated pages rather than allocating new
+                                                       // ones.
         assert_eq!(engine.page_allocator().lock().next_page_id(), PageId(7));
     }
 
@@ -325,8 +325,8 @@ fn assert_full_system_catalog(catalog: &Catalog) {
         catalog.attributes_of(PG_CLASS_OID).len(),
         PG_CLASS.columns.len()
     );
-    assert_eq!(catalog.types().len(), BUILTIN_TYPES.len());
-    assert_eq!(catalog.access_methods().len(), 2);
+    assert_eq!(catalog.types().len(), BUILTIN_TYPES.len() + 1); // + the vector row (M6 Stage C)
+    assert_eq!(catalog.access_methods().len(), 3); // heap + btree + hnsw (M6 Stage C)
 }
 
 /// Garbage line pointers that happen to decode as `Dead` would silently
@@ -410,8 +410,8 @@ fn test_partial_flush_half_state_triggers_rebootstrap() {
             catalog.attributes_of(PG_CLASS_OID).len(),
             PG_CLASS.columns.len()
         );
-        assert_eq!(catalog.types().len(), BUILTIN_TYPES.len());
-        assert_eq!(catalog.access_methods().len(), 2);
+        assert_eq!(catalog.types().len(), BUILTIN_TYPES.len() + 1); // + the vector row (M6 Stage C)
+        assert_eq!(catalog.access_methods().len(), 3); // heap + btree + hnsw (M6 Stage C)
     }
 }
 
@@ -643,5 +643,5 @@ fn header_corruption_without_user_ddl_still_rebootstraps() {
         "bootstrap-only catalog must heal"
     );
     assert_eq!(catalog.relations().len(), 6);
-    assert_eq!(catalog.types().len(), BUILTIN_TYPES.len());
+    assert_eq!(catalog.types().len(), BUILTIN_TYPES.len() + 1); // + the vector row (M6 Stage C)
 }

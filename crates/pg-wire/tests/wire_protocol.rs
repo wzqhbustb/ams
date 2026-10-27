@@ -410,6 +410,12 @@ fn type_text_encoding_roundtrips() {
     );
     // Empty bytea still carries the \x marker (PG text format).
     assert_eq!(encode_text(&Datum::Bytea(vec![])).unwrap(), b"\\x");
+    // pgvector text form (M6 Stage 0); Rust's f32 Display round-trips.
+    assert_eq!(
+        encode_text(&Datum::Vector(vec![1.0, 2.5, -3.0])).unwrap(),
+        b"[1,2.5,-3]"
+    );
+    assert_eq!(encode_text(&Datum::Vector(vec![])).unwrap(), b"[]");
 }
 
 #[test]
@@ -440,11 +446,20 @@ fn wire_type_mapping_matches_encoding() {
         wire_type(ColumnType::Uuid),
         pg_wire::types::WireType { oid: 25, len: -1 }
     );
+    // Vector reports TEXT (variable-length pgvector text form).
+    assert_eq!(
+        wire_type(ColumnType::Vector(3)),
+        pg_wire::types::WireType { oid: 25, len: -1 }
+    );
 
     assert_eq!(column_type_of(&Datum::Int4(1)), ColumnType::Int4);
     assert_eq!(
         column_type_of(&Datum::Timestamptz(0)),
         ColumnType::Timestamptz
+    );
+    assert_eq!(
+        column_type_of(&Datum::Vector(vec![1.0, 2.0])),
+        ColumnType::Vector(2)
     );
 }
 

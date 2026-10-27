@@ -7,6 +7,18 @@ authors.workspace = true
 license.workspace = true
 description = "pg_rust storage engine — Phase 1 M1 (Page, WAL, BufferPool, LSN)"
 
+# Only the [[bench]] criterion targets are benchmarks; without this,
+# `cargo bench --workspace -- --quick` also feeds --quick to the lib's
+# bench-profile unittest binary (libtest rejects it — Stage E review).
+[lib]
+bench = false
+
+# Same for the implicit bin bench target (libtest rejects --quick).
+[[bin]]
+name = "pg-waldump"
+path = "src/bin/pg-waldump.rs"
+bench = false
+
 [dependencies]
 # concurrency primitives
 parking_lot = "0.12"

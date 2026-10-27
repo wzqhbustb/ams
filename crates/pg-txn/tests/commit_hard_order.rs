@@ -76,9 +76,15 @@ fn commit_flips_clog_only_after_durable_flush() {
     assert_eq!(clog.get_state(xid), TxnState::Committed);
     assert!(mgr.active_xids().is_empty());
 
-    // The LSN returned by append must be the one flush_to was asked to
-    // fsync — the hard order depends on that propagation being exact.
-    assert_eq!(*wal_impl.last_flush_lsn.lock(), Some(Lsn::FIRST));
+    // The flush must run through the commit record's END boundary (start +
+    // record_size): flush_to's prefix semantics early-exit on a record's
+    // own start LSN right after a wave/reopen (writer.rs flush_to rustdoc),
+    // so the hard order depends on the end-boundary target being exact.
+    let commit_len = WalRecord::txn_commit(xid).unwrap().record_size() as u64;
+    assert_eq!(
+        *wal_impl.last_flush_lsn.lock(),
+        Some(Lsn(Lsn::FIRST.0 + commit_len))
+    );
 }
 
 #[test]

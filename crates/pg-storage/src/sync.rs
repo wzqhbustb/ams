@@ -27,10 +27,10 @@
 //! # What is stubbed under `cfg(loom)`
 //!
 //! - [`crate::wal::writer::WalWriter`] does not spawn its background
-//!   group-commit worker; [`WalWriter::flush_to`] marks the target LSN synced
+//!   group-commit worker; `WalWriter::flush_to` marks the target LSN synced
 //!   inline, without any fsync (loom models must not block on real I/O, and
 //!   durability is not what the models check).
-//! - [`crate::buffer_pool::BufferPool::flush_frame`] performs the
+//! - `crate::buffer_pool::BufferPool::flush_frame` performs the
 //!   dirty/rec_lsn/needs_fpi state transitions but skips the data-file write
 //!   and fsync. Loom models must size the pool so no eviction happens: an
 //!   evicted page reloaded from disk would read zeros, since nothing was ever

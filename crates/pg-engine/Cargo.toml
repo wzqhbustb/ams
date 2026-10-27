@@ -7,12 +7,27 @@ authors.workspace = true
 license.workspace = true
 description = "pg_rust engine — top-level assembly of storage, txn, catalog, and AMs"
 
+# Only the [[bench]] criterion targets are benchmarks; without this,
+# `cargo bench --workspace -- --quick` also feeds --quick to the lib's
+# bench-profile unittest binary (libtest rejects it — Stage E review).
+[lib]
+bench = false
+
+# Same for the implicit bin bench target (libtest rejects --quick).
+[[bin]]
+name = "pg-diag"
+path = "src/bin/pg-diag.rs"
+bench = false
+
 [dependencies]
 pg-storage = { path = "../pg-storage" }
 pg-txn = { path = "../pg-txn" }
 pg-catalog = { path = "../pg-catalog" }
 pg-am-heap = { path = "../pg-am-heap" }
 pg-am-btree = { path = "../pg-am-btree" }
+# Phase 2 M5 Stage 0 (2026-09-11): HNSW redo handlers register into
+# Engine::open (tech-selection §2 — the second M5 dependency edge).
+pg-am-hnsw = { path = "../pg-am-hnsw" }
 
 # error types
 thiserror = "2"
@@ -30,6 +45,11 @@ serde = { version = "1", features = ["derive"] }
 [dev-dependencies]
 # integration tests drive a real engine on a temp data dir
 tempfile = "3"
+
+# The HNSW crash tests (m5_ghost_trap / m5_hnsw_crash_rounds) arm the
+# crash-window probe — enable the test-harness feature (unified with the
+# plain dependency above on dev builds).
+pg-am-hnsw = { path = "../pg-am-hnsw", features = ["test-harness"] }
 
 
 # benchmarks

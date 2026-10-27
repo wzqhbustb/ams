@@ -20,9 +20,9 @@
 //!   `<>`/`!=` (only `=` / `<` / `>`), parenthesized expressions, and
 //!   arithmetic in statements.
 //! - `FOR NO KEY UPDATE` / `FOR KEY SHARE` (only the bare `FOR UPDATE` /
-//!   `FOR SHARE` forms). `FOR SHARE` parses but execution fails with
-//!   `Unsupported` — shared row locks need multixact, a later stage
-//!   (tech-selection §9.1).
+//!   `FOR SHARE` forms). `FOR SHARE` is fully implemented since M2c
+//!   Stage S ("multixact lite"): it stamps a shared row lock
+//!   (`HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_IS_SHARE`) on each result row.
 
 #![allow(missing_docs)]
 
@@ -76,8 +76,9 @@ pub enum Statement {
 pub enum LockClause {
     /// `FOR UPDATE`: exclusive row lock via the lock-only `t_xmax` stamp.
     ForUpdate,
-    /// `FOR SHARE`: parses, but execution returns `Unsupported` — shared
-    /// row locks require multixact, deferred to a later stage.
+    /// `FOR SHARE`: shared row lock (M2c Stage S "multixact lite"):
+    /// stamps `HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_IS_SHARE` on each result
+    /// row; the row stays visible to all snapshots.
     ForShare,
 }
 
@@ -124,6 +125,8 @@ pub enum Literal {
     Int(i64),
     Str(String),
     Null,
+    /// M6 Stage C: a vector literal `[0.1, 2.5, ...]` (INSERT path).
+    Vector(Vec<f32>),
 }
 
 // ─── Tokenizer ────────────────────────────────────────────────────────
@@ -159,6 +162,8 @@ enum Token {
     Type(ColumnType),
     // Literals
     Int(i64),
+    /// M6 Stage C: floating-point literal (vector elements).
+    Float(f64),
     Str(String),
     // Operators
     Eq,
@@ -166,6 +171,10 @@ enum Token {
     Gt,
     // Punctuation
     Comma,
+    /// `[` — M6 Stage C vector literal open.
+    LBracket,
+    /// `]`.
+    RBracket,
     Semicolon,
     LParen,
     RParen,
@@ -230,6 +239,12 @@ impl<'a> Tokenizer<'a> {
                     } else if c == ',' {
                         self.bump();
                         tokens.push(Token::Comma);
+                    } else if c == '[' {
+                        self.bump();
+                        tokens.push(Token::LBracket);
+                    } else if c == ']' {
+                        self.bump();
+                        tokens.push(Token::RBracket);
                     } else if c == ';' {
                         self.bump();
                         tokens.push(Token::Semicolon);
@@ -243,7 +258,7 @@ impl<'a> Tokenizer<'a> {
                         self.bump();
                         tokens.push(Token::Star);
                     } else if c.is_alphabetic() || c == '_' {
-                        tokens.push(self.identifier_or_keyword());
+                        tokens.push(self.identifier_or_keyword()?);
                     } else {
                         return Err(EngineError::InvalidArgument(format!(
                             "unexpected character {c:?} in SQL"
@@ -285,12 +300,25 @@ impl<'a> Tokenizer<'a> {
         if self.peek == Some('-') {
             s.push(self.bump().unwrap());
         }
+        let mut is_float = false;
         while let Some(c) = self.peek {
             if c.is_ascii_digit() {
+                s.push(self.bump().unwrap());
+            } else if c == '.' && !is_float && self.peek_next_is_digit() {
+                // M6 Stage C: a single decimal point makes it a float
+                // (vector elements). A second dot or trailing dot is a
+                // parse error via the float conversion below.
+                is_float = true;
                 s.push(self.bump().unwrap());
             } else {
                 break;
             }
+        }
+        if is_float {
+            let v: f64 = s
+                .parse()
+                .map_err(|_| EngineError::InvalidArgument(format!("invalid number: {s}")))?;
+            return Ok(Token::Float(v));
         }
         let n: i64 = s
             .parse()
@@ -298,7 +326,16 @@ impl<'a> Tokenizer<'a> {
         Ok(Token::Int(n))
     }
 
-    fn identifier_or_keyword(&mut self) -> Token {
+    /// Whether the character after the cursor is a digit (lookahead for
+    /// the decimal-point rule).
+    fn peek_next_is_digit(&self) -> bool {
+        self.chars
+            .clone()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+    }
+
+    fn identifier_or_keyword(&mut self) -> Result<Token> {
         let mut s = String::new();
         while let Some(c) = self.peek {
             if c.is_alphanumeric() || c == '_' {
@@ -307,7 +344,7 @@ impl<'a> Tokenizer<'a> {
                 break;
             }
         }
-        match s.to_ascii_uppercase().as_str() {
+        let token = match s.to_ascii_uppercase().as_str() {
             "BEGIN" => Token::Begin,
             "COMMIT" => Token::Commit,
             "ROLLBACK" => Token::Rollback,
@@ -340,8 +377,39 @@ impl<'a> Tokenizer<'a> {
             "UUID" => Token::Type(ColumnType::Uuid),
             // Unquoted identifiers fold to lowercase (PostgreSQL semantics;
             // this subset has no quoted identifiers).
+            // M6 Stage C: `VECTOR(n)` declares a vector column of dim n.
+            // Whitespace between the keyword and the parenthesis is
+            // tolerated (PG's habit); a bare `VECTOR` stays a plain
+            // identifier — nothing breaks if someone names a column
+            // "vector".
+            "VECTOR"
+                if {
+                    self.skip_whitespace();
+                    self.peek == Some('(')
+                } =>
+            {
+                self.bump(); // (
+                let dim = match self.number_literal()? {
+                    Token::Int(n) if (1..=2000).contains(&n) => n as u32,
+                    other => {
+                        return Err(EngineError::InvalidArgument(format!(
+                            "VECTOR(n) requires an integer dim in 1..=2000, got {other:?}"
+                        )))
+                    }
+                };
+                match self.bump() {
+                    Some(')') => {}
+                    other => {
+                        return Err(EngineError::InvalidArgument(format!(
+                            "VECTOR(n): expected ')', got {other:?}"
+                        )))
+                    }
+                }
+                return Ok(Token::Type(ColumnType::Vector(dim)));
+            }
             _ => Token::Ident(s.to_ascii_lowercase()),
-        }
+        };
+        Ok(token)
     }
 }
 
@@ -559,8 +627,38 @@ impl Parser {
     fn parse_literal(&mut self) -> Result<Literal> {
         match self.bump() {
             Token::Int(n) => Ok(Literal::Int(n)),
+            Token::Float(f) => Ok(Literal::Vector(vec![f as f32])),
             Token::Str(s) => Ok(Literal::Str(s)),
             Token::Null => Ok(Literal::Null),
+            // M6 Stage C: `[1.0, 2.5, ...]` vector literal.
+            Token::LBracket => {
+                let mut v = Vec::new();
+                if matches!(self.peek(), Token::RBracket) {
+                    self.bump();
+                    return Ok(Literal::Vector(v));
+                }
+                loop {
+                    match self.bump() {
+                        Token::Int(n) => v.push(n as f32),
+                        Token::Float(f) => v.push(f as f32),
+                        other => {
+                            return Err(EngineError::InvalidArgument(format!(
+                                "vector literal element must be a number, got {other:?}"
+                            )))
+                        }
+                    }
+                    match self.bump() {
+                        Token::Comma => continue,
+                        Token::RBracket => break,
+                        other => {
+                            return Err(EngineError::InvalidArgument(format!(
+                                "vector literal: expected ',' or ']', got {other:?}"
+                            )))
+                        }
+                    }
+                }
+                Ok(Literal::Vector(v))
+            }
             other => Err(EngineError::InvalidArgument(format!(
                 "expected literal, got {other:?}"
             ))),

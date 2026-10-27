@@ -727,6 +727,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg-am-hnsw"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "criterion",
+ "loom",
+ "pg-am-hnsw",
+ "pg-storage",
+ "thiserror",
+]
+
+[[package]]
 name = "pg-catalog"
 version = "0.1.0"
 dependencies = [
@@ -748,6 +760,7 @@ dependencies = [
  "parking_lot",
  "pg-am-btree",
  "pg-am-heap",
+ "pg-am-hnsw",
  "pg-catalog",
  "pg-storage",
  "pg-txn",

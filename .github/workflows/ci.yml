@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,22 +52,25 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Stage Q: pg-storage's `loom` feature swaps sync primitives for loom's
-      # instrumented ones, which PANIC outside `loom::model` — so the two
+      # instrumented ones, which PANIC outside `loom::model` — so the
       # loom-aware crates must be tested with default features. Running their
       # test suites with --all-features makes every non-model test panic.
       # (M3 Stage F: pg-wire declares NO features, so it rides the
-      # all-features branch below unchanged.)
+      # all-features branch below unchanged. Phase 2 M6 Stage B: pg-am-hnsw
+      # now declares `loom` (hnsw_loom) — same class, non-loom branch; its
+      # `test-harness` probe feature stays ON in the default test build via
+      # the dev-dependency self-reference, so the exclusion loses nothing.)
       - name: Test (default features — loom-gated crates)
-        if: matrix.crate == 'pg-storage' || matrix.crate == 'pg-am-btree'
+        if: matrix.crate == 'pg-storage' || matrix.crate == 'pg-am-btree' || matrix.crate == 'pg-am-hnsw'
         run: cargo test -p ${{ matrix.crate }}
       - name: Test (all features)
-        if: matrix.crate != 'pg-storage' && matrix.crate != 'pg-am-btree'
+        if: matrix.crate != 'pg-storage' && matrix.crate != 'pg-am-btree' && matrix.crate != 'pg-am-hnsw'
         run: cargo test -p ${{ matrix.crate }} --all-features
 
   loom:
@@ -81,6 +84,15 @@ jobs:
       # the disclosure comment in btree_loom.rs); the split model runs the
       # full bound. Budget ~5 min on a runner.
       - run: cargo test -p pg-am-btree --features loom --test btree_loom
+        env:
+          LOOM_MAX_PREEMPTIONS: 2
+      # M6 Stage B: the HNSW concurrent-insert choreography (alloc critical
+      # section, node-latch connect discipline, meta first-insert race and
+      # backfill, reader × PublishLive interleaving). Bound 2 for all three
+      # models — HNSW's search makes per-insert scheduling points an order
+      # of magnitude denser than btree's; bound 3 did not finish in 76 min
+      # locally. Budget ~12 min release on a runner.
+      - run: cargo test -p pg-am-hnsw --features loom --release --test hnsw_loom
         env:
           LOOM_MAX_PREEMPTIONS: 2
       # Guard the sync-alias rule (crates/pg-storage/src/sync.rs docs): any
@@ -127,7 +139,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-engine, pg-wire]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -135,3 +147,93 @@ jobs:
       - run: cargo doc -p ${{ matrix.crate }} --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  # Phase 2 M4 Stage A: coverage job (tech-selection §8.2 v1.3, §12) — there
+  # was no pre-existing coverage toolchain in this CI, so this job is new.
+  # tarpaulin requires Linux (ptrace); it cannot run on the macOS dev box,
+  # so the Stage E "coverage >= 90%" verdict comes from this CI report.
+  coverage:
+    name: Coverage (pg-am-hnsw)
+    runs-on: ubuntu-latest
+    # cargo-tarpaulin builds from source on first run (rust-cache amortizes
+    # it afterwards); the budget covers a cold cache with room to spare.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+      # Only pg-am-hnsw is instrumented — the M4 coverage gate (§12) applies
+      # to the new crate; Phase 1 crates keep their existing test jobs.
+      # --fail-under 90 (M5 Stage E review): without it the job is green at
+      # ANY coverage and the ≥90% gate is a gate in name only.
+      # --skip concurrent_save_same_target_with_concurrent_load: under
+      # instrumentation the test's thread-timing premise (a writer thread
+      # must observe an overlapping load within 10k iterations) cannot be
+      # met — always red under local llvm-cov, expected same under
+      # tarpaulin's ptrace tracing (non-instrumented debug/release suites
+      # are always green; registered in stage_spec Stage E ⑤, v1.68).
+      - name: Run tarpaulin
+        run: cargo tarpaulin -p pg-am-hnsw --out Xml --output-dir coverage --fail-under 90 -- --skip concurrent_save_same_target_with_concurrent_load
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-pg-am-hnsw
+          path: coverage/cobertura.xml
+          if-no-files-found: error
+
+  # Phase 2 M4 Stage D (coding plan 阶段 D "CI 数据管道手术" v1.3): the
+  # siftsmall recall hard gate as a standing line of defense. The plan's
+  # five-item registration checklist, item by item:
+  #   (1) fetch step: scripts/fetch_datasets.sh siftsmall. URL resolution
+  #       order: vars.M4_SIFTSMALL_URL -> the script's built-in default
+  #       (official ftp). Once the D-1 runner verdict lands, if ftp is
+  #       blocked we point the repo variable at the self-hosted release
+  #       asset (scheme 2) — zero changes to this job or the script.
+  #   (2) actions/cache@v4: path = datasets/, key =
+  #       m4-dataset-siftsmall-5304531 (dataset name + byte size). The
+  #       fetched payload is not content-addressable from the workflow side,
+  #       so the key uses byte size + a version prefix — bump the key when
+  #       the dataset changes.
+  #   (3) ownership: a NEW recall-gate job, deliberately NOT added to the
+  #       existing test matrix — matrix jobs have no dataset, and the gate
+  #       test skipping there is the designed, harmless behavior.
+  #   (4) M4_REQUIRE_DATASET=1 is set at STEP level env on the gate step
+  #       only; it never leaks into other steps or jobs.
+  #   (5) guardrail cross-check (2026-09-03, manual review conclusion
+  #       recorded here): the existing grep guardrails (loom job) scope
+  #       `git grep` to crates/... — no overlap with datasets/ or .github/,
+  #       so the new steps below cannot affect them; no new grep step is
+  #       needed.
+  recall-gate:
+    name: Recall gate (siftsmall)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache siftsmall dataset
+        uses: actions/cache@v4
+        with:
+          path: datasets/
+          key: m4-dataset-siftsmall-5304531
+      - name: Fetch siftsmall
+        env:
+          M4_DATASET_URL_SIFTSMALL: ${{ vars.M4_SIFTSMALL_URL }}
+        run: scripts/fetch_datasets.sh siftsmall
+      # --release is the contract's pinned tier. (Debug was measured after
+      # Stage D round 1: 62.4 s for the gate suite — recorded in
+      # docs/phase2-m4-benchmarks.md §3; release keeps the runner fast.)
+      - name: Recall hard gate
+        run: cargo test -p pg-am-hnsw --release --test recall_siftsmall
+        env:
+          M4_REQUIRE_DATASET: "1"
+      # Phase 2 M5 Stage D slice 4 (coding plan CI 清单 #11): the §11.3 ②
+      # post-recovery recall gate runs HERE, alongside recall_siftsmall —
+      # it reuses the M4_REQUIRE_DATASET=1 hard-failure semantics (a plain
+      # matrix job has no dataset and would skip it forever, the exact
+      # "green but never ran" shape this job exists to prevent).
+      - name: Post-recovery recall hard gate (M5)
+        run: cargo test -p pg-am-hnsw --release --test m5_recall_after_recovery
+        env:
+          M4_REQUIRE_DATASET: "1"

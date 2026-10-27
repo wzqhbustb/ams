@@ -72,7 +72,7 @@
 //! Write-write arbitration on a row lives in its `t_xmax`: any non-INVALID
 //! `t_xmax` — a real delete/update stamp OR a [`HEAP_XMAX_LOCK_ONLY`] stamp
 //! (`SELECT ... FOR UPDATE`) — means "row locked". A writer reaching a row
-//! runs the 5-step protocol ([`HeapAM::row_lock_gate`] + the restart loops
+//! runs the 5-step protocol (`HeapAM::row_lock_gate` + the restart loops
 //! in `delete` / `update` / [`HeapAM::lock_tuple`]):
 //!
 //! 1. under the page write latch, read `t_xmax`;
@@ -107,7 +107,7 @@
 //! ## Lock-only stamps and visibility
 //!
 //! A [`HEAP_XMAX_LOCK_ONLY`] stamp is a lock, not a delete: scan/visibility
-//! paths mask it to INVALID before judging ([`visibility_xmax`]), so a
+//! paths mask it to INVALID before judging (`visibility_xmax`), so a
 //! locked row reads as live for everyone. Lock-only stamps are NOT
 //! WAL-logged (PostgreSQL does not log row locks either): they are
 //! transient concurrency markers whose meaning ends with the stamper's
@@ -235,7 +235,7 @@ impl HeapAM {
     /// empty heap before inserting. The `PageAlloc` record written by
     /// `new_page` extends the data file, so recovery can pin the page even if
     /// it was never flushed. The page's `init` is made durable with a
-    /// post-image `FullPageImage` record (see [`Self::extend_chain`]): the
+    /// post-image `FullPageImage` record (see `Self::extend_chain`): the
     /// page may have come from the freelist, where a previous tenant's
     /// content still sits on disk, and "fresh page" detection on the
     /// recovery side keys off an all-zero page — replaying the init image is
@@ -1247,7 +1247,7 @@ impl HeapAM {
     /// [`HeapError::TupleConcurrentlyUpdated`] if the row version was
     /// deleted or updated by a transaction that has since committed; in
     /// legacy no-waiter mode that condition (and any in-progress holder) is
-    /// [`HeapError::TupleNotFound`] instead — see [`Self::row_lock_gate`].
+    /// [`HeapError::TupleNotFound`] instead — see `Self::row_lock_gate`.
     pub fn lock_tuple(&self, tid: Tid, snapshot: &Snapshot, clog: &dyn ClogAccessor) -> Result<()> {
         let self_xid = snapshot.current_xid();
         debug_assert!(
