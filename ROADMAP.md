@@ -1,451 +1,479 @@
-# pg_rust 开发 Roadmap
+# pg_rust Development Roadmap
 
-## 设计原则与纪律
+## Design principles and discipline
 
-1. **严格分层构建**：Layer 1 → Layer 2 → Layer 3，地基不稳上层必塌
-2. **每阶段可交付**：每阶段结束时内部 Agent 团队能用 psql/gRPC/MCP 客户端连接使用
-3. **AM 按优先级递进**：HNSW → FT → TS → Graph → Columnar，不追求一次性六种全做
-4. **每加 AM 必带 Vacuum/GC**：不留技术债到最后
-5. **AM 边界守得住**：内核提供原语（TTL/降采样/删除），策略由上层 SDK 实现；LLM 永远外置
-6. **正确性 > 性能 > 功能**：宁可少一个功能，不可有一个 bug
-7. **不跳阶段，不过度设计**：每阶段验证标准全部通过才进入下一阶段；接口可扩展但实现不提前
-8. **每阶段一篇技术博客**：为对外推广积累素材
+1. **Build strictly in layers**: Layer 1 → Layer 2 → Layer 3. A shaky foundation guarantees the upper layers collapse.
+2. **Deliverable at every phase**: by the end of each phase, the internal Agent team can connect and use it through psql/gRPC/MCP clients.
+3. **AMs land in priority order**: HNSW → FT → TS → Graph → Columnar. Never attempt all six at once.
+4. **Every new AM ships with Vacuum/GC**: no technical debt left to the end.
+5. **Keep AM boundaries clean**: the kernel provides primitives (TTL/downsampling/delete); policy lives in the upper SDK. The LLM always stays external.
+6. **Correctness > performance > features**: better to drop a feature than to ship a bug.
+7. **No phase-skipping, no over-design**: enter the next phase only when every acceptance check of the current one passes. Interfaces may be extensible, but implementations never land early.
+8. **One technical blog post per phase**: material for outward communication.
 
 ---
 
-## 阶段总览
+## Phase overview
 
 ```
-Phase 1：存储基座 + 行存 + 事务 + B+Tree
-         ├── M1: 物理层（Page/WAL/BufferPool/LSN）
-         ├── M2: 行存 + MVCC + B+Tree + 崩溃恢复
-         │    ├── M2a: 单语句 auto-commit
-         │    ├── M2b: 多语句事务 + MVCC
-         │    └── M2c: 完整锁管理 + 并发
-         └── M3: Vacuum（离线）+ 可观测性 + PG Wire 极简版
-              （Vacuum 在线化明确归 Phase 5b 多 AM GC 协调器，见 Phase 5b 节）
+Phase 1: storage foundation + row store + transactions + B+Tree
+         ├── M1: physical layer (Page/WAL/BufferPool/LSN)
+         ├── M2: row store + MVCC + B+Tree + crash recovery
+         │    ├── M2a: single-statement auto-commit
+         │    ├── M2b: multi-statement transactions + MVCC
+         │    └── M2c: full lock management + concurrency
+         └── M3: Vacuum (offline) + observability + minimal PG Wire
+              (online Vacuum is explicitly assigned to the multi-AM GC
+              coordinator in Phase 5b; see the Phase 5b section)
 
-Phase 2：HNSW 向量索引
-         ├── 2a: In-memory HNSW
-         ├── 2b: WAL + 持久化 + 崩溃恢复
-         └── 2c: 并发控制 + Tier 1 同步
+Phase 2: HNSW vector index
+         ├── 2a: in-memory HNSW
+         ├── 2b: WAL + persistence + crash recovery
+         └── 2c: concurrency control + Tier 1 synchronization
 
-Phase 3：全文倒排索引
-         ├── 倒排 AM + BM25
-         ├── Tier 2 完整落地
+Phase 3: full-text inverted index
+         ├── inverted AM + BM25
+         ├── Tier 2 fully landed
          └── Segment merge + GC
 
-Phase 4a：SQL 层 + PG Wire Protocol（基础）
-Phase 4b：Multi-Path Fusion + 跨模态 Planner
+Phase 4a: SQL layer + PG Wire Protocol (basics)
+Phase 4b: Multi-Path Fusion + cross-modal planner
 
-Phase 5a：时序 + 列存 + 蒸馏 stub（Phase 1 门，可与 Phase 2/3/4a 同时起步）
-         ├── 内核：TimeSeries AM + TTL、列存投影原型
-         └── SDK 层：记忆蒸馏（stub 早期并行）
+Phase 5a: time series + column store + distillation stub
+         (Phase 1 gate; may start alongside Phase 2/3/4a)
+         ├── kernel: TimeSeries AM + TTL, columnar projection prototype
+         └── SDK: memory distillation (stub may start in parallel early)
 
-Phase 5b：图 + GC + 遗忘/分层 + Fusion 接入（需 4a / ≥2 AM / 4b 陆续进）
-         ├── 内核：Graph AM（轻量版）+ 图查询语法、时间范围查询路由、多 AM GC 协调器
-         ├── SDK 层：遗忘曲线、记忆分层（等 GC 协调器落地）
-         └── Fusion 接入：图/时序参与 Fusion（等 4b）
+Phase 5b: graph + GC + forgetting/layering + Fusion integration
+         (needs 4a / ≥2 AM / 4b landing progressively)
+         ├── kernel: Graph AM (lightweight) + graph query syntax,
+         │   time-range query routing, multi-AM GC coordinator
+         ├── SDK: forgetting curve, memory layering (after the GC coordinator)
+         └── Fusion integration: graph/time-series into Fusion (after 4b)
 
-Phase 6：完整协议层 + 多 Agent 隔离
+Phase 6: full protocol layer + multi-agent isolation
 
-Phase 7：生产化
-         ├── 7a: 可观测性 + 备份恢复
-         ├── 7b: 性能与压缩
-         ├── 7c: 完整 CBO
-         └── 7d: 高可用 + 高级特性
+Phase 7: production hardening
+         ├── 7a: observability + backup/restore
+         ├── 7b: performance + compression
+         ├── 7c: full CBO
+         └── 7d: high availability + advanced features
 ```
 
 ---
 
-## 总工期估算
+## Overall schedule estimate
 
-| Phase | 乐观 | P50（典型节奏） | 长尾（遇 P0 阻塞） | 风险等级 |
+| Phase | Optimistic | P50 (typical pace) | Long tail (P0 blockers) | Risk |
 |---|---|---|---|---|
-| Phase 1 (M1+M2+M3) | 6 个月 | 9–12 个月 | 15+ 个月 | 🔴 高（事务/恢复是核心） |
-| Phase 2 (HNSW) | 9 个月 | 12–15 个月 | 24+ 个月 | 🔴 高（long pole） |
-| Phase 3 (Inverted) | 4 个月 | 6–8 个月 | 10 个月 | 🟡 中（segment 模式新） |
-| Phase 4a+4b (SQL+PG → Fusion) | 4 个月 | 6–8 个月 | 12 个月 | 🟡 中（DataFusion 集成） |
-| Phase 5a (时序+列存+蒸馏stub，可与 2/3/4a 并行) | 1.5 个月 | 2–3 个月 | 4 个月 | 🟡 中（可与主干并行） |
-| Phase 5b (图+GC+遗忘/分层+Fusion接入) | 2 个月 | 3–4 个月 | 6 个月 | 🟡 中（SDK/内核边界，门控多） |
-| Phase 6 (协议+隔离) | 6 个月 | 9–12 个月 | 18+ 个月 | 🔴 高（完整协议） |
-| Phase 7 (生产化) | 持续 | 12+ 个月 | 持续 | 🟢 低（持续优化） |
+| Phase 1 (M1+M2+M3) | 6 months | 9–12 months | 15+ months | 🔴 High (transactions/recovery is the core) |
+| Phase 2 (HNSW) | 9 months | 12–15 months | 24+ months | 🔴 High (long pole) |
+| Phase 3 (Inverted) | 4 months | 6–8 months | 10 months | 🟡 Medium (new segment model) |
+| Phase 4a+4b (SQL+PG → Fusion) | 4 months | 6–8 months | 12 months | 🟡 Medium (DataFusion integration) |
+| Phase 5a (TS+columnar+distill stub, parallel with 2/3/4a) | 1.5 months | 2–3 months | 4 months | 🟡 Medium (parallel with the main line) |
+| Phase 5b (graph+GC+forgetting/layering+Fusion) | 2 months | 3–4 months | 6 months | 🟡 Medium (SDK/kernel boundary, many gates) |
+| Phase 6 (protocol+isolation) | 6 months | 9–12 months | 18+ months | 🔴 High (full protocol) |
+| Phase 7 (production) | ongoing | 12+ months | ongoing | 🟢 Low (continuous optimization) |
 
-**合计 P50：55–75 个月 / 约 5–6 年（1–2 名高级 Rust 工程师）**
+**Total P50: 55–75 months / about 5–6 years (1–2 senior Rust engineers)**
 
-> 注：Phase 1 和 Phase 2 是风险最高的阶段，实际工期可能偏向区间上限。
+> Note: Phase 1 and Phase 2 carry the highest risk; actual duration may land at the upper end of the range.
 
 ---
 
-## Phase × Layer 映射
+## Current progress (2026-10-27)
 
-| Phase | Layer 1（物理） | Layer 2（事务/可见性） | Layer 3（Access Methods） | 跨层能力 |
-|---|---|---|---|---|
-| Phase 1 M1 | ✓ Page/WAL/BufferPool/LSN/Checkpoint | — | — | （文件管理分散在各组件中，不独立暴露） |
-| Phase 1 M2 | (扩展) Full Page Image | ✓ MVCC / Lock / Snapshot / Visibility | ✓ B+Tree（含 AccessMethod trait） | ARIES 崩溃恢复 |
-| Phase 1 M3 | — | (扩展) Vacuum | — | PG Wire 极简版 + 可观测 |
-| Phase 2 | (Tier 1 异步 IO) | (扩展) Per-tx delta | ✓ HNSW（Epoch + 节点锁） | HNSW Vacuum |
-| Phase 3 | (Tier 2 异步 IO) | (扩展) Watermark | ✓ Inverted Index（BM25） | Segment merge |
-| Phase 4a | — | — | (单路选择) | DataFusion + PG Wire Extended + EXPLAIN |
-| Phase 4b | — | (扩展) Cost hooks | (多路融合) | MultiIndexScan + Fusion + Planner |
-| Phase 5a | — | — | ✓ TimeSeries | 列存投影原型 |
-| Phase 5b | — | (扩展) Multi-AM GC 协调 | ✓ Graph（轻量） | Fusion 接入时序+图 |
-| Phase 6 | — | (扩展) RLS predicate | (稳定) | MCP Server + 完整 PG Wire |
-| Phase 7a | — | — | — | 备份恢复 + 监控 |
-| Phase 7b | (性能优化) | — | ✓ Columnar Projection | SIMD / io_uring / 大页 |
-| Phase 7c | — | ✓ 完整 CBO + 统计 | (压缩) SQ/PQ | 跨模态代价模型 |
-| Phase 7d | — | ✓ SSI | — | 高可用 + Jepsen |
+| Phase | Status | Notes |
+|---|---|---|
+| Phase 1 (M1+M2+M3) | ✅ Complete | Page/WAL/BufferPool, MVCC transactions and locks, B+Tree, crash recovery, Vacuum, minimal PG Wire — all through multiple adversarial reviews and full regression |
+| Phase 2a (In-memory HNSW) | ✅ Complete | Self-built HNSW (no third-party library), siftsmall recall@10 = 0.9990; L2/Cosine distance functions; snapshot loading |
+| Phase 2b (WAL + persistence) | ✅ Complete | Page-resident graph + 8 WAL record types + crash recovery; 25/1000 SIGKILL crash rounds; post-recovery recall bit-identical to baseline |
+| Phase 2c (concurrency + Tier 1) | 🚧 Closing | Concurrency protocol (shared handle + sharded latches + four loom models), Tier 1 transaction integration (in-row NodeId + sidecar map + IndexUndo), visibility-filtered search pipeline, vacuum extensions (leak accounting / local rebuild / dead-row backfill) — all delivered and reviewed; pgvector comparison landed (recall 0.9990 vs 0.9940, insert-throughput gap; see phase2-m6-benchmarks.md). **Still open**: first 24h stress run stalled at the watchdog (root cause under investigation), CI coverage report (needs a PR), the `phase2-m6` release tag (to be cut once CI is green, via branch + PR) |
+| Phase 3 (full-text inverted) | ⏳ Next milestone | Tech selection starting: segment-based inverted AM + BM25/WAND, Tier 2 WAL catch-up + watermark, merge/vacuum, NDCG comparison |
+| Phase 4a (SQL+PG Wire) | ⏳ Not started | Depends on the Phase 3 main line |
+| Phase 4b (Fusion + Planner) | ⏳ Not started | Depends on Phase 4a |
+| Phase 5a (TS+columnar+distill stub) | ⏳ Can start anytime | Phase 1 gate, parallel with Phase 2/3/4a; segment merge may reuse the Phase 3 architecture or a simple seal+TTL variant |
+| Phase 5b (graph+GC+forgetting/layering+Fusion) | ⏳ Not started | Graph queries/time routing need Phase 4a; multi-AM GC coordinator needs ≥2 AM (already satisfied); Fusion tails need Phase 4b |
+| Phase 6 (full protocol+isolation) | ⏳ Not started | Needs Phase 4a's PG Wire foundation and SQL layer |
+| Phase 7 (production) | ⏳ Not started | After 4b + 5b + 6 |
+
+**Near-term order**: main line Phase 3 → 4a → 4b; Phase 5a can be inserted in parallel anytime; Phase 5b/6 follow 4a, Fusion tails follow 4b; M6's three closing items (PR/CI report, 24h rerun, tag) proceed in parallel with Phase 3, not blocking each other.
 
 ---
 
-## 阶段依赖关系
+## Phase × Layer mapping
+
+| Phase | Layer 1 (physical) | Layer 2 (transactions/visibility) | Layer 3 (Access Methods) | Cross-layer capabilities |
+|---|---|---|---|---|
+| Phase 1 M1 | ✓ Page/WAL/BufferPool/LSN/Checkpoint | — | — | (file management spread across components, not exposed separately) |
+| Phase 1 M2 | (ext) Full Page Image | ✓ MVCC / Lock / Snapshot / Visibility | ✓ B+Tree (with AccessMethod trait) | ARIES crash recovery |
+| Phase 1 M3 | — | (ext) Vacuum | — | Minimal PG Wire + observability |
+| Phase 2 | (Tier 1 async IO) | (ext) Per-tx delta | ✓ HNSW (Epoch + node locks) | HNSW Vacuum |
+| Phase 3 | (Tier 2 async IO) | (ext) Watermark | ✓ Inverted Index (BM25) | Segment merge |
+| Phase 4a | — | — | (single-path selection) | DataFusion + PG Wire Extended + EXPLAIN |
+| Phase 4b | — | (ext) Cost hooks | (multi-path fusion) | MultiIndexScan + Fusion + Planner |
+| Phase 5a | — | — | ✓ TimeSeries | Columnar projection prototype |
+| Phase 5b | — | (ext) Multi-AM GC coordination | ✓ Graph (lightweight) | Fusion integration: time series + graph |
+| Phase 6 | — | (ext) RLS predicate | (stable) | MCP Server + full PG Wire |
+| Phase 7a | — | — | — | Backup/restore + monitoring |
+| Phase 7b | (performance) | — | ✓ Columnar Projection | SIMD / io_uring / huge pages |
+| Phase 7c | — | ✓ Full CBO + statistics | (compression) SQ/PQ | Cross-modal cost model |
+| Phase 7d | — | ✓ SSI | — | High availability + Jepsen |
+
+---
+
+## Phase dependencies
 
 ```
-主干（必须线性）：
+Main line (must be linear):
 Phase 1 ──→ Phase 2 ──→ Phase 3 ──→ Phase 4a ──→ Phase 4b
-(基座+行存)   (向量)      (全文)      (SQL+PG)     (Fusion)
+(foundation+row) (vector)   (full-text) (SQL+PG)   (Fusion)
 
-可并行 track（不阻塞主干，有人力时可提前启动）：
+Parallel tracks (do not block the main line; start early if capacity allows):
 
-Phase 5a（Phase 1 门，可与 Phase 2/3/4a 同时起步）：
-  ├── 时序 AM + TTL ──────── 可与 Phase 2/3/4 并行；
-  │                          注意：segment merge 逻辑需等 Phase 3 完成后复用，
-  │                          或自行实现简易版（仅时间分区 seal + TTL 清理）
-  ├── 列存投影原型 ────────── 可与 Phase 2/3 并行
-  └── 记忆蒸馏 SDK ────────── 外部 LLM，可拿 stub 早期并行
+Phase 5a (Phase 1 gate, may start with Phase 2/3/4a):
+  ├── TimeSeries AM + TTL ─────── parallel with Phase 2/3/4;
+  │                               note: segment merge logic is reused after
+  │                               Phase 3 completes, or implemented as a simple
+  │                               variant (time-partition seal + TTL cleanup only)
+  ├── Columnar projection proto ── parallel with Phase 2/3
+  └── Distillation SDK ─────────── external LLM; the stub may start early
 
-Phase 5b · 4a 门（需 SQL 层，不需 4b）：
-  ├── 图 AM（轻量版）+ 图查询语法 ── 需要 SQL 层就绪
-  └── 时间范围查询路由 ───────────── planner 谓词路由 = 4a 的活
+Phase 5b · 4a gate (needs the SQL layer, not 4b):
+  ├── Graph AM (lightweight) + graph query syntax ── needs the SQL layer ready
+  └── Time-range query routing ──────────────────── planner predicate routing = 4a's job
 
-Phase 5b · ≥2 AM 门（与 4b 正交，是 vacuum 期的事）：
-  └── 多 AM GC 协调器 ── ≥2 个 AM 落地即可起；
-                          落地后遗忘曲线 / 记忆分层 SDK 才有真实 mark_for_gc trait 可用
+Phase 5b · ≥2 AM gate (orthogonal to 4b, a vacuum-era concern):
+  └── Multi-AM GC coordinator ── can start once ≥2 AMs have landed;
+                                  only then do the forgetting curve / memory-layering
+                                  SDKs get a real mark_for_gc trait to call
 
-Phase 5b · 4b 门（仅两条 Fusion 集成尾巴）：
-  ├── 图参与 Fusion ──── 把 Graph 输出接进 4b 的 MultiIndexScan 算子
-  └── 时序参与 Fusion ── 把时序输出接进 4b 的 MultiIndexScan 算子
+Phase 5b · 4b gate (only the two Fusion integration tails):
+  ├── Graph into Fusion ──── feed Graph output into 4b's MultiIndexScan operator
+  └── Time series into Fusion ─ feed TimeSeries output into 4b's MultiIndexScan operator
 
-Phase 6（4a 门，与 5b · 4a 门同批起）：
-  ├── 完整 PG Protocol ─── 需要 Phase 4a 的 PG Wire 基础
-  └── MCP Server ────────── 需要 Phase 4a 的 SQL 层
+Phase 6 (4a gate, starts in the same batch as Phase 5b · 4a):
+  ├── Full PG Protocol ─── needs Phase 4a's PG Wire foundation
+  └── MCP Server ──────── needs Phase 4a's SQL layer
 
-注：Phase 5b 与 4b 之间是【部分、单向】依赖：仅"图/时序参与 Fusion"两条尾巴等 4b，
-其余 5b 交付物依赖 Phase 4a 或 ≥2 AM，可与 4b 并行起跑。
-反过来 4b 不依赖 Phase 5（4b 只需 HNSW + 倒排 + planner）。
-Graph AM 整体 gate 在 4a（遵循"接口可扩展但实现不提前"原则）；若团队接受 SQL 集成返工风险，
-可把 Graph AM 存储层 + BFS/DFS 原语提到 5a 起步，仅图查询语法留 5b。
+Note: Phase 5b and 4b have a【partial, one-way】dependency: only the
+"graph/time-series into Fusion" tails wait for 4b; every other Phase 5b
+deliverable depends on Phase 4a or ≥2 AM and may start in parallel with 4b.
+Conversely, 4b does not depend on Phase 5 (4b only needs HNSW + inverted + planner).
+Graph AM as a whole is gated on 4a (the "interfaces may be extensible but
+implementations never land early" principle); if the team accepts the SQL
+integration rework risk, the Graph AM storage layer + BFS/DFS primitives may
+start at 5a, with only the graph query syntax left to 5b.
 
 Phase 4b + Phase 5b + Phase 6 → Phase 7
 ```
 
 ---
 
-## Phase 1：存储基座 + 行存 + 事务 + B+Tree
+## Phase 1: Storage foundation + row store + transactions + B+Tree (✅ Complete)
 
-**目标：最小可用数据库，Agent 可以存取结构化元数据**
+**Goal: a minimal usable database so Agents can read and write structured metadata**
 
-**时间估算（1–2 高级 Rust 工程师）：** 乐观 6 个月 / P50 9–12 个月 / 长尾 15+ 个月
-**风险等级**：🔴 高（事务/恢复是核心，决定整个项目成败）
+**Time estimate (1–2 senior Rust engineers):** optimistic 6 months / P50 9–12 months / long tail 15+ months
+**Risk:** 🔴 High (transactions/recovery is the core and decides the project's success)
 
-### Milestone 1：物理层
+### Milestone 1: Physical layer
 
-| 模块 | 说明 |
+| Module | Notes |
 |------|------|
-| Page Allocator | 固定大小页分配/释放（8KB/16KB 可配置），freelist 管理，不假设页内容 |
-| WAL Writer | append-only 日志，接受 (record_type, payload)，fsync 语义，CRC32 校验；物理 WAL 完整实现（before/after image）；逻辑 WAL 接口预留（Phase 2 HNSW 接入时实现） |
-| Buffer Pool | page_id → in-memory frame 映射，LRU/CLOCK 替换，pin/unpin 协议，WAL 先行规则（刷页前确保相关 WAL 已持久化） |
-| LSN Clock | 全局单调递增，所有组件共享 |
-| 文件管理 | 数据文件/WAL/元数据文件操作分散在 PageAllocator/WalWriter/Superblock 中，不独立暴露；O_DIRECT 为 Phase 7b 优化项 |
+| Page Allocator | Fixed-size page alloc/free (8KB/16KB configurable), freelist management, no assumptions about page contents |
+| WAL Writer | Append-only log accepting (record_type, payload), fsync semantics, CRC32 checksums; full physical WAL (before/after images); logical WAL interface reserved (implemented when Phase 2 HNSW lands) |
+| Buffer Pool | page_id → in-memory frame map, LRU/CLOCK replacement, pin/unpin protocol, WAL-before-data rule (related WAL must be durable before a page is flushed) |
+| LSN Clock | Globally monotonically increasing, shared by all components |
+| File management | Data-file/WAL/metadata operations live inside PageAllocator/WalWriter/Superblock, not exposed separately; O_DIRECT is a Phase 7b optimization |
 
-**验证标准：**
-- **正确性优先（不设硬性性能指标）**：
-  - WAL 顺序写正确性：每条记录 crash 后能完整恢复
-  - Buffer Pool 正确性：pin/unpin 不泄漏、eviction 不丢页
-  - 单元测试覆盖率 ≥ 90%
-  - proptest 验证 Page Allocator 正确性（无泄漏、无重叠）
-- **性能参考基线（Phase 7b 再硬性要求）**：
-  - WAL ≥ 200MB/s（顺序写，本地 SSD 物理上限的 60%）
-  - Buffer Pool ≥ 50K ops/s（随机读 8KB page）
-- **崩溃测试**：随机 kill -9 × 1000 次无数据丢失
+**Acceptance:**
+- **Correctness first (no hard performance targets)**:
+  - WAL sequential-write correctness: every record fully recoverable after a crash
+  - Buffer Pool correctness: no pin/unpin leaks, no lost pages on eviction
+  - Unit-test coverage ≥ 90%
+  - proptest validation of Page Allocator (no leaks, no overlaps)
+- **Reference performance baseline (only enforced in Phase 7b)**:
+  - WAL ≥ 200MB/s (sequential writes, 60% of local SSD physical ceiling)
+  - Buffer Pool ≥ 50K ops/s (random 8KB page reads)
+- **Crash testing**: random kill -9 × 1000 with no data loss
 
-### Milestone 2：行存 + 事务 + B+Tree + 崩溃恢复
+### Milestone 2: Row store + transactions + B+Tree + crash recovery
 
-#### M2 内部检查点
+#### Internal M2 checkpoints
 
-为避免一次性实现完整 MVCC/死锁检测/B+Tree 后才暴露架构问题，M2 拆为三个内部检查点：
+To avoid building full MVCC/deadlock detection/B+Tree in one shot before architecture problems surface, M2 splits into three internal checkpoints:
 
-| 检查点 | 目标 | 验证 |
+| Checkpoint | Goal | Verification |
 |---|---|---|
-| M2a | 单语句 auto-commit + 堆表 + 无并发 B+Tree | `INSERT` / `SELECT` / `UPDATE` / `DELETE` 单线程正确 |
-| M2b | 多语句事务 + MVCC 快照 + 可见性判断 | 并发读写无脏读，RC/SI 快照正确 |
-| M2c | 完整锁管理 + 死锁检测 + B+Tree 并发 | 100 并发 CRUD + 随机崩溃测试通过 |
+| M2a | Single-statement auto-commit + heap table + non-concurrent B+Tree | `INSERT` / `SELECT` / `UPDATE` / `DELETE` correct single-threaded |
+| M2b | Multi-statement transactions + MVCC snapshot + visibility judgment | No dirty reads under concurrent read/write; RC/SI snapshots correct |
+| M2c | Full lock management + deadlock detection + concurrent B+Tree | 100 concurrent CRUD + random crash tests pass |
 
-#### 交付物
+#### Deliverables
 
-| 模块 | 说明 |
+| Module | Notes |
 |------|------|
-| Heap Storage | Slotted page 行存，支持变长字段，TOAST 溢出页（大对象/向量/JSONB 不放主行） |
-| Tuple 格式 | 胖 header（xmin, xmax, agent_id, trace_id, flags）+ 定长标量列 + 列指针 |
-| Transaction Manager | begin/commit/abort，事务 ID 分配（64-bit 无 wraparound） |
-| Snapshot 机制 | **LSN-based snapshot**（与"单一 WAL + 单一 LSN"根契约一致）；snapshot = {xmin_lsn, xmax_lsn, active_xacts: ATT 快照}；无 XID wraparound 问题。默认隔离级别：Snapshot Isolation（SI）；RC（每语句新快照）可选；SSI 推迟到 Phase 7d |
-| Visibility Oracle | is_visible(xmin, xmax, snapshot) 统一判断，所有 AM 共享 |
-| Lock Manager | 行级锁（基于 tuple header xmax 字段，S/X 模式），表级锁（4 标准模式），等待队列 + 死锁检测（wait-for graph，100ms 周期）。IS/IX 意向锁推迟到 Phase 6 ALTER TABLE/VACUUM FULL 支持时再加 |
-| B+Tree Index | Latch coupling 读，乐观/悲观插入，叶子页分裂，实现 AccessMethod trait。**页合并明确不做**（只分裂不合并，删除只回收条目不回收页）：合并需 latch 左兄弟 + 父页删 downlink，违反 Blink 单向锁序（DOWN/RIGHT）的全部并发正确性论证；残留为 delete-drain 空页的有界空间膨胀（churn 实测 ~0.18 页/轮，验收界 0.25 页/轮）。归属 Phase 5b（多 AM GC 协调器——安全释放页需要 horizon 推进 + 在线增量回收 + 后台调度能力） |
-| 崩溃恢复 | 完整 ARIES 变体：Analysis → Redo → Undo，CLR 保证嵌套崩溃安全 |
-| Checkpoint | Fuzzy Checkpoint：收集 ATT+DPT，后台刷脏页，更新超级块 |
-| Full Page Image | 每个 checkpoint 周期内页首次修改时记录完整页副本，防止 torn page |
+| Heap Storage | Slotted-page row store with variable-length fields, TOAST overflow pages (large objects/vectors/JSONB stay out of the main row) |
+| Tuple format | Fat header (xmin, xmax, agent_id, trace_id, flags) + fixed-width scalar columns + column pointers |
+| Transaction Manager | begin/commit/abort, 64-bit transaction IDs (no wraparound) |
+| Snapshot mechanism | **LSN-based snapshot** (consistent with the "single WAL + single LSN" root contract); snapshot = {xmin_lsn, xmax_lsn, active_xacts: ATT snapshot}; no XID wraparound. Default isolation: Snapshot Isolation (SI); RC (fresh snapshot per statement) optional; SSI deferred to Phase 7d |
+| Visibility Oracle | is_visible(xmin, xmax, snapshot), one shared judgment used by every AM |
+| Lock Manager | Row locks (tuple-header xmax field, S/X modes), table locks (4 standard modes), wait queue + deadlock detection (wait-for graph, 100ms cycle). IS/IX intention locks deferred to Phase 6 (ALTER TABLE / VACUUM FULL support) |
+| B+Tree Index | Latch-coupled reads, optimistic/pessimistic inserts, leaf splits, AccessMethod trait. **Page merge explicitly out of scope** (split only, never merge; deletes reclaim entries, not pages): merging needs a left-sibling latch plus parent downlink deletion, which breaks every concurrency-correctness argument of the Blink one-way lock order (DOWN/RIGHT). Residual shape: bounded space growth from delete-drain empty pages (churn measured ~0.18 pages/round, acceptance bound 0.25 pages/round). Owned by Phase 5b (multi-AM GC coordinator — safe page release needs horizon advancement + online incremental reclamation + background scheduling) |
+| Crash recovery | Full ARIES variant: Analysis → Redo → Undo; CLR guarantees safety under nested crashes |
+| Checkpoint | Fuzzy Checkpoint: collect ATT+DPT, flush dirty pages in the background, update the superblock |
+| Full Page Image | Full page copy recorded on the first modification of a page within each checkpoint interval, preventing torn pages |
 
-**验证标准：**
-- ACID 正确性：并发读写 + 随机 kill 进程，重启后数据始终一致
-- 能跑简单的 Agent 元数据存取（session 记录、用户画像、配置）
-- 并发性能：100 并发连接下 TPS ≥ 10K（简单 CRUD，单表，SSD，无网络协议开销）
+**Acceptance:**
+- ACID correctness: concurrent read/write + random process kills, data always consistent after restart
+- Simple Agent metadata read/write works (session records, user profiles, configuration)
+- Concurrency: TPS ≥ 10K with 100 concurrent connections (simple CRUD, single table, SSD, no protocol overhead)
 
-### Milestone 3：基础 Vacuum + 可观测性 + PG Wire 极简版
+### Milestone 3: Basic Vacuum + observability + minimal PG Wire
 
-| 模块 | 说明 |
+| Module | Notes |
 |------|------|
-| Vacuum | 扫描死元组（xmax 已提交且无活跃快照引用），回收空间，通知 B+Tree 清理对应条目 |
-| 可观测性 | WAL dump 工具（人类可读）、活跃事务列表查询、锁等待关系查询、Buffer Pool 命中率统计、查询统计（pg_stat_statements 等价物：每 query 的延迟、行数、扫描路径） |
-| PG Wire Protocol 极简版 | 仅支持 Simple Query + 文本结果格式，让 psql / 标准 PG 驱动能连上来跑 CREATE/INSERT/SELECT/UPDATE/DELETE |
-| SegmentedStorage 接口预留 | Phase 3 (Inverted) 和 Phase 5 (TimeSeries) 都是 segment-based 架构，预留接口：SegmentedStorage trait (create_segment/freeze/seal/merge)、segment lifecycle、WAL 协议扩展 (SEGMENT_SEAL/SEGMENT_MERGE 记录类型) |
-| Tier 2 接口预留 | WAL tail reader 接口、watermark registry 接口、planner 可感知索引新鲜度的 hook |
-| ~~在线/渐进式 Vacuum~~ | **不在 M3 范围**。明确归属 Phase 5b（多 AM GC 协调器）：M3 只交付离线 `Engine::vacuum(table)`（`AccessExclusive` 一次完成）及其全部可复用地基（快照注册水位线、页内压实原语、索引通知路径、WAL 记录族）。若 M3 验收后停写窗口成为实际问题，以"分段离线"（按页区间分批持锁）缓解，不做中间态独立在线化 |
+| Vacuum | Scan dead tuples (xmax committed and not referenced by any active snapshot), reclaim space, notify B+Tree to remove matching entries |
+| Observability | Human-readable WAL dump, active-transaction listing, lock-wait inspection, Buffer Pool hit-rate stats, query statistics (pg_stat_statements equivalent: per-query latency, rows, scan path) |
+| Minimal PG Wire Protocol | Simple Query + text result format only, enough for psql / standard PG drivers to run CREATE/INSERT/SELECT/UPDATE/DELETE |
+| SegmentedStorage interface reservation | Phase 3 (Inverted) and Phase 5 (TimeSeries) are both segment-based; reserve: SegmentedStorage trait (create_segment/freeze/seal/merge), segment lifecycle, WAL protocol extension (SEGMENT_SEAL/SEGMENT_MERGE record types) |
+| Tier 2 interface reservation | WAL tail reader interface, watermark registry interface, planner hook for index freshness |
+| ~~Online/incremental Vacuum~~ | **Out of M3 scope**. Explicitly assigned to Phase 5b (multi-AM GC coordinator): M3 delivers only offline `Engine::vacuum(table)` (one `AccessExclusive` pass) plus every reusable foundation (snapshot-registry watermark, in-page compaction primitives, index notification path, WAL record family). If the write-stop window becomes a real problem after M3 acceptance, mitigate with "segmented offline" (batch locks per page range) rather than building a separate online middle state |
 
-**验证标准：**
-- Vacuum 后空间可被复用，无无限膨胀
-- psql 能连接并执行基本 SQL（CREATE TABLE / INSERT / SELECT / UPDATE / DELETE）
-- 主流 PG 驱动（psycopg2、node-postgres、rust-postgres）可正常连接
-- 可通过命令行工具诊断事务和锁问题
+**Acceptance:**
+- Space reusable after Vacuum, no unbounded growth
+- psql connects and runs basic SQL (CREATE TABLE / INSERT / SELECT / UPDATE / DELETE)
+- Mainstream PG drivers (psycopg2, node-postgres, rust-postgres) connect successfully
+- Transaction and lock problems diagnosable from the command line
 
-### Phase 1 对 Agent 团队的价值
+### Value of Phase 1 for the Agent team
 
-- 替代 SQLite/PG 存储 Agent 的结构化元数据
-- session_id、agent_id、timestamp 等字段原生支持
-- 行级 provenance（谁写的、什么时候写的）
-- psql / Python / TypeScript 客户端直接可用
+- Replaces SQLite/PG as the store for structured Agent metadata
+- Native session_id, agent_id, timestamp fields
+- Row-level provenance (who wrote it, when)
+- psql / Python / TypeScript clients work out of the box
 
 ---
 
-## Phase 2：HNSW 向量索引
+## Phase 2: HNSW vector index (🚧 Closing; open items in "Current progress")
 
-**目标：支持向量存储与近邻检索，Agent 可以做语义记忆召回**
+**Goal: vector storage and nearest-neighbor search so Agents can do semantic memory recall**
 
-**时间估算（1–2 高级 Rust 工程师）：** 乐观 9 个月 / P50 12–15 个月 / 长尾 24+ 个月
-**风险等级**：🔴 高（long pole of the entire roadmap）
+**Time estimate (1–2 senior Rust engineers):** optimistic 9 months / P50 12–15 months / long tail 24+ months
+**Risk:** 🔴 High (long pole of the entire roadmap)
 
-### 拆分理由
+### Why split it
 
-HNSW 是 6 种 AM 中工程量最大的：
-- 并发控制（HNSW undo 是已知难题）
-- WAL 集成（逻辑 WAL + 一致性修复）
-- 崩溃恢复（Epoch snapshot + 增量重放）
-- 可见性过滤（2x 候选 + top-K）
+HNSW is the largest engineering effort of the six AMs:
+- Concurrency control (HNSW undo is a known hard problem)
+- WAL integration (logical WAL + consistency repair)
+- Crash recovery (Epoch snapshot + incremental replay)
+- Visibility filtering (2x candidates + top-K)
 
-任一项卡住会延期整个 Phase。拆成 3 个 sub-phase，每个有独立 demo。
+Any one of them can stall the whole phase. Split into 3 sub-phases, each with its own demo.
 
-### Phase 2a：In-memory HNSW（3 个月）
+### Phase 2a: In-memory HNSW (3 months)
 
-**目标：** 能在内存里建图、查询；不要求持久化
+**Goal:** build and query the graph in memory; no persistence required
 
-| 模块 | 说明 |
+| Module | Notes |
 |------|------|
-| VECTOR(n) 类型 | 一等公民数据类型，DDL 级声明，支持 f32/f16/bf16 |
-| HNSW 内存版 | 分层随机图、M/M_max、邻居选择（simple / robust prune）、贪心搜索 |
-| 距离函数 | L2 / Cosine / Inner Product，基础实现正确；SIMD 优化作为 Phase 2a 末尾或 Phase 7b 的优化项 |
-| 加载 API | 从磁盘加载预构建的图（用 hnswlib 格式互通） |
+| VECTOR(n) type | First-class data type, DDL-level declaration, f32/f16/bf16 support |
+| In-memory HNSW | Hierarchical random graph, M/M_max, neighbor selection (simple / robust prune), greedy search |
+| Distance functions | L2 / Cosine / Inner Product, correct basic implementations; SIMD optimization reserved for the end of 2a or Phase 7b |
+| Load API | Load a prebuilt graph from disk (hnswlib-format compatible) |
 
-**验证标准：**
-- 1M 768d 向量 recall@10 ≥ 95%（sift-128-euclidean, gist-960-euclidean）
-- 1M 向量加载时间 < 5 分钟
-- 搜索延迟 P99 < 20ms（ef_search=64）
-- 单元测试 ≥ 90%
+**Acceptance:**
+- 1M 768d vectors recall@10 ≥ 95% (sift-128-euclidean, gist-960-euclidean)
+- 1M-vector load time < 5 minutes
+- Search latency P99 < 20ms (ef_search=64)
+- Unit tests ≥ 90%
 
-### Phase 2b：HNSW WAL + 持久化（4 个月）
+### Phase 2b: HNSW WAL + persistence (4 months)
 
-**目标：** HNSW 变更进单一 WAL，崩溃后能完整恢复
+**Goal:** HNSW changes go into the single WAL and fully recover after a crash
 
-| 模块 | 说明 |
+| Module | Notes |
 |------|------|
-| 逻辑 WAL 记录 | add_node(v, neighbors), connect(a, b), remove_node(tombstone) |
-| On-disk 邻居列表 | 节点 page 写入 Buffer Pool，遵循 WAL 先行 |
-| Checkpoint HNSW 快照 | 入口点、最大层数、节点计数 |
-| 崩溃恢复 | 从 checkpoint + WAL 重放，验证图一致性 |
-| 幂等 redo | 重放同一 WAL 记录 N 次结果一致 |
+| Logical WAL records | add_node(v, neighbors), connect(a, b), remove_node(tombstone) |
+| On-disk neighbor lists | Node pages written through the Buffer Pool, WAL-before-data enforced |
+| Checkpoint HNSW snapshot | Entry point, max level, node count |
+| Crash recovery | Replay from checkpoint + WAL, verify graph consistency |
+| Idempotent redo | Replaying the same WAL record N times yields the same result |
 
-**验证标准：**
-- 1M 向量随机 kill -9 × 1000 次，图结构语义一致
-- 重启恢复时间 < 30 秒（checkpoint 后增量重放）
+**Acceptance:**
+- 1M vectors, random kill -9 × 1000, graph semantics stay consistent
+- Restart recovery time < 30 seconds (incremental replay after checkpoint)
 
-### Phase 2c：HNSW 并发控制 + Tier 1 同步（5–7 个月）
+### Phase 2c: HNSW concurrency control + Tier 1 synchronization (5–7 months)
 
-**目标：** 高并发下 HNSW 仍能正确维护
+**Goal:** HNSW stays correct under high concurrency
 
-| 模块 | 说明 |
+| Module | Notes |
 |------|------|
-| Epoch-based reclamation | 防止 use-after-free 的安全回收 |
-| 节点级细粒度锁 | 非页级，避免粒度过粗 |
-| Tier 1 同步策略 | 事务内累积 delta，commit 时批量合并到 HNSW 图 |
-| 可见性适配 | 搜索时多取 2x 候选，回表做 visibility 过滤后返回 top-K |
-| 并发 undo | abort 时标记 tombstone + 后台修复邻居连通性 |
-| Vacuum 扩展 | tombstone 比例监控 + 局部重建 |
+| Epoch-based reclamation | Safe reclamation that prevents use-after-free |
+| Node-level fine-grained locks | Not page-level, avoiding overly coarse granularity |
+| Tier 1 synchronization | Accumulate deltas inside a transaction, merge into the HNSW graph in bulk at commit |
+| Visibility adaptation | Fetch 2x candidates, filter through heap visibility before returning top-K |
+| Concurrent undo | Mark tombstone on abort + background repair of neighbor connectivity |
+| Vacuum extensions | Tombstone-ratio monitoring + local rebuild |
 
-**验证标准：**
-- 100 并发 INSERT + DELETE 持续运行 24 小时，图结构语义一致：
-  - 双向边不对称率相对单线程基线的增量 < 1%（基线 = M4 Stage B 实测聚合 15.35%，逐 cell 8.9%–17.1%——HNSW shrink 单侧删边的固有不对称，hnswlib/pgvector 同量级；<1% 约束的是并发/崩溃/修复引入的**增量**，非绝对率。2026-08-31 M4 Stage B 对抗审查 P2-1 修订：原字面口径经实测证伪，正确实现也永远过不了绝对 <1%）
-  - recall@10 不低于崩溃前 95%
-  - 无悬挂节点（所有节点可从入口点可达）
-- 并发 abort 后 HNSW 搜索精度（recall@10）≥ 单线程基线的 95%
-- 对标：与 pgvector (HNSW) 和 Qdrant 对比 recall/latency/throughput
+**Acceptance:**
+- 100 concurrent INSERT + DELETE for 24 hours with consistent graph semantics:
+  - Bidirectional-edge asymmetry increment over the single-threaded baseline < 1% (baseline = M4 Stage B measured aggregate 15.35%, per-cell 8.9%–17.1% — the inherent asymmetry of HNSW's one-sided shrink removals, same order as hnswlib/pgvector; the <1% bound constrains the **increment** introduced by concurrency/crashes/repair, not the absolute rate. 2026-08-31 M4 Stage B adversarial review P2-1 revision: the original absolute reading was falsified by measurement — even a correct implementation could never pass it)
+  - recall@10 ≥ 95% of the pre-crash value
+  - No dangling nodes (every node reachable from the entry point)
+- recall@10 after concurrent aborts ≥ 95% of the single-threaded baseline
+- Comparison: pgvector (HNSW) and Qdrant on recall/latency/throughput
 
-### Phase 2 SQL 示例
+### Phase 2 SQL examples
 
-**TOAST 决策（Phase 2 前置，2026-08-31 决策，解除"隐形前置阻塞"）：**
-
-- **HNSW 向量不走 heap TOAST**：向量自存于 `pg-am-hnsw` 自有节点存储（M4 内存连续 arena，M5 节点页布局）——距离计算在图遍历热路径上，向量必须与图同驻，回堆取向量不可行。M2 选型 §四"Phase 2 HNSW 存 4KB 向量必须走 TOAST"的假设被 M4 设计（`pg-am-hnsw` 与 `pg-am-heap` 零依赖）取代。
-- **VECTOR(n) 堆内列值内联存储**：dim ≤ 2000 为上限（与 M5 单页节点布局可行域对齐），超限响亮报错；M5 开放问题 O1（超 2000 维节点页溢出方案）维持归 M5。
-- **heap TOAST chunk I/O 本体归 Phase 4a**（见 Phase 4a 交付物表）：Phase 1 现状为大值内联至单页容量、超限 `TupleTooLarge` 响亮报错——Phase 2 全程（2a/2b/2c）不依赖 heap TOAST，阻塞解除且无功能缩量。
+**TOAST decision (Phase 2 prerequisite, decided 2026-08-31, removing the "invisible prerequisite blocker"):**
+- **HNSW vectors do not go through heap TOAST**: vectors live in `pg-am-hnsw`'s own node storage (M4 contiguous in-memory arena, M5 node-page layout) — distance computation sits on the graph-traversal hot path, so vectors must stay co-resident with the graph; fetching them from the heap is not viable. M2 selection §4's assumption that "Phase 2 HNSW storing 4KB vectors must use TOAST" is superseded by the M4 design (`pg-am-hnsw` has zero dependency on `pg-am-heap`).
+- **VECTOR(n) heap column values stored inline**: dim ≤ 2000 as the upper bound (aligned with M5's single-page node-layout feasibility); larger dims fail loudly; M5 open issue O1 (node-page overflow plan for >2000 dims) remains assigned to M5.
+- **Heap TOAST chunk I/O itself belongs to Phase 4a** (see the Phase 4a deliverables table): Phase 1's status quo is inline storage up to single-page capacity with a loud `TupleTooLarge` error beyond it — Phase 2 in its entirety (2a/2b/2c) does not depend on heap TOAST, so the blocker is gone with no functional reduction.
 
 ```sql
--- 通过 PG Wire Protocol 调用（Phase 1 M3 的最小子集即可）
+-- Invoked through PG Wire Protocol (the Phase 1 M3 minimal subset suffices)
 INSERT INTO memories (id, content, embedding) VALUES ('m1', 'hello', '[0.1, 0.2, ...]');
 
--- 纯向量检索
+-- Pure vector search
 SELECT id, content FROM memories
 ORDER BY embedding <=> $1
 LIMIT 10;
 
--- 向量 + 结构化过滤组合（Phase 1 B+Tree + Phase 2 HNSW）
+-- Vector + structured filter combo (Phase 1 B+Tree + Phase 2 HNSW)
 SELECT id, content FROM memories
 WHERE agent_id = 'a1'
 ORDER BY embedding <=> $1
 LIMIT 10;
 ```
 
-### Phase 2 对 Agent 团队的价值
+### Value of Phase 2 for the Agent team
 
-- Agent 对话/文档的 embedding 存储与语义检索
-- 与结构化过滤组合（WHERE team='sales' 先 B+Tree 过滤，再向量排序）
-- 记忆的语义去重（近似向量检测）
-- 单一事务保证：插入一条记忆 + 对应向量，要么同时成功要么同时失败
-
----
-
-## Phase 3：全文倒排索引
-
-**目标：支持 BM25 全文检索，Agent 可以做关键词记忆召回**
-
-**时间估算（1–2 高级 Rust 工程师）：** 乐观 4 个月 / P50 6–8 个月 / 长尾 10 个月
-**风险等级**：🟡 中（segment 模式新，但有 Tantivy/Lucene 参考）
-
-### 交付物
-
-| 模块 | 说明 |
-|------|------|
-| 全文索引声明 | WITH (fulltext_index = 'bm25') DDL 级声明 |
-| Inverted Index AM | 实现 AccessMethod trait，segment-based 架构 |
-| 分词器 | 中文（jieba-rs）+ 英文（stemming + stop words），可插拔 |
-| Posting List | 每个 term 对应一个有序 TID 列表 + term frequency + 位置信息 |
-| BM25 评分 | 标准 BM25 公式（k1=1.2, b=0.75），支持 WAND 加速 |
-| BM25 全局统计 | 维护 doc_count、avgdl、term_df，更新时原子递增；checkpoint 时持久化到元数据文件 |
-| Segment 架构 | 写入缓冲（内存）→ flush 为不可变 segment → 后台 merge |
-| Tier 2 完整落地 | 后台 worker 消费 WAL 流，维护 applied_lsn，planner 感知 watermark |
-| Watermark 机制 | planner 查询时检查倒排索引的 applied_lsn 是否覆盖查询 snapshot |
-| Watermark 监控 | watermark_lag_seconds 指标导出，planner 可据此判断是否 fallback；当 lag 超过可配置阈值时自动提高后台 worker 消费速率 |
-| Fallback 策略 | watermark 落后时：1) 优先只查询已 flush 的不可变 segment，忽略未 flush 的 write buffer；2) 若查询需要最新数据且 segment 覆盖不足，再回退到 seqscan；3) 大表场景下 seqscan fallback 必须配合超时/采样限制，避免查询挂死 |
-| Segment Merge | 后台合并小 segment，清理已删除的 posting 条目 |
-| Vacuum 扩展 | segment merge 时物理清理已删除 TID 的 posting |
-| 崩溃恢复 | 丢弃未 flush 的 write buffer，从 applied_lsn 继续追赶 |
-
-### 验证标准
-
-- 检索质量：标准 IR 数据集 NDCG@10 对齐 Tantivy 水平
-- Tier 2 延迟：写入后 < 1 秒可检索到（正常负载下）
-- 崩溃恢复：随机 kill 后从 applied_lsn 正确追赶，不丢不重
-- 对标：与 Tantivy / Elasticsearch 对比检索质量和延迟
-
-### Phase 3 对 Agent 团队的价值
-
-- Agent 记忆的关键词检索（"上次讨论过合同纠纷"）
-- 与向量检索互补（向量找语义相似，全文找精确关键词）
-- 无需外接 ES，减少运维复杂度
+- Embedding storage and semantic search for Agent conversations/documents
+- Combined with structured filters (WHERE team='sales' filters through B+Tree first, then vector ordering)
+- Semantic dedup of memories (approximate-vector detection)
+- Single-transaction guarantee: inserting a memory and its vector either both succeed or both fail
 
 ---
 
-## Phase 4a：SQL 层 + PG Wire Protocol（基础）
+## Phase 3: Full-text inverted index (⏳ Next milestone: tech selection starting)
 
-**目标：让 pg_rust 能被标准 SQL 和 PG 驱动完整访问**
+**Goal: BM25 full-text search so Agents can do keyword memory recall**
 
-**时间估算（1–2 高级 Rust 工程师）：** 乐观 2 个月 / P50 3–4 个月 / 长尾 6 个月
-**风险等级**：🟡 中（DataFusion 集成存在 TP 适配风险）
+**Time estimate (1–2 senior Rust engineers):** optimistic 4 months / P50 6–8 months / long tail 10 months
+**Risk:** 🟡 Medium (new segment model, but Tantivy/Lucene references exist)
 
-### DataFusion TP 适配性检查点
+### Deliverables
 
-在 Phase 4a 开始时必须先完成以下验证：
-
-1. DataFusion 能支持简单点查的延迟 < 5ms（单连接）
-2. DataFusion 能正确传递事务上下文到 TableProvider
-3. 若上述任一项不满足，必须启动"TP 路径绕过 DataFusion"的备用方案
-
-备用方案概要：
-- 简单点查/小范围查询直接走自研执行器
-- 复杂分析查询走 DataFusion
-- SQL 层统一路由，对上层透明
-
-### 交付物
-
-| 模块 | 说明 |
+| Module | Notes |
 |------|------|
-| DataFusion 集成 | SQL 解析、逻辑计划、物理计划；自定义 TableProvider 对接 pg_rust 存储 |
-| 单路索引扫描 | 查询优化器能为单个谓词选择 B+Tree / HNSW / 倒排索引 |
-| PG Wire Protocol 基础版 | Simple Query + Extended Query（参数绑定），文本/二进制结果格式 |
-| EXPLAIN | 显示单路扫描计划 + 代价估算 |
-| heap TOAST chunk I/O | Phase 1 推迟项：>8KB 文本/JSONB/超维向量的溢出存储（chunk 表读写 + 主行 20B 指针解析；WAL 复用 `HeapInsert`/`HeapDelete`，指针格式已冻结）。现状为大值内联至单页容量、超限响亮报错，无非缩量。衔接 TOAST 压缩（Phase 7b） |
-| Sequence（SERIAL） | Phase 1 裁剪项（M2 §十八曾列 M3、M3 O6 决定不做）：`nextval`/`currval` + 目录登记，DataFusion SQL 层就位后落地 |
+| Full-text index declaration | WITH (fulltext_index = 'bm25') DDL-level declaration |
+| Inverted Index AM | AccessMethod trait implementation, segment-based architecture |
+| Tokenizers | Chinese (jieba-rs) + English (stemming + stop words), pluggable |
+| Posting List | Ordered TID list per term + term frequency + position info |
+| BM25 scoring | Standard BM25 formula (k1=1.2, b=0.75), WAND acceleration |
+| BM25 global statistics | doc_count, avgdl, term_df maintained with atomic increments; persisted to the metadata file at checkpoint |
+| Segment architecture | Write buffer (in-memory) → flush to immutable segments → background merge |
+| Tier 2 fully landed | Background worker consumes the WAL stream, maintains applied_lsn, planner is watermark-aware |
+| Watermark mechanism | At query time the planner checks whether the inverted index's applied_lsn covers the query snapshot |
+| Watermark monitoring | watermark_lag_seconds metric exported so the planner can decide on fallback; when lag exceeds a configurable threshold, the background worker's consumption rate is automatically increased |
+| Fallback strategy | When the watermark lags: 1) query only flushed immutable segments, ignoring the unflushed write buffer; 2) if the query needs fresher data and segments don't cover it, fall back to seqscan; 3) on large tables the seqscan fallback MUST be bounded by timeout/sampling limits to avoid hanging queries |
+| Segment Merge | Background merge of small segments, cleaning up deleted posting entries |
+| Vacuum extensions | Physically clean deleted TIDs' postings during segment merge |
+| Crash recovery | Discard the unflushed write buffer and resume catch-up from applied_lsn |
 
-### 验证标准
+### Acceptance
 
-- psql 能连接并执行 CREATE/INSERT/SELECT/UPDATE/DELETE
-- DataFusion 能正确下推 filter 到 pg_rust 的 TableProvider
-- 主流 PG 驱动（psycopg2、node-postgres、rust-postgres）可正常连接
-- 简单点查延迟 < 5ms（如备用方案生效则绕过 DataFusion）
+- Retrieval quality: NDCG@10 on standard IR datasets at Tantivy level
+- Tier 2 latency: written rows searchable in < 1 second (normal load)
+- Crash recovery: after random kills, catch up correctly from applied_lsn with no loss or duplication
+- Comparison: Tantivy / Elasticsearch on retrieval quality and latency
 
-### Phase 4a 不做
+### Value of Phase 3 for the Agent team
 
-- MultiIndexScan / Fusion（放到 Phase 4b）
-- Extended Query 模式的完整类型映射（放到 Phase 6）
-- 跨模态 Planner（放到 Phase 4b）
+- Keyword search over Agent memory ("the contract dispute we discussed last time")
+- Complements vector search (vectors find semantic similarity, full-text finds exact keywords)
+- No external ES to operate, less operational complexity
 
 ---
 
-## Phase 4b：Multi-Path Fusion + 跨模态 Planner
+## Phase 4a: SQL layer + PG Wire Protocol (basics) (⏳ Not started)
 
-**目标：单条 SQL 同时走多个索引并融合结果 — pg_rust 的核心差异化能力**
+**Goal: make pg_rust fully accessible through standard SQL and PG drivers**
 
-**时间估算（1–2 高级 Rust 工程师）：** 乐观 2 个月 / P50 3–4 个月 / 长尾 6 个月
-**风险等级**：🟡 中
+**Time estimate (1–2 senior Rust engineers):** optimistic 2 months / P50 3–4 months / long tail 6 months
+**Risk:** 🟡 Medium (DataFusion integration carries TP adaptation risk)
 
-### 交付物
+### DataFusion TP adaptation checkpoint
 
-| 模块 | 说明 |
+The following must be verified at the START of Phase 4a:
+
+1. DataFusion can serve simple point queries with latency < 5ms (single connection)
+2. DataFusion can pass transaction context through to TableProvider correctly
+3. If either check fails, the "bypass DataFusion for the TP path" fallback plan MUST be activated
+
+Fallback plan outline:
+- Simple point queries / small-range queries go through the custom executor
+- Complex analytical queries go through DataFusion
+- The SQL layer routes uniformly, transparently to upper layers
+
+### Deliverables
+
+| Module | Notes |
 |------|------|
-| MultiIndexScan 算子 | 并行启动多个 AM scan，按 fusion strategy 合并 TID，统一 visibility check，回表取行 |
-| Fusion 策略 | 过滤式（A∩B∩C）、RRF 排序式（Reciprocal Rank Fusion）、混合式（硬过滤+软排序） |
-| 跨模态 Planner（初版） | 识别多模态谓词，自动拆分为多条 AM scan 路径，选择 fusion 策略 |
-| 基础 Cost Model | 各 AM 选择性估计：B+Tree 直方图、HNSW 距离分布、倒排 term frequency |
-| EXPLAIN 增强 | 显示多路扫描计划 + 各路径代价 + fusion 策略 |
+| DataFusion integration | SQL parsing, logical planning, physical planning; custom TableProvider wired to pg_rust storage |
+| Single-path index scan | The optimizer can choose B+Tree / HNSW / inverted index for a single predicate |
+| PG Wire Protocol (basic) | Simple Query + Extended Query (parameter binding), text/binary result formats |
+| EXPLAIN | Single-path scan plan + cost estimation |
+| heap TOAST chunk I/O | Phase 1 deferred item: overflow storage for >8KB text/JSONB/oversized vectors (chunk-table read/write + main-row 20B pointer resolution; WAL reuses `HeapInsert`/`HeapDelete`, pointer format frozen). Current status: inline up to single-page capacity with a loud error beyond it, no functional reduction. Links into TOAST compression (Phase 7b) |
+| Sequence (SERIAL) | Phase 1 trimmed item (M2 §18 once listed it under M3, M3 O6 decided against): `nextval`/`currval` + catalog registration, landed once the DataFusion SQL layer is in place |
 
-### 示例查询
+### Acceptance
+
+- psql connects and runs CREATE/INSERT/SELECT/UPDATE/DELETE
+- DataFusion correctly pushes filters down into pg_rust's TableProvider
+- Mainstream PG drivers (psycopg2, node-postgres, rust-postgres) connect successfully
+- Simple point-query latency < 5ms (or go through the fallback executor if the bypass is active)
+
+### What Phase 4a does NOT do
+
+- MultiIndexScan / Fusion (Phase 4b)
+- Complete type mapping for Extended Query mode (Phase 6)
+- Cross-modal Planner (Phase 4b)
+
+---
+
+## Phase 4b: Multi-Path Fusion + cross-modal Planner (⏳ Not started)
+
+**Goal: a single SQL statement that walks multiple indexes and fuses their results — pg_rust's core differentiator**
+
+**Time estimate (1–2 senior Rust engineers):** optimistic 2 months / P50 3–4 months / long tail 6 months
+**Risk:** 🟡 Medium
+
+### Deliverables
+
+| Module | Notes |
+|------|------|
+| MultiIndexScan operator | Start several AM scans in parallel, merge TIDs per fusion strategy, unified visibility check, fetch rows from the heap |
+| Fusion strategies | Filter-style (A∩B∩C), RRF ranking (Reciprocal Rank Fusion), hybrid (hard filter + soft ranking) |
+| Cross-modal Planner (v1) | Recognizes multi-modal predicates, splits them into per-AM scan paths, picks the fusion strategy |
+| Basic Cost Model | Selectivity estimation per AM: B+Tree histograms, HNSW distance distributions, inverted term frequencies |
+| EXPLAIN enhancements | Multi-path scan plan + per-path cost + fusion strategy |
+
+### Example query
 
 ```sql
 SELECT * FROM agent_memory
-WHERE team = 'sales'                    -- B+Tree 路径
-  AND content @@ 'contract'             -- 倒排路径
-ORDER BY embedding <=> $vec             -- HNSW 路径
+WHERE team = 'sales'                    -- B+Tree path
+  AND content @@ 'contract'             -- Inverted path
+ORDER BY embedding <=> $vec             -- HNSW path
 LIMIT 10;
 ```
 
-执行计划：
+Execution plan:
 ```
 MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 ├── BTreeScan (team = 'sales') → TID set A
@@ -457,429 +485,246 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 └── HeapFetch → Top 10 rows
 ```
 
-### 验证标准
+### Acceptance
 
-- 正确性：融合结果与"分别查询再应用层合并"结果一致（100% 符合）
-- 性能：多路并行 < 各路串行之和的 60%
-- 质量：RRF 融合的 NDCG 优于单路最佳
-- 对标：与"PG + pgvector + pg_search 分别查询 + 应用层合并"对比端到端延迟
+- Correctness: fused results match "query separately then merge in the application layer" 100%
+- Performance: parallel multi-path < 60% of the sum of serial per-path time
+- Quality: RRF fusion's NDCG beats the best single path
+- Comparison: end-to-end latency against "PG + pgvector + pg_search, queried separately and merged in the application"
 
-### Phase 4b 末：开源 Alpha 准备
+### End of Phase 4b: open-source Alpha preparation
 
-**为什么是这个节点：**
-- Phase 4b 完成意味着"一条 SQL 完成混合召回"可 demo，最适合对外展示
-- 早期用户反馈能在 Phase 5/6 进入开发前修正方向
+**Why this milestone:**
+- Phase 4b delivers "one SQL statement for hybrid recall" — the best outward demo
+- Early user feedback can correct direction before Phase 5/6 development begins
 
-**准备清单：**
-- README + CONTRIBUTING + LICENSE（Apache 2.0 或 MIT）
-- CI/CD 跑通（GitHub Actions：rust check + cargo test + benchmark）
-- API 文档自动生成（cargo doc + mdbook）
-- 性能 benchmark 公开可复现（标准数据集 + 脚本）
-- 受众声明（明确范围：单机、Agent 记忆场景优先）
+**Checklist:**
+- README + CONTRIBUTING + LICENSE (Apache 2.0 or MIT)
+- CI/CD working (GitHub Actions: rust check + cargo test + benchmark)
+- API docs generated automatically (cargo doc + mdbook)
+- Reproducible public performance benchmarks (standard datasets + scripts)
+- Audience statement (explicit scope: single-node, Agent-memory scenarios first)
 
-**不做的事（避免过度承诺）：**
-- 不承诺跨平台（初期 macOS + Linux）
-- 不承诺分布式
-- 不承诺 PostgreSQL 完全兼容
+**Explicitly NOT promised (avoid overcommitting):**
+- No cross-platform promise (initially macOS + Linux)
+- No distributed promise
+- No full-PostgreSQL-compatibility promise
 
-### Phase 4 对 Agent 团队的价值
+### Value of Phase 4 for the Agent team
 
-- **核心价值：** Agent 一次"回忆"调用 = 一条 SQL，同时利用语义+关键词+结构化
-- 大幅简化 Agent 记忆召回的应用层代码（不再需要调用三个服务再合并）
-- 事务保证：混合检索的结果是快照一致的
-- **这是对外推广时最强的 demo 场景**
-
----
-
-## Phase 5a：时序 + 列存 + 蒸馏 stub（与 Phase 2/3/4a 并行）
-
-**目标：交付时间维度记忆管理的基础设施，Phase 1 完成即可独立起步**
-
-**时间估算（1–2 高级 Rust 工程师）：** 乐观 1.5 个月 / P50 2–3 个月 / 长尾 4 个月
-**风险等级**：🟡 可与主干并行（Phase 1 门；segment merge 复用需等 Phase 3 的 Tier-2 异步链路，属增量）
-
-### 5a.1 内核交付物（必做）
-
-| 模块 | 说明 |
-|------|------|
-| TimeSeries AM | 时间分区存储（按天/小时自动分区），范围扫描，降采样聚合（segment merge 复用需等 Phase 3 的 Tier-2 异步链路就绪） |
-| TTL 自动过期 | 声明式 TTL（WITH ts_partition = 'day', ttl = '90d'），后台自动清理过期分区 |
-| 列存投影原型 | 时序/记忆分析场景的轻量列存物化视图，Tier 2 异步维护，验证 HTAP 架构可行性；**原型不含压缩编码**（plain 列布局即可，编码/压缩归 Phase 7b 生产版，2026-09-02 口径补登） |
-
-### 5a.2 SDK 层交付物（必做，但不在内核）
-
-| 模块 | 说明 |
-|------|------|
-| 记忆蒸馏 SDK | 多条细节记忆 → 一条摘要记忆（调用外部 LLM），作为后台异步 job 执行，不阻塞写入事务；蒸馏结果以新元组写入并重新建索引（Phase 5a 拿 stub 早期并行） |
-
-### 验证标准
-
-- 时序查询性能：100M 时间点，热分区范围查询延迟 < 5ms（SSD，无聚合）；带降采样聚合的查询延迟 < 50ms
-- TTL 正确性：过期数据在后台清理后不可查询，空间可回收
-- 蒸馏正确性：蒸馏后的摘要记忆可被向量和全文索引正确检索
+- **Core value:** one "recall" call for an Agent = one SQL statement using semantics + keywords + structure at once
+- Application-layer code for memory recall gets dramatically simpler (no more calling three services and merging results manually)
+- Transactional guarantee: hybrid retrieval results are snapshot-consistent
+- **This is the strongest outward demo scenario**
 
 ---
 
-## Phase 5b：图 + GC + 遗忘/分层 + Fusion 接入
+## Phase 5a: Time series + column store + distillation stub (parallel with Phase 2/3/4a) (⏳ Can start anytime)
 
-**目标：补齐关联维度、统一 GC、遗忘/分层，并完成时序/图对 MultiIndexScan 的接入**
+**Goal: deliver the infrastructure for time-dimension memory management; can start independently once Phase 1 is done**
 
-**时间估算（1–2 高级 Rust 工程师）：** 乐观 2 个月 / P50 3–4 个月 / 长尾 6 个月
-**风险等级**：🟡 门控多（4a / ≥2 AM / 4b 三道门陆续进）
+**Time estimate (1–2 senior Rust engineers):** optimistic 1.5 months / P50 2–3 months / long tail 4 months
+**Risk:** 🟡 Parallel with the main line (Phase 1 gate; the segment-merge reuse depends on Phase 3's Tier-2 async pipeline and is incremental)
 
-### 5b.1 内核交付物（必做）
+### 5a.1 Kernel deliverables (required)
 
-| 模块 | 说明 | 启动门 |
+| Module | Notes |
+|------|------|
+| TimeSeries AM | Time-partitioned storage (auto day/hour partitions), range scans, downsampling aggregation (segment-merge reuse depends on Phase 3's Tier-2 async pipeline) |
+| TTL auto-expiry | Declarative TTL (WITH ts_partition = 'day', ttl = '90d'), automatic cleanup of expired partitions in the background |
+| Columnar projection prototype | Lightweight columnar materialized views for time-series/memory analytics, maintained asynchronously by Tier 2, validating HTAP architecture feasibility; **prototype excludes compression encoding** (plain column layout is enough; encoding/compression belongs to the Phase 7b production version, registered 2026-09-02) |
+
+### 5a.2 SDK deliverables (required, but not in the kernel)
+
+| Module | Notes |
+|------|------|
+| Memory distillation SDK | Many detailed memories → one summary memory (via external LLM), executed as a background async job that never blocks write transactions; distilled results are written back as new tuples and re-indexed (the stub may start in parallel at Phase 5a) |
+
+### Acceptance
+
+- Time-series query performance: 100M time points, hot-partition range-query latency < 5ms (SSD, no aggregation); queries with downsampling aggregation < 50ms
+- TTL correctness: expired data is not queryable after background cleanup, space is reclaimed
+- Distillation correctness: distilled summary memories are retrievable by both vector and full-text indexes
+
+---
+
+## Phase 5b: Graph + GC + forgetting/layering + Fusion integration (⏳ Not started)
+
+**Goal: complete the relationship dimension, unified GC, forgetting/layering, and wire time-series/graph into MultiIndexScan**
+
+**Time estimate (1–2 senior Rust engineers):** optimistic 2 months / P50 3–4 months / long tail 6 months
+**Risk:** 🟡 Many gates (4a / ≥2 AM / 4b landing progressively)
+
+### 5b.1 Kernel deliverables (required)
+
+| Module | Notes | Start gate |
 |------|------|--------|
-| 时间范围查询 | WHERE created_at BETWEEN ... AND ... 自动路由到时序索引 | Phase 4a（planner 路由） |
-| Graph AM（轻量版） | 邻接表存储，支持有向/无向边，边属性（JSONB），3 跳以内 BFS/DFS | Phase 4a（SQL 层就绪） |
-| 图查询语法 | SQL 扩展（LATERAL 递归或类 Cypher 子句） | Phase 4a |
-| 多 AM 统一 GC 协调器 | 统一的 Vacuum 协调：基于 oldest_active_snapshot 推进，回收死元组时通知所有引用该 TID 的索引。**含 Vacuum 在线化**：heap/B+Tree 的在线渐进式 vacuum 与 **B+Tree 页合并 + 页内死空间压实**（Phase 1 M2 推迟项：delete-drain 空页合并 + 页释放、叶页死空间回收，需突破单向锁序并复用 horizon 安全判定）作为协调器的第一批消费者落地（页级 TOCTOU 判定重验证、节流/背压、增量进度追踪、后台调度生命周期）；同窗口清偿的 Phase 1 小项：vacuum 索引清理批量/按页合并接口（替代逐条随机下探）、无锁读者跨 relation 页复用的 chain 代际校验、vacuum 崩溃窗口②消窗（unlink→free 间崩溃的单页泄漏，需 PageFree payload 版本化）；M3 的离线 vacuum 交付物（水位线注册表、压实原语、索引通知路径、`HeapCleanup`/`PageFree` WAL 族）全部作为其底层能力直接复用 | ≥2 个 AM 落地（与 4b 正交） |
-| 图参与 Fusion | 图遍历结果可与向量/全文/结构化联合检索 | Phase 4b（MultiIndexScan 算子） |
-| 时序参与 Fusion | 时序索引加入 MultiIndexScan，支持"最近 7 天 + 语义相似 + 关键词匹配"组合 | Phase 4b |
+| Time-range queries | WHERE created_at BETWEEN ... AND ... routed automatically to the time-series index | Phase 4a (planner routing) |
+| Graph AM (lightweight) | Adjacency-list storage, directed/undirected edges, edge properties (JSONB), BFS/DFS up to 3 hops | Phase 4a (SQL layer ready) |
+| Graph query syntax | SQL extensions (LATERAL recursion or Cypher-like clauses) | Phase 4a |
+| Multi-AM unified GC coordinator | Unified Vacuum coordination driven by oldest_active_snapshot; when dead tuples are reclaimed, every index referencing the TID is notified. **Includes online Vacuum**: online incremental vacuum for heap/B+Tree plus **B+Tree page merge + in-page dead-space compaction** (Phase 1 M2 deferred items: delete-drain empty-page merge + page release, leaf dead-space reclamation — requires breaking the one-way lock order and reusing the horizon safety judgment) landing as the coordinator's first consumers (page-level TOCTOU re-verification, throttling/backpressure, incremental progress tracking, background scheduling lifecycle). Also settled in the same window, the Phase 1 small items: batched/per-page index-cleanup interfaces for vacuum (replacing per-entry random descents), lock-free reader chain-generation checks for cross-relation page reuse, vacuum crash-window ② elimination (the single-page leak between unlink→free, needs PageFree payload versioning). All M3 offline-vacuum deliverables (watermark registry, compaction primitives, index notification path, `HeapCleanup`/`PageFree` WAL families) are reused directly as its underlying capabilities | ≥2 AM landed (orthogonal to 4b) |
+| Graph into Fusion | Graph traversal results can be jointly retrieved with vector/full-text/structured | Phase 4b (MultiIndexScan operator) |
+| Time series into Fusion | Time-series index joins MultiIndexScan, enabling "last 7 days + semantic similarity + keyword match" combinations | Phase 4b |
 
-### 5b.2 SDK 层交付物（必做，但不在内核）
+### 5b.2 SDK deliverables (required, but not in the kernel)
 
-| 模块 | 说明 | 启动门 |
+| Module | Notes | Start gate |
 |------|------|--------|
-| 遗忘曲线 SDK | 基于访问频率 + 时间衰减的重要性评分，标记可淘汰记忆（应用层评分 + 触发内核 GC） | GC 协调器落地（≥2 AM） |
-| 记忆分层 SDK | 短期（会话内）→ 工作（任务级）→ 长期（持久化）的视图抽象 | GC 协调器落地（≥2 AM） |
+| Forgetting-curve SDK | Importance scoring from access frequency + time decay, marking memories as evictable (application-layer scoring + kernel GC trigger) | GC coordinator landed (≥2 AM) |
+| Memory-layering SDK | View abstractions for short-term (in-session) → working (task-level) → long-term (persistent) memory | GC coordinator landed (≥2 AM) |
 
-**Layer 边界说明：**
-- 内核 trait 只暴露 `mark_for_gc(tids) / vacuum_range()` 这类原子能力（由 Phase 5b 的多 AM GC 协调器提供）
-- 评分算法、LLM 调用、分层策略都是 SDK 层，不进内核
-- Graph AM 保持整体在 5b（避免在 SQL 层未定时盲建实现）；若需提前并行，可将"邻接表存储 + 遍历算子"与"SQL/查询语法"拆为 storage / query 两段，storage 段下沉到 5a，但 query 段仍需 4a — 需承担 storage 接口返工风险
+**Layer-boundary notes:**
+- Kernel traits expose only atomic capabilities like `mark_for_gc(tids) / vacuum_range()` (provided by Phase 5b's multi-AM GC coordinator)
+- Scoring algorithms, LLM calls, and layering policy all live in the SDK, never in the kernel
+- Graph AM stays wholly in 5b (avoid building the implementation before the SQL layer is settled); if parallel work is needed earlier, split "adjacency-list storage + traversal operators" from "SQL/query syntax" into storage/query halves — the storage half may drop to 5a, but the query half still needs 4a, and the storage-interface rework risk must be accepted
 
-### 验证标准
+### Acceptance
 
-- 图遍历：百万边规模，3 跳遍历 < 50ms
-- GC 协调：多 AM 环境下无 TID 泄漏，无悬挂索引条目
+- Graph traversal: million-edge scale, 3-hop traversal < 50ms
+- GC coordination: no TID leaks and no dangling index entries across multiple AMs
 
-### Phase 5（5a+5b）对 Agent 团队的价值
+### Value of Phase 5 (5a+5b) for the Agent team
 
-- "最近 7 天的所有交互按时间线展示" — 时序查询（5a）
-- "用户 A 上周投诉了物流 → 关联到订单 X" — 图遍历（5b）
-- 自动遗忘不重要的记忆，避免记忆库无限膨胀（5b）
-- 记忆蒸馏：Agent 自动将碎片记忆整合为结构化知识（5a stub → 5b 完整）
-
----
-
-## Phase 6：完整协议层 + 多 Agent 隔离
-
-**目标：对外提供标准服务能力**
-
-**时间估算（1–2 高级 Rust 工程师）：** 乐观 6 个月 / P50 9–12 个月 / 长尾 18+ 个月
-**风险等级**：🔴 高（完整 PG 协议兼容 + RLS 正确性）
-
-### 交付物
-
-| 模块 | 说明 |
-|------|------|
-| 完整 PG Wire Protocol | Extended Query 完整支持、Prepared Statement、参数绑定、类型映射、错误码兼容 |
-| MCP Server | 原生 MCP 工具接口，暴露记忆读写/检索/管理能力 |
-| RLS（Row Level Security） | Agent 级别的行级安全策略，多 Agent 数据隔离 |
-| 多租户配额 | Agent 维度的存储/查询配额限制 |
-| IS/IX 意向锁 | 支持 ALTER TABLE / VACUUM FULL 等表级操作与行级操作协调 |
-| 完整 multixact | Phase 1 推迟项：共享行锁的持久段存储、页外成员集合、崩溃后精确恢复（当前为单 bit + 内存持有者注册表简版，崩溃即弃靠"死 XID 章视为 aborted"兜底）。同窗口落地 lock_timeout / NOWAIT / SKIP LOCKED |
-| 子事务与语句级回滚 | Phase 1 裁剪项：SAVEPOINT / failed-txn 态 / 语句失败不毁事务；落地时重审 EPQ（EvalPlanQual）与 cmin/cmax combo CID、`lock_tuple` 覆盖 `t_cid` 有损三处挂账 |
-| 系统表化与目录扩容 | pg_type 族 catalog 探针（psql `\d` 可用）、QueryStats 系统表化（替代内存 ring buffer）、Catalog 多页化（解除系统表单页容量上限，当前 ~70–80 表触顶报 CatalogFull） |
-
-### 验证标准
-
-- PG 协议兼容性：主流 PG 驱动（psycopg2、node-postgres、rust-postgres、asyncpg）完整测试矩阵通过
-- MCP 集成：Claude Code / Dify 可通过 MCP 直接使用记忆能力
-- RLS 正确性：Agent A 无法读取 Agent B 的数据（混合检索场景下也正确）
-- Fusion 算子统一注入 RLS 谓词，per-tenant 隔离测试通过
-
-### Phase 6 对 Agent 团队的价值
-
-- 多 Agent 协作场景：共享记忆但有权限边界
-- 对外推广：标准接口，第三方 Agent 框架可直接集成
-- Claude Code / Dify / LangChain 等主流框架可通过 MCP 或 PG 协议直接使用
+- "Show every interaction from the last 7 days on a timeline" — time-series queries (5a)
+- "User A complained about shipping last week → link to order X" — graph traversal (5b)
+- Automatic forgetting of unimportant memories, keeping the memory store from growing without bound (5b)
+- Memory distillation: Agents automatically consolidate fragmented memories into structured knowledge (5a stub → 5b full)
 
 ---
 
-## Phase 7：生产化
+## Phase 6: Full protocol layer + multi-agent isolation (⏳ Not started)
 
-**目标：达到可对外推广的生产质量**
+**Goal: provide standard service capabilities externally**
 
-**时间估算：** 持续 / 12+ 个月
-**风险等级**：🟢 低（优化阶段，无架构风险）
+**Time estimate (1–2 senior Rust engineers):** optimistic 6 months / P50 9–12 months / long tail 18+ months
+**Risk:** 🔴 High (full PG protocol compatibility + RLS correctness)
 
-### Phase 7a：可观测性 + 备份恢复（3–4 个月）
+### Deliverables
 
-| 模块 | 说明 |
+| Module | Notes |
 |------|------|
-| 监控体系 | Prometheus metrics 导出、慢查询日志、查询热力图 |
-| 物理备份 | 文件级快照（CoW 极简版，仅用作快照备份） |
-| 逻辑备份 | 导出/导入工具 |
-| PITR | 基于 WAL 的 Point-in-Time Recovery |
-| WAL Shipping | 用于热备（不做主从自动切换） |
-| Autovacuum 生产形态 | 后台自动 vacuum 调度（基于 Phase 5b 的在线 vacuum 能力：水位监控、节流参数、触发策略）+ VACUUM FULL/CLUSTER |
+| Full PG Wire Protocol | Full Extended Query support, prepared statements, parameter binding, type mapping, error-code compatibility |
+| MCP Server | Native MCP tool interface exposing memory read/write/retrieval/management |
+| RLS (Row Level Security) | Agent-level row-level security policies, data isolation across agents |
+| Multi-tenant quotas | Per-agent storage/query quota limits |
+| IS/IX intention locks | Coordination between table-level operations (ALTER TABLE / VACUUM FULL) and row-level operations |
+| Full multixact | Phase 1 deferred item: durable segment storage for shared row locks, off-page member sets, exact recovery after crashes (currently a single-bit + in-memory holder registry simplified version, discarded on crash with the "dead XID stamp counts as aborted" fallback). lock_timeout / NOWAIT / SKIP LOCKED land in the same window |
+| Subtransactions and statement-level rollback | Phase 1 trimmed item: SAVEPOINT / failed-txn state / statement failure must not destroy the transaction; on landing, re-review EPQ (EvalPlanQual) and the cmin/cmax combo CID, plus the three `lock_tuple` entries covering the lossy `t_cid` bookkeeping |
+| System-table-ization and catalog expansion | pg_type-family catalog probes (psql `\d` works), QueryStats moved into system tables (replacing the in-memory ring buffer), multi-page catalog (removing the single-page system-table capacity cap, currently ~70–80 tables hits CatalogFull) |
 
-**前置技术债（来自 Phase 1 Stage B）**：
-- **WAL LSN 空洞兼容性**：Phase 1 的 `LsnClock::reserve` 占位机制（用于 checkpoint
-  FPI race 消除）允许在 WAL 流中产生合法的零字节空洞（`reserve` 后进程崩溃、未执行
-  `append_at`）。当前 recovery scanner 将零字节视为 end-of-WAL，本地恢复行为正确。
-  但 WAL Shipping 场景下，receiver 端扫到零字节无法区分"sender 尚未发送完毕"与
-  "合法空洞即 WAL 结尾"。**解决方向**：引入类 PostgreSQL 的 WAL page header（含
-  `xlp_pageaddr` 连续性校验 + page magic），使 receiver 能通过 page header 判断页面
-  是否完整接收。此项必须在 WAL Shipping 实现前落地。
-- **WAL/Recovery 加固专项（Phase 1 残留一簇，修复方案均已记录在 stage_spec）**：
-  ① ~~回收页撕页暴露~~ **已提前至 Phase 2 M4 修复**（2026-08-31 决策：Phase 2 新 AM
-  上线后页回收更频繁、暴露概率上升，见 docs/phase2-m4-coding-plan.md）；
-  ② split-CLR redo 同构不对称窗口（`force_reload_from_disk`
-  修复模式已知）；③ WAL 撕裂尾 header 自 CRC（PG xl_crc 模式，消除 payload_len
-  bit-rot 放大的静默截断窗口）；④ `reserve_and_append` >32B 洞漏检（推进前校验
-  payload 长度 + IO 失败毒化 writer）；⑤ `open_at` 起始段缺失的 warn + 空基线降级
-  未实现；⑥ analysis/replay catch-all 对 `MetadataCorrupted`/`WalReadFailed` 仍
-  warn+break 的静默截断面。
-- **目录损坏修复工具**：系统页头损坏且已有用户 DDL 时当前拒绝打开且无修复路径
-  （自愈 rewrite 会孤儿化用户表）；7a 备份恢复工具族一并交付。
-- **恢复性能**：三遍全量扫描合并（find_latest 可短路）+ undo 两处全页扫描
-  （`scan_split_incomplete_pages`/`find_parent_page`）大库恢复 I/O 优化。
-- **长跑稳定性专项**：并发 crash 1000 轮、100 conn × 60min 挑战档纳入 7a 验收
-  （Phase 1 未执行项，命令见 docs/phase1-m2-benchmarks.md §复现）；loser 索引补偿的
-  WAL 段回收边界随 WAL archiving 落地自然消解。
+### Acceptance
 
-### Phase 7b：性能与压缩（3–4 个月）
+- PG protocol compatibility: full test matrix across mainstream PG drivers (psycopg2, node-postgres, rust-postgres, asyncpg)
+- MCP integration: Claude Code / Dify can use memory capabilities directly through MCP
+- RLS correctness: Agent A cannot read Agent B's data (also correct under hybrid retrieval)
+- RLS predicates injected uniformly through the Fusion operator, per-tenant isolation tests pass
 
-| 模块 | 说明 |
-|------|------|
-| 列存投影生产版 | 通用 AP 场景的列式物化视图，Tier 2 异步维护，向量化扫描；**列式编码明细（原未列出，2026-09-02 补登）**：字典编码 / RLE / bit-packing 按列类型自动选择 + 块级压缩（LZ4/zstd 选型随 7b 开工定，对齐 PG 14+ TOAST/备份链的算法面） |
-| 向量压缩 | Scalar Quantization (SQ) / Product Quantization (PQ)，自动策略选择 |
-| SIMD 全面优化 | 覆盖所有距离函数、B+Tree 比较、CRC 校验 |
-| io_uring | Linux 异步 I/O |
-| 大页内存 | 减少 TLB miss |
-| Phase 1 性能债清偿 | batch commit 摊薄 fsync（M1/M2 未达标项根治）、commit/checkpoint barrier 收窄到临界段、ClogBuffer 分片、allocation_lock 下去 fsync 等待、B+Tree 悲观写"安全节点"提前释放、hint bit 写回接线（替代每次 CLOG 查询）、CLOCK-Pro / freelist bitmap / WAL 段复用与压缩 / 多文件数据存储、TOAST 压缩（LZ4/PGLZ，前提是 Phase 4a 的 TOAST 本体） |
-| B+Tree 结构维护 | tid 分隔符（重复 key 跨内部页 ~20 万同 key 退化根治）+ stale 内部分隔键间隙楔死根治（分隔键维护/内部层左跳协议，消除持久响亮 Unsupported 面）；落地前以概率论证 + REINDEX 逃生门为既定口径 |
+### Value of Phase 6 for the Agent team
 
-### Phase 7c：完整 CBO（4–6 个月）
-
-| 模块 | 说明 |
-|------|------|
-| 跨模态统计信息收集 | 各 AM 统计形态：B+Tree 直方图、HNSW 距离分布、Inverted term frequency、TimeSeries bucket 分布 |
-| 代价模型校准 | 基于真实 workload 的代价参数校准工具 |
-| EXPLAIN 跨模态分解 | 每条访问路径的代价分解，可解释计划选择 |
-
-### Phase 7d：高可用 + 高级特性（持续）
-
-| 模块 | 说明 |
-|------|------|
-| Jepsen 测试 | 事务隔离 + 崩溃恢复的标准化测试 |
-| SSI（Serializable） | 完整 SSI 冲突检测（谓词锁 + dangerous structure） |
-| 主从切换 | 基于 WAL Shipping + Raft/Paxos 选主 |
-| 文档与 SDK | Python/TypeScript/Go SDK + 完整 API 文档 + 示例项目 |
-
-### Phase 7 验证标准（总）
-
-- Jepsen 测试通过（事务隔离 + 崩溃恢复）
-- 7×24 稳定运行测试（72 小时高并发压测无 OOM/死锁/数据丢失）
-- 对标综合 benchmark：Agent 记忆场景端到端性能 ≥ PG+pgvector+ES 方案的 80%
+- Multi-agent collaboration: shared memory with permission boundaries
+- Outward adoption: standard interfaces, third-party Agent frameworks integrate directly
+- Claude Code / Dify / LangChain and other mainstream frameworks can use it via MCP or the PG protocol
 
 ---
 
-## 里程碑与 Agent 团队对接节点
+## Phase 7: Production hardening (⏳ Not started)
 
-| 完成阶段 | Agent 团队可开始使用的能力 | 替代的外部组件 |
+**Goal: reach externally deployable production quality**
+
+**Time estimate:** ongoing / 12+ months
+**Risk:** 🟢 Low (optimization phase, no architectural risk)
+
+### Phase 7a: Observability + backup/restore (3–4 months)
+
+| Module | Notes |
+|------|------|
+| Monitoring | Prometheus metrics export, slow-query log, query heatmaps |
+| Physical backup | File-level snapshots (CoW minimal version, used only for snapshot backup) |
+| Logical backup | Export/import tooling |
+| PITR | WAL-based Point-in-Time Recovery |
+| WAL Shipping | For hot standby (no automatic primary-replica failover) |
+| Autovacuum in production form | Background automatic vacuum scheduling (built on Phase 5b's online vacuum capabilities: watermark monitoring, throttle parameters, trigger policy) + VACUUM FULL/CLUSTER |
+
+**Outstanding technical debt (from Phase 1 Stage B):**
+- **WAL LSN hole compatibility**: Phase 1's `LsnClock::reserve` placeholder mechanism (used to eliminate the checkpoint FPI race) allows legitimate zero-byte holes in the WAL stream (process crashes after `reserve` without executing `append_at`). The current recovery scanner treats zero bytes as end-of-WAL, which is correct locally. But in a WAL Shipping setup, a receiver hitting zero bytes cannot distinguish "sender has not finished sending" from "a legitimate hole meaning end of WAL". **Direction**: introduce a PostgreSQL-like WAL page header (with `xlp_pageaddr` continuity checking + page magic) so the receiver can tell whether a page was fully received. This MUST land before WAL Shipping is implemented.
+- **WAL/Recovery hardening bundle (a Phase 1 leftover cluster; fixes are all recorded in stage_spec)**: ① ~~Torn-page exposure on reclaimed pages~~ **pulled forward and fixed in Phase 2 M4** (decision 2026-08-31: after the new AM lands, page recycling happens more often and exposure probability rises; see docs/phase2-m4-coding-plan.md); ② split-CLR redo isomorphic asymmetry window (the `force_reload_from_disk` repair mode is known); ③ WAL torn-tail header self-CRC (the PG xl_crc model, eliminating the silent truncation window from payload_len bit-rot amplification); ④ `reserve_and_append` >32B hole miss-detection (validate payload length before advancing + poison the writer on IO failure); ⑤ `open_at` missing-initial-segment warn + empty-baseline fallback is unimplemented; ⑥ analysis/replay catch-all still does warn+break on `MetadataCorrupted`/`WalReadFailed`, a silent truncation surface.
+- **Catalog-corruption repair tooling**: with a corrupted system page header and existing user DDL, open is currently rejected with no repair path (self-healing rewrite would orphan user tables); delivered as part of 7a's backup/restore tool family.
+- **Recovery performance**: merge the three full scans (find_latest can short-circuit) + the two full-page scans in undo (`scan_split_incomplete_pages`/`find_parent_page`) for large-database recovery I/O optimization.
+- **Long-run stability bundle**: concurrent crash 1000 rounds and the 100-conn × 60min challenge configuration enter 7a acceptance (a Phase 1 unexecuted item; commands in docs/phase1-m2-benchmarks.md §reproduction); the WAL-segment recycling boundary of loser index compensation resolves naturally once WAL archiving lands.
+
+### Phase 7b: Performance and compression (3–4 months)
+
+| Module | Notes |
+|------|------|
+| Columnar projection (production) | Columnar materialized views for general AP workloads, maintained asynchronously by Tier 2, vectorized scans; **columnar encoding details (not previously listed, registered 2026-09-02)**: dictionary encoding / RLE / bit-packing selected automatically per column type + block-level compression (LZ4/zstd chosen at 7b kickoff, aligned with PG 14+ TOAST/backup-chain algorithms) |
+| Vector compression | Scalar Quantization (SQ) / Product Quantization (PQ), automatic strategy selection |
+| Full SIMD optimization | All distance functions, B+Tree comparisons, CRC checks |
+| io_uring | Linux async I/O |
+| Huge pages | Fewer TLB misses |
+| Phase 1 performance-debt payoff | Batch commit to amortize fsync (the M1/M2 unmet-item root fix), commit/checkpoint barrier narrowed to the critical section, ClogBuffer sharding, moving fsync waits out of allocation_lock, early release of B+Tree pessimistic-write "safe nodes", hint-bit write-back wiring (replacing per-access CLOG lookups), CLOCK-Pro / freelist bitmap / WAL segment reuse and compression / multi-file data storage, TOAST compression (LZ4/PGLZ, contingent on Phase 4a's TOAST implementation) |
+| B+Tree structural maintenance | tid separators (root fix for ~200k duplicate-key degradation across internal pages) + root fix for stale internal separator-key gaps wedging (separator-key maintenance / internal-level left-jump protocol, eliminating the durable loud Unsupported surface); before landing, the accepted position is probability argument + the REINDEX escape hatch |
+
+### Phase 7c: Full CBO (4–6 months)
+
+| Module | Notes |
+|------|------|
+| Cross-modal statistics collection | Per-AM statistics shapes: B+Tree histograms, HNSW distance distributions, Inverted term frequencies, TimeSeries bucket distributions |
+| Cost-model calibration | Cost-parameter calibration tooling driven by real workloads |
+| EXPLAIN cross-modal decomposition | Per-access-path cost breakdown, making plan choices explainable |
+
+### Phase 7d: High availability + advanced features (ongoing)
+
+| Module | Notes |
+|------|------|
+| Jepsen testing | Standardized testing of transaction isolation + crash recovery |
+| SSI (Serializable) | Full SSI conflict detection (predicate locks + dangerous structures) |
+| Primary-replica failover | WAL Shipping + Raft/Paxos leader election |
+| Documentation and SDKs | Python/TypeScript/Go SDKs + full API docs + example projects |
+
+### Phase 7 acceptance (overall)
+
+- Jepsen tests pass (transaction isolation + crash recovery)
+- 7×24 stable operation (72 hours of high-concurrency stress with no OOM/deadlock/data loss)
+- Comprehensive benchmark comparison: end-to-end performance in the Agent-memory scenario ≥ 80% of the PG+pgvector+ES solution
+
+---
+
+## Milestones and Agent-team integration points
+
+| Completed phase | Capabilities the Agent team can start using | External components replaced |
 |----------|------------------------|--------------|
-| Phase 1 M3 | 结构化元数据存取（psql / Python 客户端） | SQLite / PG（基础 CRUD） |
-| Phase 2a | 语义记忆检索（内存版，重启丢失） | 开发阶段原型验证 |
-| Phase 2c | 语义记忆检索（持久化 + 并发安全） | pgvector / Qdrant |
-| Phase 3 | 关键词记忆检索（BM25 全文） | Elasticsearch / Meilisearch |
-| Phase 4b | **一条 SQL 完成混合召回**（核心 demo） | 应用层多服务拼装 |
-| Phase 5a | 时序记忆 + 蒸馏 stub（与 2/3/4a 并行交付） | — |
-| Phase 5b | 完整记忆生命周期管理 + 图关联 + 遗忘/分层 | 自研遗忘/蒸馏逻辑 |
-| Phase 6 | 标准协议对外服务 + 多 Agent 隔离 | — |
-| Phase 7 | 生产级部署 | 整套多引擎架构 |
+| Phase 1 M3 | Structured metadata read/write (psql / Python clients) | SQLite / PG (basic CRUD) |
+| Phase 2a | Semantic memory retrieval (in-memory, lost on restart) | Prototyping/validation only |
+| Phase 2c | Semantic memory retrieval (persistent + concurrency-safe) | pgvector / Qdrant |
+| Phase 3 | Keyword memory retrieval (BM25 full-text) | Elasticsearch / Meilisearch |
+| Phase 4b | **One SQL statement for hybrid recall** (the core demo) | Application-layer multi-service assembly |
+| Phase 5a | Time-series memory + distillation stub (delivered in parallel with 2/3/4a) | — |
+| Phase 5b | Full memory lifecycle management + graph relations + forgetting/layering | Custom forgetting/distillation logic |
+| Phase 6 | Standard-protocol external service + multi-agent isolation | — |
+| Phase 7 | Production-grade deployment | The whole multi-engine architecture |
 
 ---
 
-## 每阶段的 Benchmark 对标策略
+## Benchmark strategy per phase
 
-| 阶段 | 对标对象 | 测试场景 | 达标线 |
+| Phase | Comparison target | Test scenario | Pass line |
 |------|---------|---------|--------|
-| Phase 1 | SQLite / PG | 纯 TP（CRUD 混合负载） | ≥ SQLite 性能的 50% |
-| Phase 2 | pgvector / Qdrant | 纯向量检索（ANN benchmark） | recall@10 ≥ 95%, latency 差距 < 2x |
-| Phase 3 | Tantivy / ES | 纯全文检索（标准 IR 数据集） | NDCG@10 对齐，latency 差距 < 3x |
-| Phase 4b | PG+pgvector+ES 拼装 | 混合检索端到端 | 总延迟 < 拼装方案的 50% |
-| Phase 5 | TimescaleDB / Neo4j | 时序范围 / 图遍历 | latency 差距 < 3x |
+| Phase 1 | SQLite / PG | Pure TP (mixed CRUD workload) | ≥ 50% of SQLite performance |
+| Phase 2 | pgvector / Qdrant | Pure vector retrieval (ANN benchmark) | recall@10 ≥ 95%, latency gap < 2x |
+| Phase 3 | Tantivy / ES | Pure full-text retrieval (standard IR datasets) | NDCG@10 aligned, latency gap < 3x |
+| Phase 4b | PG+pgvector+ES assembly | End-to-end hybrid retrieval | Total latency < 50% of the assembled solution |
+| Phase 5 | TimescaleDB / Neo4j | Time-series ranges / graph traversal | Latency gap < 3x |
 
 ---
 
-## 显式战略边界
+## Explicit strategic boundaries
 
-| 能力 | 处理 | 阶段 | 备注 |
+| Capability | Decision | Phase | Notes |
 |---|---|---|---|
-| HTAP（行+列统一引擎） | **做（原型 + 生产）** | Phase 5（列存投影原型）+ Phase 7b（生产版） | 满足"统一引擎"差异化定位 |
-| CoW 快照（基础） | **做（极简）** | Phase 7a（备份恢复中实现） | 仅用作快照备份，不展开为通用特性 |
-| CoW 秒级分支（Agent 沙箱） | **推迟** | 不在 7 阶段 roadmap 中 | 当前 Agent 场景不刚需 |
-| Serverless / 计算存储分离 | **不做** | — | 战略选择：聚焦内核质量，不与 Neon 竞争 |
-| 跨地域分布式事务 | **不做** | — | 单机路线 |
-| 多租户 RLS | **做** | Phase 6 | 多 Agent 隔离刚需 |
-| 多租户配额 | **做** | Phase 6 | 同上 |
-| 动态脱敏（DLP） | **推迟** | Phase 6 之后评估 | 看需求 |
-
----
-
-## 持续正确性保障
-
-数据库的正确性不能靠手工测试保证。每个 Phase 应配备以下测试基础设施：
-
-| 测试类型 | 引入阶段 | 工具 | 目标 |
-|---|---|---|---|
-| 单元测试 | Phase 1 M1 起 | cargo test | 覆盖率 ≥ 90%（核心模块） |
-| 模糊测试 | Phase 1 M1 起 | proptest | Page Allocator 不泄漏、WAL 记录可 round-trip |
-| 并发模型检查 | Phase 1 M2b 起 | loom | Lock-free 数据结构正确性、Latch 无死锁 |
-| 随机崩溃测试 | Phase 1 M2a 起 | 自研 harness（kill -9 + 重启 + 校验） | ACID 正确性 |
-| 确定性模拟测试 | Phase 2b 起 | 自研（I/O + 并发顺序注入） | 并发 bug 可复现 |
-| Jepsen | Phase 7d | jepsen | 事务隔离 + 崩溃恢复 业界标准验证 |
-
----
-
-## 风险登记
-
-| 风险 | 影响 | 缓解措施 |
-|------|------|---------|
-| Phase 1 工期失控，占项目总工期 40% 以上 | 后续 Phase 被迫压缩 | 设 M1/M2a/M2b/M2c 内部检查点，允许分期交付；若 M2 延期，优先保证 M2a 单语句可用 |
-| HNSW 并发 bug 难以复现 | Phase 2c 延期 | Loom 并发模型检查 + 大量 stress test + 确定性模拟测试 |
-| DataFusion 不适合 TP 路径 | Phase 4a 架构调整 | Phase 4a 前做 TP 点查原型验证；保留"TP 路径绕过 DataFusion"的备用方案 |
-| Tier 2 watermark 长期落后导致查询退化到 seqscan | 全文/列存查询延迟暴增，Agent 体验降级 | 监控 watermark_lag_seconds；超过阈值时自动提高 worker 速率或临时升为 Tier 1；planner 在 EXPLAIN 中显示是否发生 fallback |
-| 多 AM GC 协调器复杂度导致 TID 泄漏或过早清理 | 索引膨胀或查询结果缺失 | 统一基于 oldest_active_snapshot 推进；每个 AM 实现 reclaim_tid 并做 fuzz 测试 |
-| 单人/小团队工程量过大 | 整体延期 | 严格 MVP 思维，每个 Phase 只做最小必要集 |
-| HNSW undo 的 tombstone 累积 | 搜索精度下降 | Vacuum 中加入 tombstone 比例监控，超过阈值触发局部重建 |
-| 类型系统演进（VECTOR/AGENT_ID 加列/删列/改类型） | online DDL 复杂 | online DDL 设计 + 向后兼容测试 |
-| RLS 在混合检索下的正确性 | 权限泄漏 | Fusion 算子统一注入 RLS 谓词，per-tenant 隔离测试 |
-| PG 协议兼容性陷阱（Prepared Statement / 类型映射 / 异常） | 驱动不兼容 | 用真实 PG 驱动做兼容性测试矩阵 |
-| Segment-based AM 与 Buffer Pool 抽象的张力 | Phase 3 回头改 Layer 1 | Phase 1 M3 提前预留 SegmentedStorage 接口 |
-| Agent 长会话的 snapshot 累积（百万级活跃事务） | 内存爆炸 | snapshot 老化 + oldest_active_snapshot 推进策略 |
-
----
-
-## 开放问题
-
-### 来自设计阶段自我批评
-
-1. **回表开销被低估**：图遍历多跳每步都回表做可见性检查，延迟指数放大；FT posting 含百万 TID 不能逐一回表。缓解：HNSW 多取 2x 候选、Phase 2c 末评估 TID+XID 索引条目、posting 段级 snapshot 过滤。
-
-2. **HNSW 并发控制**：HNSW 图结构的并发修改是已知难题，undo() 对图意味着"删除节点+修复所有邻居"可能破坏连通性。缓解：Epoch-based reclamation + 节点级细粒度锁（Phase 2c）；参考 Vamana/DiskANN 无锁设计（Phase 2 启动前研究任务）。
-
-3. **列存投影 Tier 2 一致性窗口**：AP 查询若命中 Tier 2 投影，存在秒~分钟级滞后；fallback 到 seqscan 等于退化。缓解：精细增量合并（类似 Delta Lake Z-Order merge），watermark-aware planner 避免退化路径。
-
-4. **跨模态 CBO 是"画饼"最重的部分**：无数学公式、无统计信息收集方案、HNSW 代价高度依赖数据分布。缓解：Phase 4b 用启发式策略选择，Phase 7c 再做完整 CBO；统计信息维护按 AM 单独设计。
-
-5. **Multi-Path Fusion 正确性问题**：RRF 在候选集不重叠时退化为 union；融合策略自动选择没明确算法。缓解：Phase 4b 显式拆分"过滤式"（实）和"RRF"（虚）两个子阶段；可解释 EXPLAIN 让用户能 override。
-
-### TODO（尚未设计完成）
-
-6. **HNSW 并发协议**（参考 Vamana/DiskANN 无锁设计）：Phase 2c 启动前需补齐方案或选择"单写者简化路径"。
-
-7. **增量 Vacuum 协议**（6 种 AM 的 GC watermark 推进机制）：Phase 5 多 AM GC 协调器实现前需补齐。
-
----
-
-## 技术选型
-
-| 组件 | 选择 | 理由 |
-|------|------|------|
-| 语言 | Rust | 内存安全、零成本抽象、SIMD 友好、async 生态成熟 |
-| 异步运行时 | tokio | 业界标准，DataFusion 依赖 |
-| SQL 引擎 | DataFusion（Phase 4a 引入） | Arrow 生态、可插拔、AP 向量化执行 |
-| 中文分词 | jieba-rs | 轻量、无外部依赖 |
-| 序列化 | bincode / postcard | 零拷贝、紧凑 |
-| 测试框架 | proptest + loom + 自研崩溃注入 | 覆盖正确性、并发、崩溃三个维度 |
-| 连接协议 | **PG Wire Protocol 最小子集（Phase 1 M3 起）+ Extended Query（Phase 4a）** | SQL 是 Agent 已经熟悉的接口（pgvector/Qdrant 都用 SQL）；Phase 1 M3 实现最小子集仅需 ~500 行 Rust 代码 |
-| PG Wire 实现 | 自研（参考 PostgreSQL 官方协议文档 + pgwire crate） | 协议消息类型多但每条简单；~3000 行 Rust 可覆盖 psql/SQLAlchemy/Prisma 兼容；自研可控性高 |
-| 图索引 V1 | 邻接表 + B+Tree（Phase 5） | 先验证图语义，避免过早做原生图存储；性能不足时再引入专用 Graph AM |
-
----
-
-## 附录：Phase 1 遗留技术债登记（2026-08-31 补录）
-
-Phase 1（M1/M2/M3）收口时全部以"预留接口 + 文档声明"形式挂账的推迟项，此处统一登记
-phase 归属。标 ✅正文 的项同时已写入对应 phase 的交付物表/前置技术债节（双向可追溯）；
-其余以此表为唯一归属记录。出处均为 `docs/stage_spec.md` 各 stage"已知残留与后续归队"
-小节与代码注释，逐项核实于 2026-08-31。
-
-### A 类：正确性相关
-
-| # | 事项 | 状态 | 归属 |
-|---|------|------|------|
-| A1 | 回收页撕页暴露（freelist 复用页 `needs_fpi=false` 假设不成立） | **已修复 2026-08-31（M4 Stage A）**：审计确认唯一未覆盖消费者为 btree 在线 split 右页，在 `split_prepare_on_guards` 单一收口点补 `log_page_init`（post-image FPI）；红→绿测试两枚（`btree_split_crash.rs`：FPI 先于 Prepare 断言 + 手工撕页恢复）；`new_page` 统一处理方案经论证否决（FPI 双门控时序，理由见 buffer_pool.rs:424 注释） | ~~Phase 2 M4~~ **已清偿** |
-| A2 | split-CLR redo 同构不对称窗口（四连条件触发）；2026-08-31 审计追加同族项：undo 路径两处新根预留（`index.rs:3421/3607`）仅余"首 sector 新、其余撕裂"的通用撕页窗口；2026-08-31 review 再登记两条：① (FPI, record) 间 checkpoint begin 微窗口（checkpoint begin 落在 log_page_init 与 Prepare 两条相邻 append 之间时 redo 从 begin LSN 起跳过该 FPI，全系统 ensure_fpi 调用对同型存在，A1 已把暴露面收窄到纳秒级窗口；候选根治：redo 点 = min(begin_lsn, DPT 最小 rec_lsn)，或 FPI+owning record 对 checkpoint_lsn 发布原子化）；② `force_reload_from_disk` 信任撕裂盘镜像的 pd_lsn（`redo.rs:254-258`,Stage D 遗留——anchor-mismatch 分支以 `disk_lsn >= record.lsn` 放行盘上镜像，撕裂页 pd_lsn 不可信；根治需页校验和或 Copy 后对右页补 post-image FPI) | 理论残留，修复模式已知 | Phase 7a 加固专项 ✅正文（同族项随本项一并处理） |
-| A3 | WAL 撕裂尾 header 无自 CRC（payload_len bit-rot 静默截断面） | 接受（CRC 兜底），方案已知 | Phase 7a 加固专项 ✅正文 |
-| A4 | `reserve_and_append` 可留 >32B 洞逃过 reader 前探 | 待修，方案已写 | Phase 7a 加固专项 ✅正文 |
-| A5 | `open_at` 起始段缺失 warn + 空基线降级未实现 | 完全未做 | Phase 7a 加固专项 ✅正文 |
-| A6 | replay catch-all 对特定错误仍 warn+break（pub API 直调静默截断面） | 有兜底不完备 | Phase 7a 加固专项 ✅正文 |
-| A7 | WAL LSN 空洞 vs WAL Shipping 连续性校验 | 有方案未实现 | Phase 7a（前置技术债，原有记录）✅正文 |
-| A8 | stale 内部分隔键间隙楔死（耗尽重启预算 → 插入持久响亮 Unsupported） | 响亮失败兜底；stage_spec 归属记录自相矛盾（Q 说归 S，S 未做），以此表为准 | Phase 7b（B+Tree 结构维护）✅正文；此前口径 = 概率论证 + REINDEX 逃生门 |
-| A9 | Catalog 单页容量上限（~70–80 表触顶报 CatalogFull） | 有保护性兜底 | Phase 6（Catalog 多页化）✅正文 |
-| A10 | 目录系统页损坏 + 已有用户 DDL → 拒开且无修复工具 | 响亮失败兜底 | Phase 7a（目录修复工具）✅正文 |
-| A11 | 裸 `Engine::scan`/`index_lookup` 不取 AccessShare，与 DDL 有竞态缺口 | 已文档化 | Phase 4a（SQL 层接管后裸 API 收敛或加锁） |
-| A12 | 裸 `txn_manager()` commit 不释放表锁（XID/horizon 泄漏面） | 已文档化 | Phase 4a（同 A11 一并收敛） |
-| A13 | panic 泄漏链（panic=abort/forget 钉死 horizon） | 已核销为既定进程级语义 | —（改 panic 策略时需重估） |
-| A14 | 无锁读者撞跨 relation 页复用窗口（MVCC 兜底，一次可重试错误） | 观察项 | Phase 5b（读者侧 chain 代际校验）✅正文 |
-| A15 | vacuum 崩溃窗口② 单页泄漏（消窗需 PageFree payload 版本化） | 既定取舍，测试钉死口径 | Phase 5b（在线化时消窗）✅正文 |
-| A16 | loser 索引补偿的 WAL 段回收边界 | 已知边界 | Phase 7a（随 WAL archiving 自然消解）✅正文 |
-| A17 | 虚假 DeadlockVictim 残余窗口 | 已核销（语义安全可重试） | — |
-| A18 | 跨页 UPDATE 空间复查重启无上界 | 观察项（对手有进展必终止） | Phase 7b 复核 |
-| A19 | `lock_tuple` 覆盖 `t_cid` 有损（当前 executor 不可达） | TODO 挂账 | Phase 6（随子事务/EPQ 重审）✅正文 |
-| A20 | WAL fsync 永久失败无恢复路径（`crates/pg-storage/src/wal/writer.rs`：fsync/dup 失败 → `shutdown=true` fail-stop，之后所有 append 永久失败直至进程重启；语义安全不丢数据，但一次磁盘满/EIO 即写路径可用性悬崖——错误未上抛事务层做"abort + 上报"高层决策，也无 segment 轮换/重试；代码内 TODO(M2+) 挂账）。交互链未闭合：fsync 失败前最后一个 segment 可能已撕裂在盘上，重启 recovery 扫到该撕裂尾时与 A3（payload_len bit-rot 截断面）/ A5（起始段缺失降级）三者叠加，"fsync 失败 → 撕裂尾 → 恢复"的端到端处置口径未写 | fail-stop 兜底，无恢复路径 | Phase 7a（WAL/Recovery 加固簇；消窗候选：错误上抛高层决策 / segment 轮换重试 / 撕裂尾链式处置口径随 A3/A5 一并定） |
-
-### B 类：性能债
-
-| # | 事项 | 归属 |
-|---|------|------|
-| B1 | fsync 封顶全家（WAL 吞吐 / 并发 TPS / heap INSERT 未达标；根治 = batch commit + O_DIRECT + io_uring） | Phase 7b ✅正文（batch commit 已点名） |
-| B2 | commit/checkpoint barrier 写锁覆盖整个 checkpoint | Phase 7b ✅正文 |
-| B3 | ClogBuffer 全局单锁（命中也写锁 + 锁内 I/O） | Phase 7b ✅正文 |
-| B4 | allocation_lock 下等组提交 fsync | Phase 7b ✅正文 |
-| B5 | hint bit 写回 no-op（每次 tuple 访问一次 CLOG 查询） | Phase 7b ✅正文 |
-| B6 | B+Tree 悲观写全路径 X latch（无"安全节点"提前释放） | Phase 7b ✅正文 |
-| B7 | CLOCK-Pro / freelist bitmap / WAL 段复用与压缩 / 多文件数据存储 / fallocate | Phase 7b ✅正文 |
-| B8 | 恢复三遍全量扫描合并 + undo 两处全页扫描 | Phase 7a（恢复性能）✅正文 |
-| B9 | 行锁唤醒盖戳无公平性 | 接受（与 PG 行为一致），需要时再做 |
-| B10 | vacuum 索引清理逐条随机下探 O（死行×索引数） | Phase 5b（批量/按页合并接口）✅正文 |
-| B11 | 快照 registry 全局单锁 | 已验收无显著回归；分片备选保留，Phase 7b 复核 |
-| B12 | TOAST 压缩（LZ4/PGLZ） | Phase 7b ✅正文（前提：Phase 4a 的 TOAST 本体） |
-
-### C 类：功能裁剪
-
-| # | 事项 | 归属 |
-|---|------|------|
-| C1 | B+Tree 页合并（delete-drain 空页有界膨胀 ~0.18 页/轮，验收界 0.25） | Phase 5b ✅正文 |
-| C2 | B+Tree 页内死空间压实（`remove_entry_at` 只缩 LP 数组） | Phase 5b ✅正文 |
-| C3 | 重复 key 跨内部页退化（~20 万同 key；tid 分隔符根治） | Phase 7b ✅正文 |
-| C4 | 唯一索引不执行 / 无 DROP INDEX / 无多列索引 | Phase 4a（SQL 层就绪后落地） |
-| C5 | 在线建索引（当前阻塞式 bulk load + Exclusive 表锁） | Phase 5b（复用在线化基础设施：后台调度 + 节流 + 追赶写入；暂定归口） |
-| C6 | 子事务 / 语句级回滚 / 事务内 DDL | Phase 6 ✅正文 |
-| C7 | EPQ（EvalPlanQual） | Phase 6（随子事务重审）✅正文 |
-| C8 | cmin/cmax combo CID | Phase 6（随子事务重审）✅正文 |
-| C9 | TOAST chunk 表 I/O 未实现（M2 承诺 Stage I 交付未兑现） | **Phase 4a ✅正文**；Phase 2 不依赖（向量自存 + dim ≤ 2000 内联，见 Phase 2 TOAST 决策） |
-| C10 | SSI | Phase 7d（原有记录）✅正文 |
-| C11 | IS/IX 意向锁 | Phase 6（原有记录）✅正文 |
-| C12 | 完整 multixact（持久段 + 页外成员 + 崩溃精确恢复） | Phase 6 ✅正文 |
-| C13 | lock_timeout / NOWAIT / SKIP LOCKED | Phase 6 ✅正文 |
-| C14 | Sequence（SERIAL）（M2 文档曾列 M3，M3 O6 决定不做） | Phase 4a ✅正文 |
-| C15 | 执行器只有 seq scan / SQL 硬编码子集 | Phase 4a/7c 路线图主线，非债 |
-| C16 | pg-wire 细项：流式结果集、slow-loris 防护/读超时/连接上限/优雅关闭、protocol 版本协商、CancelRequest/BackendKeyData、Timestamptz/Uuid 真 OID | Phase 4a（Extended Query 同窗口）/ Phase 6（完整协议） |
-| C17 | psql catalog 探针（`\d`/`pg_type` 族） | Phase 6（系统表化）✅正文 |
-| C18 | QueryStats 系统表化 / 跨进程 live 诊断 / 死锁检测器 tracing 告警 / 数据目录锁活性检测 / waldump 段长自描述 | Phase 6 ✅正文 / Phase 4a / Phase 7a / Phase 7a / Phase 7a |
-| C19 | segment/tier2 契约桩、WAL record 100-111 硬失败 | Phase 2/3/5 各自主线，刻意防护，非债 |
-| C20 | RLS/触发器/存储过程/CTAS/MV/并行查询/逻辑复制/XID freeze | Phase 6 / 4a / 4a / 4a / 4b+ / 7d / 永不做（M2 §十八原有记录） |
-| C21 | 多字符集 / `client_encoding` 转码（2026-09-02 补登）：现状 UTF8-only 硬编码（`pg-wire/src/session.rs` 固定回报 server/client_encoding=UTF8，非 UTF8 startup 参数拒绝，无转码层）；PG 支持 ~40 种 server encoding + 连接级双向转码 | **决策待定**：接受 UTF8-only 则写入「显式战略边界」表作正式产品决策；若做兼容面则归 Phase 6（pg-wire 完整协议窗口，与 C16 同批） |
-
-### D 类：工程/文档债处理记录
-
-| # | 事项 | 处理 |
-|---|------|------|
-| D1 | FOR SHARE 过期注释（sql.rs×2、engine.rs×1） | **已清偿 2026-08-31**（注释对齐 Stage S 实现） |
-| D2 | M2 文档口径漂移（§十八 HOT prune / Sequence） | **已清偿 2026-08-31**（口径回改 + 指向本登记） |
-| D3 | stage_spec `flags >> 12` 残留笔记 | **已清偿 2026-08-31**（核实实现为 u8 `flags >> 4`，笔记改为已核实状态；tech-selection §11.4 加偏离脚注） |
-| D4 | 长跑未执行：btree 1h soak / 100conn×60min / 并发 crash 1000 轮 | **已清偿 2026-08-31**（三项全绿：soak 3606s、挑战档 3608s、并发 crash 3911s；数字已落盘 docs/phase1-m2-benchmarks.md §复现）；后续同类长跑归 Phase 7a 稳定性专项 ✅正文 |
-| D5 | 测试补强项（post-copy 插入回归输入、段回收/快照损坏/checkpoint 介入 split/二次崩溃/mid-checkpoint kill 覆盖） | Phase 7a 稳定性专项 |
-| D6 | loom 模型未覆盖多级树父页递归 split | 需要时专项（随 Phase 7a 评估；线程压测兜底维持） |
-| D7 | CI 无 nightly benchmark job | **已清偿 2026-08-31**（`.github/workflows/bench-nightly.yml`，criterion `--quick`；baseline 回归比对归 Phase 4b） |
-| D8 | 手动三客户端矩阵不进 CI / `m3_wal_bytes_probe` 无断言 | Phase 4a（驱动兼容矩阵随 Extended Query 进 CI） |
-| D9 | `crates/pg-engine/src/sql.rs` `#![allow(missing_docs)]`（SQL parser 模块豁免 crate 级 rustdoc 纪律；D 类此前登记的都是"过期文档"，这是唯一的"缺失文档"豁免项） | 未处理：登记挂账，低优先级；补齐 sql.rs 公开项 rustdoc 后移除豁免，回归全 workspace 统一 `#![warn(missing_docs)]` 口径 |
-| D10 | M6「双向边不对称率 < 1%」字面口径被 M4 实测证伪（HNSW shrink 单侧删边固有 15% 量级有向不对称，正确实现也过不了绝对 <1%） | **已清偿 2026-08-31**（M4 Stage B 对抗审查 P2-1）：ROADMAP Phase 2 验证标准与 ROADMAP-changes A5/§3.1 改**增量口径**（基线 = Stage B 实测聚合 15.35%，<1% 约束并发/崩溃引入的增量）；tech-selection §9② 落盘基线数字 |
+| HTAP (unified row+column engine) | **Do (prototype + production)** | Phase 5 (columnar projection prototype) + Phase 7b (production) | Supports the "unified engine" differentiator |
+| CoW snapshots (basics) | **Do (minimal)** | Phase 7a (inside backup/restore) | Used only for snapshot backup, not a general feature |
+| CoW second-level branching (Agent sandbox) | **Defer** | Not in the 7-phase roadmap | Not required by current Agent scenarios |
+| Serverless / compute-storage separation | **Do not** | — | Strategic choice: focus on kernel quality, do not compete with Neon |
+| Cross-region distributed transactions | **Do not** | — | Single-node route |
+| Multi-tenant RLS | **Do** | Phase 6 | Hard requirement for multi-agent isolation |
+| Multi-tenant quotas | **Do** | Phase 6 | Same as above |
