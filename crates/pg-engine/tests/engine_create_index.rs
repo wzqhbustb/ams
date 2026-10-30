@@ -247,6 +247,56 @@ fn create_index_rejects_duplicates_and_unknown_columns() {
     ));
 }
 
+#[test]
+fn sql_create_index_does_not_silently_drop_name_or_opclass() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine.create_table("t", &schema()).unwrap();
+
+    let err = engine
+        .exec(None, "CREATE INDEX custom_name ON t (k)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("named BTree index DDL"), "{err}");
+
+    let err = engine
+        .exec(None, "CREATE INDEX ON t (k vector_l2_ops)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("only valid with USING hnsw"), "{err}");
+
+    let err = engine
+        .exec(None, "CREATE INDEX h ON t USING hnsw (k vector_l2_ops)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Stage B"), "{err}");
+    assert!(engine.indexes().is_empty());
+}
+
+#[test]
+fn btree_on_vector_column_is_rejected_for_default_and_explicit_methods() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table(
+            "vectors",
+            &[ColumnDef {
+                name: "embedding".to_string(),
+                col_type: ColumnType::Vector(3),
+            }],
+        )
+        .unwrap();
+
+    for sql in [
+        "CREATE INDEX ON vectors (embedding)",
+        "CREATE INDEX ON vectors USING btree (embedding)",
+    ] {
+        let err = engine.exec(None, sql).unwrap_err().to_string();
+        assert!(err.contains("not an indexable M2b key type"), "{err}");
+    }
+    assert!(engine.indexes().is_empty());
+}
+
 /// P1-1: DML must maintain every index on the table, in the same
 /// transaction as the heap mutation — covering insert, delete, update
 /// (key-changing and key-preserving), multiple indexes on one table, and

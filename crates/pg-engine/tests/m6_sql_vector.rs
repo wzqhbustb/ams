@@ -1,6 +1,10 @@
 //! M6 Stage C slice C-4: the SQL minimum — `VECTOR(n)` column type in
 //! CREATE TABLE and `[v0, v1, ...]` vector literals in INSERT (selection
-//! §11). The ANN operator and CREATE INDEX are Phase 4b (not here).
+//! §11). Phase 4a Stage 0's early ANN-rejection tests also live here.
+
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Duration;
 
 use pg_am_heap::Datum;
 use pg_engine::{Engine, EngineConfig, QueryResult};
@@ -92,5 +96,83 @@ fn vector_column_type_roundtrip() {
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0
         ]))]
     );
+    engine.shutdown();
+}
+
+const ANN_SELECT: &str = "SELECT * FROM t ORDER BY v <-> '[1,2,3]' ASC LIMIT 1";
+const ANN_FOR_UPDATE: &str = "SELECT * FROM t ORDER BY v <-> '[1,2,3]' ASC LIMIT 1 FOR UPDATE";
+const ANN_INVALID_FILTER_FOR_UPDATE: &str =
+    "SELECT * FROM t WHERE missing = 1 ORDER BY v <-> '[1,2,3]' ASC LIMIT 1 FOR UPDATE";
+
+fn assert_ann_stage_b(result: Result<QueryResult, pg_engine::EngineError>) {
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("Stage B"), "unexpected ANN rejection: {err}");
+}
+
+#[test]
+fn ann_rejection_precedes_scan_and_row_locks_in_auto_commit() {
+    let tmp = TempDir::new().unwrap();
+    let engine = Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap();
+    engine
+        .exec(None, "CREATE TABLE t (id INT4, v VECTOR(3))")
+        .unwrap();
+    engine
+        .exec(None, "INSERT INTO t VALUES (1, [1,2,3])")
+        .unwrap();
+
+    assert_ann_stage_b(engine.exec(None, ANN_SELECT));
+    assert_ann_stage_b(engine.exec(None, ANN_FOR_UPDATE));
+    // An invalid filter column must still produce the Stage B error, not
+    // InvalidPredicate: rejection happens before predicate setup or heap I/O.
+    assert_ann_stage_b(engine.exec(None, ANN_INVALID_FILTER_FOR_UPDATE));
+    // The failed statements must not leave a row lock behind.
+    engine
+        .exec(None, "UPDATE t SET v = [4,5,6] WHERE id = 1")
+        .unwrap();
+    let rows = engine.scan("t", None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1[1], Some(Datum::Vector(vec![4.0, 5.0, 6.0])));
+    engine.shutdown();
+}
+
+#[test]
+fn ann_rejection_precedes_scan_and_row_locks_in_explicit_txn() {
+    let tmp = TempDir::new().unwrap();
+    let engine = Arc::new(Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap());
+    engine
+        .exec(None, "CREATE TABLE t (id INT4, v VECTOR(3))")
+        .unwrap();
+    engine
+        .exec(None, "INSERT INTO t VALUES (1, [1,2,3])")
+        .unwrap();
+    let txn = engine.begin_txn().unwrap();
+
+    assert_ann_stage_b(engine.exec(Some(&txn), ANN_SELECT));
+    assert_ann_stage_b(engine.exec(Some(&txn), ANN_FOR_UPDATE));
+    assert_ann_stage_b(engine.exec(Some(&txn), ANN_INVALID_FILTER_FOR_UPDATE));
+
+    // Drop only the table locks. If the failed ANN FOR UPDATE stamped a row
+    // lock, the writer below would still block until txn.abort() releases it.
+    engine.lock_manager().release_all(txn.xid());
+    let (tx, rx) = mpsc::channel();
+    let engine2 = Arc::clone(&engine);
+    let writer = thread::spawn(move || {
+        let result = engine2.exec(None, "UPDATE t SET v = [4,5,6] WHERE id = 1");
+        tx.send(result).unwrap();
+    });
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(result) => {
+            assert!(matches!(result, Ok(QueryResult::Affected(1))));
+        }
+        Err(_) => {
+            txn.abort().unwrap();
+            writer.join().unwrap();
+            panic!("failed ANN FOR UPDATE left a row lock behind");
+        }
+    }
+    txn.abort().unwrap();
+    let rows = engine.scan("t", None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1[1], Some(Datum::Vector(vec![4.0, 5.0, 6.0])));
     engine.shutdown();
 }

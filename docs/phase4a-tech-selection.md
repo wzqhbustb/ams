@@ -80,11 +80,15 @@ planner 以 **AM 注册表 + 单路选择器** 组织，禁止 if/else 按 AM �
 
 ```rust
 enum AmKind { BTree, Hnsw, Inverted /* Phase 3 注册 */ }
-struct AmRegistration { kind: AmKind, scan: fn(&ScanRequest) -> Result<ScanPlan> }
+struct AmRegistration {
+    kind: AmKind,
+    matches: fn(&ScanRequest) -> bool,
+    scan: fn(&ScanRequest) -> Result<ScanPlan>,
+}
 ```
 
 - Phase 4a 交付 `BTree`/`Hnsw` 两项注册；Phase 3 的倒排 AM 后续注册即插入，**无需修改 selector/executor 的核心分派结构**。新增 AM 所需的注册项、token/AST（例如 `@@`）和语法测试仍属于对应阶段工作（Phase 4a 验收不含倒排路径，倒排路径验收归 Phase 4b)。
-- 选择器按谓词形状分派：等值/范围（B+Tree)、ANN 算子（HNSW)、全文 `@@`（倒排，后续）、时间范围（TimeSeries，后续）。
+- 每个注册项用 `matches` 自判谓词形状，selector 只遍历注册表并分派，不直接匹配 AM 专属 AST：等值/范围（B+Tree)、ANN 算子（HNSW)、全文 `@@`（倒排，后续）、时间范围（TimeSeries，后续）。`ScanRequest` 提供索引列和 AM 参数元数据，`ScanSpec` 唯一表示实际执行路径；Seq/BTree 节点自带 predicate/order_by/limit，HNSW 节点自带 query，执行器无需回读原始 Statement 恢复扫描形状。
 
 ### 4.2 单路选择 + cost hooks（非完整 CBO)
 
@@ -158,7 +162,7 @@ struct AmRegistration { kind: AmKind, scan: fn(&ScanRequest) -> Result<ScanPlan>
 
 - `nextval(seq_name)`：全局并发安全、单调递增且不重用的计数器，独立于事务 XID。**只随 checkpoint 持久化不足以保证崩溃安全**：任何值/预留块在对调用者可见前，必须先用 sequence WAL 记录持久化新的高水位；redo 恢复高水位，checkpoint 只作为后续优化。可以记录每次 nextval，也可以 WAL-first 预留一批值，但崩溃后允许出现空洞，绝不允许回退并复用已发放值。
 - `nextval` 不因外层事务 ROLLBACK 而撤销，也不写事务 undo；并发 nextval 不得发放重复值。不能照搬 OID 分配器“checkpoint + 启动扫描已用值”的修正，因为 sequence 已发放值不一定出现在任何表中。
-- `currval(seq_name)`:**会话内最近一次 `nextval` 的返回值**(per-session state，不是全局计数器的当前值）。本 session 从未调用过 `nextval` 时返回错误；连接断开或进程重启后旧 session 的 currval 不恢复，新 session 必须先调用 nextval。checkpoint 不改变 currval 语义。
+- `currval(seq_name)`:**会话内该 sequence 最近一次 `nextval` 的返回值**(per-session、per-sequence state，不是全局计数器的当前值）。本 session 从未对该 sequence 调用过 `nextval` 时返回错误；连接断开或进程重启后旧 session 的 currval 不恢复，新 session 必须先调用 nextval。checkpoint 不改变 currval 语义。
 - 序列名注册进 catalog（新系统表 `pg_rust_sequences`,oid/name/current_value 三列）；current_value 的 WAL 高水位与 checkpoint 表示必须遵循同一恢复口径。
 - `SERIAL` 列声明在 `CREATE TABLE` 时展开为 `INT + DEFAULT nextval('...')` 语义（声明期展开，不引入新的运行时依赖）。
 

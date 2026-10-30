@@ -160,7 +160,7 @@ use pg_txn::{
 
 use crate::error::{EngineError, Result};
 use crate::query_stats::{ExecutionPath, QueryStatEntry, QueryStats, DEFAULT_QUERY_STATS_CAPACITY};
-use crate::sql::{self, CmpOp, Filter, Literal, LockClause, OrderBy, SelectCols, Statement};
+use crate::sql::{self, CmpOp, Filter, Literal, LockClause, OrderByKind, SelectCols, Statement};
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
 ///
@@ -3673,7 +3673,30 @@ impl Engine {
                 self.create_table(&name, &defs)?;
                 Ok(QueryResult::Ok)
             }
-            Statement::CreateIndex { table, column } => {
+            Statement::CreateIndex {
+                table,
+                column,
+                name,
+                method,
+                opclass,
+            } => {
+                if method == Some(sql::IndexMethod::Hnsw) {
+                    return Err(EngineError::InvalidArgument(
+                        "HNSW index DDL is not yet supported in this execution path (Stage B)"
+                            .to_string(),
+                    ));
+                }
+                if name.is_some() {
+                    return Err(EngineError::InvalidArgument(
+                        "named BTree index DDL is not yet supported in this execution path"
+                            .to_string(),
+                    ));
+                }
+                if opclass.is_some() {
+                    return Err(EngineError::InvalidArgument(
+                        "a vector opclass is only valid with USING hnsw".to_string(),
+                    ));
+                }
                 self.create_index(&table, &column)?;
                 Ok(QueryResult::Ok)
             }
@@ -3915,18 +3938,26 @@ impl Engine {
         columns: &SelectCols,
         table: &str,
         filter: &Option<Filter>,
-        order_by: &Option<OrderBy>,
+        order_by: &Option<OrderByKind>,
         limit: &Option<usize>,
         lock_rows: bool,
         shared: bool,
     ) -> Result<QueryResult> {
+        // Stage 0 execution boundary: reject ANN before table lookup, heap
+        // scanning, or row locking. Stage B will replace this guard with the
+        // real hnsw_search_visible pipeline.
+        if matches!(order_by, Some(OrderByKind::Expr(_))) {
+            return Err(EngineError::InvalidArgument(
+                "ANN order by is not yet supported in this select path (Stage B)".to_string(),
+            ));
+        }
         let entry = self.table_entry(table)?;
         let pred = filter
             .as_ref()
             .map(|f| filter_to_predicate(&entry, f))
             .transpose()?;
         let mut rows = self.scan_inner(snap, table, pred.as_ref())?;
-        if let Some(ob) = order_by {
+        if let Some(OrderByKind::Column(ob)) = order_by {
             let idx = entry
                 .columns
                 .iter()

@@ -29,10 +29,12 @@
 | 任务 | 交付物 |
 |------|--------|
 | Statement AST 扩展（`pg-engine/src/sql.rs`) | 在现有 `CreateIndex` 变体上增加 `name: Option<String>`、`method: Option<IndexMethod>`、`opclass: Option<VectorOpclass>`，不新增第二 AST 形态；统一支持既有 `CREATE INDEX ON t(col)` 与 `CREATE INDEX name ON t USING hnsw(col vector_l2_ops)`。`USING` 缺省为 BTree，HNSW 强制显式 opclass，非 HNSW 方法作用于 `VECTOR` 列时响亮拒绝；`OrderBy` 保持列名形态，新增 `OrderByExpr` 承载 `DistanceOp { op: L2/Cosine/InnerProduct, left: Expr, right: Expr }` 与 ASC/DESC，`Select.order_by` 改为 `Option<OrderByKind>`（sum-type `Column(OrderBy) | Expr(OrderByExpr)`，二者互斥），`Limit` 保留 |
-| AM 注册表 + 单路选择器（新增 `pg-engine/src/planner.rs`) | `AmKind { BTree, Hnsw }` + `AmRegistration { kind, scan: fn(&ScanRequest) -> Result<ScanPlan> }` + `plan_for_predicate(pred) -> ScanPlan`；倒排位置预留但不在本阶段注册。planner 负责 LIMIT/ASC/metric/WHERE 回退判定，不把执行计划规则塞进 tokenizer |
+| AM 注册表 + 单路选择器（新增 `pg-engine/src/planner.rs`) | `AmKind { BTree, Hnsw }` + `AmRegistration { kind, matches, scan }`（注册项自判请求形状）+ `plan_for_predicate(pred) -> ScanPlan`；倒排位置预留但不在本阶段注册。planner 负责 LIMIT/ASC/metric/WHERE 回退判定，不把执行计划规则塞进 tokenizer；`ScanRequest` 携带索引列、B+Tree 可用性和 HNSW ef 等元数据，`ScanSpec` 是唯一执行路径来源，Seq/BTree 节点携带 predicate/order_by/limit，HNSW 节点另携带 query 字面量 |
 | SQL session/执行上下文（新增 `pg-engine/src/session.rs`) | 定义 Engine 侧 session 抽象，后续承载事务/语句 SnapshotGuard owner 与 per-session `currval`；pg-wire Session 只拥有并传递该上下文，不独占 SQL 语义 |
 | EXPLAIN 骨架 | `ScanPlan` 可序列化输出（路径类型、谓词、AM 参数、代价估算占位），含 `SeqScan` 回退形态与 HNSW `max_retry_rounds=3` 字段 |
-| 测试 | 解析器正/负例（三种 opclass、HNSW 缺 opclass/未知 opclass 响亮拒绝、三个算子及 ASC/DESC 解析）；planner 的 LIMIT 缺失、非 ASC、metric 不匹配、额外 WHERE 回退；AM 注册表分派正确性 |
+| 测试 | 解析器正/负例（三种 opclass、HNSW 缺 opclass/未知 opclass 响亮拒绝、三个算子及 ASC/DESC 解析、无空格负数比较）；planner 的 LIMIT 缺失、非 ASC、metric 不匹配、额外 WHERE、索引列不匹配、无 B+Tree 回退、ef 传递与候选数溢出；AM 注册表分派正确性；DDL 执行不静默丢弃 name/opclass |
+
+**Stage 0 执行边界**：AST 可以表示完整 `CREATE INDEX` 形态，但 Stage B 前的 `exec` 对 HNSW、命名 B+Tree 以及非 HNSW vector opclass 响亮拒绝，不静默改写为自动命名的 B+Tree。ANN SELECT 在 `exec_select` 入口、谓词构造和堆扫描之前拒绝，且不得留下行锁；auto-commit 与显式事务的普通 ANN/FOR UPDATE 均有回归覆盖。
 
 **验收**:`cargo test -p pg-engine --lib`(AST 与 planner 单测全绿）。
 
@@ -113,7 +115,7 @@
 | 任务 | 交付物 |
 |------|--------|
 | WAL-first 序列实现（`pg-engine/src/sequence.rs` + `pg_rust_sequences` 系统表 + `pg-storage/src/wal/record.rs`/recovery） | nextval 全局并发安全、单调且不重用；值或预留块对调用者可见前，用独立 sequence WAL 类型持久化高水位，redo 恢复高水位，checkpoint 仅作优化。允许崩溃空洞，禁止回退复用；不得依赖“扫描表中已用值”修正；新 WAL discriminant 固定并加入 waldump/编解码测试 |
-| 事务与会话语义 | nextval 不随外层事务 ROLLBACK 撤销、不写事务 undo；currval 保存于 Stage 0 的 pg-engine SQL session，记录该 session 最近一次 nextval，未调用则报错。pg-wire 只传递 session；Simple/Extended/嵌入式 Engine 调用共享同一语义，重启后不恢复旧 session currval |
+| 事务与会话语义 | nextval 不随外层事务 ROLLBACK 撤销、不写事务 undo；currval 保存于 Stage 0 的 pg-engine SQL session，按 sequence OID 分别记录该 session 各 sequence 最近一次 nextval，未调用则报错。pg-wire 只传递 session；Simple/Extended/嵌入式 Engine 调用共享同一语义，重启后不恢复旧 session currval |
 | SERIAL 展开 | `CREATE TABLE` 时 `SERIAL` 列展开为 `INT + DEFAULT nextval('...')`（声明期展开，不引入新的运行时依赖）；DEFAULT 执行通过同一 SQL session 调用 nextval |
 | 测试 | 并发 nextval 唯一/单调、rollback 不回收、跨 session currval 隔离、新 session 与重启后 currval 报错、SERIAL 展开；已发放值用于提交 INSERT 后 SIGKILL，恢复后不得复用；覆盖 sequence WAL 与 heap/CLOG 交错及 checkpoint 前后 crash rounds |
 

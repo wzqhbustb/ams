@@ -28,7 +28,9 @@ pub mod clog_snapshot_migrate;
 pub mod diag;
 pub mod engine;
 pub mod error;
+pub mod planner;
 pub mod query_stats;
+pub mod session;
 pub mod sql;
 
 pub use engine::{
