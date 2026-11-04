@@ -39,6 +39,8 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    /// EXPLAIN of one inner statement (Stage A supports SELECT).
+    Explain(Box<Statement>),
     CreateTable {
         name: String,
         columns: Vec<ColumnSpec>,
@@ -203,6 +205,7 @@ enum Token {
     Commit,
     Rollback,
     Create,
+    Explain,
     Table,
     Insert,
     Into,
@@ -440,6 +443,7 @@ impl<'a> Tokenizer<'a> {
             "COMMIT" => Token::Commit,
             "ROLLBACK" => Token::Rollback,
             "CREATE" => Token::Create,
+            "EXPLAIN" => Token::Explain,
             "TABLE" => Token::Table,
             "INSERT" => Token::Insert,
             "INTO" => Token::Into,
@@ -573,6 +577,10 @@ impl Parser {
                 self.bump();
                 self.eat(&Token::Eof)?;
                 Ok(Statement::Rollback)
+            }
+            Token::Explain => {
+                self.bump();
+                Ok(Statement::Explain(Box::new(self.parse_statement()?)))
             }
             Token::Create => self.parse_create(),
             Token::Insert => self.parse_insert(),
@@ -1052,6 +1060,17 @@ mod tests {
                 assert_eq!(rows.len(), 2);
             }
             _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_explain_select() {
+        let stmt = parse("EXPLAIN SELECT * FROM users WHERE id = 1").unwrap();
+        match stmt {
+            Statement::Explain(inner) => {
+                assert!(matches!(*inner, Statement::Select { .. }));
+            }
+            other => panic!("expected Explain, got {other:?}"),
         }
     }
 

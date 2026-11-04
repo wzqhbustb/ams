@@ -50,6 +50,8 @@
 
 **验收**：自研执行器与 `Engine::exec` 现有路径结果一致；点查 <5ms；可见性负例全绿。
 
+**实现补充**：普通 B+Tree 的删除是 eager removal，因此执行器只在 `snap.xmax == current_xid` 且快照没有其他在飞行事务时使用 B+Tree，并在候选扫描后复核 XID；否则以 `SnapshotFallback` 改走 SeqScan，防止旧快照因旧索引条目已物理删除而漏行。查询 literal 超过索引条目存储上限时，执行与 EXPLAIN 同步以 `KeyTooLarge` 回退 SeqScan，因为堆谓词边界不受该存储限制。`EXPLAIN SELECT` 走独立只规划路径，`est_rows`/`est_pages` 是同一快照下的精确可见结果行数与关系页数（不是估算，也不代表计划实际触达页数），统计阶段会物化扫描，属于已知限制。实测登记见 `docs/phase4a-benchmarks.md`。
+
 ---
 
 ## Stage B：向量 SQL 语义（DDL for HNSW + ANN 算子 + EXPLAIN)(2–3 天）

@@ -94,6 +94,7 @@ struct AmRegistration {
 
 - 单谓词 → 单 AM 路径，按 ROADMAP 的"单路索引扫描"交付，不做多路代价比较；
 - cost hooks 仅保留最小集合：B+Tree 基础统计（行数/页数）、HNSW ef/k 与候选池参数、后续 AM 的选择性估计接口预留。代价估算进 EXPLAIN，不做真实 CBO（归 Phase 7c)。
+- 普通 B+Tree 的 eager removal 不允许它独立承担旧快照候选源：执行器仅在快照仍为当前 XID 且无其他在飞行事务时使用 B+Tree，并在扫描后复核；否则以 `SnapshotFallback` 回退到 MVCC 完整的 SeqScan，避免旧快照漏行。查询 literal 超过索引条目存储上限时，执行与 EXPLAIN 同步以 `KeyTooLarge` 回退 SeqScan，因为堆谓词边界不受该存储限制。EXPLAIN SELECT 只规划并读取表统计，不执行内层计划或加行锁；`est_rows`/`est_pages` 是精确快照统计而非估算，且 est_pages 为关系页数而非计划触达页数。
 
 ### 4.3 执行计划节点与 EXPLAIN
 

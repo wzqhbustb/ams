@@ -1140,11 +1140,21 @@ fn concurrent_save_same_target_with_concurrent_load() {
     let stop = AtomicBool::new(false);
     let reader_saw_overlap = AtomicBool::new(false);
     let saves_in_flight = AtomicUsize::new(0);
+    let (save_start_tx, save_start_rx) = std::sync::mpsc::channel::<()>();
+    let (save_finish_tx, save_finish_rx) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|s| {
-        let reader = s.spawn(|| {
+        let stop = &stop;
+        let g = &g;
+        let tmp = &tmp;
+        let saves_in_flight = &saves_in_flight;
+        let reader_saw_overlap = &reader_saw_overlap;
+        let reader = s.spawn(move || {
             let (mut ok, mut overlapped, mut enoent, mut attempts) =
                 (0usize, 0usize, 0usize, 0usize);
             while !stop.load(Ordering::Relaxed) || overlapped == 0 {
+                if attempts == 0 {
+                    save_start_rx.recv().unwrap();
+                }
                 attempts += 1;
                 assert!(
                     attempts <= 10_000,
@@ -1157,6 +1167,9 @@ fn concurrent_save_same_target_with_concurrent_load() {
                         // during the assert did not overlap this load's
                         // execution and must not count towards overlap.
                         let overlapped_now = saves_in_flight.load(Ordering::Relaxed) > 0;
+                        if attempts == 1 {
+                            save_finish_tx.send(()).unwrap();
+                        }
                         // A completed load passed CRC + the full checklist;
                         // since every writer saves the same input, it must
                         // also BE that graph.
@@ -1168,6 +1181,9 @@ fn concurrent_save_same_target_with_concurrent_load() {
                         }
                     }
                     Err(HnswError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if attempts == 1 {
+                            save_finish_tx.send(()).unwrap();
+                        }
                         enoent += 1;
                     }
                     Err(e) => panic!("concurrent load saw a torn/invalid file: {e}"),
@@ -1176,11 +1192,36 @@ fn concurrent_save_same_target_with_concurrent_load() {
             (ok, overlapped, enoent)
         });
         let mut writers = Vec::new();
-        for _ in 0..8 {
-            writers.push(s.spawn(|| {
-                // Every writer saves at least once, then keeps saving until
-                // the reader has observed an overlapped load — so writes
-                // are provably in flight while the reader is active.
+        let save_start_tx = &save_start_tx;
+        let save_finish_rx = save_finish_rx;
+        writers.push(s.spawn(move || {
+            // One writer owns the finish receiver and uses both channels to
+            // make the first overlap deterministic.
+            let mut saves = 0usize;
+            loop {
+                saves_in_flight.fetch_add(1, Ordering::Relaxed);
+                let result = snapshot::save(&g, tmp.path());
+                if saves == 0 {
+                    // Signal only after the file exists, then hold the gauge
+                    // until the reader has returned from its load.
+                    save_start_tx.send(()).unwrap();
+                    save_finish_rx.recv().unwrap();
+                }
+                saves_in_flight.fetch_sub(1, Ordering::Relaxed);
+                result.unwrap();
+                saves += 1;
+                if reader_saw_overlap.load(Ordering::Relaxed) {
+                    break;
+                }
+                assert!(
+                    saves <= 10_000,
+                    "writer saved 10_000 times without an overlapped load — test logic failure"
+                );
+            }
+            saves
+        }));
+        for _ in 0..7 {
+            writers.push(s.spawn(move || {
                 let mut saves = 0usize;
                 loop {
                     saves_in_flight.fetch_add(1, Ordering::Relaxed);

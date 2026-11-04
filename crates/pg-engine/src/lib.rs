@@ -28,6 +28,7 @@ pub mod clog_snapshot_migrate;
 pub mod diag;
 pub mod engine;
 pub mod error;
+pub(crate) mod executor;
 pub mod planner;
 pub mod query_stats;
 pub mod session;

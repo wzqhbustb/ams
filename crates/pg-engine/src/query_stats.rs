@@ -41,13 +41,13 @@ pub const MAX_QUERY_TEXT_BYTES: usize = 1024;
 /// How a statement was executed (M3 Stage E, tech-selection §6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionPath {
-    /// SELECT. The M3 SQL executor always seq-scans (`exec_select` →
-    /// `scan_inner`); there is no index access path in the executor yet.
+    /// SELECT executed through the sequential heap path.
     SeqScan,
-    /// Reserved for a future executor index path. The typed
-    /// `Engine::index_lookup` is NOT instrumented (§6.3), so no entry can
-    /// carry this variant today.
+    /// SELECT executed through an index access path. The typed
+    /// `Engine::index_lookup` API remains uninstrumented.
     IndexLookup,
+    /// EXPLAIN of an inner statement.
+    Explain,
     /// INSERT.
     Insert,
     /// UPDATE (its row lookup is a seq scan; the label reports the
@@ -68,6 +68,7 @@ impl ExecutionPath {
     /// the `exec` probe.
     pub(crate) fn of(stmt: &Statement) -> Self {
         match stmt {
+            Statement::Explain(_) => Self::Explain,
             Statement::Select { .. } => Self::SeqScan,
             Statement::Insert { .. } => Self::Insert,
             Statement::Update { .. } => Self::Update,
@@ -82,6 +83,7 @@ impl ExecutionPath {
         match self {
             Self::SeqScan => "seq_scan",
             Self::IndexLookup => "index_lookup",
+            Self::Explain => "explain",
             Self::Insert => "insert",
             Self::Update => "update",
             Self::Delete => "delete",
@@ -257,6 +259,7 @@ mod tests {
     fn execution_path_labels_are_stable() {
         assert_eq!(ExecutionPath::SeqScan.as_str(), "seq_scan");
         assert_eq!(ExecutionPath::IndexLookup.to_string(), "index_lookup");
+        assert_eq!(ExecutionPath::Explain.to_string(), "explain");
         assert_eq!(ExecutionPath::TxnControl.to_string(), "txn_control");
     }
 }

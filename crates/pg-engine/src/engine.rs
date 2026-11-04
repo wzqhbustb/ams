@@ -2510,7 +2510,7 @@ impl Engine {
     /// as `EntryNotFound`. A stale entry resolving to an unrelated row in
     /// a recycled slot therefore requires a phase-ordering violation, not
     /// just bad luck.
-    fn heap_tuple_visible(&self, snap: &Snapshot, tid: Tid) -> Result<Option<Tid>> {
+    pub(crate) fn heap_tuple_visible(&self, snap: &Snapshot, tid: Tid) -> Result<Option<Tid>> {
         let guard = self.storage.buffer_pool().pin(tid.page_id)?;
         let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
         let Some(bytes) = SlottedPage::tuple(page, tid.slot_id)? else {
@@ -2572,7 +2572,7 @@ impl Engine {
             .indexes
             .read()
             .iter()
-            .find(|e| e.table_oid == entry.oid && e.column == column)
+            .find(|e| e.table_oid == entry.oid && e.column.eq_ignore_ascii_case(column))
             .cloned()
             .ok_or_else(|| EngineError::IndexNotFound(format!("{table}({column})")))?;
         let btree = BTreeAM::new(
@@ -2725,7 +2725,7 @@ impl Engine {
         self.scan_inner(&snap, table, predicate.as_ref())
     }
 
-    fn scan_inner(
+    pub(crate) fn scan_inner(
         &self,
         snap: &Snapshot,
         table: &str,
@@ -3196,7 +3196,7 @@ impl Engine {
 
     /// Every index registered on `entry`'s table, joined with the position
     /// of its indexed column in the table's schema.
-    fn indexes_of(&self, entry: &TableEntry) -> Vec<(IndexEntry, usize)> {
+    pub(crate) fn indexes_of(&self, entry: &TableEntry) -> Vec<(IndexEntry, usize)> {
         self.indexes
             .read()
             .iter()
@@ -3249,7 +3249,7 @@ impl Engine {
     /// heap page (raw read, no visibility filter: DML uses this to recover
     /// the OLD key of a row the caller already addressed by TID, before the
     /// heap mutation runs in the same statement).
-    fn read_row_by_tid(
+    pub(crate) fn read_row_by_tid(
         &self,
         entry: &TableEntry,
         col_types: &[ColumnType],
@@ -3627,10 +3627,10 @@ impl Engine {
     pub fn exec(&self, txn: Option<&TxnHandle>, sql: &str) -> Result<QueryResult> {
         let started = Instant::now();
         let stmt = sql::parse(sql)?;
-        let path = ExecutionPath::of(&stmt);
+        let mut path = ExecutionPath::of(&stmt);
         let result = match txn {
-            None => self.exec_auto(stmt),
-            Some(h) => self.exec_txn(h, stmt),
+            None => self.exec_auto(stmt, &mut path),
+            Some(h) => self.exec_txn(h, stmt, &mut path),
         };
         // F2 (Stage E review): capacity 0 means "stats off" — skip the
         // per-statement String allocation entirely.
@@ -3651,7 +3651,7 @@ impl Engine {
         result
     }
 
-    fn exec_auto(&self, stmt: Statement) -> Result<QueryResult> {
+    fn exec_auto(&self, stmt: Statement, path: &mut ExecutionPath) -> Result<QueryResult> {
         match stmt {
             // Transaction control is programmatic only (Stage O review):
             // auto-commit mode has no transaction to begin or end, so these
@@ -3662,6 +3662,30 @@ impl Engine {
             Statement::Commit | Statement::Rollback => Err(EngineError::InvalidArgument(
                 "no transaction in progress".to_string(),
             )),
+            Statement::Explain(inner) => {
+                let Statement::Select {
+                    table,
+                    columns,
+                    filter,
+                    order_by,
+                    limit,
+                    ..
+                } = *inner
+                else {
+                    return Err(EngineError::Unsupported(
+                        "EXPLAIN currently supports SELECT only".to_string(),
+                    ));
+                };
+                // EXPLAIN plans and estimates only: no inner B+Tree/ANN
+                // execution and no FOR UPDATE row-lock stamping. The local
+                // guard covers the statistics scan.
+                let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
+                snap.advance_curcid();
+                let entry = self.table_entry(&table)?;
+                crate::executor::explain(
+                    self, &snap, &table, &entry, &columns, &filter, &order_by, &limit,
+                )
+            }
             Statement::CreateTable { name, columns } => {
                 let defs: Vec<ColumnDef> = columns
                     .into_iter()
@@ -3739,7 +3763,7 @@ impl Engine {
                         let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
                         snap.advance_curcid();
                         self.exec_select(
-                            &snap, &columns, &table, &filter, &order_by, &limit, false, false,
+                            &snap, &columns, &table, &filter, &order_by, &limit, false, false, path,
                         )
                     }
                     // FOR UPDATE (M2c Stage P) needs a real transaction:
@@ -3751,7 +3775,7 @@ impl Engine {
                     Some(LockClause::ForUpdate) => self.auto_commit(|snap| {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                         self.exec_select(
-                            snap, &columns, &table, &filter, &order_by, &limit, true, false,
+                            snap, &columns, &table, &filter, &order_by, &limit, true, false, path,
                         )
                     }),
                     // FOR SHARE (Stage S multixact lite): stamps a shared
@@ -3760,7 +3784,7 @@ impl Engine {
                     Some(LockClause::ForShare) => self.auto_commit(|snap| {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                         self.exec_select(
-                            snap, &columns, &table, &filter, &order_by, &limit, true, true,
+                            snap, &columns, &table, &filter, &order_by, &limit, true, true, path,
                         )
                     }),
                 }
@@ -3809,7 +3833,12 @@ impl Engine {
         }
     }
 
-    fn exec_txn(&self, handle: &TxnHandle, stmt: Statement) -> Result<QueryResult> {
+    fn exec_txn(
+        &self,
+        handle: &TxnHandle,
+        stmt: Statement,
+        path: &mut ExecutionPath,
+    ) -> Result<QueryResult> {
         // A handle is bound to its creating engine (Stage O review): using
         // it against another instance would run statements against the wrong
         // registry while writing through the original engine's txn manager.
@@ -3830,6 +3859,25 @@ impl Engine {
             Statement::Rollback => Err(EngineError::InvalidArgument(
                 "ROLLBACK via exec is not supported; call TxnHandle::abort() instead".to_string(),
             )),
+            Statement::Explain(inner) => {
+                let Statement::Select {
+                    table,
+                    columns,
+                    filter,
+                    order_by,
+                    limit,
+                    ..
+                } = *inner
+                else {
+                    return Err(EngineError::Unsupported(
+                        "EXPLAIN currently supports SELECT only".to_string(),
+                    ));
+                };
+                let entry = self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
+                crate::executor::explain(
+                    self, &snap, &table, &entry, &columns, &filter, &order_by, &limit,
+                )
+            }
             Statement::CreateTable { .. } | Statement::CreateIndex { .. } => {
                 drop(snap);
                 Err(EngineError::InvalidArgument(
@@ -3861,19 +3909,19 @@ impl Engine {
                 None => {
                     self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
                     self.exec_select(
-                        &snap, &columns, &table, &filter, &order_by, &limit, false, false,
+                        &snap, &columns, &table, &filter, &order_by, &limit, false, false, path,
                     )
                 }
                 Some(LockClause::ForUpdate) => {
                     self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                     self.exec_select(
-                        &snap, &columns, &table, &filter, &order_by, &limit, true, false,
+                        &snap, &columns, &table, &filter, &order_by, &limit, true, false, path,
                     )
                 }
                 Some(LockClause::ForShare) => {
                     self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                     self.exec_select(
-                        &snap, &columns, &table, &filter, &order_by, &limit, true, true,
+                        &snap, &columns, &table, &filter, &order_by, &limit, true, true, path,
                     )
                 }
             },
@@ -3913,6 +3961,47 @@ impl Engine {
         }
     }
 
+    /// Validate the Stage A SELECT shape without doing heap I/O. EXPLAIN and
+    /// normal execution share this gate so they cannot disagree on supported ANN
+    /// syntax, projection columns, or ORDER BY columns.
+    pub(crate) fn validate_select_shape(
+        entry: &TableEntry,
+        columns: &SelectCols,
+        order_by: &Option<OrderByKind>,
+    ) -> Result<()> {
+        if matches!(order_by, Some(OrderByKind::Expr(_))) {
+            return Err(EngineError::InvalidArgument(
+                "ANN order by is not yet supported in this select path (Stage B)".to_string(),
+            ));
+        }
+        if let Some(OrderByKind::Column(ob)) = order_by {
+            if !entry
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&ob.column))
+            {
+                return Err(EngineError::InvalidPredicate(format!(
+                    "no column {:?} in table",
+                    ob.column
+                )));
+            }
+        }
+        if let SelectCols::Cols(cols) = columns {
+            for name in cols {
+                if !entry
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(name))
+                {
+                    return Err(EngineError::InvalidPredicate(format!(
+                        "no column {name:?} in table"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Shared SELECT execution. `lock_rows` is the M2c `FOR UPDATE` mode
     /// (§9.1): after the scan/filter/sort/LIMIT, every surviving row is
     /// stamped with a lock-only `t_xmax` via [`HeapAM::lock_tuple`] BEFORE
@@ -3942,6 +4031,7 @@ impl Engine {
         limit: &Option<usize>,
         lock_rows: bool,
         shared: bool,
+        path: &mut ExecutionPath,
     ) -> Result<QueryResult> {
         // Stage 0 execution boundary: reject ANN before table lookup, heap
         // scanning, or row locking. Stage B will replace this guard with the
@@ -3952,11 +4042,15 @@ impl Engine {
             ));
         }
         let entry = self.table_entry(table)?;
-        let pred = filter
-            .as_ref()
-            .map(|f| filter_to_predicate(&entry, f))
-            .transpose()?;
-        let mut rows = self.scan_inner(snap, table, pred.as_ref())?;
+        Self::validate_select_shape(&entry, columns, order_by)?;
+        let output = crate::executor::execute(self, snap, table, &entry, filter, order_by, limit)?;
+        let mut rows = output.rows;
+        *path = match &output.plan.spec {
+            crate::planner::ScanSpec::BTree(_) | crate::planner::ScanSpec::Hnsw(_) => {
+                ExecutionPath::IndexLookup
+            }
+            crate::planner::ScanSpec::Seq(_) => ExecutionPath::SeqScan,
+        };
         if let Some(OrderByKind::Column(ob)) = order_by {
             let idx = entry
                 .columns
@@ -4394,7 +4488,7 @@ fn tuple_header(curcid: u32) -> TupleHeader {
 }
 
 /// The codec column types of a registry entry, in schema order.
-fn column_types(entry: &TableEntry) -> Vec<ColumnType> {
+pub(crate) fn column_types(entry: &TableEntry) -> Vec<ColumnType> {
     entry.columns.iter().map(|c| c.col_type).collect()
 }
 
@@ -4545,7 +4639,7 @@ fn build_insert_values(
 
 /// Build a `Predicate` from a parsed `Filter`, resolving the column name
 /// to a 0-based index and converting the literal.
-fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate> {
+pub(crate) fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate> {
     let col_index = entry
         .columns
         .iter()

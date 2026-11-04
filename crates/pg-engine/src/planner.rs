@@ -80,9 +80,10 @@ pub struct BTreeScanSpec {
     pub order_by: Option<OrderByKind>,
     /// The optional maximum number of result rows.
     pub limit: Option<usize>,
-    /// The estimated number of result rows (Stage A/B placeholder).
+    /// The exact visible result rows at the snapshot, not a cost estimate.
     pub est_rows: u64,
-    /// The estimated number of pages read (Stage A/B placeholder).
+    /// The exact heap pages in the relation at the snapshot, not the pages
+    /// this plan will necessarily touch.
     pub est_pages: u64,
 }
 
@@ -111,6 +112,11 @@ pub struct SeqScanSpec {
     pub order_by: Option<OrderByKind>,
     /// The optional maximum number of result rows.
     pub limit: Option<usize>,
+    /// The exact visible result rows at the snapshot, not a cost estimate.
+    pub est_rows: u64,
+    /// The exact heap pages in the relation at the snapshot, not the pages
+    /// this plan will necessarily touch.
+    pub est_pages: u64,
     /// Why the planner selected a sequential scan.
     pub reason: SeqScanReason,
 }
@@ -130,11 +136,17 @@ pub enum SeqScanReason {
     Desc,
     /// ANN selection cannot be combined with an additional WHERE predicate.
     ExtraWhere,
+    /// The snapshot is too old for an eager-removal B+Tree to be a complete
+    /// candidate source, so execution must use the heap instead.
+    SnapshotFallback,
+    /// The query literal exceeds the index entry size limit, but is a valid
+    /// heap predicate boundary and must use SeqScan instead.
+    KeyTooLarge,
 }
 
 impl ScanPlan {
-    /// EXPLAIN output: path type, predicate, AM parameters, cost estimate
-    /// (cost is a Stage A/B placeholder, not a real CBO).
+    /// EXPLAIN output: path type, predicate, AM parameters, and exact snapshot
+    /// statistics (not a CBO estimate).
     pub fn explain(&self) -> String {
         match &self.spec {
             ScanSpec::BTree(s) => format!(
@@ -146,8 +158,8 @@ impl ScanPlan {
                 s.ef, s.opclass, s.query, s.k, s.candidates, s.max_retry_rounds
             ),
             ScanSpec::Seq(s) => format!(
-                "SeqScan (reason={:?}, predicate={:?}, order_by={:?}, limit={:?})",
-                s.reason, s.predicate, s.order_by, s.limit
+                "SeqScan (reason={:?}, predicate={:?}, order_by={:?}, limit={:?}, est_rows={}, est_pages={})",
+                s.reason, s.predicate, s.order_by, s.limit, s.est_rows, s.est_pages
             ),
         }
     }
@@ -194,6 +206,8 @@ fn seq_plan(req: &ScanRequest, reason: SeqScanReason) -> ScanPlan {
             predicate: req.predicate.clone(),
             order_by: req.order_by.clone(),
             limit: req.limit,
+            est_rows: 0,
+            est_pages: 0,
             reason,
         }),
     }
