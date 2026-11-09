@@ -93,7 +93,9 @@ pub struct HnswScanSpec {
     pub ef: usize,
     /// The vector opclass whose distance metric is used.
     pub opclass: VectorOpclass,
-    /// The query vector literal (decoded by Stage B/C execution).
+    /// The indexed VECTOR column used for distance evaluation.
+    pub column: String,
+    /// The query vector literal (decoded by Stage B execution).
     pub query: Literal,
     /// The requested number of nearest neighbors.
     pub k: usize,
@@ -284,6 +286,7 @@ fn plan_hnsw(req: &ScanRequest) -> Result<ScanPlan> {
         spec: ScanSpec::Hnsw(HnswScanSpec {
             ef,
             opclass: required,
+            column: column.clone(),
             query: query.clone(),
             k,
             candidates: k.saturating_mul(2),
@@ -438,6 +441,7 @@ mod tests {
                 assert_eq!(s.candidates, 20);
                 assert_eq!(s.max_retry_rounds, 3);
                 assert_eq!(s.opclass, VectorOpclass::VectorL2Ops);
+                assert_eq!(s.column, "v");
                 assert_eq!(s.query, Literal::Vector(vec![1.0, 2.0, 3.0]));
                 assert_eq!(s.ef, 64);
             }

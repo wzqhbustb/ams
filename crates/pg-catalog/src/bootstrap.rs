@@ -315,7 +315,8 @@ mod tests {
             bootstrap_rows(&crate::system_tables::PG_ATTRIBUTE).len(),
             6 + 7 + 3 + 2 + 5 + 4
         );
-        assert_eq!(bootstrap_rows(&crate::system_tables::PG_TYPE).len(), 7);
+        // Seven built-in scalar types plus the dynamically-dimensioned VECTOR.
+        assert_eq!(bootstrap_rows(&crate::system_tables::PG_TYPE).len(), 8);
         assert_eq!(bootstrap_rows(&crate::system_tables::PG_AM).len(), 3);
         assert!(bootstrap_rows(&crate::system_tables::PG_INDEX).is_empty());
         assert!(bootstrap_rows(&crate::system_tables::PG_RELPAGES).is_empty());

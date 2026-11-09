@@ -221,6 +221,8 @@ pub enum ColumnType {
     Int4,
     /// 8-byte integer.
     Int8,
+    /// 8-byte IEEE-754 floating-point value.
+    Float8,
     /// 8-byte timestamp (microseconds since epoch).
     Timestamptz,
     /// 16-byte UUID.
@@ -254,7 +256,7 @@ impl ColumnType {
     fn fixed_width(self) -> Option<usize> {
         match self {
             ColumnType::Int4 => Some(4),
-            ColumnType::Int8 | ColumnType::Timestamptz => Some(8),
+            ColumnType::Int8 | ColumnType::Float8 | ColumnType::Timestamptz => Some(8),
             ColumnType::Uuid => Some(16),
             ColumnType::Text | ColumnType::Bytea => None,
             ColumnType::Vector(dim) => Some(dim as usize * 4),
@@ -273,12 +275,14 @@ fn check_vector_dim(dim: u32) -> Result<()> {
 }
 
 /// A single column value. `None` at the `values` level encodes SQL NULL.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Datum {
     /// 4-byte integer.
     Int4(i32),
     /// 8-byte integer.
     Int8(i64),
+    /// 8-byte IEEE-754 floating-point value.
+    Float8(f64),
     /// 8-byte timestamp (microseconds since epoch).
     Timestamptz(i64),
     /// 16-byte UUID.
@@ -296,11 +300,40 @@ pub enum Datum {
     External(ToastPointer),
 }
 
+impl PartialEq for Datum {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Datum::Int4(a), Datum::Int4(b)) => a == b,
+            (Datum::Int8(a), Datum::Int8(b)) => a == b,
+            (Datum::Float8(a), Datum::Float8(b)) => {
+                // PostgreSQL: NaN equals NaN; positive and negative zero are
+                // also equal. This intentionally matches PartialOrd.
+                (a.is_nan() && b.is_nan()) || a == b
+            }
+            (Datum::Timestamptz(a), Datum::Timestamptz(b)) => a == b,
+            (Datum::Uuid(a), Datum::Uuid(b)) => a == b,
+            (Datum::Text(a), Datum::Text(b)) => a == b,
+            (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
+            (Datum::Vector(a), Datum::Vector(b)) => a == b,
+            (Datum::External(a), Datum::External(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 impl PartialOrd for Datum {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Datum::Int4(a), Datum::Int4(b)) => Some(a.cmp(b)),
             (Datum::Int8(a), Datum::Int8(b)) => Some(a.cmp(b)),
+            (Datum::Float8(a), Datum::Float8(b)) => match (a.is_nan(), b.is_nan()) {
+                // PostgreSQL: NaN sorts after every non-NaN, NaNs compare
+                // equal, and positive/negative zero compare equal.
+                (true, true) => Some(std::cmp::Ordering::Equal),
+                (true, false) => Some(std::cmp::Ordering::Greater),
+                (false, true) => Some(std::cmp::Ordering::Less),
+                (false, false) => a.partial_cmp(b),
+            },
             (Datum::Timestamptz(a), Datum::Timestamptz(b)) => Some(a.cmp(b)),
             (Datum::Uuid(a), Datum::Uuid(b)) => Some(a.cmp(b)),
             (Datum::Text(a), Datum::Text(b)) => Some(a.cmp(b)),
@@ -322,6 +355,7 @@ impl Datum {
         match self {
             Datum::Int4(_) => ColumnType::Int4,
             Datum::Int8(_) => ColumnType::Int8,
+            Datum::Float8(_) => ColumnType::Float8,
             Datum::Timestamptz(_) => ColumnType::Timestamptz,
             Datum::Uuid(_) => ColumnType::Uuid,
             Datum::Text(_) => ColumnType::Text,
@@ -465,6 +499,7 @@ fn encode_tuple_impl(
         match val {
             Datum::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
             Datum::Int8(v) | Datum::Timestamptz(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Datum::Float8(v) => out.extend_from_slice(&v.to_le_bytes()),
             Datum::Uuid(v) => out.extend_from_slice(v.as_bytes()),
             Datum::Text(s) => write_inline_varlena(&mut out, s.as_bytes())?,
             Datum::Bytea(b) => write_inline_varlena(&mut out, b)?,
@@ -571,6 +606,9 @@ pub fn decode_tuple(
                 match col {
                     ColumnType::Int4 => Datum::Int4(i32::from_le_bytes(field.try_into().unwrap())),
                     ColumnType::Int8 => Datum::Int8(i64::from_le_bytes(field.try_into().unwrap())),
+                    ColumnType::Float8 => {
+                        Datum::Float8(f64::from_le_bytes(field.try_into().unwrap()))
+                    }
                     ColumnType::Timestamptz => {
                         Datum::Timestamptz(i64::from_le_bytes(field.try_into().unwrap()))
                     }
@@ -978,5 +1016,43 @@ mod tests {
         let (h2, _) = decode_tuple(&clean, &columns).unwrap();
         assert_eq!(h2.t_infomask2 & HEAP_HAS_NODEID, 0);
         assert_eq!(tuple_node_id(&clean, &columns).unwrap(), None);
+    }
+
+    #[test]
+    fn float8_roundtrip_preserves_value_bits() {
+        let columns = [ColumnType::Float8, ColumnType::Float8];
+        let values = vec![Some(Datum::Float8(-0.0)), Some(Datum::Float8(1.25))];
+        let bytes = encode_tuple(sample_header(), &columns, &values).unwrap();
+        let (_, decoded) = decode_tuple(&bytes, &columns).unwrap();
+        let [Some(Datum::Float8(negative_zero)), Some(Datum::Float8(value))] = &decoded[..] else {
+            panic!("unexpected FLOAT8 decode: {decoded:?}")
+        };
+        assert_eq!(negative_zero.to_bits(), (-0.0f64).to_bits());
+        assert_eq!(value.to_bits(), 1.25f64.to_bits());
+    }
+
+    #[test]
+    fn float8_nan_ordering_matches_postgresql() {
+        let nan = Datum::Float8(f64::NAN);
+        let one = Datum::Float8(1.0);
+        assert_eq!(nan.partial_cmp(&one), Some(std::cmp::Ordering::Greater));
+        assert_eq!(one.partial_cmp(&nan), Some(std::cmp::Ordering::Less));
+        assert_eq!(nan.partial_cmp(&nan), Some(std::cmp::Ordering::Equal));
+        assert_eq!(
+            Datum::Float8(0.0).partial_cmp(&Datum::Float8(-0.0)),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn float8_equality_matches_postgresql() {
+        assert_eq!(Datum::Float8(f64::NAN), Datum::Float8(f64::NAN));
+        assert_eq!(Datum::Float8(0.0), Datum::Float8(-0.0));
+        assert_eq!(Datum::Float8(f64::INFINITY), Datum::Float8(f64::INFINITY));
+        assert_eq!(
+            Datum::Float8(f64::NEG_INFINITY),
+            Datum::Float8(f64::NEG_INFINITY)
+        );
+        assert_ne!(Datum::Float8(f64::NAN), Datum::Float8(1.0));
     }
 }

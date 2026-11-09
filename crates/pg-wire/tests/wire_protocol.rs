@@ -391,6 +391,8 @@ fn type_text_encoding_roundtrips() {
         encode_text(&Datum::Int8(i64::MAX)).unwrap(),
         b"9223372036854775807"
     );
+    assert_eq!(encode_text(&Datum::Float8(5.0)).unwrap(), b"5");
+    assert_eq!(encode_text(&Datum::Float8(-11.5)).unwrap(), b"-11.5");
     assert_eq!(
         encode_text(&Datum::Text("héllo".to_string())).unwrap(),
         "héllo".as_bytes()
@@ -430,6 +432,10 @@ fn wire_type_mapping_matches_encoding() {
         pg_wire::types::WireType { oid: 20, len: 8 }
     );
     assert_eq!(
+        wire_type(ColumnType::Float8),
+        pg_wire::types::WireType { oid: 701, len: 8 }
+    );
+    assert_eq!(
         wire_type(ColumnType::Text),
         pg_wire::types::WireType { oid: 25, len: -1 }
     );
@@ -453,6 +459,7 @@ fn wire_type_mapping_matches_encoding() {
     );
 
     assert_eq!(column_type_of(&Datum::Int4(1)), ColumnType::Int4);
+    assert_eq!(column_type_of(&Datum::Float8(1.0)), ColumnType::Float8);
     assert_eq!(
         column_type_of(&Datum::Timestamptz(0)),
         ColumnType::Timestamptz
@@ -809,4 +816,70 @@ fn select_result_carries_schema_types_and_text_values() {
     }
     assert_eq!(nulls, 5);
     assert_eq!(command_tags(&out), ["SELECT 2"]);
+}
+
+#[test]
+fn empty_distance_result_still_reports_float8() {
+    let (_tmp, _engine, mut session) = open_session();
+    let mut out = Vec::new();
+    session.handle_query("CREATE TABLE t (id INT4, v VECTOR(2))", &mut out);
+    out.clear();
+    session.handle_query(
+        "SELECT id, v <-> '[0,0]' FROM t ORDER BY v <-> '[0,0]' ASC LIMIT 1",
+        &mut out,
+    );
+    let msgs = scan_messages(&out);
+    assert_eq!(msgs[0].tag, b'T');
+    assert!(!msgs.iter().any(|msg| msg.tag == b'D'));
+
+    let body = &msgs[0].body;
+    let mut rest = &body[2..];
+    let mut oids = Vec::new();
+    for _ in 0..2 {
+        let nul = rest.iter().position(|&b| b == 0).unwrap();
+        rest = &rest[nul + 1..];
+        rest = &rest[4 + 2..]; // table OID + attribute number
+        oids.push(u32::from_be_bytes(rest[0..4].try_into().unwrap()));
+        rest = &rest[4 + 2 + 4 + 2..];
+    }
+    assert_eq!(oids, [23, 701]);
+}
+
+#[test]
+fn distance_row_carries_float8_oid_and_text_value() {
+    let (_tmp, _engine, mut session) = open_session();
+    let mut out = Vec::new();
+    session.handle_query("CREATE TABLE t (id INT4, v VECTOR(2))", &mut out);
+    session.handle_query("INSERT INTO t VALUES (1, [3,4])", &mut out);
+    out.clear();
+    session.handle_query(
+        "SELECT id, v <-> '[0,0]' FROM t ORDER BY v <-> '[0,0]' ASC LIMIT 1",
+        &mut out,
+    );
+    let msgs = scan_messages(&out);
+    assert_eq!(msgs[0].tag, b'T');
+    let body = &msgs[0].body;
+    let mut rest = &body[2..];
+    let mut oids = Vec::new();
+    for _ in 0..2 {
+        let nul = rest.iter().position(|&b| b == 0).unwrap();
+        rest = &rest[nul + 1..];
+        rest = &rest[4 + 2..];
+        oids.push(u32::from_be_bytes(rest[0..4].try_into().unwrap()));
+        rest = &rest[4 + 2 + 4 + 2..];
+    }
+    assert_eq!(oids, [23, 701]);
+
+    let rows: Vec<&Msg> = msgs.iter().filter(|msg| msg.tag == b'D').collect();
+    assert_eq!(rows.len(), 1);
+    let mut values = Vec::new();
+    let mut rest = &rows[0].body[2..];
+    for _ in 0..2 {
+        let len = i32::from_be_bytes(rest[0..4].try_into().unwrap());
+        rest = &rest[4..];
+        assert!(len >= 0);
+        values.push(std::str::from_utf8(&rest[..len as usize]).unwrap());
+        rest = &rest[len as usize..];
+    }
+    assert_eq!(values, ["1", "5"]);
 }

@@ -1785,3 +1785,38 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 **F-5 二轮对抗复核回流(2026-10-26,agent-23 verdict PASS,P1/P2/P3 零;2 nano 闭合)**:一轮 3 nano 修复全部核验正确;新攻击面全闭合——quiesce 介入顺序(checkpoint 线程先停后 vacuum,无死等面)、恢复计时口径(open 含 WAL replay + catalog/registry 重建,<30s 余量大)、双向优先替换二阶效应(候选恒为 T 的活邻居,recall 三处独立实证无退化,loom 断言与排序正交)、benchmark 映射与计分(pre/post 恒等是机制非巧合)、pgvector harness 解析(裸 SELECT,正则不误吞)、24h 运行时形态(watchdog 不误触)、stage_spec 逐句互洽。**nano ①**:mid 轮 expectation 文件存在性竞态(慢首写 panic)——修复 = 文件缺失按空集处理(与"单连接单未记录 op"上界兼容;缺失 = 未提交或首写未落盘,均被 mid 上界覆盖)。**nano ②**:clippy/doc 补票由主线闭合(双口径 + doc 全绿)。
 
 **F-5 三轮外部复核回流(2026-10-27,外部 review:P3×2 + nano×2 闭合)**:**P3-1(pgvector ef_search=64 未作用于查询会话)**:GUC 不跨 psql 会话,初版在独立进程 SET 后另起会话查询,实际跑默认 ef=40——修复:每个查询文件内 `LOAD 'vector' + SET hnsw.ef_search = 64`,另加 SHOW 一次性实证;复测 recall@10 仍 0.9940(我方略优未被推翻),延迟/吞吐全部重跑回填(bulk 3414 rows/s、index build 2.37s、auto-commit 527 rows/s、延迟 mean 2.503ms / p50 1.165ms / p95 1.856ms / max 128.664ms(单查询离群))。**P3-2(修复腿 .abs() 误杀 >1pp 改善)**:m6_concurrent_stress.rs 与 index.rs 对称率预算测试的 `(C-B).abs()` 改为**有向** `C-B < 0.01`——预算是单侧增量上限,>1pp 的改善不再被判红(与 crash"下界非缺陷信号"同口径)。**nano-1(候选侧越界 panic)**:redirect 候选节点的 `adjs[c][l]` 改 `.get()` + 结构化 `HnswError::Corrupted`(与目标侧同型),for 循环替代迭代链避免闭包返回类型推断问题。**nano-2(文档漂移)**:benchmarks.md 的 release 待回填行同步为 debug+release 均 EXIT=0。复跑:lib redirect/symmetry/stress 全绿,fmt/clippy --all-features 绿。
+
+## Phase 4a Stage B：向量 SQL 语义与审查边界登记
+
+- **ANN 近似检索的结果数口径**：可见非 NULL 行数 ≥ k 时，ANN 仍可能因近似召回或可见性过滤返回不足 k 行；若表内没有 NULL 向量行，最终 LIMIT 结果也可少于 k。**不为此补非 NULL 行**——这是近似检索的固有边界，不是结果完整性缺陷。仅当命中不足 k 时，才在同一 snapshot 下用 heap 扫描补足可见 NULL 向量行，以满足 ASC NULLS LAST 与 FOR UPDATE 行锁语义；不得以“补足 k 行”为由另起精确召回路径。
+- **FLOAT8 文本编码归 Stage C 类型映射验收**：Simple Query 当前以 Rust `f64::to_string` 输出距离，其科学计数法阈值和尾零形态与 PostgreSQL `float8_out` 可能有细微差异（如 `1e30`、`1.0`）。Stage C 必须把 PG 兼容文本格式及 golden bytes 纳入验收，不能只覆盖 `5.0 → "5"`；二进制 f64 继续按 network byte order。
+- **性能备忘（非缺陷）**：`execute` 入口的向量预检与 `execute_hnsw` / `sort_by_distance` 内的 `prepare_distance` 会重复解码一次 query 向量。当前点查与 siftsmall 验收无性能压力，后续热路径优化时可把验证后的 `DistanceEvaluator` 直接下传，避免重复解析。
+- **规划器与错误语义正面登记**：`btree_matches` 对 distance `Expr` ORDER BY 显式让路给 HNSW handler，ExtraWhere 回退责任归属清晰；`IndexExists` 使用 `index {name} already exists`，兼容自定义索引名与 `(table,column)` 重复，避免旧文案误读。
+- **配套 CI 修复**：已提交的 M6 `snapshot_roundtrip` 并发测试存在 3 处 `needless_borrow`（两处 `snapshot::save`、一处 `assert_identical`），已做最小修复并复跑 `pg-am-hnsw` 全 feature Clippy 与并发 snapshot 测试；不改变测试语义。
+
+### P3 边界登记（非 Stage B 引入，不阻塞）
+
+- **P3-1 WHERE 比较算子缺口**：当前仅支持 `=`、`<`、`>`；`>=`、`<=`、`<>` 尚不支持，且 `>=` 会被拆成 `>`、`=` 后报出偏晦涩的 `expected literal, got Eq`。补齐比较算子及对应错误诊断归 Phase 6 SQL 完整性工作，不纳入 Phase 4a 当前最小语法承诺。
+- **P3-2 标识符大小写语义不统一**：表/索引名及 `relation_name_exists` 使用精确匹配，查询侧列名使用 `eq_ignore_ascii_case`，DDL 的列名查找又是精确匹配，因此 `CREATE INDEX … (V …)` 与 `ORDER BY V <-> …` 的行为可能不同。当前无错误结果，但存在易用性不一致；PostgreSQL 的标识符折叠规则及 typed API/SQL 的统一归 Phase 6，不在 Stage B 扩大改动面。
+- **P3-3 wire 距离查询全链路覆盖（已闭合）**：`empty_distance_result_still_reports_float8` 覆盖空结果 OID 701；`distance_row_carries_float8_oid_and_text_value` 进一步联合验证非空行的 RowDescription OID 701 与 DataRow 文本 `5`。Stage C 驱动矩阵继续保留两种形态的回归，不再将该项描述为仅缺空结果覆盖。
+- **P3-4 正面确认**：`USING btree (v)` 作用于 VECTOR 列会响亮报 `not an indexable M2b key type`，符合 Stage 0 规格，无需修改。`ensure_float8_storage_supported` 位于 `create_table_inner` 顶部、`create_heap` 之前，不存在该路径的孤儿页；当前改动无 TODO/FIXME 残留或新增不可达 `unwrap`。
+
+### 第二轮功能修复与验收证据
+
+- **超大 LIMIT 与 ScanSpec**：候选数/ef 受图 HWM 约束，结果容量 `min(k,hwm)`，空图早退；`HnswScanSpec` 的 column/candidates/max_retry_rounds 直接驱动内部 policy，M6 默认 2k/3 wrapper 行为不变。
+- **名称与事务回滚**：索引仅在自身及父表均 live 时占用名称，drop 后 HNSW/B+Tree 均可复名（含 reopen）；commit 失败回滚 registry/handle，op Err 清理 pending_hnsw。回退先排除 ExtraWhere、缺 LIMIT、DESC 和其他列，再 lazy-open 目标索引。
+- **排序与旧目录**：普通 VECTOR ORDER BY 响亮拒绝；FLOAT8 按 PG 规则处理 NaN 和 ±0。真实旧目录通过物理删除 OID 701 + checkpoint + reopen 构造，验证打开兼容与建表拒绝；当前版本目录若同样缺行，无法与合法旧目录区分，作为兼容边界登记。
+- **验收证据与 scratch**：siftsmall 每次查询同时断言 `ExecutionPath::IndexLookup`，避免精确 SeqScan 以 recall=1.0 冒充 ANN；非空 wire 距离行联合验证 OID 701 与文本值。`zz_review_probes.rs` 已排除，不将“ANN 必须始终等于精确 SeqScan”的近似语义错误 oracle 纳入交付。
+
+### DROP 事务、回滚并发与 NaN 等值
+
+- **DROP 顺序**：事务 op 只写 drop marker，物理页面释放、heap/table/index registry 和 HNSW handle 清理一律推迟到 commit 成功的 `on_success` 钩子；commit 失败不释放页面、不删除内存项，原表可读且可重试 DROP。`build_registry` 使用 fresh MVCC scan 过滤 aborted marker，`build_index_registry` 只登记父表仍 live 的索引，成功 DROP 后及 reopen 均无孤儿索引。清理时先删除所有 live 入口，再释放页面，post-commit free 失败也只泄漏页面而不会复活 live table；HNSW handle 按 `index_oid` 集合清除，而非误用父表 OID。
+- **回滚并发窗口**：`auto_commit_with_hooks` 在锁释放前执行失败回滚，B+Tree/HNSW 的 registry/handle 清理不再落到锁释放之后。确定性回归在创建线程持 Exclusive 后启动等待写者，commit 失败时写者继续，最终 registry/handle 为空。
+- **FLOAT8 等值与排序**：`Datum` 手写 `PartialEq`，NaN 与 NaN 相等、±0 相等，和 `PartialOrd` 规则一致；typed `Predicate::Eq` 覆盖 NaN、±0、±Infinity，ORDER BY 继续采用 NaN 大于非 NaN 的规则。
+
+### 相邻并发边界与 post-commit 错误契约
+
+- **lazy-open × DROP**：`hnsw_handle` 在首次 liveness 检查、图 open、publish 前复查及 handle 插入期间持续持有 table registry 与 index registry 的读锁；DROP 清理对应写锁，因此不能在注册表清空后又被 lazy-open 插回旧 handle。open 前后任一检查失败均返回 `IndexNotFound`。确定性交错测试 `lazy_open_cannot_reinsert_a_handle_after_drop` 先把 ANN 停在 publish 前，等 DROP 提交并进入 post-commit cleanup；放行前直接断言两个 registry 的 `try_write` 均被 ANN 的读锁排除（无同步实现与此线程时序无关地失败），随后才放行 ANN 并验证最终 registry/handle 均为空。
+- **post-commit cleanup 错误契约**：drop marker 已 durable 且 live 入口删除后，`walk_chain` / `free_page` 失败只通过 `tracing::warn!` 报告并保留未释放页面，DROP 返回成功；调用方不会把“已提交但清理不完整”误当成“未提交、可直接重试”。重试已提交的 DROP 得到 `TableNotFound`，泄漏优先于复活或损坏。`drop_cleanup_error_never_resurrects_a_live_table` 覆盖 double-free，`drop_page_walk_error_after_commit_is_only_a_warning` 以自环链覆盖 walk 失败，两者均验证当前进程与 reopen 后表和索引入口保持删除。
+- **无锁 reader × DROP 非目标**：typed `Engine::scan`、普通 auto-commit SELECT 及相应无锁 ANN 路径不取 `AccessShare`，仍可能已解析旧 `TableEntry` 后与 DROP 的 post-commit 页面释放/复用交错。本轮的 post-commit free 与 lazy-open 同步不消除该既有 DDL-vs-DML 窗口，不得宣称此边界已闭合；读取锁、关系生命周期 lease 或按读者/快照 horizon 延迟释放留待后续专门设计。
+- **本轮验证（2026-11-09）**：`pg-engine` 全套件与 workspace debug 全量回归均 EXIT=0；`pg-am-heap`/`pg-catalog`/`pg-engine`/`pg-wire` release 全套件 EXIT=0；八个 crate 的 Clippy `--all-targets --all-features -D warnings`、相关 crate rustdoc `-D warnings`、fmt 与 `git diff --check` 全绿。siftsmall SQL ANN release 基准通过：recall@10 = **0.9990**，bulk 10000 行 **13.91s**，查询 mean/p50/p95/max = **0.305/0.297/0.412/0.645ms**，每次查询均断言 `ExecutionPath::IndexLookup`。最终独立只读复核提出的交错测试与 walk-error 覆盖缺口均已修复并复审闭合，无遗留 P1/P2/P3。

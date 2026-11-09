@@ -137,12 +137,12 @@ use pg_am_heap::tuple::{decode_tuple, encode_tuple, ColumnType, Datum, TupleHead
 use pg_am_heap::{
     heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM,
 };
-use pg_catalog::builtin_types::{column_type_of_attr, BUILTIN_TYPES, VECTOR_OID};
+use pg_catalog::builtin_types::{column_type_of_attr, BUILTIN_TYPES, FLOAT8_OID, VECTOR_OID};
 use pg_catalog::system_tables::{
     SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, PG_ATTRIBUTE, PG_CLASS, PG_INDEX, PG_RELPAGES,
     RELKIND_INDEX, RELKIND_TABLE,
 };
-use pg_catalog::{Catalog, RelationRow, TypeOid};
+use pg_catalog::{Catalog, TableOid, TypeOid};
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::clog::ClogFlush;
 use pg_storage::config::StorageConfig;
@@ -160,7 +160,9 @@ use pg_txn::{
 
 use crate::error::{EngineError, Result};
 use crate::query_stats::{ExecutionPath, QueryStatEntry, QueryStats, DEFAULT_QUERY_STATS_CAPACITY};
-use crate::sql::{self, CmpOp, Filter, Literal, LockClause, OrderByKind, SelectCols, Statement};
+use crate::sql::{
+    self, CmpOp, Filter, Literal, LockClause, OrderByKind, SelectCols, SelectItem, Statement,
+};
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
 ///
@@ -950,6 +952,16 @@ fn pending_map_remove(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_AUTO_COMMIT_HOOK: std::cell::Cell<Option<fn()>> =
+        std::cell::Cell::new(None);
+    static BEFORE_HNSW_PUBLISH_HOOK: std::cell::Cell<Option<fn()>> =
+        std::cell::Cell::new(None);
+    static BEFORE_DROP_CLEANUP_HOOK: std::cell::Cell<Option<fn()>> =
+        std::cell::Cell::new(None);
+}
+
 impl Engine {
     /// Open (or create) a database at `data_dir`, assembling all layers.
     ///
@@ -1055,8 +1067,8 @@ impl Engine {
 
         // 7. Table registry from the catalog, index registry from the
         //    `pg_index` heap chain.
-        let registry = Self::build_registry(&catalog)?;
-        let indexes = Self::build_index_registry(&catalog, &heap, clog.as_ref())?;
+        let registry = Self::build_registry(&catalog, &heap, &txn, clog.as_ref())?;
+        let indexes = Self::build_index_registry(&catalog, &heap, clog.as_ref(), &registry)?;
 
         // 8. Lock manager (sharing the victim registry) and the deadlock
         //    detector thread (M2c Stage R, §9.3). Started LAST, once both
@@ -1108,52 +1120,77 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Rebuild the table registry from the catalog snapshot.
-    ///
-    /// `pg_class` rows are folded **last-version-wins per OID** in slot
-    /// order: `drop_table` appends a `relkind = 'd'` version after the live
-    /// one, and a fresh insert always appends, so the last row for an OID is
-    /// its current state. System catalogs (OID < `FIRST_USER`) are not user
-    /// tables and are skipped.
-    fn build_registry(catalog: &Catalog) -> Result<HashMap<String, TableEntry>> {
-        let mut live: HashMap<u64, &RelationRow> = HashMap::new();
-        for row in catalog.relations() {
-            if row.kind == RELKIND_DROPPED {
-                live.remove(&row.oid.raw().0);
+    /// Rebuild the table registry through a fresh MVCC heap scan. Raw
+    /// last-version-wins cannot distinguish an aborted DROP marker from a
+    /// committed one, so recovery must use visibility rather than slot order.
+    fn build_registry(
+        catalog: &Catalog,
+        heap: &HeapAM,
+        txn: &TxnManager,
+        clog: &dyn ClogAccessor,
+    ) -> Result<HashMap<String, TableEntry>> {
+        let (snapshot, _guard) = txn.snapshot(TxnId::INVALID);
+        let columns = PG_CLASS.column_types();
+        let rows = heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_CLASS.oid.raw(),
+                first_page: PG_CLASS.first_page,
+                columns: &columns,
+            },
+            snapshot: &snapshot,
+            clog,
+        })?;
+        let mut live: HashMap<i64, Vec<Value>> = HashMap::new();
+        for (_, values) in rows {
+            let (Some(Some(Datum::Int8(oid))), Some(Some(Datum::Text(kind)))) =
+                (values.first(), values.get(2))
+            else {
+                continue;
+            };
+            if kind == RELKIND_DROPPED {
+                live.remove(oid);
             } else {
-                live.insert(row.oid.raw().0, row);
+                live.insert(*oid, values);
             }
         }
 
         let mut registry = HashMap::new();
-        for row in live.into_values() {
-            let oid = row.oid.raw();
-            if oid.0 < Oid::FIRST_USER.0 {
+        for (raw_oid, values) in live {
+            let oid = u64::try_from(raw_oid)
+                .map_err(|_| EngineError::Corrupted(format!("negative pg_class OID {raw_oid}")))?;
+            if oid < Oid::FIRST_USER.0 {
                 continue;
             }
-            if row.kind != RELKIND_TABLE {
-                // Index relations (`relkind = 'i'`, Stage M wave 2) are NOT
-                // tables: they carry no heap chain and must never be reached
-                // through the DML API. They live in the index registry
-                // (`build_index_registry`), keyed by (table, column).
+            let kind = match values.get(2) {
+                Some(Some(Datum::Text(kind))) => kind,
+                _ => continue,
+            };
+            if kind != RELKIND_TABLE {
                 continue;
             }
-            let Some(relpages) = catalog.relpages_of(row.oid) else {
-                // Half-created table from a crash mid-create_table (module
-                // docs, "DDL crash atomicity"): leak the pages, skip the row.
+            let name = match values.get(1) {
+                Some(Some(Datum::Text(name))) => name.clone(),
+                _ => continue,
+            };
+            let natts = match values.get(3) {
+                Some(Some(Datum::Int4(natts))) => *natts,
+                _ => continue,
+            };
+            let table_oid = TableOid::new(Oid(oid));
+            let Some(relpages) = catalog.relpages_of(table_oid) else {
                 tracing::warn!(
-                    table = %row.name,
-                    oid = oid.0,
+                    table = %name,
+                    oid = oid,
                     "pg_class row without pg_rust_relpages entry; skipping half-created table"
                 );
                 continue;
             };
-            let mut columns = Vec::with_capacity(row.natts as usize);
-            for attr in catalog.attributes_of(row.oid) {
+            let mut columns = Vec::with_capacity(natts as usize);
+            for attr in catalog.attributes_of(table_oid) {
                 let col_type = column_type_of_attr(attr.type_oid, attr.len).ok_or_else(|| {
                     EngineError::Corrupted(format!(
                         "{}.{}: unknown type OID {:?} or malformed vector len {}",
-                        row.name, attr.name, attr.type_oid, attr.len
+                        name, attr.name, attr.type_oid, attr.len
                     ))
                 })?;
                 columns.push(ColumnDef {
@@ -1163,9 +1200,9 @@ impl Engine {
             }
             if registry
                 .insert(
-                    row.name.clone(),
+                    name.clone(),
                     TableEntry {
-                        oid,
+                        oid: Oid(oid),
                         first_page: relpages.first_page,
                         columns,
                     },
@@ -1174,7 +1211,7 @@ impl Engine {
             {
                 return Err(EngineError::Corrupted(format!(
                     "duplicate live pg_class rows for table {:?}",
-                    row.name
+                    name
                 )));
             }
         }
@@ -1196,6 +1233,7 @@ impl Engine {
         catalog: &Catalog,
         heap: &HeapAM,
         clog: &dyn ClogAccessor,
+        tables: &HashMap<String, TableEntry>,
     ) -> Result<Vec<IndexEntry>> {
         let columns = PG_INDEX.column_types();
         let rows = heap.scan(ScanContext {
@@ -1217,6 +1255,12 @@ impl Engine {
                 ));
             };
             let index_oid = Oid(*indexrelid as u64);
+            let table_oid = Oid(*indrelid as u64);
+            if !tables.values().any(|entry| entry.oid == table_oid) {
+                // DROP TABLE leaves index rows behind, but an index whose
+                // parent is dropped is unreachable and must not be rebuilt.
+                continue;
+            }
             let attrs = catalog.attributes_of(pg_catalog::TableOid(index_oid));
             let relpages = catalog.relpages_of(pg_catalog::TableOid(index_oid));
             let (Some(attr), Some(relpages)) = (attrs.first(), relpages) else {
@@ -1294,7 +1338,7 @@ impl Engine {
             ));
         }
         let _ddl = self.ddl_lock.lock();
-        if self.registry.read().contains_key(name) {
+        if self.registry.read().contains_key(name) || self.relation_name_exists(name)? {
             return Err(EngineError::TableExists(name.to_string()));
         }
 
@@ -1337,6 +1381,7 @@ impl Engine {
         name: &str,
         schema: &[ColumnDef],
     ) -> Result<PageId> {
+        ensure_float8_storage_supported(self.catalog.type_by_oid(FLOAT8_OID).is_some(), schema)?;
         let first_page = self.heap.create_heap(oid)?;
 
         let class_row = vec![
@@ -1380,34 +1425,22 @@ impl Engine {
         Ok(first_page)
     }
 
-    /// Drop a table: mark its `pg_class` row `relkind = 'd'`, free its data
-    /// pages, and remove it from the registry.
+    /// Drop a table: write `relkind = 'd'`, then perform physical cleanup
+    /// only after the commit is durable.
     ///
     /// The marker is an MVCC **update through the heap AM**, not a physical
-    /// row removal: the old version stays in the page (invisible to scans
-    /// once the drop commits), and the registry rebuild's last-version-wins
-    /// fold reads the drop. A physical removal would need either slot
-    /// recycling (breaks TID stability) or a raw in-place rewrite that
-    /// reaches past the AM into tuple internals — both worse than one extra
-    /// dead version per dropped table in M2a.
+    /// row removal. Physical page freeing, heap/table/index registry removal
+    /// and HNSW handle cleanup run in `auto_commit_with_hooks`'s
+    /// `on_success` hook, before the AccessExclusive lock is released. A DML
+    /// statement queued behind that lock therefore observes the completed
+    /// drop, while a commit failure performs none of those destructive steps.
+    /// The `pg_rust_relpages` row is left behind; it is keyed by the table's
+    /// never-reused OID and ignored by the rebuild (leaked row, documented
+    /// M2a simplification).
     ///
-    /// Ordering inside the transaction (module docs, "DDL crash
-    /// atomicity"): the `'d'` marker is written **first**, then the data
-    /// pages are walked and freed (`PageFree` WAL + redo, Stage E), then
-    /// the heap AM's cached page list is dropped. The `pg_rust_relpages`
-    /// row is left behind; it is keyed by the table's never-reused OID and
-    /// ignored by the rebuild (leaked row, documented M2a simplification).
-    ///
-    /// The registry entry is removed INSIDE the transaction, before commit
-    /// releases the AccessExclusive lock (M2c Stage P review): a DML
-    /// statement that resolved the table before the drop and queued behind
-    /// its lock must observe the removal the moment its own lock is
-    /// granted — `lock_table_entry`'s post-lock registry re-check relies on
-    /// this ordering. If the commit itself fails (WAL-fatal, process
-    /// teardown territory) the in-memory removal has already happened while
-    /// the durable pg_class row is not marked 'd': the two diverge until
-    /// restart, when the rebuild resurrects the table consistent with the
-    /// durable state.
+    /// Recovery rebuilds the table registry through a fresh MVCC scan, not a
+    /// raw last-version-wins fold, so an aborted marker cannot hide the
+    /// original table after restart.
     ///
     /// Fails with [`EngineError::TableNotFound`] if the table does not
     /// exist.
@@ -1420,26 +1453,27 @@ impl Engine {
             .cloned()
             .ok_or_else(|| EngineError::TableNotFound(name.to_string()))?;
 
-        self.auto_commit(|snap| {
-            // AccessExclusive (§9.2): blocks — and is blocked by — every
-            // other lock mode on this table, so a DROP waits for in-flight
-            // readers/writers and new ones queue behind it (M2c Stage P).
-            self.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
-            self.drop_table_inner(snap, name, &entry)?;
-            // Remove BEFORE commit releases the lock (see the fn docs).
-            self.registry.write().remove(name);
-            Ok(())
-        })
+        self.auto_commit_with_hooks(
+            |snap| {
+                // AccessExclusive (§9.2): blocks — and is blocked by — every
+                // other lock mode on this table, so a DROP waits for in-flight
+                // readers/writers and new ones queue behind it (M2c Stage P).
+                self.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
+                self.drop_table_marker(snap, name, &entry)
+            },
+            || self.drop_table_storage(name, &entry),
+            || {},
+        )
     }
 
-    /// The page-freeing half of `drop_table`, inside transaction `snap`.
-    fn drop_table_inner(&self, snap: &Snapshot, name: &str, entry: &TableEntry) -> Result<()> {
-        // 1. Mark relkind = 'd' (before freeing pages — see the fn docs).
+    /// Write only the drop marker inside the transaction. Physical cleanup
+    /// is deferred until the commit is durable, so a commit failure leaves
+    /// the original table and every data page intact.
+    fn drop_table_marker(&self, snap: &Snapshot, name: &str, entry: &TableEntry) -> Result<()> {
         let old_tid = self.find_live_pg_class_row(entry.oid)?;
         let columns = PG_CLASS.column_types();
         let class_row = vec![
             Some(Datum::Int8(entry.oid.0 as i64)),
-            // The name is repeated so the row stays self-describing.
             Some(Datum::Text(name.to_string())),
             Some(Datum::Text(RELKIND_DROPPED.to_string())),
             Some(Datum::Int4(entry.columns.len() as i32)),
@@ -1462,15 +1496,47 @@ impl Engine {
             clog: self.clog.as_ref(),
             hot_eligible: false,
         })?;
+        Ok(())
+    }
 
-        // 2. Free the data pages along the chain.
-        for page_id in self.walk_chain(entry.first_page)? {
-            self.storage.page_allocator().lock().free_page(page_id)?;
-        }
-
-        // 3. Forget the relation in the AM cache: the freed page IDs can be
-        //    handed out again and must never be reached through this OID.
+    /// Post-commit physical and in-memory cleanup, before the table lock is
+    /// released. No part of this runs when the commit fails.
+    fn drop_table_storage(&self, name: &str, entry: &TableEntry) -> Result<()> {
+        // Remove every live entry point BEFORE freeing any page. If a later
+        // page walk/free fails, the table is already unreachable and pages
+        // merely leak; no DML can observe a live table with reclaimed pages.
+        #[cfg(test)]
+        Self::run_before_drop_cleanup_hook();
+        let index_oids: HashSet<Oid> = self
+            .indexes
+            .read()
+            .iter()
+            .filter(|index| index.table_oid == entry.oid)
+            .map(|index| index.index_oid)
+            .collect();
         self.heap.drop_relation(entry.oid);
+        self.registry.write().remove(name);
+        self.indexes
+            .write()
+            .retain(|index| index.table_oid != entry.oid);
+        self.hnsw_handles
+            .lock()
+            .retain(|index_oid, _| !index_oids.contains(index_oid));
+        let pages = match self.walk_chain(entry.first_page) {
+            Ok(pages) => pages,
+            Err(error) => {
+                tracing::warn!(%error, table = %name, "post-commit DROP page walk failed; leaving pages leaked");
+                Vec::new()
+            }
+        };
+        for page_id in pages {
+            if let Err(error) = self.storage.page_allocator().lock().free_page(page_id) {
+                tracing::warn!(%error, table = %name, ?page_id, "post-commit DROP page free failed; leaving page leaked");
+            }
+        }
+        // The marker is already durable and every live entry is gone. These
+        // cleanup failures are warnings, not a DROP failure: the table is
+        // dropped, and any unfreed pages are leaks by design.
         Ok(())
     }
 
@@ -1525,6 +1591,10 @@ impl Engine {
         {
             return Err(EngineError::IndexExists(format!("{table}({column})")));
         }
+        let index_name = format!("{}_{column}_idx", entry.oid.0);
+        if self.relation_name_exists(&index_name)? {
+            return Err(EngineError::IndexExists(index_name));
+        }
 
         // Catalog-room pre-check BEFORE the expensive scan + bulk load
         // (~1s and ~20MB of WAL for a large table): the four catalog rows
@@ -1544,67 +1614,79 @@ impl Engine {
         // transaction, leaving only unreachable pages — the documented
         // "leak, never corruption" policy.
         let col_types = column_types(&entry);
-        self.auto_commit(|snap| {
-            let entry = self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
-            // Re-take the snapshot AFTER the lock wait (M2c Stage P
-            // review): `auto_commit`'s snapshot was taken before we queued
-            // on Exclusive, so a writer we blocked behind would be stuck in
-            // its `xip` and its rows would silently never enter the index.
-            // The lock guarantees no writer can be in flight now, so a
-            // fresh snapshot sees exactly the committed contents the index
-            // must cover. `_re_guard` keeps the re-snapshot registered
-            // until this auto-commit closure ends (M3 Stage A, §3.3).
-            let (mut snap, _re_guard) = self.txn.snapshot(snap.current_xid());
-            snap.advance_curcid();
+        let result = self.auto_commit_with_hooks(
+            |snap| {
+                let entry =
+                    self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
+                // Re-take the snapshot AFTER the lock wait (M2c Stage P
+                // review): `auto_commit`'s snapshot was taken before we queued
+                // on Exclusive, so a writer we blocked behind would be stuck in
+                // its `xip` and its rows would silently never enter the index.
+                // The lock guarantees no writer can be in flight now, so a
+                // fresh snapshot sees exactly the committed contents the index
+                // must cover. `_re_guard` keeps the re-snapshot registered
+                // until this auto-commit closure ends (M3 Stage A, §3.3).
+                let (mut snap, _re_guard) = self.txn.snapshot(snap.current_xid());
+                snap.advance_curcid();
 
-            // Collect (key_bytes, tid) from a full heap scan (M2b: simple
-            // scan, no ordering assumption on the source).
-            let rows = self.heap.scan(ScanContext {
-                rel: relation_desc(&entry, &col_types),
-                snapshot: &snap,
-                clog: self.clog.as_ref(),
-            })?;
-            let mut entries = Vec::with_capacity(rows.len());
-            for (tid, values) in rows {
-                // NULL keys are not indexed (see the fn docs).
-                if let Some(datum) = &values[col_index] {
-                    // Post-Stage-S review H2: the scan yields the VISIBLE
-                    // version, which for a HOT chain is a `HEAP_ONLY_TUPLE`
-                    // tail that never gets index entries of its own. Build
-                    // the entry against the chain ROOT instead, so a later
-                    // key-changing update or delete — which retires entries
-                    // via `hot_chain_root` — finds it (`EntryNotFound`
-                    // otherwise, and the index would leak the deleted row
-                    // forever). Safe under the build's Exclusive table lock:
-                    // no writer can be mutating the chains mid-scan.
-                    let index_tid = self.hot_chain_root(tid)?;
-                    entries.push((encode_key(datum)?, index_tid));
+                // Collect (key_bytes, tid) from a full heap scan (M2b: simple
+                // scan, no ordering assumption on the source).
+                let rows = self.heap.scan(ScanContext {
+                    rel: relation_desc(&entry, &col_types),
+                    snapshot: &snap,
+                    clog: self.clog.as_ref(),
+                })?;
+                let mut entries = Vec::with_capacity(rows.len());
+                for (tid, values) in rows {
+                    // NULL keys are not indexed (see the fn docs).
+                    if let Some(datum) = &values[col_index] {
+                        // Post-Stage-S review H2: the scan yields the VISIBLE
+                        // version, which for a HOT chain is a `HEAP_ONLY_TUPLE`
+                        // tail that never gets index entries of its own. Build
+                        // the entry against the chain ROOT instead, so a later
+                        // key-changing update or delete — which retires entries
+                        // via `hot_chain_root` — finds it (`EntryNotFound`
+                        // otherwise, and the index would leak the deleted row
+                        // forever). Safe under the build's Exclusive table lock:
+                        // no writer can be mutating the chains mid-scan.
+                        let index_tid = self.hot_chain_root(tid)?;
+                        entries.push((encode_key(datum)?, index_tid));
+                    }
                 }
-            }
 
-            let btree = BTreeAM::new(
-                Arc::clone(self.storage.buffer_pool()),
-                Arc::clone(self.storage.wal_writer()),
-            );
-            let index = btree.build_index(index_oid, key_type, entries)?;
-            let meta_page = index.meta_page();
+                let btree = BTreeAM::new(
+                    Arc::clone(self.storage.buffer_pool()),
+                    Arc::clone(self.storage.wal_writer()),
+                );
+                let index = btree.build_index(index_oid, key_type, entries)?;
+                let meta_page = index.meta_page();
 
-            self.create_index_catalog_rows(&snap, &entry, column, index_oid, meta_page)?;
-            // Registry push INSIDE the lock-holding transaction (round-4
-            // P3-C): pushing after the lock released left a residual window
-            // where a concurrent INSERT saw no index and wrote rows without
-            // index maintenance. The registry is in-memory (crash-rebuilt
-            // from the catalog), so the in-transaction push is safe.
-            self.indexes.write().push(IndexEntry {
-                index_oid,
-                table_oid: entry.oid,
-                column: column.to_string(),
-                key_type,
-                meta_page,
-                map_page: None,
-            });
-            Ok(())
-        })?;
+                self.create_index_catalog_rows(&snap, &entry, column, index_oid, meta_page)?;
+                // Registry push INSIDE the lock-holding transaction (round-4
+                // P3-C): pushing after the lock released left a residual window
+                // where a concurrent INSERT saw no index and wrote rows without
+                // index maintenance. The registry is in-memory (crash-rebuilt
+                // from the catalog), so the in-transaction push is safe.
+                self.indexes.write().push(IndexEntry {
+                    index_oid,
+                    table_oid: entry.oid,
+                    column: column.to_string(),
+                    key_type,
+                    meta_page,
+                    map_page: None,
+                });
+                Ok(())
+            },
+            || Ok(()),
+            || {
+                // Registry publication is in-memory and OID-scoped: a failed
+                // commit must not leave a usable ghost index behind.
+                self.indexes
+                    .write()
+                    .retain(|index| index.index_oid != index_oid);
+            },
+        );
+        result?;
         Ok(index_oid)
     }
 
@@ -1619,6 +1701,25 @@ impl Engine {
         &self,
         table: &str,
         column: &str,
+        params: pg_am_hnsw::HnswParams,
+        dim: u16,
+        metric: pg_am_hnsw::Metric,
+        selection: pg_am_hnsw::NeighborSelection,
+        rng_seed: u64,
+    ) -> Result<(Oid, PageId)> {
+        self.create_hnsw_index_on_named(
+            table, column, None, params, dim, metric, selection, rng_seed,
+        )
+    }
+
+    /// Phase 4a Stage B named SQL form. The public M6 wrapper above keeps its
+    /// signature and automatic name; SQL supplies `index_name` here.
+    #[allow(clippy::too_many_arguments)]
+    fn create_hnsw_index_on_named(
+        &self,
+        table: &str,
+        column: &str,
+        index_name: Option<&str>,
         params: pg_am_hnsw::HnswParams,
         dim: u16,
         metric: pg_am_hnsw::Metric,
@@ -1667,6 +1768,12 @@ impl Engine {
                 "table {table:?} already has an HNSW index (one per table: the row carries a single NodeId)"
             )));
         }
+        let index_name = index_name
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}_{column}_hnsw_idx", entry.oid.0));
+        if self.relation_name_exists(&index_name)? {
+            return Err(EngineError::IndexExists(index_name));
+        }
         // M6 Stage C review P2-1 (+ round-3 P2-1): index creation does NOT
         // backfill existing rows — non-empty tables are refused loudly. The
         // WHOLE creation (emptiness check + graph + map + catalog rows) runs
@@ -1674,10 +1781,10 @@ impl Engine {
         // create_index's exact precedent): without this, a concurrent insert
         // in the window between the check and the registry push would
         // encode rows with no NodeId, permanently invisible to ANN search.
-        // The registry push happens right after the lock releases (the
-        // registry is in-memory; a crash rebuilds it from the catalog).
+        // The registry is published inside that lock-holding transaction.
         let index_oid = self.catalog.oid_allocator().alloc();
-        let meta_page = self.auto_commit(|snap| {
+        self.ensure_hnsw_index_catalog_room(&entry, column, &index_name, index_oid, dim)?;
+        let result = self.auto_commit_with_hooks(|snap| {
             let _locked = self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
             // Re-take the snapshot AFTER the lock wait (the auto-commit
             // snapshot predates it — btree create_index's precedent).
@@ -1706,7 +1813,14 @@ impl Engine {
             )?;
             let map_page = map.meta_page();
             self.create_hnsw_index_catalog_rows(
-                &snap, &entry, column, index_oid, meta_page, map_page, dim,
+                &snap,
+                &entry,
+                column,
+                &index_name,
+                index_oid,
+                meta_page,
+                map_page,
+                dim,
             )?;
             // Registry push + handle cache INSIDE the lock-holding
             // transaction (round-4 P3-C): pushing outside left a residual
@@ -1724,64 +1838,197 @@ impl Engine {
                 map_page: Some(map_page),
             });
             Ok(meta_page)
-        })?;
+        }, || Ok(()), || {
+            self.hnsw_handles.lock().remove(&index_oid);
+            self.indexes
+                .write()
+                .retain(|index| index.index_oid != index_oid);
+        });
+        let meta_page = result?;
         Ok((index_oid, meta_page))
     }
 
-    /// The catalog rows of a table-linked HNSW index (M6 Stage C): same
-    /// four-row shape as [`Self::create_index_catalog_rows`] but the AM row
-    /// is HNSW_AM_OID, the attribute carries VECTOR_OID with len = dim × 4,
-    /// and the relpages row's `last_page` records the sidecar map's meta
-    /// page. Runs inside the caller's auto-commit.
+    /// Whether a committed live table or index already owns `name`.
+    /// `Catalog`'s open-time snapshot cannot see relations created later in
+    /// this process, so name validation reads `pg_class` through a fresh
+    /// MVCC snapshot. Drop markers (`relkind='d'`) do not block reuse.
+    fn relation_name_exists(&self, name: &str) -> Result<bool> {
+        // Bootstrap catalog rows use a synthetic XID that an ordinary MVCC
+        // heap scan cannot see. Only system relations use the open-time
+        // snapshot: its user rows may be stale after DROP, while system
+        // relations are immutable for this stage.
+        if self.catalog.relation_by_name(name).is_some_and(|row| {
+            row.oid.raw().is_system() && (row.kind == RELKIND_TABLE || row.kind == RELKIND_INDEX)
+        }) {
+            return Ok(true);
+        }
+        let (snapshot, _guard) = self.txn.snapshot(TxnId::INVALID);
+        let scan = |def: &SystemTableDef| -> Result<Vec<(Tid, Vec<Value>)>> {
+            let columns = def.column_types();
+            Ok(self.heap.scan(ScanContext {
+                rel: RelationDesc {
+                    rel_oid: def.oid.raw(),
+                    first_page: def.first_page,
+                    columns: &columns,
+                },
+                snapshot: &snapshot,
+                clog: self.clog.as_ref(),
+            })?)
+        };
+        let class_rows = scan(&PG_CLASS)?;
+        let index_rows = scan(&PG_INDEX)?;
+        let index_parents: HashMap<i64, i64> = index_rows
+            .into_iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(1)) {
+                (Some(Some(Datum::Int8(index_oid))), Some(Some(Datum::Int8(parent_oid)))) => {
+                    Some((*index_oid, *parent_oid))
+                }
+                _ => None,
+            })
+            .collect();
+        let live_tables: HashSet<i64> = class_rows
+            .iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(2)) {
+                (Some(Some(Datum::Int8(oid))), Some(Some(Datum::Text(kind))))
+                    if kind == RELKIND_TABLE =>
+                {
+                    Some(*oid)
+                }
+                _ => None,
+            })
+            .collect();
+        Ok(class_rows.into_iter().any(|(_, values)| {
+            let (Some(Some(Datum::Text(existing))), Some(Some(Datum::Text(kind)))) =
+                (values.get(1), values.get(2))
+            else {
+                return false;
+            };
+            if existing != name {
+                return false;
+            }
+            if kind == RELKIND_TABLE {
+                return true;
+            }
+            if kind != RELKIND_INDEX {
+                return false;
+            }
+            // An index relation is live only while its parent table is live.
+            // DROP TABLE deliberately leaves index catalog pages/rows behind,
+            // but those orphans must not block a name's reuse.
+            let Some(Some(Datum::Int8(index_oid))) = values.first() else {
+                return false;
+            };
+            index_parents
+                .get(index_oid)
+                .is_some_and(|parent_oid| live_tables.contains(parent_oid))
+        }))
+    }
+
+    /// Write the four catalog rows of a table-linked HNSW index inside the
+    /// caller's auto-commit. Their shape is shared with the build-time room
+    /// precheck by [`Self::hnsw_index_catalog_rows`].
     #[allow(clippy::too_many_arguments)]
     fn create_hnsw_index_catalog_rows(
         &self,
         snap: &Snapshot,
         entry: &TableEntry,
         column: &str,
+        index_name: &str,
         index_oid: Oid,
         meta_page: PageId,
         map_page: PageId,
         dim: u16,
     ) -> Result<()> {
-        let class_row = vec![
-            Some(Datum::Int8(index_oid.0 as i64)),
-            Some(Datum::Text(format!("{}_{column}_hnsw_idx", entry.oid.0))),
-            Some(Datum::Text(RELKIND_INDEX.to_string())),
-            Some(Datum::Int4(1)),
-            Some(Datum::Int8(0)),
-            Some(Datum::Int8(pg_catalog::system_tables::HNSW_AM_OID.0 as i64)),
-        ];
-        self.insert_catalog_row(snap, &PG_CLASS, &class_row)?;
-
-        let attr_row = vec![
-            Some(Datum::Int8(index_oid.0 as i64)),
-            Some(Datum::Text(column.to_string())),
-            Some(Datum::Int8(VECTOR_OID.raw().0 as i64)),
-            Some(Datum::Int4(dim as i32 * 4)),
-            Some(Datum::Int4(1)),
-            Some(Datum::Int4(0)),
-            Some(Datum::Int4(1)),
-        ];
-        self.insert_catalog_row(snap, &PG_ATTRIBUTE, &attr_row)?;
-
-        let index_row = vec![
-            Some(Datum::Int8(index_oid.0 as i64)),
-            Some(Datum::Int8(entry.oid.0 as i64)),
-            Some(Datum::Int4(1)),
-            Some(Datum::Int4(0)),
-            Some(Datum::Int4(0)),
-        ];
-        self.insert_catalog_row(snap, &PG_INDEX, &index_row)?;
-
-        let relpages_row = vec![
-            Some(Datum::Int8(index_oid.0 as i64)),
-            Some(Datum::Int8(meta_page.0 as i64)),
-            Some(Datum::Int8(map_page.0 as i64)),
-            Some(Datum::Int8(1)),
-        ];
-        self.insert_catalog_row(snap, &PG_RELPAGES, &relpages_row)?;
+        for (def, row) in Self::hnsw_index_catalog_rows(
+            entry, column, index_name, index_oid, meta_page, map_page, dim,
+        ) {
+            self.insert_catalog_row(snap, def, &row)?;
+        }
         Ok(())
+    }
+
+    /// Fail before allocating any graph/map pages when the catalog rows
+    /// cannot fit. Page ids are zero placeholders: they have the same
+    /// fixed-width encoding as the real meta/map pages.
+    fn ensure_hnsw_index_catalog_room(
+        &self,
+        entry: &TableEntry,
+        column: &str,
+        index_name: &str,
+        index_oid: Oid,
+        dim: u16,
+    ) -> Result<()> {
+        let rows = Self::hnsw_index_catalog_rows(
+            entry,
+            column,
+            index_name,
+            index_oid,
+            PageId(0),
+            PageId(0),
+            dim,
+        );
+        for (def, row) in &rows {
+            let columns = def.column_types();
+            let tuple = encode_tuple(tuple_header(0), &columns, row)?;
+            self.ensure_catalog_room(def, tuple.len())?;
+        }
+        Ok(())
+    }
+
+    /// The single source of HNSW catalog-row shape for writes and prechecks.
+    fn hnsw_index_catalog_rows(
+        entry: &TableEntry,
+        column: &str,
+        index_name: &str,
+        index_oid: Oid,
+        meta_page: PageId,
+        map_page: PageId,
+        dim: u16,
+    ) -> [(&'static SystemTableDef, Vec<Value>); 4] {
+        [
+            (
+                &PG_CLASS,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Text(index_name.to_string())),
+                    Some(Datum::Text(RELKIND_INDEX.to_string())),
+                    Some(Datum::Int4(1)),
+                    Some(Datum::Int8(0)),
+                    Some(Datum::Int8(pg_catalog::system_tables::HNSW_AM_OID.0 as i64)),
+                ],
+            ),
+            (
+                &PG_ATTRIBUTE,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Text(column.to_string())),
+                    Some(Datum::Int8(VECTOR_OID.raw().0 as i64)),
+                    Some(Datum::Int4(dim as i32 * 4)),
+                    Some(Datum::Int4(1)),
+                    Some(Datum::Int4(0)),
+                    Some(Datum::Int4(1)),
+                ],
+            ),
+            (
+                &PG_INDEX,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Int8(entry.oid.0 as i64)),
+                    Some(Datum::Int4(1)),
+                    Some(Datum::Int4(0)),
+                    Some(Datum::Int4(0)),
+                ],
+            ),
+            (
+                &PG_RELPAGES,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Int8(meta_page.0 as i64)),
+                    Some(Datum::Int8(map_page.0 as i64)),
+                    Some(Datum::Int8(1)),
+                ],
+            ),
+        ]
     }
 
     /// Create an HNSW vector index and register its meta page in
@@ -1999,8 +2246,41 @@ impl Engine {
     /// The shared HNSW handle for an index OID (M6 Stage C): cache-hit
     /// returns it; a miss opens the index from its meta page with
     /// self-evidencing parameters ([`pg_am_hnsw::index::expected_params_of`])
-    /// and caches the handle.
-    fn hnsw_handle(&self, idx: &IndexEntry) -> Result<Arc<pg_am_hnsw::HnswIndex>> {
+    /// and caches the handle. Registry read locks cover open + publish, so a
+    /// concurrent DROP cannot clear the registry and then see a stale insert.
+    #[cfg(test)]
+    fn run_before_hnsw_publish_hook() {
+        BEFORE_HNSW_PUBLISH_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook();
+            }
+        });
+    }
+
+    #[cfg(test)]
+    fn run_before_drop_cleanup_hook() {
+        BEFORE_DROP_CLEANUP_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook();
+            }
+        });
+    }
+
+    pub(crate) fn hnsw_handle(&self, idx: &IndexEntry) -> Result<Arc<pg_am_hnsw::HnswIndex>> {
+        let table_registry = self.registry.read();
+        let indexes = self.indexes.read();
+        let live = || {
+            table_registry
+                .values()
+                .any(|entry| entry.oid == idx.table_oid)
+                && indexes.iter().any(|entry| entry.index_oid == idx.index_oid)
+        };
+        if !live() {
+            return Err(EngineError::IndexNotFound(format!(
+                "index {} is no longer live",
+                idx.index_oid.0
+            )));
+        }
         if let Some(h) = self.hnsw_handles.lock().get(&idx.index_oid) {
             return Ok(Arc::clone(h));
         }
@@ -2012,6 +2292,14 @@ impl Engine {
             idx.meta_page,
             &expected,
         )?;
+        #[cfg(test)]
+        Self::run_before_hnsw_publish_hook();
+        if !live() {
+            return Err(EngineError::IndexNotFound(format!(
+                "index {} is no longer live",
+                idx.index_oid.0
+            )));
+        }
         let handle = Arc::new(outcome.index);
         self.hnsw_handles
             .lock()
@@ -2108,12 +2396,15 @@ impl Engine {
     ///
     /// `snap` is the caller's transaction snapshot (visibility is judged
     /// against it). Returns `(tid, distance)` of visible rows, ascending.
-    pub fn hnsw_search_visible(
+    #[allow(clippy::too_many_arguments)] // public M6 parameters + ScanSpec's two policy knobs
+    pub(crate) fn hnsw_search_visible_with_policy(
         &self,
         table: &str,
         query: &[f32],
         k: usize,
         ef: Option<usize>,
+        candidates: usize,
+        max_retry_rounds: u8,
         snap: &Snapshot,
     ) -> Result<Vec<(Tid, f64)>> {
         let entry = self.table_entry(table)?;
@@ -2136,18 +2427,29 @@ impl Engine {
         if k == 0 {
             return Ok(Vec::new());
         }
+        if max_retry_rounds == 0 {
+            return Err(EngineError::InvalidArgument(
+                "HNSW search requires at least one candidate round".to_string(),
+            ));
+        }
+        let hwm = handle.hwm();
+        if hwm == 0 {
+            return Ok(Vec::new());
+        }
+        let hwm = usize::try_from(hwm).unwrap_or(usize::MAX);
+        let result_capacity = k.min(hwm);
         let ef_base = ef.unwrap_or(handle.params().ef_search_default as usize);
-        for round in 0..3u32 {
-            // Round 0: 2k candidates (§7 initial 2x); each retry WIDENS
-            // the candidate pool (round-3 review nano: saturating shift —
-            // a pathological k must clamp, never wrap). The ef passed is
-            // max(ef_base, want): when ef_base already exceeds the want the
-            // beam stays put while the pool still doubles.
-            let want = k.saturating_mul(2usize.saturating_pow(round + 1));
+        for round in 0..u32::from(max_retry_rounds) {
+            // Candidate counts are capped by the graph's actual node count,
+            // so a user-controlled huge k cannot force a capacity overflow
+            // or an oversized allocation. `ef` still satisfies ef >= want.
+            let want = candidates
+                .saturating_mul(2usize.saturating_pow(round))
+                .min(hwm);
             let ef_round = ef_base.max(want);
             let candidates =
                 handle.search(self.storage.buffer_pool(), query, want, Some(ef_round))?;
-            let mut results: Vec<(Tid, f64)> = Vec::with_capacity(k);
+            let mut results: Vec<(Tid, f64)> = Vec::with_capacity(result_capacity);
             for (node_id, dist) in candidates {
                 // 2. Map forward lookup — a miss IS the tombstone path.
                 //    lookup_ALL (round-7 P1): a non-HOT non-vector update
@@ -2183,11 +2485,25 @@ impl Engine {
                     break;
                 }
             }
-            if results.len() == k || round == 2 {
+            if results.len() == k || round + 1 == u32::from(max_retry_rounds) {
                 return Ok(results);
             }
         }
         unreachable!("the loop returns on the last round")
+    }
+
+    /// Visibility-filtered ANN search with the M6 default policy (2k initial
+    /// candidates and at most three rounds). This is the public compatibility
+    /// wrapper; Phase 4a's ScanSpec supplies the same values explicitly.
+    pub fn hnsw_search_visible(
+        &self,
+        table: &str,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+        snap: &Snapshot,
+    ) -> Result<Vec<(Tid, f64)>> {
+        self.hnsw_search_visible_with_policy(table, query, k, ef, k.saturating_mul(2), 3, snap)
     }
 
     /// The leak ledger for the table's HNSW index (M6 Stage E,
@@ -3705,10 +4021,49 @@ impl Engine {
                 opclass,
             } => {
                 if method == Some(sql::IndexMethod::Hnsw) {
-                    return Err(EngineError::InvalidArgument(
-                        "HNSW index DDL is not yet supported in this execution path (Stage B)"
-                            .to_string(),
-                    ));
+                    let opclass = opclass.ok_or_else(|| {
+                        EngineError::InvalidArgument(
+                            "USING hnsw requires an explicit vector opclass".to_string(),
+                        )
+                    })?;
+                    let metric = match opclass {
+                        sql::VectorOpclass::VectorL2Ops => pg_am_hnsw::Metric::L2,
+                        sql::VectorOpclass::VectorCosineOps => pg_am_hnsw::Metric::Cosine,
+                        sql::VectorOpclass::VectorIpOps => pg_am_hnsw::Metric::InnerProduct,
+                    };
+                    let entry = self.table_entry(&table)?;
+                    let column_def =
+                        entry
+                            .columns
+                            .iter()
+                            .find(|c| c.name == column)
+                            .ok_or_else(|| {
+                                EngineError::InvalidArgument(format!(
+                                    "table {table:?} has no column {column:?}"
+                                ))
+                            })?;
+                    let ColumnType::Vector(dim) = column_def.col_type else {
+                        return Err(EngineError::InvalidArgument(format!(
+                            "hnsw index requires a VECTOR column; {table}({column}) is {:?}",
+                            column_def.col_type
+                        )));
+                    };
+                    let dim = u16::try_from(dim).map_err(|_| {
+                        EngineError::InvalidArgument(format!(
+                            "VECTOR dim {dim} exceeds the HNSW u16 parameter range"
+                        ))
+                    })?;
+                    self.create_hnsw_index_on_named(
+                        &table,
+                        &column,
+                        name.as_deref(),
+                        pg_am_hnsw::HnswParams::default(),
+                        dim,
+                        metric,
+                        pg_am_hnsw::NeighborSelection::Heuristic,
+                        42,
+                    )?;
+                    return Ok(QueryResult::Ok);
                 }
                 if name.is_some() {
                     return Err(EngineError::InvalidArgument(
@@ -3961,41 +4316,46 @@ impl Engine {
         }
     }
 
-    /// Validate the Stage A SELECT shape without doing heap I/O. EXPLAIN and
+    /// Validate the Stage A/B SELECT shape without doing heap I/O. EXPLAIN and
     /// normal execution share this gate so they cannot disagree on supported ANN
-    /// syntax, projection columns, or ORDER BY columns.
+    /// syntax, projection expressions, or ORDER BY columns.
     pub(crate) fn validate_select_shape(
         entry: &TableEntry,
         columns: &SelectCols,
         order_by: &Option<OrderByKind>,
     ) -> Result<()> {
-        if matches!(order_by, Some(OrderByKind::Expr(_))) {
-            return Err(EngineError::InvalidArgument(
-                "ANN order by is not yet supported in this select path (Stage B)".to_string(),
-            ));
-        }
         if let Some(OrderByKind::Column(ob)) = order_by {
-            if !entry
+            let column = entry
                 .columns
                 .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(&ob.column))
-            {
-                return Err(EngineError::InvalidPredicate(format!(
-                    "no column {:?} in table",
+                .find(|c| c.name.eq_ignore_ascii_case(&ob.column))
+                .ok_or_else(|| {
+                    EngineError::InvalidPredicate(format!("no column {:?} in table", ob.column))
+                })?;
+            if matches!(column.col_type, ColumnType::Vector(_)) {
+                return Err(EngineError::InvalidArgument(format!(
+                    "ORDER BY VECTOR column {:?} is not supported; use a distance operator instead",
                     ob.column
                 )));
             }
         }
-        if let SelectCols::Cols(cols) = columns {
-            for name in cols {
-                if !entry
-                    .columns
-                    .iter()
-                    .any(|c| c.name.eq_ignore_ascii_case(name))
-                {
-                    return Err(EngineError::InvalidPredicate(format!(
-                        "no column {name:?} in table"
-                    )));
+        if let SelectCols::Cols(items) = columns {
+            for item in items {
+                match item {
+                    SelectItem::Column(name) => {
+                        if !entry
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(name))
+                        {
+                            return Err(EngineError::InvalidPredicate(format!(
+                                "no column {name:?} in table"
+                            )));
+                        }
+                    }
+                    SelectItem::Distance(expr) => {
+                        crate::executor::prepare_distance(entry, expr)?;
+                    }
                 }
             }
         }
@@ -4033,17 +4393,10 @@ impl Engine {
         shared: bool,
         path: &mut ExecutionPath,
     ) -> Result<QueryResult> {
-        // Stage 0 execution boundary: reject ANN before table lookup, heap
-        // scanning, or row locking. Stage B will replace this guard with the
-        // real hnsw_search_visible pipeline.
-        if matches!(order_by, Some(OrderByKind::Expr(_))) {
-            return Err(EngineError::InvalidArgument(
-                "ANN order by is not yet supported in this select path (Stage B)".to_string(),
-            ));
-        }
         let entry = self.table_entry(table)?;
         Self::validate_select_shape(&entry, columns, order_by)?;
         let output = crate::executor::execute(self, snap, table, &entry, filter, order_by, limit)?;
+        let is_hnsw = matches!(&output.plan.spec, crate::planner::ScanSpec::Hnsw(_));
         let mut rows = output.rows;
         *path = match &output.plan.spec {
             crate::planner::ScanSpec::BTree(_) | crate::planner::ScanSpec::Hnsw(_) => {
@@ -4060,15 +4413,28 @@ impl Engine {
                     EngineError::InvalidPredicate(format!("no column {:?} in table", ob.column))
                 })?;
             rows.sort_by(|a, b| {
-                let av = a.1.get(idx);
-                let bv = b.1.get(idx);
-                let cmp = av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal);
+                let av = a.1.get(idx).and_then(|value| value.as_ref());
+                let bv = b.1.get(idx).and_then(|value| value.as_ref());
+                // PostgreSQL defaults: ASC NULLS LAST, DESC NULLS FIRST.
+                let cmp = match (av, bv) {
+                    (Some(a), Some(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                };
                 if ob.desc {
                     cmp.reverse()
                 } else {
                     cmp
                 }
             });
+        }
+        // hnsw_search_visible already returns the exact M6 order. Only an
+        // exact SeqScan fallback needs a SQL-distance sort here.
+        if !is_hnsw {
+            if let Some(OrderByKind::Expr(expr)) = order_by {
+                rows = crate::executor::sort_by_distance(&entry, rows, expr)?;
+            }
         }
         if let Some(n) = limit {
             rows.truncate(*n);
@@ -4089,26 +4455,53 @@ impl Engine {
                 let rows: Vec<Vec<Value>> = rows.into_iter().map(|(_, v)| v).collect();
                 (names, rows)
             }
-            SelectCols::Cols(cols) => {
-                let indices: Vec<usize> = cols
+            SelectCols::Cols(items) => {
+                enum Projection {
+                    Column(usize),
+                    Distance(crate::executor::DistanceEvaluator),
+                }
+                let names: Vec<String> = items
                     .iter()
-                    .map(|name| {
-                        entry
-                            .columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(name))
-                            .ok_or_else(|| {
-                                EngineError::InvalidPredicate(format!(
-                                    "no column {name:?} in table"
-                                ))
-                            })
+                    .map(|item| match item {
+                        SelectItem::Column(name) => name.clone(),
+                        SelectItem::Distance(_) => "?column?".to_string(),
+                    })
+                    .collect();
+                let projections = items
+                    .iter()
+                    .map(|item| match item {
+                        SelectItem::Column(name) => {
+                            let index = entry
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(name))
+                                .ok_or_else(|| {
+                                    EngineError::InvalidPredicate(format!(
+                                        "no column {name:?} in table"
+                                    ))
+                                })?;
+                            Ok(Projection::Column(index))
+                        }
+                        SelectItem::Distance(expr) => Ok(Projection::Distance(
+                            crate::executor::prepare_distance(&entry, expr)?,
+                        )),
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let rows: Vec<Vec<Value>> = rows
+                let projected = rows
                     .into_iter()
-                    .map(|(_, v)| indices.iter().map(|&i| v[i].clone()).collect())
-                    .collect();
-                (cols.clone(), rows)
+                    .map(|(_, values)| {
+                        projections
+                            .iter()
+                            .map(|projection| match projection {
+                                Projection::Column(index) => Ok(values[*index].clone()),
+                                Projection::Distance(evaluator) => evaluator
+                                    .evaluate(&values)
+                                    .map(|distance| distance.map(Datum::Float8)),
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (names, projected)
             }
         };
         Ok(QueryResult::Rows {
@@ -4135,7 +4528,27 @@ impl Engine {
     /// panic mid-transaction leaves in-memory state no one can vouch for,
     /// and the process-level failure policy (same as a WAL-fatal error)
     /// applies rather than a best-effort cleanup that might make it worse.
+    #[cfg(test)]
+    fn run_before_auto_commit_hook() {
+        BEFORE_AUTO_COMMIT_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook();
+            }
+        });
+    }
+
     fn auto_commit<T>(&self, op: impl FnOnce(&Snapshot) -> Result<T>) -> Result<T> {
+        self.auto_commit_with_hooks(op, || Ok(()), || {})
+    }
+
+    /// `on_success` runs after a durable commit but before table locks are
+    /// released; `on_error` runs before lock release on either failure path.
+    fn auto_commit_with_hooks<T>(
+        &self,
+        op: impl FnOnce(&Snapshot) -> Result<T>,
+        on_success: impl FnOnce() -> Result<()>,
+        on_error: impl FnOnce(),
+    ) -> Result<T> {
         let xid = self.txn.begin_txn();
         // The snapshot's registry entry is dropped when `op` returns — the
         // post-commit cleanup's watermark read (oldest_snapshot_xmin) must
@@ -4149,6 +4562,8 @@ impl Engine {
         };
         match op_result {
             Ok(v) => {
+                #[cfg(test)]
+                Self::run_before_auto_commit_hook();
                 let result = self.txn.commit_txn(xid);
                 if result.is_err() {
                     // Same fallback as TxnHandle::commit (F7): a failed
@@ -4169,7 +4584,7 @@ impl Engine {
                         tracing::warn!(error = %abort_err, xid = xid.0, "auto-commit commit-failure fallback abort failed");
                     }
                 }
-                if result.is_ok() {
+                let hook_result = if result.is_ok() {
                     // M6 Stage C: deferred post-commit graph actions run
                     // after the commit is durable AND before the table
                     // locks release (round-3 P3-1).
@@ -4182,10 +4597,14 @@ impl Engine {
                         self.txn.oldest_snapshot_xmin(),
                     );
                     self.index_undo.lock().remove(&xid);
+                    on_success()
                 } else {
                     self.pending_hnsw.lock().remove(&xid);
-                }
+                    on_error();
+                    Ok(())
+                };
                 self.lock_manager.release_all(xid);
+                hook_result?;
                 result?;
                 Ok(v)
             }
@@ -4200,6 +4619,10 @@ impl Engine {
                 if let Err(abort_err) = self.txn.abort_txn(xid) {
                     tracing::warn!(error = %abort_err, "auto-commit abort failed");
                 }
+                // Deferred graph actions belong to a now-aborted XID and
+                // must never accumulate across failed statements.
+                self.pending_hnsw.lock().remove(&xid);
+                on_error();
                 self.lock_manager.release_all(xid);
                 Err(e)
             }
@@ -4544,6 +4967,21 @@ fn apply_predicate(rows: &mut Vec<(Tid, Vec<Value>)>, predicate: Option<&Predica
     }
 }
 
+/// Refuse to persist a FLOAT8 attribute into a legacy catalog that cannot
+/// describe OID 701. Computed distance results do not go through this gate.
+fn ensure_float8_storage_supported(has_float8_type: bool, schema: &[ColumnDef]) -> Result<()> {
+    if !has_float8_type
+        && schema
+            .iter()
+            .any(|column| column.col_type == ColumnType::Float8)
+    {
+        return Err(EngineError::Unsupported(
+            "legacy catalog has no FLOAT8 pg_type row; FLOAT8 column storage requires a catalog migration (distance results remain supported)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Map a codec column type to its built-in `pg_type` OID and `attlen`
 /// (§5.1; the built-in set has exactly one type per codec type).
 fn type_oid_of(col_type: ColumnType) -> Result<(TypeOid, i32)> {
@@ -4711,4 +5149,554 @@ fn apply_sets(
         new_values[idx] = literal_to_value(lit, entry.columns[idx].col_type)?;
     }
     Ok(new_values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_catalog_rejects_only_float8_column_storage() {
+        let float8 = [ColumnDef {
+            name: "distance".to_string(),
+            col_type: ColumnType::Float8,
+        }];
+        let err = ensure_float8_storage_supported(false, &float8).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)));
+        ensure_float8_storage_supported(true, &float8).unwrap();
+
+        let ordinary = [ColumnDef {
+            name: "id".to_string(),
+            col_type: ColumnType::Int4,
+        }];
+        ensure_float8_storage_supported(false, &ordinary).unwrap();
+    }
+
+    use tempfile::TempDir;
+
+    fn open(dir: &std::path::Path) -> Engine {
+        Engine::open(dir, EngineConfig::new(dir)).unwrap()
+    }
+
+    fn create_l2_table(engine: &Engine) {
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, v VECTOR(2))")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX ann_idx ON t USING hnsw (v vector_l2_ops)",
+            )
+            .unwrap();
+    }
+
+    fn raw_hnsw_map_page(engine: &Engine, index_oid: Oid) -> PageId {
+        let def = &PG_RELPAGES;
+        let columns = def.column_types();
+        let guard = engine.storage.buffer_pool().pin(def.first_page).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        for slot in 0..SlottedPage::slot_count(page) as u16 {
+            let Some(bytes) = SlottedPage::tuple(page, slot).unwrap() else {
+                continue;
+            };
+            let (_, values) = decode_tuple(bytes, &columns).unwrap();
+            if !matches!(values.first(), Some(Some(Datum::Int8(oid))) if *oid == index_oid.0 as i64)
+            {
+                continue;
+            }
+            return match values.get(2) {
+                Some(Some(Datum::Int8(page))) => PageId(*page as u64),
+                other => panic!("invalid relpages map page: {other:?}"),
+            };
+        }
+        panic!("no physical relpages row for failed index {index_oid:?}")
+    }
+
+    static COMMIT_FAIL_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static WRITER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static CREATE_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static ANN_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static ANN_RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static DROP_CLEANUP_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn wait_for_drop() {
+        ANN_STARTED.store(true, Ordering::SeqCst);
+        while !ANN_RELEASE.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    fn signal_drop_cleanup() {
+        DROP_CLEANUP_STARTED.store(true, Ordering::SeqCst);
+    }
+
+    fn wait_for_writer_ready() {
+        CREATE_LOCKED.store(true, Ordering::SeqCst);
+        while !WRITER_READY.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    #[expect(dead_code, reason = "the guard is held only for its Drop")]
+    struct CommitFailGuard(std::sync::MutexGuard<'static, ()>);
+
+    impl CommitFailGuard {
+        fn arm() -> Self {
+            let guard = COMMIT_FAIL_HOOK_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pg_txn::manager::test_hooks::set_commit_txn_force_fail(true);
+            Self(guard)
+        }
+    }
+
+    impl Drop for CommitFailGuard {
+        fn drop(&mut self) {
+            pg_txn::manager::test_hooks::set_commit_txn_force_fail(false);
+        }
+    }
+
+    #[test]
+    fn auto_commit_discards_pending_hnsw_after_a_later_error() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        create_l2_table(&engine);
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, [1,0])")
+            .unwrap();
+        let tid = engine.scan("t", None).unwrap()[0].0;
+
+        let result = engine.auto_commit(|snap| {
+            let _entry =
+                engine.lock_table_entry(snap.current_xid(), "t", LockMode::RowExclusive)?;
+            engine.delete_inner(snap, "t", tid)?;
+            Err::<(), _>(EngineError::InvalidArgument(
+                "injected failure after the first deferred HNSW action".to_string(),
+            ))
+        });
+        assert!(result.is_err());
+        assert!(
+            engine.pending_hnsw.lock().is_empty(),
+            "aborted XID left deferred HNSW actions behind"
+        );
+        assert_eq!(engine.scan("t", None).unwrap().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn hnsw_create_commit_failure_rolls_back_registry_and_handle() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, v VECTOR(2))")
+            .unwrap();
+        let hook = CommitFailGuard::arm();
+        let result = engine.create_hnsw_index_on(
+            "t",
+            "v",
+            pg_am_hnsw::HnswParams::default(),
+            2,
+            pg_am_hnsw::Metric::L2,
+            pg_am_hnsw::NeighborSelection::Heuristic,
+            42,
+        );
+        drop(hook);
+        assert!(result.is_err());
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+
+        engine
+            .create_hnsw_index_on(
+                "t",
+                "v",
+                pg_am_hnsw::HnswParams::default(),
+                2,
+                pg_am_hnsw::Metric::L2,
+                pg_am_hnsw::NeighborSelection::Heuristic,
+                42,
+            )
+            .unwrap();
+        assert_eq!(engine.indexes().len(), 1);
+        assert_eq!(engine.hnsw_handles.lock().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn btree_create_commit_failure_rolls_back_registry() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (id INT4)").unwrap();
+        let hook = CommitFailGuard::arm();
+        let result = engine.create_index("t", "id");
+        drop(hook);
+        assert!(result.is_err());
+        assert!(engine.indexes().is_empty());
+
+        engine.create_index("t", "id").unwrap();
+        assert_eq!(engine.indexes().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn seqscan_fallbacks_do_not_open_hnsw_handles() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(
+                None,
+                "CREATE TABLE t (id INT4, v VECTOR(2), other VECTOR(2))",
+            )
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX ann_idx ON t USING hnsw (v vector_l2_ops)",
+            )
+            .unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, [1,0], [0,1])")
+            .unwrap();
+
+        for query in [
+            "SELECT * FROM t ORDER BY v <-> '[1,0]' DESC LIMIT 1",
+            "SELECT * FROM t ORDER BY v <-> '[1,0]' ASC",
+            "SELECT * FROM t WHERE id > 0 ORDER BY v <-> '[1,0]' ASC LIMIT 1",
+            "SELECT * FROM t ORDER BY other <-> '[1,0]' ASC LIMIT 1",
+        ] {
+            engine.hnsw_handles.lock().clear();
+            engine.exec(None, query).unwrap();
+            assert!(
+                engine.hnsw_handles.lock().is_empty(),
+                "fallback opened an HNSW handle: {query}"
+            );
+        }
+
+        engine.hnsw_handles.lock().clear();
+        engine
+            .exec(None, "SELECT * FROM t ORDER BY v <-> '[1,0]' ASC LIMIT 1")
+            .unwrap();
+        assert_eq!(engine.hnsw_handles.lock().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn real_legacy_directory_rejects_float8_storage_before_heap_creation() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        let def = &pg_catalog::system_tables::PG_TYPE;
+        let columns = def.column_types();
+        let guard = engine.storage.buffer_pool().pin(def.first_page).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        let mut tid = None;
+        for slot in 0..SlottedPage::slot_count(page) as u16 {
+            let Some(bytes) = SlottedPage::tuple(page, slot).unwrap() else {
+                continue;
+            };
+            let (_, values) = decode_tuple(bytes, &columns).unwrap();
+            if matches!(values.first(), Some(Some(Datum::Int8(701)))) {
+                tid = Some(Tid {
+                    page_id: def.first_page,
+                    slot_id: slot,
+                });
+                break;
+            }
+        }
+        drop(guard);
+        let tid = tid.expect("fresh catalog contains FLOAT8");
+        let mut guard = engine.storage.buffer_pool().pin_mut(tid.page_id).unwrap();
+        let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+        SlottedPage::delete_tuple(page, tid.slot_id).unwrap();
+        drop(guard);
+        engine.checkpoint().unwrap();
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert!(
+            engine.catalog.type_by_oid(FLOAT8_OID).is_none(),
+            "legacy fixture still contains FLOAT8"
+        );
+        let before = engine.storage().page_allocator().lock().next_page_id();
+        let err = engine
+            .create_table(
+                "legacy_float8",
+                &[ColumnDef {
+                    name: "distance".to_string(),
+                    col_type: ColumnType::Float8,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
+        let after = engine.storage().page_allocator().lock().next_page_id();
+        assert_eq!(before, after);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn drop_cleanup_error_never_resurrects_a_live_table() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        create_l2_table(&engine);
+        let entry = engine.describe_table("t").unwrap();
+        // Force the post-commit page-free path to fail after the committed
+        // marker. In-memory cleanup must already have removed every entry.
+        engine
+            .storage
+            .page_allocator()
+            .lock()
+            .free_page(entry.first_page)
+            .unwrap();
+        let result = engine.drop_table("t");
+        assert!(result.is_ok(), "post-commit cleanup is only a warning");
+        assert!(matches!(
+            engine.scan("t", None),
+            Err(EngineError::TableNotFound(_))
+        ));
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert!(matches!(
+            engine.scan("t", None),
+            Err(EngineError::TableNotFound(_))
+        ));
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn drop_page_walk_error_after_commit_is_only_a_warning() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        create_l2_table(&engine);
+        let entry = engine.describe_table("t").unwrap();
+        // A self-link makes the post-commit chain walk fail before any page
+        // can be freed. The durable marker and in-memory cleanup still win.
+        let mut guard = engine
+            .storage
+            .buffer_pool()
+            .pin_mut(entry.first_page)
+            .unwrap();
+        let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+        SlottedPage::set_next_page(page, Some(entry.first_page)).unwrap();
+        drop(guard);
+
+        let result = engine.drop_table("t");
+        assert!(result.is_ok(), "post-commit page walk is only a warning");
+        assert!(matches!(
+            engine.scan("t", None),
+            Err(EngineError::TableNotFound(_))
+        ));
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert!(matches!(
+            engine.scan("t", None),
+            Err(EngineError::TableNotFound(_))
+        ));
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn drop_commit_failure_preserves_table_and_allows_retry() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        create_l2_table(&engine);
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, [1,0])")
+            .unwrap();
+        let hook = CommitFailGuard::arm();
+        let result = engine.drop_table("t");
+        drop(hook);
+        assert!(result.is_err());
+        assert_eq!(engine.scan("t", None).unwrap().len(), 1);
+        assert!(matches!(
+            engine.exec(None, "CREATE TABLE t (id INT4)"),
+            Err(EngineError::TableExists(_))
+        ));
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert_eq!(engine.scan("t", None).unwrap().len(), 1);
+        assert!(matches!(
+            engine.exec(None, "CREATE TABLE t (id INT4)"),
+            Err(EngineError::TableExists(_))
+        ));
+
+        engine.drop_table("t").unwrap();
+        assert!(matches!(
+            engine.scan("t", None),
+            Err(EngineError::TableNotFound(_))
+        ));
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        create_l2_table(&engine);
+        assert_eq!(engine.indexes().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn create_index_commit_failure_rolls_back_before_waiters_run() {
+        let tmp = TempDir::new().unwrap();
+        let engine = Arc::new(open(tmp.path()));
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, v VECTOR(2))")
+            .unwrap();
+        let table_oid = engine.describe_table("t").unwrap().oid;
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                BEFORE_AUTO_COMMIT_HOOK.with(|hook| hook.set(None));
+                WRITER_READY.store(false, Ordering::SeqCst);
+                CREATE_LOCKED.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetHook;
+
+        let creator_engine = Arc::clone(&engine);
+        let creator = std::thread::spawn(move || {
+            let _hook = CommitFailGuard::arm();
+            BEFORE_AUTO_COMMIT_HOOK.with(|hook| hook.set(Some(wait_for_writer_ready)));
+            creator_engine.create_hnsw_index_on(
+                "t",
+                "v",
+                pg_am_hnsw::HnswParams::default(),
+                2,
+                pg_am_hnsw::Metric::L2,
+                pg_am_hnsw::NeighborSelection::Heuristic,
+                42,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !CREATE_LOCKED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "CREATE INDEX never reached its pre-commit hook"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let writer_engine = Arc::clone(&engine);
+        let writer =
+            std::thread::spawn(move || writer_engine.exec(None, "INSERT INTO t VALUES (1, [1,0])"));
+        let mut waiter_queued = false;
+        for _ in 0..10_000 {
+            if engine.table_lock_state(table_oid).is_some_and(|state| {
+                state
+                    .waiters
+                    .iter()
+                    .any(|(_, mode)| *mode == LockMode::RowExclusive)
+            }) {
+                waiter_queued = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(waiter_queued, "writer never queued behind Exclusive");
+        WRITER_READY.store(true, Ordering::SeqCst);
+        let create_result = creator.join().unwrap();
+        let write_result = writer.join().unwrap();
+
+        assert!(create_result.is_err());
+        assert!(write_result.is_ok(), "{write_result:?}");
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        // The failed index OID is allocated immediately after the table OID.
+        // Read the physical sidecar directly: MVCC would hide the aborted
+        // relpages row and produce a vacuous `hnsw_map_get == None` result.
+        let map_page = raw_hnsw_map_page(&engine, Oid(table_oid.0 + 1));
+        let map = pg_am_btree::BTreeIndex::open(
+            Arc::clone(engine.storage.buffer_pool()),
+            Arc::clone(engine.storage.wal_writer()),
+            Oid(table_oid.0 + 1),
+            map_page,
+            ColumnType::Int8,
+        )
+        .unwrap();
+        let key = encode_key(&Datum::Int8(0)).unwrap();
+        assert!(map.lookup(&key).unwrap().is_none());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn lazy_open_cannot_reinsert_a_handle_after_drop() {
+        let tmp = TempDir::new().unwrap();
+        let engine = Arc::new(open(tmp.path()));
+        create_l2_table(&engine);
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, [1,0])")
+            .unwrap();
+        engine.hnsw_handles.lock().clear();
+
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                BEFORE_HNSW_PUBLISH_HOOK.with(|hook| hook.set(None));
+                BEFORE_DROP_CLEANUP_HOOK.with(|hook| hook.set(None));
+                ANN_RELEASE.store(true, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetHook;
+        ANN_STARTED.store(false, Ordering::SeqCst);
+        ANN_RELEASE.store(false, Ordering::SeqCst);
+        DROP_CLEANUP_STARTED.store(false, Ordering::SeqCst);
+
+        let ann_engine = Arc::clone(&engine);
+        let ann = std::thread::spawn(move || {
+            BEFORE_HNSW_PUBLISH_HOOK.with(|hook| hook.set(Some(wait_for_drop)));
+            ann_engine.hnsw_search_visible("t", &[1.0, 0.0], 1, Some(64), &Snapshot::everything())
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ANN_STARTED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "ANN never reached its publish hook"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let drop_engine = Arc::clone(&engine);
+        let drop_thread = std::thread::spawn(move || {
+            BEFORE_DROP_CLEANUP_HOOK.with(|hook| hook.set(Some(signal_drop_cleanup)));
+            drop_engine.drop_table("t")
+        });
+        while !DROP_CLEANUP_STARTED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "DROP never reached post-commit cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // DROP is committed and inside cleanup while ANN is paused at publish.
+        // Prove the guards directly: an unsynchronized open/publish would let
+        // either try_write succeed here, regardless of thread scheduling.
+        assert!(
+            engine.registry.try_write().is_none(),
+            "table registry is not read-locked across HNSW publish"
+        );
+        assert!(
+            engine.indexes.try_write().is_none(),
+            "index registry is not read-locked across HNSW publish"
+        );
+        ANN_RELEASE.store(true, Ordering::SeqCst);
+        let ann_result = ann.join().unwrap();
+        let drop_result = drop_thread.join().unwrap();
+
+        assert!(ann_result.is_ok(), "{ann_result:?}");
+        assert!(drop_result.is_ok(), "{drop_result:?}");
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+    }
 }

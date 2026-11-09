@@ -340,9 +340,19 @@ fn validate_content(
         }
     }
     for ty in crate::builtin_types::BUILTIN_TYPES {
-        let row = types.iter().find(|t| t.oid == ty.oid).ok_or_else(|| {
-            CatalogError::Corrupted(format!("catalog is missing builtin type {}", ty.name))
-        })?;
+        let Some(row) = types.iter().find(|t| t.oid == ty.oid) else {
+            // Phase 4a Stage B added FLOAT8 after M6 directories were already
+            // deployed. It is a computed-result type, so an older catalog can
+            // safely serve SQL distances without a pg_type rewrite; fresh
+            // bootstraps still register the row.
+            if ty.oid == crate::builtin_types::FLOAT8_OID {
+                continue;
+            }
+            return Err(CatalogError::Corrupted(format!(
+                "catalog is missing builtin type {}",
+                ty.name
+            )));
+        };
         if row.name != ty.name || row.len != ty.len {
             return Err(CatalogError::Corrupted(format!(
                 "pg_type row for {} does not match builtin definition",
@@ -668,5 +678,81 @@ mod tests {
         assert!(err.to_string().contains("sane OID ceiling"), "{err}");
         // A garbage row must not hide behind a legal predecessor.
         assert!(check_relpages_oid_bounds(&[row(16_384), row(u64::MAX)]).is_err());
+    }
+
+    #[test]
+    fn legacy_catalog_without_float8_is_accepted() {
+        let relations: Vec<RelationRow> = crate::system_tables::SYSTEM_TABLES
+            .iter()
+            .map(|def| RelationRow {
+                oid: def.oid,
+                name: def.name.to_string(),
+                kind: "r".to_string(),
+                natts: def.columns.len() as i32,
+                toastrelid: Oid::INVALID,
+                am: crate::system_tables::HEAP_AM_OID,
+            })
+            .collect();
+        let attributes: BTreeMap<TableOid, Vec<AttributeRow>> = crate::system_tables::SYSTEM_TABLES
+            .iter()
+            .map(|def| {
+                let rows = def
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| AttributeRow {
+                        rel: def.oid,
+                        name: column.name.to_string(),
+                        type_oid: column.type_oid,
+                        len: column.len,
+                        num: index as i32 + 1,
+                        not_null: column.not_null,
+                        nullable: !column.not_null,
+                    })
+                    .collect();
+                (def.oid, rows)
+            })
+            .collect();
+        let types: Vec<TypeRow> = crate::builtin_types::BUILTIN_TYPES
+            .iter()
+            .map(|ty| TypeRow {
+                oid: ty.oid,
+                name: ty.name.to_string(),
+                len: ty.len,
+            })
+            .chain(std::iter::once(TypeRow {
+                oid: crate::builtin_types::VECTOR_OID,
+                name: "vector".to_string(),
+                len: -1,
+            }))
+            .collect();
+        let access_methods = vec![
+            AmRow {
+                oid: crate::system_tables::HEAP_AM_OID,
+                name: "heap".to_string(),
+            },
+            AmRow {
+                oid: crate::system_tables::BTREE_AM_OID,
+                name: "btree".to_string(),
+            },
+            AmRow {
+                oid: crate::system_tables::HNSW_AM_OID,
+                name: "hnsw".to_string(),
+            },
+        ];
+        let legacy: Vec<TypeRow> = types
+            .iter()
+            .filter(|ty| ty.oid != crate::builtin_types::FLOAT8_OID)
+            .cloned()
+            .collect();
+        validate_content(&relations, &attributes, &legacy, &access_methods).unwrap();
+
+        // The exemption is type-specific, not a general weakening of catalog
+        // validation: any pre-existing builtin remains mandatory.
+        let missing_int8: Vec<TypeRow> = legacy
+            .into_iter()
+            .filter(|ty| ty.oid != crate::builtin_types::INT8_OID)
+            .collect();
+        assert!(validate_content(&relations, &attributes, &missing_int8, &access_methods).is_err());
     }
 }

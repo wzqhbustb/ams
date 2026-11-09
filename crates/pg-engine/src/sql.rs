@@ -160,7 +160,16 @@ pub struct ColumnSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectCols {
     All,
-    Cols(Vec<String>),
+    Cols(Vec<SelectItem>),
+}
+
+/// One SELECT-list item: a plain column or a vector distance expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectItem {
+    Column(String),
+    /// Distance expression. `desc` is unused in a SELECT list and stays
+    /// false; ORDER BY owns the direction for its own expression.
+    Distance(OrderByExpr),
 }
 
 /// A WHERE clause filter.
@@ -859,17 +868,51 @@ impl Parser {
                 Ok(SelectCols::All)
             }
             Token::Ident(_) => {
-                let mut cols = vec![self.eat_ident()?];
+                let mut items = vec![self.parse_select_item()?];
                 while matches!(self.peek(), Token::Comma) {
                     self.bump();
-                    cols.push(self.eat_ident()?);
+                    items.push(self.parse_select_item()?);
                 }
-                Ok(SelectCols::Cols(cols))
+                Ok(SelectCols::Cols(items))
             }
             other => Err(EngineError::InvalidArgument(format!(
                 "expected column list or '*', got {other:?}"
             ))),
         }
+    }
+
+    fn parse_select_item(&mut self) -> Result<SelectItem> {
+        let column = self.eat_ident()?;
+        if matches!(
+            self.peek(),
+            Token::L2Op | Token::CosineOp | Token::InnerProductOp
+        ) {
+            let (op, right) = self.parse_distance_tail()?;
+            Ok(SelectItem::Distance(OrderByExpr {
+                op,
+                left: Expr::Column(column),
+                right: Expr::Literal(right),
+                desc: false,
+            }))
+        } else {
+            Ok(SelectItem::Column(column))
+        }
+    }
+
+    /// Parse the operator and right operand shared by SELECT-list and ORDER
+    /// BY distance expressions. Direction belongs only to ORDER BY.
+    fn parse_distance_tail(&mut self) -> Result<(DistanceOp, Literal)> {
+        let op = match self.bump() {
+            Token::L2Op => DistanceOp::L2,
+            Token::CosineOp => DistanceOp::Cosine,
+            Token::InnerProductOp => DistanceOp::InnerProduct,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "expected vector distance operator, got {other:?}"
+                )))
+            }
+        };
+        Ok((op, self.parse_literal()?))
     }
 
     fn parse_optional_filter(&mut self) -> Result<Option<Filter>> {
@@ -899,28 +942,11 @@ impl Parser {
         self.bump(); // ORDER
         self.eat(&Token::By)?;
         let column = self.eat_ident()?;
-        // A distance-operator expression (`ORDER BY <distance> ASC|DESC`)
-        // vs a plain column ORDER BY.
-        let op = match self.peek() {
-            Token::L2Op => {
-                self.bump();
-                Some(DistanceOp::L2)
-            }
-            Token::CosineOp => {
-                self.bump();
-                Some(DistanceOp::Cosine)
-            }
-            Token::InnerProductOp => {
-                self.bump();
-                Some(DistanceOp::InnerProduct)
-            }
-            _ => None,
-        };
-        // The right operand precedes ASC/DESC in a distance expression.
-        // Parse it before looking for the direction keyword; otherwise the
-        // vector literal would be mistaken for the end of the ORDER BY.
-        let right = if op.is_some() {
-            Some(self.parse_literal()?)
+        let distance = if matches!(
+            self.peek(),
+            Token::L2Op | Token::CosineOp | Token::InnerProductOp
+        ) {
+            Some(self.parse_distance_tail()?)
         } else {
             None
         };
@@ -935,11 +961,11 @@ impl Parser {
             }
             _ => false,
         };
-        if let Some(op) = op {
+        if let Some((op, right)) = distance {
             Ok(Some(OrderByKind::Expr(OrderByExpr {
                 op,
                 left: Expr::Column(column),
-                right: Expr::Literal(right.expect("distance operand parsed above")),
+                right: Expr::Literal(right),
                 desc,
             })))
         } else {
@@ -1112,7 +1138,10 @@ mod tests {
             } => {
                 assert_eq!(
                     columns,
-                    SelectCols::Cols(vec!["id".to_string(), "name".to_string()])
+                    SelectCols::Cols(vec![
+                        SelectItem::Column("id".to_string()),
+                        SelectItem::Column("name".to_string())
+                    ])
                 );
                 assert_eq!(table, "users");
                 let f = filter.unwrap();
@@ -1282,6 +1311,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_select_list_mixes_columns_and_distance_expressions() {
+        let stmt =
+            parse("SELECT id, embedding <-> '[1,2,3]', embedding <#> [4,5,6] FROM items").unwrap();
+        let Statement::Select { columns, .. } = stmt else {
+            panic!("expected SELECT")
+        };
+        let SelectCols::Cols(items) = columns else {
+            panic!("expected SELECT items")
+        };
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], SelectItem::Column("id".to_string()));
+        let SelectItem::Distance(l2) = &items[1] else {
+            panic!("expected L2 SELECT item")
+        };
+        assert_eq!(l2.op, DistanceOp::L2);
+        assert!(!l2.desc);
+        let SelectItem::Distance(ip) = &items[2] else {
+            panic!("expected inner-product SELECT item")
+        };
+        assert_eq!(ip.op, DistanceOp::InnerProduct);
+        assert_eq!(
+            ip.right,
+            Expr::Literal(Literal::Vector(vec![4.0, 5.0, 6.0]))
+        );
+    }
+
+    #[test]
     fn parse_negative_int() {
         let stmt = parse("SELECT * FROM t WHERE v < -5").unwrap();
         match stmt {
@@ -1339,7 +1395,10 @@ mod tests {
                 order_by,
                 ..
             } => {
-                assert_eq!(columns, SelectCols::Cols(vec!["id".to_string()]));
+                assert_eq!(
+                    columns,
+                    SelectCols::Cols(vec![SelectItem::Column("id".to_string())])
+                );
                 assert_eq!(table, "users");
                 assert_eq!(filter.unwrap().column, "id");
                 let OrderByKind::Column(ob) = order_by.unwrap() else {

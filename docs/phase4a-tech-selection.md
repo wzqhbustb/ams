@@ -109,7 +109,7 @@ struct AmRegistration {
 
 - 语法（唯一规范形式）:`CREATE INDEX <name> ON <table> USING hnsw ( <column> <opclass> )`，与 PostgreSQL/pgvector 的 `USING` 位置和 opclass 形态一致。不引入 `CREATE HNSW INDEX` 的第二 AST 形态（别名不支持，避免两套解析路径）。**统一 `CREATE INDEX` 文法**：`name` 与 `USING` 均可省略——缺省 `USING` 即 btree（兼容既有 `CREATE INDEX ON t (col)` 形态，PG 默认行为），`USING hnsw` 则强制显式 opclass；两者共用同一解析路径，不另起第二套语法。
 - 4a 支持且要求显式指定 opclass：`vector_l2_ops` → `Metric::L2`、`vector_cosine_ops` → `Metric::Cosine`、`vector_ip_ops` → `Metric::InnerProduct`。未知 opclass 响亮报错，禁止默认成 L2 后创建错误 metric 的图。
-- SQL/catalog 层登记 `<name>`，并将 opclass 映射为 `Metric` 后调用或适度扩展 `Engine::create_hnsw_index_on`；图构建、空表校验、每表至多一个向量索引、列类型/dim 校验继续复用现有 typed method，selection 默认 `NeighborSelection::Heuristic`，不另写第二套 AM 创建逻辑。
+- SQL/catalog 层登记 `<name>`，并将 opclass 映射为 `Metric` 后调用或适度扩展 `Engine::create_hnsw_index_on`；图构建、空表校验、每表至多一个向量索引、列类型/dim 校验继续复用现有 typed method，selection 默认 `NeighborSelection::Heuristic`，SQL 创建路径固定 seed 42 以保证可复现性，不另写第二套 AM 创建逻辑。planner 的 metric/ef 以 HNSW meta page 为权威来源，首次 ANN 规划时 lazy-open 获取，reopen 后不依赖仅内存的 opclass 副本。
 - **M6 约束如实继承**：仅空表可建、每表至多一个 HNSW 索引（行内单 NodeId 载体）、索引创建不 backfill（后续阶段再议，不归 4a)。
 
 ### 5.2 ANN 检索算子与 ORDER BY
@@ -122,7 +122,7 @@ struct AmRegistration {
 
 - **metric 匹配是 ANN 路径硬门槛**：只有查询算子与索引 opclass/metric 一致时，`ORDER BY <distance> ASC LIMIT k` 才能调用 `hnsw_search_visible(table, query, k, ef, snap)`。无索引或 metric 不匹配一律走 SeqScan + 同一 SQL 距离语义的暴力排序，禁止借 L2 图回答 Cosine/IP 查询。
 - 查询快照及其 Guard 遵守 §3.1：保留 M6 的 repeatable-read 语义，禁止退化为 `Snapshot::everything()`，Guard 存活至 ANN 回表和结果流结束。
-- 若 SQL 直接投影距离表达式，返回值必须符合上表：`hnsw_search_visible` 返回的 `f64` 是**内部 metric 距离**（L2 下即平方 L2，`Metric::L2` 为 `l2_squared`），SQL 投影时 `<=>`/`<#>` 已是目标距离无需换算、投影 `<->` 须 `sqrt` 还原欧氏距离；平方 L2 仅作为图内排序键，绝不作 SQL 返回值。ANN 与 SeqScan 仅允许召回/性能策略不同，不得产生不同的距离值定义。
+- SELECT 列表允许普通列与距离表达式混合（如 `SELECT id, embedding <-> $vec`），表达式列以 `FLOAT8`(OID 701）返回，不得以 TEXT 冒充数值。返回值必须符合上表：`hnsw_search_visible` 返回的 `f64` 是**内部 metric 距离**（L2 下即平方 L2，`Metric::L2` 为 `l2_squared`），SQL 投影时 `<=>`/`<#>` 已是目标距离无需换算、投影 `<->` 须 `sqrt` 还原欧氏距离；平方 L2 仅作为图内排序键，绝不作 SQL 返回值。ANN 与 SeqScan 仅允许召回/性能策略不同，不得产生不同的距离值定义。NULL 向量的距离投影为 NULL，排序采用 PG 默认的 ASC NULLS LAST / DESC NULLS FIRST。
 - `LIMIT k` 是 ANN 路径的必要参数：k 决定返回行数；ef 默认取索引的 `ef_search_default`，候选池按 M6 §7 的 2x 起步。**缺 LIMIT 时一律回退到 SeqScan + 暴力距离排序**；**`ORDER BY` 非 ASC（如 `DESC` 最远优先）同样回退 SeqScan**——HNSW 是最近邻索引无法服务最远优先，ANN 触发形仅限 `ASC`。
 - 4a 不为带额外普通过滤谓词的查询构造“ANN TopK 后再 post-filter”的近似计划：凡同时含额外 `WHERE`，一律 SeqScan → 普通过滤 → 距离排序 → LIMIT，避免过滤后结果不足 k 或改变 SQL 语义。多谓词与 ANN overscan/补轮归后续阶段；距离阈值过滤仍按 §1 非目标处理。
 
@@ -137,8 +137,8 @@ struct AmRegistration {
 在现有 Simple Query(session.rs 的 `'Q'` 状态机）之上补 Extended Query:
 
 - **消息族**:Parse / Bind / Describe / Execute / Sync / Flush / Close（Prepared Statement 生命周期）；错误响应沿用 `WireError::sqlstate_of` 的 SQLSTATE 映射。
-- **参数绑定**:`$1..$n`，类型映射 `Int4 / Int8 / Text / Vector(f32[])`(VECTOR 经 `[a,b,c]` 文本字面量编码为 f32 数组，与 Stage C 的 VECTOR 字面量同一解码路径）。Parse 提供参数类型 OID；**Bind 的 parameter format codes 决定参数编码**。
-- **结果格式**：文本 + 二进制，**按 Bind 的 result format codes 选择**；Describe 只返回 ParameterDescription/RowDescription 等描述信息，不决定 Execute 的结果编码。Simple Query 保持现有文本格式不变。
+- **参数绑定**:`$1..$n`，类型映射 `Int4 / Int8 / Float8 / Text / Vector(f32[])`(VECTOR 经 `[a,b,c]` 文本字面量编码为 f32 数组，与 Stage C 的 VECTOR 字面量同一解码路径）。Parse 提供参数类型 OID；**Bind 的 parameter format codes 决定参数编码**。
+- **结果格式**：文本 + 二进制，**按 Bind 的 result format codes 选择**；Stage B 距离表达式的 FLOAT8 结果同样覆盖两种格式，二进制 f64 使用 network byte order，文本格式须对齐 PostgreSQL `float8_out` 的科学计数法阈值与尾零（含 `1e30`、`1.0` golden cases），不得把 Rust `f64::to_string` 直接视为 PG 兼容完成标准。Describe 只返回 ParameterDescription/RowDescription 等描述信息，不决定 Execute 的结果编码。Simple Query 保持现有文本格式不变。
 - **statement/portal 生命周期**：新的 Parse 替换 unnamed statement，新的 Bind 替换 unnamed portal；named statement/portal 响应 Close，portal 在事务结束时清理，所有会话状态在连接结束时清理。Flush 只刷新输出，不代替 Sync。
 - **错误恢复红线**：Extended Query 任一消息失败后，在 Sync 到达前忽略后续消息（Sync 本身除外）；处理 Sync 后发送携带正确事务状态的 ReadyForQuery。不得在错误后继续 Execute 同一批消息，也不得由 Close/Flush 隐式完成 Sync 恢复。
 - **事务拦截沿用现有规则**:BEGIN/COMMIT/ROLLBACK 仍不进 `Engine::exec`（与 Simple Query 同型，见 session.rs 的事务拦截注释）。
@@ -171,7 +171,7 @@ struct AmRegistration {
 
 ## §9 验证方法论
 
-1. **驱动矩阵**:psql / psycopg2 / node-postgres / rust-postgres 的连接与 CRUD + 事务（与 M3 的极简版矩阵同型）。Extended Query 必须真实覆盖 Parse/Bind/Describe/Execute/Sync、Bind 参数与结果 format codes、named/unnamed statement/portal，以及“错误后忽略至 Sync”的恢复序列。
+1. **驱动矩阵**:psql / psycopg2 / node-postgres / rust-postgres 的连接与 CRUD + 事务（与 M3 的极简版矩阵同型）。Extended Query 必须真实覆盖 Parse/Bind/Describe/Execute/Sync、Bind 参数与结果 format codes、named/unnamed statement/portal，以及“错误后忽略至 Sync”的恢复序列。Simple Query 另需端到端覆盖距离投影的有行/空结果两种形态，核对 FLOAT8 RowDescription OID 701 和 DataRow 文本值。
 2. **DataFusion 适配实测**：点查延迟 <5ms（不达标走自研执行器并登记实测值）；B+Tree 等值/范围 filter 下推正确性。ANN 不作为 DataFusion filter 验收项。另跑“旧快照查询执行中 UPDATE/DELETE + vacuum”，证明 SnapshotGuard 存活期间旧版本不会被回收。
 3. **向量 SQL 端到端**：三种 opclass 建索引后，只有 metric 匹配的 `ORDER BY <distance> LIMIT k` 走 HNSW；ANN 返回行及顺序与 M6 API 路径**逐位一致**（同图同查询，ANN SQL 路径不得引入第二套召回逻辑），投影距离则按 §5.2 的 SQL 语义单独断言。覆盖无索引、metric 不匹配、缺 LIMIT、额外 WHERE 的 SeqScan 回退，以及 `<#>` 负内积和投影 `<->` 欧氏距离值。
 4. **TOAST 大值与 MVCC**：>8KB 文本/JSONB、多 chunk、多个 attribute 合计超页的写入-读取-更新-删除；固定断言现有 20B 指针字节布局。覆盖旧快照读取期间 UPDATE/DELETE + vacuum、abort 回收、chunk_seq 损坏检测，以及 chunk WAL 后/主行 WAL 前等崩溃 rounds。

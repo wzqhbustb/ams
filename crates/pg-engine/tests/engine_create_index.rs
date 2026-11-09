@@ -269,7 +269,7 @@ fn sql_create_index_does_not_silently_drop_name_or_opclass() {
         .exec(None, "CREATE INDEX h ON t USING hnsw (k vector_l2_ops)")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("Stage B"), "{err}");
+    assert!(err.contains("requires a VECTOR column"), "{err}");
     assert!(engine.indexes().is_empty());
 }
 
@@ -519,4 +519,25 @@ fn create_index_fails_fast_when_catalog_is_full() {
     eprintln!("catalog full surfaced in {which}");
     // The engine is still fully functional for reads.
     assert!(!engine.indexes().is_empty());
+}
+
+#[test]
+fn dropped_table_allows_btree_index_recreation_and_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine.create_table("t", &schema()).unwrap();
+    engine.create_index("t", "k").unwrap();
+    engine.drop_table("t").unwrap();
+    engine.shutdown();
+
+    let engine = open(tmp.path());
+    engine.create_table("t", &schema()).unwrap();
+    engine.create_index("t", "k").unwrap();
+    engine.drop_table("t").unwrap();
+    engine.shutdown();
+
+    let engine = open(tmp.path());
+    engine.create_table("t", &schema()).unwrap();
+    engine.create_index("t", "k").unwrap();
+    engine.shutdown();
 }

@@ -1173,7 +1173,7 @@ fn concurrent_save_same_target_with_concurrent_load() {
                         // A completed load passed CRC + the full checklist;
                         // since every writer saves the same input, it must
                         // also BE that graph.
-                        assert_identical(&g, &loaded, 64);
+                        assert_identical(g, &loaded, 64);
                         ok += 1;
                         if overlapped_now {
                             overlapped += 1;
@@ -1200,7 +1200,7 @@ fn concurrent_save_same_target_with_concurrent_load() {
             let mut saves = 0usize;
             loop {
                 saves_in_flight.fetch_add(1, Ordering::Relaxed);
-                let result = snapshot::save(&g, tmp.path());
+                let result = snapshot::save(g, tmp.path());
                 if saves == 0 {
                     // Signal only after the file exists, then hold the gauge
                     // until the reader has returned from its load.
@@ -1225,7 +1225,7 @@ fn concurrent_save_same_target_with_concurrent_load() {
                 let mut saves = 0usize;
                 loop {
                     saves_in_flight.fetch_add(1, Ordering::Relaxed);
-                    let result = snapshot::save(&g, tmp.path());
+                    let result = snapshot::save(g, tmp.path());
                     saves_in_flight.fetch_sub(1, Ordering::Relaxed);
                     result.unwrap();
                     saves += 1;

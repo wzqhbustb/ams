@@ -26,7 +26,7 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
 
-use pg_engine::sql::Statement;
+use pg_engine::sql::{SelectCols, SelectItem, Statement};
 use pg_engine::{Engine, EngineError, QueryResult, TxnHandle, Value};
 
 use crate::codec::{self, FieldDesc, FrontendMessage, StartupPacket};
@@ -324,9 +324,15 @@ impl Session {
         columns: &[String],
         rows: &[Vec<Value>],
     ) -> Vec<FieldDesc> {
-        let schema = match stmt {
-            Statement::Select { table, .. } => self.engine.describe_table(table),
-            _ => None,
+        let (schema, select_items) = match stmt {
+            Statement::Select { table, columns, .. } => (
+                self.engine.describe_table(table),
+                match columns {
+                    SelectCols::Cols(items) => Some(items),
+                    SelectCols::All => None,
+                },
+            ),
+            _ => (None, None),
         };
         columns
             .iter()
@@ -342,6 +348,15 @@ impl Session {
                 });
                 let (table_oid, attnum, ty) = match resolved {
                     Some((oid, attnum, ty)) => (oid, attnum, ty),
+                    None if matches!(
+                        select_items.and_then(|items| items.get(i)),
+                        Some(SelectItem::Distance(_))
+                    ) =>
+                    {
+                        // Computed distance columns have a static type even
+                        // when the result is empty and no datum can infer it.
+                        (0, 0, pg_engine::ColumnType::Float8)
+                    }
                     None => {
                         let inferred = rows
                             .iter()

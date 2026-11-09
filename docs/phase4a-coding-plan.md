@@ -66,6 +66,14 @@
 
 **验收**:ANN SQL 返回行及顺序与 M6 API 逐位一致，投影距离符合 SQL 语义；全部门禁绿；可见性负例与旧快照 vacuum 防护通过。
 
+**实现补充**：SQL HNSW 创建使用固定 seed 42 与默认 `HnswParams`，公共 M6 typed API 保持原签名，SQL 通过内部 named/core 路径登记自定义名称；live relation 重名检查同时覆盖 open-time catalog 与 fresh MVCC snapshot 的 `pg_class`，表、索引及系统目录共用同一命名空间。四类 HNSW catalog 行由单一构造器生成，图/map 页创建前完成空间预检。planner 仅在 ANN 规划时从 lazy/cached HNSW handle 读取 meta 中的 metric/ef，reopen 不 eager-open 图。SELECT 列表支持列与距离表达式混合投影，距离以 `FLOAT8`(OID 701）返回；NULL 距离保持 NULL，ASC NULLS LAST、DESC NULLS FIRST。ANN 保持 M6 API 行序，只有 SeqScan 回退重新做精确距离排序；当 ANN 命中不足 k 时，在同一 snapshot 下用 heap 扫描补足可见 NULL 向量行，确保 LIMIT 与 FOR UPDATE 不漏行。旧目录缺少 FLOAT8 `pg_type` 行时仍可用于距离计算，但禁止持久化 FLOAT8 列，避免写入不自描述的 `pg_attribute`。普通列 ORDER BY 同样采用 PG 默认 NULL 方向。基准登记见 `docs/phase4a-benchmarks.md`。
+
+**二轮审查补充**：`hnsw_search_visible` 的 M6 默认 wrapper 与内部 policy 共用同一管线，候选数和重试轮次由 `HnswScanSpec` 真实驱动；候选数/ef 均受图 HWM 限制，结果容量为 `min(k,hwm)`，超大 LIMIT 不再 capacity overflow。索引仅在自身和父表均 live 时占用名称，drop 后可复名；B+Tree/HNSW commit 失败会回滚内存 registry/handle，auto-commit 的 op Err 同步清理 pending。ExtraWhere、缺 LIMIT、DESC 和其他列不再 lazy-open HNSW。普通 VECTOR ORDER BY 响亮拒绝，FLOAT8 NaN 大于所有非 NaN、NaN 之间相等且 ±0 相等。siftsmall 每个查询同时断言 `ExecutionPath::IndexLookup`，防止以精确 SeqScan 冒充 ANN 验收。真实旧目录通过物理删除 OID 701 后重开构造，证明兼容打开与拒绝 FLOAT8 存储建表并存。
+
+**三轮审查补充**：`auto_commit_with_hooks` 在锁释放前执行成功/失败清理。DROP 只在事务内写 marker，commit 成功后才释放页面并清理 table/index registry 与 HNSW handle；commit 失败不释放页面，fresh MVCC 重建仍能读原表。清理先删除所有 live 入口再释放页面，free 失败也只泄漏而不复活；HNSW handle 按 `index_oid` 清除。创建索引的 registry/handle 回滚同样位于锁释放前，覆盖并发 waiter。`Datum` 手写 `PartialEq`，NaN 与 NaN 相等、±0 相等，和 `PartialOrd` 一致。
+
+**相邻边界补充**：HNSW lazy-open 全程持有 table/index registry 读锁，并在 open 前后检查父表和索引均为 live，与 DROP 的写锁清理互斥，防止旧 handle 在 DROP 后重新发布。drop marker 提交后，`walk_chain`/`free_page` 失败仅告警并保留页面泄漏，DROP 按已提交返回成功，不再向调用方混淆为可重试的 commit failure。既有无锁 reader × DROP 页面释放/复用窗口明确保留为非目标；本阶段不引入读取锁、关系 lease 或 horizon 延迟释放，也不宣称该 DDL-vs-DML 边界已闭合。
+
 ---
 
 ## Stage C：PG Wire Extended Query(2–3 天）
@@ -74,10 +82,10 @@
 |------|--------|
 | Extended Query 消息族（`crates/pg-wire/src/session.rs`、`codec.rs`) | Parse/Bind/Describe/Execute/Sync/Flush/Close 生命周期；**Bind parameter format codes 决定参数编码，Bind result format codes 决定结果编码**；Describe 只返回描述，不选择 Execute 格式 |
 | statement/portal 与错误恢复 | 新 Parse 替换 unnamed statement，新 Bind 替换 unnamed portal；named 对象响应 Close，portal 随事务结束清理，连接结束清理全部 session。Extended Query 出错后忽略至 Sync，Sync 后发送正确事务状态的 ReadyForQuery；Flush 不代替 Sync。BEGIN/COMMIT/ROLLBACK 仍不进 `Engine::exec`，SQLSTATE 沿用 `WireError::sqlstate_of` |
-| 标量类型映射（`types.rs`) | Int4/Int8/Text 的文本与二进制格式成对实现，二进制整数使用 network byte order；Bind format code 数量/值非法时响亮报错 |
+| 标量类型映射（`types.rs`) | Int4/Int8/Float8/Text 的文本与二进制格式成对实现，二进制整数与 f64 使用 network byte order；**FLOAT8 文本需对齐 PostgreSQL `float8_out` 的科学计数法阈值、尾零及 `1e30`/`1.0` 等边界，不得仅以 Rust `f64::to_string` 作为兼容完成标准**；Bind format code 数量/值非法时响亮报错 |
 | VECTOR 类型契约 | 文本保持 pgvector 形态 `[0.1,0.2,0.3]`；二进制 payload 采用 pgvector VECTOR 形态：`dim:u16 + unused:u16(0) + dim 个 f32`，整数与 f32 均按 network byte order，DataRow 外层 field length 不属于 payload。RowDescription/ParameterDescription 使用 pg_rust catalog 登记的 VECTOR OID，**不得继续上报 TEXT(25) 或冒称 FLOAT4[](1022)**；文本和二进制共用同一维度与数值解码校验 |
-| 协议测试 | 独立 golden-byte 测试覆盖 Int4/Int8/VECTOR 文本与二进制、Bind 格式协商、null/非法维度/非法 format code；覆盖 named/unnamed 生命周期及“Parse/Bind/Execute 出错 → 后续消息 → Sync → ReadyForQuery”序列，禁止只做自研 encoder/decoder 对称 round-trip |
-| 驱动矩阵测试 | psql / psycopg2 / node-postgres / rust-postgres：连接、CRUD、事务、参数绑定查询（含 ANN 路径）。VECTOR 默认走文本以保证 stock driver 可用；二进制 VECTOR 用显式字节断言/自定义 decoder 验证，不宣称 stock driver 无扩展即可自动解码自定义 OID |
+| 协议测试 | 独立 golden-byte 测试覆盖 Int4/Int8/Float8/VECTOR 文本与二进制、Bind 格式协商、null/非法维度/非法 format code；覆盖 named/unnamed 生命周期及“Parse/Bind/Execute 出错 → 后续消息 → Sync → ReadyForQuery”序列，禁止只做自研 encoder/decoder 对称 round-trip |
+| 驱动矩阵测试 | psql / psycopg2 / node-postgres / rust-postgres：连接、CRUD、事务、参数绑定查询（含 ANN 路径）。**Simple Query 全链路距离投影必须覆盖有行/空结果两种形态，核对 FLOAT8 RowDescription OID 701 与 DataRow 文本值**。VECTOR 默认走文本以保证 stock driver 可用；二进制 VECTOR 用显式字节断言/自定义 decoder 验证，不宣称 stock driver 无扩展即可自动解码自定义 OID |
 
 **验收**：psql 与三类驱动 Extended Query 全流程通过；Bind/Sync/portal 与 VECTOR golden bytes 通过；ANN 参数绑定查询正确；Simple Query 的文本 payload、消息状态机与事务行为零回归（VECTOR RowDescription 从 TEXT OID 升级为独立 VECTOR OID 是本 Stage 的显式例外）。
 

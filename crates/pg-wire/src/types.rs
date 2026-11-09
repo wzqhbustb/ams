@@ -6,6 +6,7 @@
 //! |----------------|---------------------------------|--------------|
 //! | `Int4`         | decimal                         | 23 (`int4`)  |
 //! | `Int8`         | decimal                         | 20 (`int8`)  |
+//! | `Float8`       | decimal                         | 701 (`float8`) |
 //! | `Text`         | as-is                           | 25 (`text`)  |
 //! | `Bytea`        | `\x` + lowercase hex (PG text)  | 17 (`bytea`) |
 //! | `Timestamptz`  | µs-since-epoch integer          | 20 (`int8`)  |
@@ -40,6 +41,7 @@ pub fn wire_type(ty: ColumnType) -> WireType {
     match ty {
         ColumnType::Int4 => WireType { oid: 23, len: 4 },
         ColumnType::Int8 => WireType { oid: 20, len: 8 },
+        ColumnType::Float8 => WireType { oid: 701, len: 8 },
         ColumnType::Text => WireType { oid: 25, len: -1 },
         ColumnType::Bytea => WireType { oid: 17, len: -1 },
         // Reported as INT8 / TEXT so the declared OID matches the bytes
@@ -59,6 +61,7 @@ pub fn column_type_of(d: &Datum) -> ColumnType {
     match d {
         Datum::Int4(_) => ColumnType::Int4,
         Datum::Int8(_) => ColumnType::Int8,
+        Datum::Float8(_) => ColumnType::Float8,
         Datum::Text(_) => ColumnType::Text,
         Datum::Bytea(_) => ColumnType::Bytea,
         Datum::Timestamptz(_) => ColumnType::Timestamptz,
@@ -78,6 +81,7 @@ pub fn encode_text(d: &Datum) -> Result<Vec<u8>> {
     let bytes = match d {
         Datum::Int4(v) => v.to_string().into_bytes(),
         Datum::Int8(v) => v.to_string().into_bytes(),
+        Datum::Float8(v) => v.to_string().into_bytes(),
         Datum::Timestamptz(us) => us.to_string().into_bytes(),
         Datum::Uuid(u) => u.to_string().into_bytes(),
         Datum::Text(s) => s.as_bytes().to_vec(),

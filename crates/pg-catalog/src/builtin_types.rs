@@ -1,6 +1,6 @@
 //! Built-in type definitions (tech-selection §5.2).
 //!
-//! M2 hardcodes the six built-in types here; there is no `CREATE TYPE` at
+//! M2 hardcodes the seven built-in types here; there is no `CREATE TYPE` at
 //! runtime. OIDs use the PostgreSQL conventional values so dumps and mental
 //! models transfer directly. `timestamptz` is 1184 (1114 is `timestamp`
 //! without time zone in PostgreSQL, which M2 does not have).
@@ -14,6 +14,8 @@ use crate::TypeOid;
 pub const INT4_OID: TypeOid = TypeOid(Oid(23));
 /// PostgreSQL-conventional OID of `int8`.
 pub const INT8_OID: TypeOid = TypeOid(Oid(20));
+/// PostgreSQL-conventional OID of `float8`.
+pub const FLOAT8_OID: TypeOid = TypeOid(Oid(701));
 /// PostgreSQL-conventional OID of `text`.
 pub const TEXT_OID: TypeOid = TypeOid(Oid(25));
 /// PostgreSQL-conventional OID of `bytea`.
@@ -58,7 +60,7 @@ pub struct BuiltinType {
 }
 
 /// All built-in types, in bootstrap write order.
-pub const BUILTIN_TYPES: [BuiltinType; 6] = [
+pub const BUILTIN_TYPES: [BuiltinType; 7] = [
     BuiltinType {
         oid: INT4_OID,
         name: "int4",
@@ -70,6 +72,12 @@ pub const BUILTIN_TYPES: [BuiltinType; 6] = [
         name: "int8",
         len: 8,
         column_type: ColumnType::Int8,
+    },
+    BuiltinType {
+        oid: FLOAT8_OID,
+        name: "float8",
+        len: 8,
+        column_type: ColumnType::Float8,
     },
     BuiltinType {
         oid: TEXT_OID,

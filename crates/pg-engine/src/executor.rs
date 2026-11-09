@@ -1,18 +1,20 @@
-//! Phase 4a Stage A: the self-owned transactional-processing executor.
+//! Phase 4a Stages A/B: the self-owned transactional-processing executor.
 //!
 //! The caller owns the snapshot and its SnapshotGuard. This module only
 //! chooses and executes a ScanPlan; it never creates a fresh snapshot and
 //! never commits or aborts a transaction.
 
 use pg_am_btree::encode_key;
-use pg_am_heap::tuple::ColumnType;
+use pg_am_heap::tuple::{ColumnType, Datum};
 use pg_storage::types::Tid;
 use pg_txn::Snapshot;
 
 use crate::engine::{column_types, filter_to_predicate, Engine, TableEntry, Value};
 use crate::error::{EngineError, Result};
-use crate::planner::{plan_for_predicate, AmKind, IndexMetadata, ScanPlan, ScanRequest, ScanSpec};
-use crate::sql::{CmpOp, Filter, OrderByKind};
+use crate::planner::{
+    plan_for_predicate, AmKind, HnswScanSpec, IndexMetadata, ScanPlan, ScanRequest, ScanSpec,
+};
+use crate::sql::{CmpOp, DistanceOp, Expr, Filter, Literal, OrderByExpr, OrderByKind};
 
 #[cfg(test)]
 thread_local! {
@@ -42,7 +44,12 @@ pub(crate) fn execute(
     order_by: &Option<OrderByKind>,
     limit: &Option<usize>,
 ) -> Result<ScanOutput> {
-    let request = build_request(engine, table, entry, filter, order_by, limit);
+    if let Some(OrderByKind::Expr(expr)) = order_by {
+        // Reject malformed vectors and non-VECTOR columns before any heap
+        // scan, regardless of whether the planner selects ANN or a fallback.
+        prepare_distance(entry, expr)?;
+    }
+    let request = build_request(engine, table, entry, filter, order_by, limit)?;
     let mut plan = plan_for_predicate(&request)?;
     let mut fallback_reason = None;
     let rows = match &plan.spec {
@@ -74,11 +81,7 @@ pub(crate) fn execute(
             execute_seq(engine, snap, table, entry, filter)?
         }
         ScanSpec::Seq(spec) => execute_seq(engine, snap, table, entry, &spec.predicate)?,
-        ScanSpec::Hnsw(_) => {
-            return Err(EngineError::InvalidArgument(
-                "HNSW execution is not yet supported in this select path (Stage B)".to_string(),
-            ))
-        }
+        ScanSpec::Hnsw(spec) => execute_hnsw(engine, snap, table, entry, spec)?,
     };
     if let Some(reason) = fallback_reason {
         plan.spec = ScanSpec::Seq(crate::planner::SeqScanSpec {
@@ -93,6 +96,231 @@ pub(crate) fn execute(
     Ok(ScanOutput { rows, plan })
 }
 
+fn execute_hnsw(
+    engine: &Engine,
+    snap: &Snapshot,
+    table: &str,
+    entry: &TableEntry,
+    spec: &HnswScanSpec,
+) -> Result<ScanRows> {
+    let op = match spec.opclass {
+        crate::sql::VectorOpclass::VectorL2Ops => DistanceOp::L2,
+        crate::sql::VectorOpclass::VectorCosineOps => DistanceOp::Cosine,
+        crate::sql::VectorOpclass::VectorIpOps => DistanceOp::InnerProduct,
+    };
+    let evaluator = prepare_distance_parts(entry, &spec.column, op, &spec.query)?;
+    let hits = engine.hnsw_search_visible_with_policy(
+        table,
+        &evaluator.query,
+        spec.k,
+        Some(spec.ef),
+        spec.candidates,
+        spec.max_retry_rounds,
+        snap,
+    )?;
+    let col_types = column_types(entry);
+    let mut rows = hits
+        .into_iter()
+        .map(|(tid, _)| {
+            // hnsw_search_visible already judged this exact TID against
+            // `snap`; the caller's guard keeps that version reclaim-safe.
+            let values = engine.read_row_by_tid(entry, &col_types, tid)?;
+            Ok((tid, values))
+        })
+        .collect::<Result<ScanRows>>()?;
+    if rows.len() < spec.k {
+        // NULL vectors have no graph node or sidecar entry. SQL ASC is
+        // NULLS LAST, so they belong after the ANN hits and must still fill
+        // LIMIT when fewer than k non-NULL rows are visible. This heap read
+        // uses the same snapshot/guard and cannot duplicate indexed rows.
+        let missing = spec.k - rows.len();
+        let null_rows = execute_seq(engine, snap, table, entry, &None)?
+            .into_iter()
+            .filter(|(_, values)| matches!(values.get(evaluator.column), Some(None)))
+            .take(missing)
+            .collect::<ScanRows>();
+        rows.extend(null_rows);
+    }
+    Ok(rows)
+}
+
+/// A validated vector-column/query pair plus its SQL distance operator.
+pub(crate) struct DistanceEvaluator {
+    column: usize,
+    op: DistanceOp,
+    query: Vec<f32>,
+}
+
+pub(crate) fn prepare_distance(
+    entry: &TableEntry,
+    expr: &OrderByExpr,
+) -> Result<DistanceEvaluator> {
+    let Expr::Column(column) = &expr.left else {
+        return Err(EngineError::InvalidArgument(
+            "distance left operand must be a column reference".to_string(),
+        ));
+    };
+    let Expr::Literal(literal) = &expr.right else {
+        return Err(EngineError::InvalidArgument(
+            "distance right operand must be a vector literal".to_string(),
+        ));
+    };
+    prepare_distance_parts(entry, column, expr.op, literal)
+}
+
+fn prepare_distance_parts(
+    entry: &TableEntry,
+    column: &str,
+    op: DistanceOp,
+    literal: &Literal,
+) -> Result<DistanceEvaluator> {
+    let (column, dim) = vector_column(entry, column)?;
+    let query = decode_vector_literal(literal, dim)?;
+    if op == DistanceOp::Cosine {
+        // Match the HNSW entry-point contract even for an empty-table or
+        // SeqScan query, and reject before any FOR UPDATE row locks.
+        pg_am_hnsw::distance::cosine(&query, &query)?;
+    }
+    Ok(DistanceEvaluator { column, op, query })
+}
+
+impl DistanceEvaluator {
+    /// Evaluate one row. SQL NULL distance stays NULL; ORDER BY places it
+    /// last for ASC and first for DESC, matching PostgreSQL's defaults.
+    pub(crate) fn evaluate(&self, values: &[Value]) -> Result<Option<f64>> {
+        let Some(value) = values.get(self.column) else {
+            return Err(EngineError::Corrupted(format!(
+                "distance column index {} is outside a row of width {}",
+                self.column,
+                values.len()
+            )));
+        };
+        let Some(datum) = value else {
+            return Ok(None);
+        };
+        let Datum::Vector(vector) = datum else {
+            return Err(EngineError::Corrupted(format!(
+                "VECTOR column {} decoded as {datum:?}",
+                self.column
+            )));
+        };
+        let distance = match self.op {
+            DistanceOp::L2 => pg_am_hnsw::distance::l2_squared(vector, &self.query)?.sqrt(),
+            DistanceOp::Cosine => pg_am_hnsw::distance::cosine(vector, &self.query)?,
+            DistanceOp::InnerProduct => {
+                pg_am_hnsw::distance::negative_inner_product(vector, &self.query)?
+            }
+        };
+        Ok(Some(distance))
+    }
+}
+
+fn vector_column(entry: &TableEntry, column: &str) -> Result<(usize, u32)> {
+    let index = entry
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(column))
+        .ok_or_else(|| EngineError::InvalidPredicate(format!("no column {column:?} in table")))?;
+    let ColumnType::Vector(dim) = entry.columns[index].col_type else {
+        return Err(EngineError::InvalidArgument(format!(
+            "distance left operand {column:?} is not a VECTOR column"
+        )));
+    };
+    Ok((index, dim))
+}
+
+fn decode_vector_literal(literal: &Literal, dim: u32) -> Result<Vec<f32>> {
+    let vector = match literal {
+        Literal::Vector(vector) => vector.clone(),
+        Literal::Str(text) => parse_vector_text(text)?,
+        other => {
+            return Err(EngineError::InvalidArgument(format!(
+                "distance right operand must be a vector literal, got {other:?}"
+            )))
+        }
+    };
+    if vector.len() != dim as usize {
+        return Err(EngineError::InvalidArgument(format!(
+            "query vector has {} components, column is VECTOR({dim})",
+            vector.len()
+        )));
+    }
+    if let Some((index, _)) = vector
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(EngineError::InvalidArgument(format!(
+            "query vector component {index} is not finite"
+        )));
+    }
+    Ok(vector)
+}
+
+fn parse_vector_text(text: &str) -> Result<Vec<f32>> {
+    let text = text.trim();
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|text| text.strip_suffix(']'))
+        .ok_or_else(|| {
+            EngineError::InvalidArgument(format!(
+                "query vector must use pgvector text form '[...]', got {text:?}"
+            ))
+        })?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|component| {
+            let component = component.trim();
+            if component.is_empty() {
+                return Err(EngineError::InvalidArgument(
+                    "query vector contains an empty component".to_string(),
+                ));
+            }
+            component.parse::<f32>().map_err(|_| {
+                EngineError::InvalidArgument(format!(
+                    "invalid query vector component {component:?}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Apply an exact distance ORDER BY to a sequential-scan result. Distances
+/// are evaluated once per row, both for error propagation and to avoid
+/// re-decoding the query vector inside the comparator.
+pub(crate) fn sort_by_distance(
+    entry: &TableEntry,
+    rows: ScanRows,
+    expr: &OrderByExpr,
+) -> Result<ScanRows> {
+    let evaluator = prepare_distance(entry, expr)?;
+    let mut keyed = Vec::with_capacity(rows.len());
+    for (tid, values) in rows {
+        let distance = evaluator.evaluate(&values)?;
+        keyed.push((tid, values, distance));
+    }
+    keyed.sort_by(|a, b| {
+        let cmp = match (&a.2, &b.2) {
+            (Some(a), Some(b)) => a.total_cmp(b),
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+        };
+        if expr.desc {
+            cmp.reverse()
+        } else {
+            cmp
+        }
+    });
+    Ok(keyed
+        .into_iter()
+        .map(|(tid, values, _)| (tid, values))
+        .collect())
+}
+
 fn build_request(
     engine: &Engine,
     table: &str,
@@ -100,30 +328,53 @@ fn build_request(
     filter: &Option<Filter>,
     order_by: &Option<OrderByKind>,
     limit: &Option<usize>,
-) -> ScanRequest {
+) -> Result<ScanRequest> {
+    let ann_column = match (filter, limit, order_by) {
+        (None, Some(_), Some(OrderByKind::Expr(expr))) if !expr.desc => {
+            match (&expr.left, &expr.right) {
+                (Expr::Column(column), Expr::Literal(Literal::Vector(_) | Literal::Str(_))) => {
+                    Some(column.as_str())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     let indexes = engine
         .indexes_of(entry)
         .into_iter()
-        .map(|(idx, _)| IndexMetadata {
-            kind: if matches!(idx.key_type, ColumnType::Vector(_)) {
-                AmKind::Hnsw
+        .map(|(idx, _)| {
+            let is_hnsw = matches!(idx.key_type, ColumnType::Vector(_));
+            let (opclass, ef_search_default) = if is_hnsw
+                && ann_column.is_some_and(|column| idx.column.eq_ignore_ascii_case(column))
+            {
+                // Only a usable ANN shape pays the lazy-open cost, and only
+                // for the distance column's own index.
+                let params = engine.hnsw_handle(&idx)?.params();
+                let opclass = match params.metric {
+                    pg_am_hnsw::Metric::L2 => crate::sql::VectorOpclass::VectorL2Ops,
+                    pg_am_hnsw::Metric::Cosine => crate::sql::VectorOpclass::VectorCosineOps,
+                    pg_am_hnsw::Metric::InnerProduct => crate::sql::VectorOpclass::VectorIpOps,
+                };
+                (Some(opclass), Some(params.ef_search_default as usize))
             } else {
-                AmKind::BTree
-            },
-            column: idx.column,
-            // Stage B fills the HNSW opclass and ef metadata. Ordinary
-            // B+Tree planning needs neither field.
-            opclass: None,
-            ef_search_default: None,
+                (None, None)
+            };
+            Ok(IndexMetadata {
+                kind: if is_hnsw { AmKind::Hnsw } else { AmKind::BTree },
+                column: idx.column,
+                opclass,
+                ef_search_default,
+            })
         })
-        .collect();
-    ScanRequest {
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ScanRequest {
         table: table.to_string(),
         predicate: filter.clone(),
         order_by: order_by.clone(),
         limit: *limit,
         indexes,
-    }
+    })
 }
 
 /// Whether this snapshot can use an eager-removal B+Tree as a complete
@@ -163,13 +414,17 @@ pub(crate) fn explain(
     order_by: &Option<OrderByKind>,
     limit: &Option<usize>,
 ) -> Result<crate::QueryResult> {
-    // EXPLAIN shares normal SELECT's Stage A shape gate and schema checks.
+    // EXPLAIN shares normal SELECT's shape gate and vector validation but
+    // never executes the inner B+Tree/ANN plan.
     Engine::validate_select_shape(entry, columns, order_by)?;
+    if let Some(OrderByKind::Expr(expr)) = order_by {
+        prepare_distance(entry, expr)?;
+    }
     let predicate = filter
         .as_ref()
         .map(|filter| filter_to_predicate(entry, filter))
         .transpose()?;
-    let request = build_request(engine, table, entry, filter, order_by, limit);
+    let request = build_request(engine, table, entry, filter, order_by, limit)?;
     let mut plan = plan_for_predicate(&request)?;
     let key_too_large = predicate.as_ref().is_some_and(|predicate| {
         matches!(
@@ -896,6 +1151,31 @@ mod tests {
             );
             writer.join().unwrap();
         }
+    }
+
+    #[test]
+    fn ordinary_order_by_uses_pg_null_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let engine = Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap();
+        engine.exec(None, "CREATE TABLE t (id INT4)").unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (NULL), (1)")
+            .unwrap();
+
+        for (direction, expected) in [("ASC", Some(Datum::Int4(1))), ("DESC", None)] {
+            let result = engine
+                .exec(
+                    None,
+                    &format!("SELECT * FROM t ORDER BY id {direction} LIMIT 1"),
+                )
+                .unwrap();
+            let QueryResult::Rows { rows, .. } = result else {
+                panic!("expected rows")
+            };
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], expected, "unexpected {direction} NULL order");
+        }
+        engine.shutdown();
     }
 
     #[test]
