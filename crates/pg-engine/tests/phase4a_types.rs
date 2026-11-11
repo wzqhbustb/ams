@@ -172,3 +172,27 @@ fn float8_equality_predicate_matches_nan_zero_and_infinity() {
     }
     engine.shutdown();
 }
+
+#[test]
+fn float8_sql_ddl_and_parameter_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .exec(None, "CREATE TABLE measurements (id INT4, score FLOAT8)")
+        .unwrap();
+    engine
+        .exec(None, "INSERT INTO measurements VALUES (1, -11.5)")
+        .unwrap();
+    let pg_engine::QueryResult::Rows { rows, .. } = engine
+        .exec_with_params(
+            None,
+            "SELECT score FROM measurements WHERE id = $1",
+            &[Some(Datum::Int4(1))],
+        )
+        .unwrap()
+    else {
+        panic!("expected SELECT rows")
+    };
+    assert_eq!(rows[0][0], Some(Datum::Float8(-11.5)));
+    engine.shutdown();
+}

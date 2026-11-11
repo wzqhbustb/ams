@@ -87,7 +87,9 @@
 | 协议测试 | 独立 golden-byte 测试覆盖 Int4/Int8/Float8/VECTOR 文本与二进制、Bind 格式协商、null/非法维度/非法 format code；覆盖 named/unnamed 生命周期及“Parse/Bind/Execute 出错 → 后续消息 → Sync → ReadyForQuery”序列，禁止只做自研 encoder/decoder 对称 round-trip |
 | 驱动矩阵测试 | psql / psycopg2 / node-postgres / rust-postgres：连接、CRUD、事务、参数绑定查询（含 ANN 路径）。**Simple Query 全链路距离投影必须覆盖有行/空结果两种形态，核对 FLOAT8 RowDescription OID 701 与 DataRow 文本值**。VECTOR 默认走文本以保证 stock driver 可用；二进制 VECTOR 用显式字节断言/自定义 decoder 验证，不宣称 stock driver 无扩展即可自动解码自定义 OID |
 
-**验收**：psql 与三类驱动 Extended Query 全流程通过；Bind/Sync/portal 与 VECTOR golden bytes 通过；ANN 参数绑定查询正确；Simple Query 的文本 payload、消息状态机与事务行为零回归（VECTOR RowDescription 从 TEXT OID 升级为独立 VECTOR OID 是本 Stage 的显式例外）。
+**验收**：psql、node-postgres、rust-postgres 的 Extended Query 全流程通过；psycopg2 的 CRUD、事务及 ANN 查询通过（其公开 cursor API 默认客户端插值，不谎报为服务端 Bind）。Bind/Sync/portal 与 VECTOR golden bytes 通过；ANN 参数绑定查询正确；Simple Query 的文本 payload、消息状态机与事务行为零回归（VECTOR RowDescription 从 TEXT OID 升级为独立 VECTOR OID 是本 Stage 的显式例外）。
+
+**实现补充**：engine 新增 `Literal::Param` 与 `Literal::Float`，在 AST 中完成类型化绑定，不做 SQL 文本替换；`Engine::parameter_types` 负责按 schema 推断参数类型，`Engine::exec_with_params` 复用既有执行与 query-stat 路径。wire session 持有 prepared statement/portal，覆盖 OID 校验、format code 展开、文本/二进制参数、Describe、Execute 行数截断与恢复、Close、错误后忽略至 Sync。extended 隐式事务在 Sync 按成功/失败提交或回滚；空 Parse（含分号空语句）、EXPLAIN RowDescription、unnamed 失效、幂等 Close、整页挂起、u16 计数和消息体错误恢复均有回归。extended 隐式事务中的 DDL 一律响亮拒绝；Simple Query 先完整解析整条字符串，DML 使用统一隐式事务，后续错误一并回滚。显式事务错误立即 abort 并进入 failed 状态，普通语句返回 25P02，COMMIT 按 ROLLBACK 处理；重复 BEGIN 与空闲 COMMIT/ROLLBACK 使用 WARNING 而非 failed。malformed Sync 先置 extended_error 再恢复，解码错误同步触发 failed 状态，failed 下 Parse/Bind/DDL 均拒绝。TEXT OID 到 inferred VECTOR 的输入转换同时覆盖 Binary format 的文本载荷。驱动验收发现的两个 Stage B 语法缺口已修复：`FLOAT8` 现在是合法 DDL 类型名，普通小数 literal 不再被误当作单元素 VECTOR。psycopg2 的原始向量字面量使用 `AsIs`，避免其客户端插值把 VECTOR 变成 TEXT 字符串。
 
 ---
 

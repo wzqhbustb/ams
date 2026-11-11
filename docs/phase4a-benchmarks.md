@@ -21,3 +21,16 @@ This is a focused executor sanity measurement, not a general throughput benchmar
 - Consistency: every benchmark query also asserts `ExecutionPath::IndexLookup`, so an exact SeqScan cannot satisfy the recall gate by masquerading as ANN. Separate integration tests compare SQL ANN rows and ordering with `Engine::hnsw_search_visible` on the same snapshot for all three metrics, including after reopen.
 
 The benchmark is ignored by default so CI does not pay the 10k graph-build cost; the command above is the manual acceptance gate.
+
+## Stage C: Extended Query and driver acceptance
+
+- Date: 2026-11-10 (UTC)
+- Protocol: `cargo test -p pg-wire --no-fail-fast` passed **79 tests**: 35 protocol/type tests, 23 Extended Query state/golden tests, 11 real-socket rust-postgres client tests, and 10 additional Stage C review probes. Engine parameter binding passed 10 focused tests; the pg-engine full suite also passed.
+- psql: `scripts/phase4a_stagec_psql.sh` passed with exact golden-output diff for CRUD, transactions, and parameterized ANN.
+- node-postgres: `NODE_PATH=target/tmp/stagec-node/node_modules node scripts/phase4a_stagec_node.js` — **PASS**, including server-side `$1..$n` CRUD and ANN parameters.
+- psycopg2: `target/tmp/stagec-drivers-venv/bin/python scripts/phase4a_stagec_psycopg2.py` — **PASS**. psycopg2 composes ordinary cursor parameters client-side, so this is a CRUD/transaction/ANN driver check, not a claim of server-side Bind; raw VECTOR literals use `AsIs`.
+- rust-postgres: real TCP typed CRUD, binary scalar results, NULL, EXPLAIN, error recovery, and parameterized ANN passed in `wire_clients.rs`; VECTOR binary layout and suspension/resume have exact golden coverage in `wire_extended.rs`.
+
+These are correctness/protocol acceptance results, not latency benchmarks. Third-party drivers were installed only under `target/tmp` in isolated environments.
+
+Final gates: workspace debug tests and release tests for all four changed runtime crates exited 0; all eight crate Clippy checks, rustdoc, fmt, and `git diff --check` passed. The final independent review found no remaining P1/P2/P3 issues.

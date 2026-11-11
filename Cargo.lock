@@ -805,6 +805,7 @@ dependencies = [
 name = "pg-wire"
 version = "0.1.0"
 dependencies = [
+ "pg-catalog",
  "pg-engine",
  "postgres",
  "tempfile",

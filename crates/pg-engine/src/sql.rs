@@ -199,10 +199,13 @@ pub struct OrderBy {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Int(i64),
+    Float(f64),
     Str(String),
     Null,
     /// M6 Stage C: a vector literal `[0.1, 2.5, ...]` (INSERT path).
     Vector(Vec<f32>),
+    /// A 1-based bind parameter (`$1`, `$2`, ...).
+    Param(usize),
 }
 
 // ─── Tokenizer ────────────────────────────────────────────────────────
@@ -242,6 +245,7 @@ enum Token {
     /// M6 Stage C: floating-point literal (vector elements).
     Float(f64),
     Str(String),
+    Param(usize),
     // Operators
     Eq,
     Lt,
@@ -269,6 +273,8 @@ enum Token {
     // End of input
     Eof,
 }
+
+const MAX_PARAMETER_COUNT: usize = u16::MAX as usize;
 
 struct Tokenizer<'a> {
     chars: std::str::Chars<'a>,
@@ -310,6 +316,8 @@ impl<'a> Tokenizer<'a> {
                 Some(c) => {
                     if c == '\'' {
                         tokens.push(self.string_literal()?);
+                    } else if c == '$' {
+                        tokens.push(self.parameter_placeholder()?);
                     } else if c == '-' || c.is_ascii_digit() {
                         tokens.push(self.number_literal()?);
                     } else if c == '<' {
@@ -398,6 +406,45 @@ impl<'a> Tokenizer<'a> {
         Ok(Token::Str(s))
     }
 
+    fn parameter_placeholder(&mut self) -> Result<Token> {
+        self.bump(); // $
+        let mut digits = String::new();
+        while self.peek.is_some_and(|c| c.is_ascii_digit()) {
+            digits.push(self.bump().unwrap());
+        }
+        if digits.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "malformed parameter placeholder: expected a decimal index after '$'".to_string(),
+            ));
+        }
+        let parameter_limit_error = || {
+            EngineError::InvalidArgument(format!(
+                "parameter placeholder ${digits} exceeds the PostgreSQL parameter limit of {MAX_PARAMETER_COUNT}"
+            ))
+        };
+        let index = digits
+            .parse::<usize>()
+            .map_err(|_| parameter_limit_error())?;
+        if index == 0 {
+            return Err(EngineError::InvalidArgument(
+                "parameter placeholder indices are 1-based; $0 is invalid".to_string(),
+            ));
+        }
+        if self
+            .peek
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$'))
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "malformed parameter placeholder ${digits}: non-decimal suffix {:?}",
+                self.peek.unwrap()
+            )));
+        }
+        if index > MAX_PARAMETER_COUNT {
+            return Err(parameter_limit_error());
+        }
+        Ok(Token::Param(index))
+    }
+
     fn number_literal(&mut self) -> Result<Token> {
         let mut s = String::new();
         if self.peek == Some('-') {
@@ -476,6 +523,7 @@ impl<'a> Tokenizer<'a> {
             "NULL" => Token::Null,
             "INT" | "INT4" | "INTEGER" => Token::Type(ColumnType::Int4),
             "BIGINT" | "INT8" => Token::Type(ColumnType::Int8),
+            "FLOAT8" => Token::Type(ColumnType::Float8),
             "TEXT" | "VARCHAR" => Token::Type(ColumnType::Text),
             "BYTEA" => Token::Type(ColumnType::Bytea),
             "TIMESTAMPTZ" => Token::Type(ColumnType::Timestamptz),
@@ -786,9 +834,10 @@ impl Parser {
     fn parse_literal(&mut self) -> Result<Literal> {
         match self.bump() {
             Token::Int(n) => Ok(Literal::Int(n)),
-            Token::Float(f) => Ok(Literal::Vector(vec![f as f32])),
+            Token::Float(f) => Ok(Literal::Float(f)),
             Token::Str(s) => Ok(Literal::Str(s)),
             Token::Null => Ok(Literal::Null),
+            Token::Param(index) => Ok(Literal::Param(index)),
             // M6 Stage C: `[1.0, 2.5, ...]` vector literal.
             Token::LBracket => {
                 let mut v = Vec::new();
@@ -1031,6 +1080,73 @@ pub fn parse(sql: &str) -> Result<Statement> {
     }
     let mut parser = Parser::new(tokens);
     parser.parse_statement()
+}
+
+pub(crate) fn max_parameter_index(stmt: &Statement) -> usize {
+    fn literal_max(literal: &Literal) -> usize {
+        match literal {
+            Literal::Param(index) => *index,
+            _ => 0,
+        }
+    }
+
+    fn filter_max(filter: &Option<Filter>) -> usize {
+        filter
+            .as_ref()
+            .map_or(0, |filter| literal_max(&filter.value))
+    }
+
+    fn expr_max(expr: &OrderByExpr) -> usize {
+        let left = match &expr.left {
+            Expr::Literal(literal) => literal_max(literal),
+            Expr::Column(_) => 0,
+        };
+        let right = match &expr.right {
+            Expr::Literal(literal) => literal_max(literal),
+            Expr::Column(_) => 0,
+        };
+        left.max(right)
+    }
+
+    match stmt {
+        Statement::Explain(inner) => max_parameter_index(inner),
+        Statement::Insert { rows, .. } => rows.iter().flatten().map(literal_max).max().unwrap_or(0),
+        Statement::Select {
+            columns,
+            filter,
+            order_by,
+            ..
+        } => {
+            let columns_max = match columns {
+                SelectCols::All => 0,
+                SelectCols::Cols(items) => items
+                    .iter()
+                    .map(|item| match item {
+                        SelectItem::Column(_) => 0,
+                        SelectItem::Distance(expr) => expr_max(expr),
+                    })
+                    .max()
+                    .unwrap_or(0),
+            };
+            let order_max = match order_by {
+                Some(OrderByKind::Expr(expr)) => expr_max(expr),
+                _ => 0,
+            };
+            columns_max.max(filter_max(filter)).max(order_max)
+        }
+        Statement::Update { sets, filter, .. } => sets
+            .iter()
+            .map(|(_, literal)| literal_max(literal))
+            .max()
+            .unwrap_or(0)
+            .max(filter_max(filter)),
+        Statement::Delete { filter, .. } => filter_max(filter),
+        Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. } => 0,
+    }
 }
 
 #[cfg(test)]

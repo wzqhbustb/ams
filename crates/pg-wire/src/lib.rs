@@ -1,26 +1,23 @@
-//! pg-wire — minimal PostgreSQL v3 wire protocol server (Phase 1 M3 Stage F).
+//! pg-wire — PostgreSQL v3 wire protocol server (Phase 4a Stage C).
 //!
-//! Scope (tech-selection §7.1): protocol codec + connection management +
-//! SQL passthrough ONLY — no execution logic lives here. Statements are
-//! handed to [`pg_engine::Engine::exec`]; `BEGIN`/`COMMIT`/`ROLLBACK` are intercepted
-//! at this layer and mapped to the engine's programmatic transaction API
-//! (`Engine::begin_txn` / `TxnHandle::commit` / `TxnHandle::abort`), which
-//! is the only way the engine accepts transaction control.
+//! Scope: protocol codec + connection management + SQL passthrough — no
+//! execution logic lives here. Statements use `Engine::exec` or
+//! `Engine::exec_with_params`; `BEGIN`/`COMMIT`/`ROLLBACK` are intercepted
+//! and mapped to the engine's programmatic transaction API.
 //!
-//! Protocol coverage (§7.2 minimal closed set):
+//! Protocol coverage:
 //!
-//! - startup: StartupMessage → AuthenticationOk (trust) → ParameterStatus
-//!   (minimal set) → ReadyForQuery; SSLRequest → `'N'`, GSSENCRequest →
-//!   `'N'`, CancelRequest → close;
-//! - Simple Query (`'Q'`) only — multi-statement strings execute in order,
-//!   the first error aborts the rest of the string but not the connection;
-//! - results: RowDescription + text-format DataRow + CommandComplete
-//!   (`SELECT n` / `INSERT 0 n` / `UPDATE n` / `DELETE n` tags);
-//! - errors → ErrorResponse + ReadyForQuery; Terminate (`'X'`) closes
-//!   cleanly.
+//! - startup negotiation and trust-mode AuthenticationOk;
+//! - Simple Query (`'Q'`) with ordered multi-statement strings;
+//! - Extended Query Parse/Bind/Describe/Execute/Close/Flush/Sync, including
+//!   named and unnamed statement/portal lifecycles and error-until-Sync
+//!   recovery;
+//! - RowDescription + text or Bind-selected binary DataRow values;
+//! - errors → ErrorResponse, with ReadyForQuery at Simple Query/Sync
+//!   boundaries; Terminate (`'X'`) closes cleanly.
 //!
-//! Non-goals (§7.2): Extended Query, COPY, authentication, CancelRequest
-//! handling, TLS.
+//! Non-goals: COPY, authentication, CancelRequest handling, TLS, and the
+//! complete PostgreSQL type system (Phase 6).
 //!
 //! Threading (§7.3): `std::net::TcpListener`, one std thread per
 //! connection, `Arc<Engine>` shared across all of them. Each connection

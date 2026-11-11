@@ -21,6 +21,7 @@ bench = false
 
 [dependencies]
 pg-engine = { path = "../pg-engine" }
+pg-catalog = { path = "../pg-catalog" }
 
 # error types
 thiserror = "2"

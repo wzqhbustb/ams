@@ -161,7 +161,8 @@ use pg_txn::{
 use crate::error::{EngineError, Result};
 use crate::query_stats::{ExecutionPath, QueryStatEntry, QueryStats, DEFAULT_QUERY_STATS_CAPACITY};
 use crate::sql::{
-    self, CmpOp, Filter, Literal, LockClause, OrderByKind, SelectCols, SelectItem, Statement,
+    self, CmpOp, Expr, Filter, Literal, LockClause, OrderByExpr, OrderByKind, SelectCols,
+    SelectItem, Statement,
 };
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
@@ -280,7 +281,7 @@ pub struct ColumnDef {
 /// exists between the engine API and the AM.
 pub type Value = Option<Datum>;
 
-/// The outcome of an [`Engine::exec`] call.
+/// The outcome of an [`Engine::exec`] or [`Engine::exec_with_params`] call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryResult {
     /// A SELECT result set.
@@ -539,8 +540,8 @@ pub struct Engine {
     /// commit AND abort, so the map never leaks committed transactions.
     index_undo: Arc<Mutex<HashMap<TxnId, Vec<IndexUndo>>>>,
     /// Query statistics ring buffer (M3 Stage E, tech-selection §6.3):
-    /// [`Self::exec`] records one entry per statement — see
-    /// [`Self::query_stats`].
+    /// [`Self::exec`] and [`Self::exec_with_params`] record one entry per
+    /// statement — see [`Self::query_stats`].
     query_stats: QueryStats,
 }
 
@@ -3943,10 +3944,65 @@ impl Engine {
     pub fn exec(&self, txn: Option<&TxnHandle>, sql: &str) -> Result<QueryResult> {
         let started = Instant::now();
         let stmt = sql::parse(sql)?;
+        self.exec_parsed(txn, sql, started, stmt, None)
+    }
+
+    /// Execute a SQL statement with typed `$1..$n` bind parameters.
+    ///
+    /// Parameters replace [`Literal::Param`] nodes in the parsed AST; they are
+    /// never interpolated into SQL text. Int4, Int8, Float8, Text, Vector, and
+    /// NULL values are supported. Types must match the inferred column type
+    /// exactly, including a vector's dimension; in particular, Text is not
+    /// implicitly decoded as Vector. The parameter slice length must equal the
+    /// greatest referenced index (unused gaps remain valid, as in PostgreSQL).
+    /// Query statistics retain the original SQL text, including placeholders.
+    pub fn exec_with_params(
+        &self,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let started = Instant::now();
+        let stmt = sql::parse(sql)?;
+        self.exec_parsed(txn, sql, started, stmt, Some(params))
+    }
+
+    /// Infer the schema type of every parameter slot in `$1..$max` order.
+    ///
+    /// A gap or an otherwise uninferable position is returned as `None`.
+    /// Repeated parameters must have exactly compatible types; vector types
+    /// include their dimension. Statements without parameters return an empty
+    /// vector without requiring schema lookup.
+    pub fn parameter_types(&self, stmt: &Statement) -> Result<Vec<Option<ColumnType>>> {
+        let max_index = sql::max_parameter_index(stmt);
+        if max_index == 0 {
+            return Ok(Vec::new());
+        }
+        let mut inference = ParameterInference::new(max_index);
+        infer_statement_parameters(self, stmt, &mut inference)?;
+        Ok(inference.slots)
+    }
+
+    fn exec_parsed(
+        &self,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+        started: Instant,
+        stmt: Statement,
+        params: Option<&[Value]>,
+    ) -> Result<QueryResult> {
         let mut path = ExecutionPath::of(&stmt);
-        let result = match txn {
-            None => self.exec_auto(stmt, &mut path),
-            Some(h) => self.exec_txn(h, stmt, &mut path),
+        let result = match params {
+            Some(params) => self
+                .bind_parameters(stmt, params)
+                .and_then(|stmt| match txn {
+                    None => self.exec_auto(stmt, &mut path),
+                    Some(handle) => self.exec_txn(handle, stmt, &mut path),
+                }),
+            None => match txn {
+                None => self.exec_auto(stmt, &mut path),
+                Some(handle) => self.exec_txn(handle, stmt, &mut path),
+            },
         };
         // F2 (Stage E review): capacity 0 means "stats off" — skip the
         // per-statement String allocation entirely.
@@ -3965,6 +4021,30 @@ impl Engine {
             });
         }
         result
+    }
+
+    fn bind_parameters(&self, mut stmt: Statement, params: &[Value]) -> Result<Statement> {
+        let inferred = self.parameter_types(&stmt)?;
+        if params.len() != inferred.len() {
+            let kind = if params.len() < inferred.len() {
+                "missing"
+            } else {
+                "extra"
+            };
+            return Err(EngineError::InvalidArgument(format!(
+                "{kind} parameter values: statement requires {} value(s), but {} were supplied",
+                inferred.len(),
+                params.len()
+            )));
+        }
+        let literals = params
+            .iter()
+            .zip(&inferred)
+            .enumerate()
+            .map(|(index, (value, expected))| parameter_to_literal(index + 1, *expected, value))
+            .collect::<Result<Vec<_>>>()?;
+        replace_parameters(&mut stmt, &literals)?;
+        Ok(stmt)
     }
 
     fn exec_auto(&self, stmt: Statement, path: &mut ExecutionPath) -> Result<QueryResult> {
@@ -4882,10 +4962,10 @@ impl Engine {
     }
 
     /// The query statistics ring buffer (M3 Stage E, tech-selection §6.3):
-    /// one entry per [`Self::exec`] call, oldest dropped on overflow. The
-    /// typed API (`scan` / `insert` / `update` / `delete` /
-    /// `index_lookup`) does NOT produce entries — it never passes through
-    /// `exec`.
+    /// one entry per [`Self::exec`] or [`Self::exec_with_params`] call, oldest
+    /// dropped on overflow. The typed API (`scan` / `insert` / `update` /
+    /// `delete` / `index_lookup`) does NOT produce entries — it never passes
+    /// through either SQL execution entry point.
     pub fn query_stats(&self) -> &QueryStats {
         &self.query_stats
     }
@@ -4998,6 +5078,19 @@ fn type_oid_of(col_type: ColumnType) -> Result<(TypeOid, i32)> {
         .ok_or_else(|| EngineError::InvalidArgument(format!("no builtin type for {col_type:?}")))
 }
 
+fn ensure_finite_vector_components(vector: &[f32], description: &str) -> Result<()> {
+    if let Some((index, value)) = vector
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(EngineError::InvalidArgument(format!(
+            "{description} component {index} is not finite ({value})"
+        )));
+    }
+    Ok(())
+}
+
 /// Convert a SQL `Literal` to a heap `Value` (`Option<Datum>`) given the
 /// target column type.
 fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
@@ -5009,6 +5102,7 @@ fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
         }
         (Literal::Int(n), ColumnType::Int8) => Ok(Some(Datum::Int8(*n))),
         (Literal::Int(n), ColumnType::Timestamptz) => Ok(Some(Datum::Timestamptz(*n))),
+        (Literal::Float(f), ColumnType::Float8) => Ok(Some(Datum::Float8(*f))),
         (Literal::Str(s), ColumnType::Text) => Ok(Some(Datum::Text(s.clone()))),
         (Literal::Str(s), ColumnType::Bytea) => Ok(Some(Datum::Bytea(s.clone().into_bytes()))),
         // M6 Stage C: a vector literal must match the column's dim exactly
@@ -5021,6 +5115,7 @@ fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
                     v.len()
                 )));
             }
+            ensure_finite_vector_components(v, "vector literal")?;
             Ok(Some(Datum::Vector(v.clone())))
         }
         (Literal::Null, _) => Ok(None),
@@ -5108,6 +5203,15 @@ pub(crate) fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result
                 )))
             }
         },
+        Literal::Float(f) => match col_type {
+            ColumnType::Float8 => Datum::Float8(*f),
+            _ => {
+                return Err(EngineError::InvalidPredicate(format!(
+                    "column {:?} is not FLOAT8",
+                    filter.column
+                )))
+            }
+        },
         Literal::Str(s) => match col_type {
             ColumnType::Text => Datum::Text(s.clone()),
             _ => {
@@ -5122,12 +5226,302 @@ pub(crate) fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result
                 "NULL in WHERE is not supported".to_string(),
             ))
         }
+        Literal::Param(index) => {
+            return Err(EngineError::InvalidArgument(format!(
+                "unbound parameter ${index}; use Engine::exec_with_params"
+            )))
+        }
     };
     Ok(match filter.op {
         CmpOp::Eq => Predicate::Eq { col_index, value },
         CmpOp::Lt => Predicate::Lt { col_index, value },
         CmpOp::Gt => Predicate::Gt { col_index, value },
     })
+}
+
+struct ParameterInference {
+    slots: Vec<Option<ColumnType>>,
+}
+
+impl ParameterInference {
+    fn new(max_index: usize) -> Self {
+        Self {
+            slots: vec![None; max_index],
+        }
+    }
+
+    fn infer(&mut self, literal: &Literal, expected: ColumnType) -> Result<()> {
+        let Literal::Param(index) = literal else {
+            return Ok(());
+        };
+        let Some(slot) = index
+            .checked_sub(1)
+            .and_then(|index| self.slots.get_mut(index))
+        else {
+            return Err(EngineError::InvalidArgument(format!(
+                "invalid parameter index ${index}"
+            )));
+        };
+        match slot {
+            Some(existing) if *existing != expected => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "parameter ${index} has incompatible inferred types {existing:?} and {expected:?}"
+                )))
+            }
+            Some(_) => {}
+            None => *slot = Some(expected),
+        }
+        Ok(())
+    }
+}
+
+fn infer_statement_parameters(
+    engine: &Engine,
+    stmt: &Statement,
+    inference: &mut ParameterInference,
+) -> Result<()> {
+    match stmt {
+        Statement::Explain(inner) => infer_statement_parameters(engine, inner, inference)?,
+        Statement::Insert {
+            table,
+            columns,
+            rows,
+        } => {
+            let entry = engine.table_entry(table)?;
+            let targets = match columns {
+                Some(columns) => columns
+                    .iter()
+                    .map(|column| required_column_type(&entry, column, false))
+                    .collect::<Result<Vec<_>>>()?,
+                None => column_types(&entry),
+            };
+            for row in rows {
+                if row.len() != targets.len() {
+                    let message = if columns.is_some() {
+                        format!(
+                            "column list has {} entries but {} values given",
+                            targets.len(),
+                            row.len()
+                        )
+                    } else {
+                        format!(
+                            "table has {} columns but {} values given",
+                            targets.len(),
+                            row.len()
+                        )
+                    };
+                    return Err(EngineError::InvalidArgument(message));
+                }
+                for (literal, expected) in row.iter().zip(&targets) {
+                    inference.infer(literal, *expected)?;
+                }
+            }
+        }
+        Statement::Select {
+            columns,
+            table,
+            filter,
+            order_by,
+            ..
+        } => {
+            let entry = engine.table_entry(table)?;
+            if let SelectCols::Cols(items) = columns {
+                for item in items {
+                    if let SelectItem::Distance(expr) = item {
+                        infer_distance_parameter(&entry, expr, inference)?;
+                    }
+                }
+            }
+            infer_filter_parameter(&entry, filter, inference)?;
+            if let Some(OrderByKind::Expr(expr)) = order_by {
+                infer_distance_parameter(&entry, expr, inference)?;
+            }
+        }
+        Statement::Update {
+            table,
+            sets,
+            filter,
+        } => {
+            let entry = engine.table_entry(table)?;
+            for (column, literal) in sets {
+                let expected = required_column_type(&entry, column, false)?;
+                inference.infer(literal, expected)?;
+            }
+            infer_filter_parameter(&entry, filter, inference)?;
+        }
+        Statement::Delete { table, filter } => {
+            let entry = engine.table_entry(table)?;
+            infer_filter_parameter(&entry, filter, inference)?;
+        }
+        Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. } => {}
+    }
+    Ok(())
+}
+
+fn required_column_type(entry: &TableEntry, column: &str, predicate: bool) -> Result<ColumnType> {
+    entry
+        .columns
+        .iter()
+        .find(|candidate| candidate.name.eq_ignore_ascii_case(column))
+        .map(|column| column.col_type)
+        .ok_or_else(|| {
+            let message = format!("no column {column:?} in table");
+            if predicate {
+                EngineError::InvalidPredicate(message)
+            } else {
+                EngineError::InvalidArgument(message)
+            }
+        })
+}
+
+fn infer_filter_parameter(
+    entry: &TableEntry,
+    filter: &Option<Filter>,
+    inference: &mut ParameterInference,
+) -> Result<()> {
+    if let Some(filter) = filter {
+        let expected = required_column_type(entry, &filter.column, true)?;
+        inference.infer(&filter.value, expected)?;
+    }
+    Ok(())
+}
+
+fn infer_distance_parameter(
+    entry: &TableEntry,
+    expr: &OrderByExpr,
+    inference: &mut ParameterInference,
+) -> Result<()> {
+    if !matches!(expr.right, Expr::Literal(Literal::Param(_))) {
+        return Ok(());
+    }
+    let Expr::Column(column) = &expr.left else {
+        return Ok(());
+    };
+    let expected = required_column_type(entry, column, true)?;
+    let ColumnType::Vector(_) = expected else {
+        return Err(EngineError::InvalidArgument(format!(
+            "distance left operand {column:?} is not a VECTOR column"
+        )));
+    };
+    let Expr::Literal(literal) = &expr.right else {
+        unreachable!()
+    };
+    inference.infer(literal, expected)
+}
+
+fn parameter_to_literal(
+    index: usize,
+    expected: Option<ColumnType>,
+    value: &Value,
+) -> Result<Literal> {
+    let Some(datum) = value else {
+        return Ok(Literal::Null);
+    };
+    let (actual, literal) = match datum {
+        Datum::Int4(value) => (ColumnType::Int4, Literal::Int(i64::from(*value))),
+        Datum::Int8(value) => (ColumnType::Int8, Literal::Int(*value)),
+        Datum::Float8(value) => (ColumnType::Float8, Literal::Float(*value)),
+        Datum::Text(value) => (ColumnType::Text, Literal::Str(value.clone())),
+        Datum::Vector(value) => {
+            ensure_finite_vector_components(value, &format!("parameter ${index} vector"))?;
+            let dim = u32::try_from(value.len()).map_err(|_| {
+                EngineError::InvalidArgument(format!(
+                    "parameter ${index} vector dimension exceeds u32"
+                ))
+            })?;
+            (ColumnType::Vector(dim), Literal::Vector(value.clone()))
+        }
+        other => {
+            return Err(EngineError::InvalidArgument(format!(
+                "parameter ${index} uses unsupported datum type {other:?}"
+            )))
+        }
+    };
+    if let Some(expected) = expected {
+        if expected != actual {
+            return Err(EngineError::InvalidArgument(format!(
+                "parameter ${index} expects {expected:?}, got {actual:?}"
+            )));
+        }
+    }
+    Ok(literal)
+}
+
+fn replace_parameters(stmt: &mut Statement, literals: &[Literal]) -> Result<()> {
+    match stmt {
+        Statement::Explain(inner) => replace_parameters(inner, literals)?,
+        Statement::Insert { rows, .. } => {
+            for literal in rows.iter_mut().flatten() {
+                replace_parameter(literal, literals)?;
+            }
+        }
+        Statement::Select {
+            columns,
+            filter,
+            order_by,
+            ..
+        } => {
+            if let SelectCols::Cols(items) = columns {
+                for item in items {
+                    if let SelectItem::Distance(expr) = item {
+                        replace_expr_parameters(expr, literals)?;
+                    }
+                }
+            }
+            if let Some(filter) = filter {
+                replace_parameter(&mut filter.value, literals)?;
+            }
+            if let Some(OrderByKind::Expr(expr)) = order_by {
+                replace_expr_parameters(expr, literals)?;
+            }
+        }
+        Statement::Update { sets, filter, .. } => {
+            for (_, literal) in sets {
+                replace_parameter(literal, literals)?;
+            }
+            if let Some(filter) = filter {
+                replace_parameter(&mut filter.value, literals)?;
+            }
+        }
+        Statement::Delete { filter, .. } => {
+            if let Some(filter) = filter {
+                replace_parameter(&mut filter.value, literals)?;
+            }
+        }
+        Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. } => {}
+    }
+    Ok(())
+}
+
+fn replace_expr_parameters(expr: &mut OrderByExpr, literals: &[Literal]) -> Result<()> {
+    for operand in [&mut expr.left, &mut expr.right] {
+        if let Expr::Literal(literal) = operand {
+            replace_parameter(literal, literals)?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_parameter(literal: &mut Literal, literals: &[Literal]) -> Result<()> {
+    let index = match literal {
+        Literal::Param(index) => *index,
+        _ => return Ok(()),
+    };
+    let Some(replacement) = index.checked_sub(1).and_then(|index| literals.get(index)) else {
+        return Err(EngineError::InvalidArgument(format!(
+            "missing value for parameter ${index}"
+        )));
+    };
+    *literal = replacement.clone();
+    Ok(())
 }
 
 /// Apply UPDATE SET assignments to an existing row, producing the full new
