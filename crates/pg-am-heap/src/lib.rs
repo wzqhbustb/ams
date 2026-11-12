@@ -1,13 +1,10 @@
-//! pg_rust heap access method — Phase 1 M2.
+//! pg_rust heap access method.
 //!
-//! Current stage (M2a Stage G) implements the **in-memory page format** only:
-//! - Slotted page layout (line pointer array + tuple data)
-//! - Tuple encoding/decoding (64-byte header + null bitmap + attributes)
-//! - TOAST pointer encoding (oversized attribute storage)
-//!
-//! Trait implementations (`pg-catalog::AccessMethod`, `UpdatableAM`,
-//! `Vacuumable`), heap redo handlers (`HeapInsert`, `HeapUpdate`,
-//! `HeapDelete`) and TOAST chunk table I/O land in Stage I.
+//! Provides the slotted-page and 64-byte tuple formats, WAL-backed CRUD and
+//! redo handlers, MVCC/HOT updates, vacuum, and Phase 4a TOAST chunk I/O.
+//! External attributes retain the frozen 20-byte pointer and live in hidden
+//! heap relations whose chunks share the main row's transaction and snapshot
+//! visibility rules.
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]

@@ -1834,3 +1834,32 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - **事务与失败语义**：显式事务出错立即 abort 并进入 failed 状态，ReadyForQuery 为 `E`；后续普通语句返回 25P02，ROLLBACK 清理，COMMIT 按 ROLLBACK 返回。Simple Query 先完整解析，DML 使用统一隐式事务，错误后回滚。extended 隐式事务中的 DDL 一律响亮拒绝，避免 auto-commit DDL 穿透 Sync 回滚；**DDL 在 Simple Query 中仍是 auto-commit 的已知非目标，多语句原子性承诺仅覆盖非 DDL 语句**。`Execute(max_rows)` 的消息语义正确，但当前先物化全部结果再截取，不是执行或内存边界，登记为已知限制。
 - **独立复核回流**：参数索引以 `u16::MAX` 为硬上限，杜绝短 Parse 触发超大推断分配；extended 隐式事务在 Sync 按成功/失败提交或回滚；EXPLAIN 有 TEXT `plan` 描述，空 Parse 合法，缺失关系在 Parse 报错；失败 Parse 与 Simple Query 正确失效 unnamed 对象；FunctionCall 返回 ErrorResponse + ReadyForQuery，消息体错误可在 Sync 恢复；Close 幂等，恰好整页 Execute 先 PortalSuspended；前端 count 按 u16 解码。TEXT OID 到 inferred VECTOR 的输入转换保留 pgvector 文本语义，Binary format 的 TEXT 载荷也按文本解析，不引入 catalog 探针依赖。
 - **最终验收（2026-11-10）**：workspace debug 全量回归 EXIT=0；`pg-am-heap`/`pg-catalog`/`pg-engine`/`pg-wire` release 全套件 EXIT=0；八 crate Clippy、相关 crate rustdoc、fmt 与 `git diff --check` 全绿。最终独立复核确认全部审查项闭合，无剩余 P1/P2/P3。
+
+## Phase 4a Stage D：heap TOAST chunk I/O
+
+**状态**：✅ 完成（2026-11-11；VECTOR 边界、建表注册原子性及零长度缺块修复、专项回归与全量门禁均通过；未 commit——等用户确认）。
+
+### 交付内容
+
+1. **隐藏 chunk heap 与目录**：每个含 TOASTable 列的用户表在 DDL 时获得一个隐藏 heap，OID 仅由 catalog `oid_allocator` 分配。主表既有 `pg_class.reltoastrelid` 记录 OID，`pg_rust_relpages.last_page` 记录隐藏链头；普通表 tail 原本只是 advisory 字段，隐藏关系自身不新增任何系统目录行。pre-Stage-D 目录在 open 时通过事务补建并更新两条既有目录行，失败不发布内存状态；二次 reopen 仍正确。chunk 行是 `(valueid Int8, chunk_seq Int4, payload Bytea)` 的标准 heap tuple，payload ≤2000B，seq 从 0 连续递增。
+2. **写入与装页**：`encode_row_with_toast` 先外置所有超过 2048B 的值，再按最大 inline 值循环外置并重编主行，直至满足 `MAX_TUPLE_BYTES`；无法继续外置时仍由 HeapAM 返回 `TupleTooLarge`。TEXT/BYTEA/VECTOR 共用 20B 指针和 chunk 编解码；VECTOR 的 `MAX_VECTOR_DIM=2000` 类型上限不变。chunk 使用普通 `HeapInsert`，与主行同 XID、同 curcid，并严格先于主行 WAL；没有新增 WAL 记录类型。
+3. **快照读取**：HeapAM scan、B+Tree/HNSW 回表和 SQL/wire 都在主行版本及其查询快照下 detoast，一次主行至多一次可见性 chunk 扫描。拼接前检查缺块、重块、seq 连续性和 rawsize/extsize；尺寸先按实际 chunk 合计核对，再 `try_reserve`，不让 corrupted size 直接触发巨额分配。物理 detoast 仅用于 crash-loser 索引补偿和 vacuum，不作为用户查询路径，也未引入 `Snapshot::everything()` detoast。
+4. **UPDATE 共享与 valueid**：修改值创建新 group；未修改值经当前快照下的字节比较后继续共享旧 group。valueid 在主表关系内单调分配，open 时扫描包括 aborted/loser 在内的全部物理 chunk 恢复高水位，重复注册不倒退。catalog 的 OID 启动校正同时纳入 `reltoastrelid`，避免 checkpointless restart 重发隐藏 OID。
+5. **回收与 DROP**：vacuum 先按既有 horizon 回收主行，再回收不再被任何物理主行版本引用的 chunk group；旧快照和部分死亡 HOT 链通过保留的物理指针自然钉住 group，aborted 和无主行 loser group 也能回收。`VacuumStats.toast_chunks_reclaimed` 直接报告本轮回收量，第二次 pass 应归零。DROP 在 commit 成功后同时释放主堆和隐藏 TOAST 链，并清理注册信息。
+6. **目录版本兼容**：TOAST 迁移与 DROP 均按当前快照寻找 live `pg_class` 版本，relpages 同样按快照定位迁移目标；`Catalog::relpages_of` 取最新物理版本，避免把首次 slot 的旧版本用于更新或 reopen。
+
+### 审查回流
+
+- **VECTOR 误识别与修复**：初版“首 u32 精确等于 external tag + 20B”仍与合法 f32 位模式冲突，最小探针 `f32::from_bits(0x4000_0014)` 实证 inline 行被截断误读。现以 `HEAP_VECTOR_EXTERNAL(0x1000)` 统一标记全部非 NULL VECTOR attribute 外置，engine 在外置任一 VECTOR 时归一化同元组其他 VECTOR，codec 拒绝混合形态，不再根据 payload 猜指针；新增精确位模式、混合 TEXT sibling、混合 VECTOR 拒绝及全 VECTOR reopen 回归。
+- **建表注册原子性**：初版在 commit 后才注册隐藏 TOAST，注册失败会形成“表已提交但 API 报错且无完整 registry”的幽灵状态。现注册移到提交前，commit 成功后才发布 table registry；op/commit 失败均在锁释放前清理。新增冲突注册失败与 commit 失败后的重试/reopen 回归。
+- **零长度缺块**：初版 `va_extsize == 0` 时即使没有可见 chunk 也会拼出空值，违反“缺块必须 Corrupted”。现零可见 chunk 一律报错；合法空值仍保留一个 seq=0 空 chunk，TEXT/BYTEA 均覆盖删除唯一空 chunk 的负例。
+- **恢复与目录**：OID 校正原先只看主关系 OID，已补隐藏 OID；迁移初版 raw first-slot 会更新已死亡目录版本，已统一改为当前快照下的 live 版本。
+- **既有页布局探针**：HNSW 跨表复用测试原先硬编码页号与三行布局，在隐藏 TOAST 页加入后失效；现直接构造携带目标 NodeId 的堆行，保留精确 TID + NodeId 碰撞及“不得返回他表行”的断言，不改变生产可见性逻辑。
+- **已知边界**：detoast 以简单、正确为先，当前一个主行至多一次完整可见 chunk 扫描，未声明大 TOAST 关系的性能指标；压缩仍归 Phase 7b，超 dim VECTOR 声明仍响亮拒绝。当前类型系统没有 `Jsonb`/`JSONB` Datum 或 DDL 类型，本 Stage 不伪造 JSONB 映射；以 BYTEA 覆盖二进制 varlena 路径，未来接入 JSONB 类型时必须补其 TOAST 回归。
+
+### 专项验证
+
+- `phase4a_toast` **17/17**：大 TEXT/BYTEA、多列合计超页、外部 VECTOR、reopen、旧快照 UPDATE/DELETE、共享引用、aborted INSERT/UPDATE、缺/重 chunk（含零长度唯一空 chunk）、旧目录迁移、精确 f32 位模式与全 VECTOR 归一化、注册失败/commit 失败重试，以及 chunk-only 和主行未提交两类 crash。
+- heap lib **39/39**，wire protocol **36/36**（含 9000B Simple Query DataRow）。
+- 八 crate Clippy `--all-targets --all-features -D warnings`、八 crate rustdoc `-D warnings`、fmt 与 `git diff --check` 全绿。
+- 最新 TOAST 专项 release 亦 **17/17**；`pg-am-heap`/`pg-catalog`/`pg-engine`/`pg-wire` release 全量 EXIT=0。`cargo test --workspace --no-fail-fast` 全量 EXIT=0、零失败；`cargo check --workspace --all-features` 同步通过。

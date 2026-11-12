@@ -34,3 +34,15 @@ The benchmark is ignored by default so CI does not pay the 10k graph-build cost;
 These are correctness/protocol acceptance results, not latency benchmarks. Third-party drivers were installed only under `target/tmp` in isolated environments.
 
 Final gates: workspace debug tests and release tests for all four changed runtime crates exited 0; all eight crate Clippy checks, rustdoc, fmt, and `git diff --check` passed. The final independent review found no remaining P1/P2/P3 issues.
+
+## Stage D: TOAST correctness and crash acceptance
+
+- Date: 2026-11-11 (UTC)
+- `cargo test -p pg-engine --test phase4a_toast`（debug 与 release）：**17 tests passed**. Coverage includes >8KB multi-chunk TEXT/BYTEA, multi-attribute aggregate overflow, external VECTOR roundtrip, checkpointless reopen and OID/valueid progress, unchanged-group sharing, old-snapshot UPDATE/DELETE × vacuum, aborted INSERT/UPDATE groups, missing/duplicate chunks, legacy catalog migration, and two uncommitted WAL windows.
+- Crash windows: chunk WAL durable without main-row WAL, and chunk + main-row WAL durable without commit. In both cases reopen exposes no row, and the following vacuum physically reclaims all three chunks; a subsequent pass reclaims zero.
+- `cargo test -p pg-am-heap --lib`: **39 tests passed**, including the frozen 20-byte external pointer, `HEAP_VECTOR_EXTERNAL`, exact `0x4000_0014` inline/external disambiguation, and mixed-representation rejection.
+- `cargo test -p pg-wire --test wire_protocol`: **36 tests passed**, including a 9000-byte TEXT value returned through Simple Query with exact DataRow length and payload.
+- Static checks for the four changed runtime crates: Clippy `--all-targets --all-features -D warnings`, rustdoc `-D warnings`, fmt, and `git diff --check` all passed.
+- Post-fix gates: `cargo test --workspace --no-fail-fast` exited 0 with no failures; release tests for `pg-am-heap`, `pg-catalog`, `pg-engine`, and `pg-wire` also exited 0. `cargo check --workspace --all-features`, all eight crate Clippy/rustdoc checks, fmt, and `git diff --check` passed.
+
+These are correctness and recovery acceptance results, not throughput measurements. TOAST detoast currently favors a simple one-chunk-scan-per-main-row implementation; no performance claim is made for large TOAST relations. The current type system has no JSONB Datum/DDL type, so BYTEA covers the binary varlena path; JSONB-specific acceptance remains a follow-up when that type exists.

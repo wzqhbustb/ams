@@ -89,7 +89,9 @@ pub struct RelpagesRow {
     pub rel_oid: TableOid,
     /// Head of the relation's on-disk page chain.
     pub first_page: PageId,
-    /// Tail of the relation's on-disk page chain.
+    /// Tail of the relation's on-disk page chain for ordinary relations. For
+    /// a Stage D heap table with `reltoastrelid != 0`, this slot instead holds
+    /// the hidden TOAST chain head; ordinary table tails were advisory only.
     pub last_page: PageId,
     /// Number of pages in the chain (`>= 1`).
     pub page_count: u64,
@@ -207,6 +209,11 @@ impl Catalog {
         let max_in_use = relations
             .iter()
             .map(|r| r.oid.raw())
+            // Stage D: hidden TOAST relations have no pg_class/relpages row
+            // of their own. Their OID survives only in the MAIN row's
+            // reltoastrelid, which must therefore join the startup correction
+            // or a no-checkpoint reopen could reissue the hidden OID.
+            .chain(relations.iter().map(|r| r.toastrelid))
             .chain(types.iter().map(|t| t.oid.raw()))
             .chain(access_methods.iter().map(|a| a.oid))
             // 2026-09-17, Stage B review round 3 P1: the HNSW minimal
@@ -287,9 +294,15 @@ impl Catalog {
         &self.relpages
     }
 
-    /// Look up the page-chain directory entry of a relation.
+    /// Look up the latest physical version of a relation's page-chain entry.
+    /// Stage D's legacy TOAST migration updates this row through ordinary
+    /// heap MVCC, so the first matching slot may be an obsolete version.
     pub fn relpages_of(&self, rel_oid: TableOid) -> Option<RelpagesRow> {
-        self.relpages.iter().find(|r| r.rel_oid == rel_oid).cloned()
+        self.relpages
+            .iter()
+            .rev()
+            .find(|r| r.rel_oid == rel_oid)
+            .cloned()
     }
 
     /// The OID allocator, shared with the checkpoint coordinator.

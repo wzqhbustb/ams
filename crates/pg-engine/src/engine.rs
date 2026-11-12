@@ -132,7 +132,9 @@ use pg_am_btree::{
 use pg_am_heap::access_method::{
     DeleteContext, InsertContext, RelationDesc, ScanContext, UpdateContext, Vacuumable,
 };
+use pg_am_heap::heap_am::MAX_TUPLE_BYTES;
 use pg_am_heap::line_pointer::LINE_POINTER_SIZE;
+use pg_am_heap::toast::{inline_size, toastable, ToastRelation, TOAST_TUPLE_THRESHOLD};
 use pg_am_heap::tuple::{decode_tuple, encode_tuple, ColumnType, Datum, TupleHeader};
 use pg_am_heap::{
     heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM,
@@ -366,6 +368,10 @@ pub struct TableEntry {
     pub first_page: PageId,
     /// Column schema in `attnum` order.
     pub columns: Vec<ColumnDef>,
+    /// Hidden chunk heap for TOASTable columns. Its first page is persisted
+    /// in the main table's `pg_rust_relpages.last_page` slot; no catalog row
+    /// is added for the hidden relation.
+    pub toast: Option<ToastRelation>,
 }
 
 /// One entry of the engine's in-memory index registry (M2b Stage M wave 2).
@@ -414,6 +420,9 @@ pub struct VacuumStats {
     /// (`EntryNotFound` → Ok at the vacuum call site): eager online index
     /// maintenance had removed them.
     pub index_entries_already_gone: usize,
+    /// Physical TOAST chunk rows reclaimed after main-row reclamation. This
+    /// directly proves that the pass performed out-of-line garbage collection.
+    pub toast_chunks_reclaimed: usize,
 }
 
 /// The default leak-ratio threshold for [`Engine::hnsw_leak_report`] (M6
@@ -1100,6 +1109,11 @@ impl Engine {
             query_stats: QueryStats::new(config.query_stats_capacity),
         };
 
+        // 7b. Stage D migration for pre-TOAST directories. New tables already
+        //     carry reltoastrelid; legacy TOASTable tables get the hidden heap
+        //     and catalog metadata once, transactionally, before any DML.
+        engine.install_missing_toast_relations()?;
+
         // 7c. Recovery-time index compensation for loser transactions
         //     (Stage T stress finding): index maintenance WAL records are
         //     physical (xid=0), so the CLOG/MVCC filtering that hides a
@@ -1199,6 +1213,32 @@ impl Engine {
                     col_type,
                 });
             }
+            let toast = match values.get(4) {
+                Some(Some(Datum::Int8(raw_toast_oid))) if *raw_toast_oid != 0 => {
+                    let toast_oid = u64::try_from(*raw_toast_oid).map_err(|_| {
+                        EngineError::Corrupted(format!(
+                            "negative reltoastrelid {raw_toast_oid} for table {name:?}"
+                        ))
+                    })?;
+                    if toast_oid > u32::MAX as u64 {
+                        return Err(EngineError::Corrupted(format!(
+                            "reltoastrelid {toast_oid} exceeds the 20-byte pointer's u32 range"
+                        )));
+                    }
+                    let toast = ToastRelation {
+                        rel_oid: Oid(toast_oid),
+                        first_page: relpages.last_page,
+                    };
+                    heap.register_toast_relation(Oid(oid), toast)?;
+                    Some(toast)
+                }
+                Some(Some(Datum::Int8(_))) => None,
+                _ => {
+                    return Err(EngineError::Corrupted(format!(
+                        "table {name:?} has malformed pg_class.reltoastrelid"
+                    )))
+                }
+            };
             if registry
                 .insert(
                     name.clone(),
@@ -1206,6 +1246,7 @@ impl Engine {
                         oid: Oid(oid),
                         first_page: relpages.first_page,
                         columns,
+                        toast,
                     },
                 )
                 .is_some()
@@ -1316,13 +1357,154 @@ impl Engine {
         self.storage.shutdown();
     }
 
+    /// Add hidden TOAST heaps to pre-Stage-D tables. Catalog updates and the
+    /// in-memory publication use the same success/failure hooks as other DDL;
+    /// a failed commit leaves only an unreachable, leaked empty heap.
+    fn install_missing_toast_relations(&self) -> Result<()> {
+        let pending: Vec<(String, TableEntry)> = self
+            .registry
+            .read()
+            .iter()
+            .filter(|(_, entry)| entry.toast.is_none())
+            .filter(|(_, entry)| {
+                entry
+                    .columns
+                    .iter()
+                    .any(|column| toastable(column.col_type))
+            })
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect();
+        for (name, entry) in pending {
+            let toast_oid = self.catalog.oid_allocator().alloc();
+            if toast_oid.0 > u32::MAX as u64 {
+                return Err(EngineError::InvalidArgument(
+                    "TOAST relation OID exceeds the frozen pointer's u32 range".to_string(),
+                ));
+            }
+            let toast = ToastRelation {
+                rel_oid: toast_oid,
+                first_page: self.heap.create_heap(toast_oid)?,
+            };
+            self.heap.register_toast_relation(entry.oid, toast)?;
+            self.auto_commit_with_hooks(
+                |snap| {
+                    self.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
+                    self.write_toast_catalog_metadata(snap, &name, &entry, toast)
+                },
+                || {
+                    let mut registry = self.registry.write();
+                    let live = registry.get_mut(&name).ok_or_else(|| {
+                        EngineError::Corrupted(format!(
+                            "table {name:?} disappeared during TOAST migration"
+                        ))
+                    })?;
+                    live.toast = Some(toast);
+                    Ok(())
+                },
+                || {
+                    self.heap.unregister_toast_relation(entry.oid);
+                    self.heap.drop_relation(toast_oid);
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Persist a legacy table's hidden relation in the two existing catalog
+    /// rows. The hidden relation itself gets no pg_class/pg_attribute row.
+    fn write_toast_catalog_metadata(
+        &self,
+        snap: &Snapshot,
+        name: &str,
+        entry: &TableEntry,
+        toast: ToastRelation,
+    ) -> Result<()> {
+        let class_tid = self.find_live_pg_class_row(snap, entry.oid)?;
+        let class_row = vec![
+            Some(Datum::Int8(entry.oid.0 as i64)),
+            Some(Datum::Text(name.to_string())),
+            Some(Datum::Text(RELKIND_TABLE.to_string())),
+            Some(Datum::Int4(entry.columns.len() as i32)),
+            Some(Datum::Int8(toast.rel_oid.0 as i64)),
+            Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
+        ];
+        self.update_catalog_row(snap, &PG_CLASS, class_tid, &class_row)?;
+
+        let relpages_tid = self.find_relpages_row(snap, entry.oid)?;
+        let previous = self
+            .catalog
+            .relpages_of(TableOid::new(entry.oid))
+            .ok_or_else(|| {
+                EngineError::Corrupted(format!(
+                    "table OID {} has no pg_rust_relpages row",
+                    entry.oid.0
+                ))
+            })?;
+        let relpages_row = vec![
+            Some(Datum::Int8(entry.oid.0 as i64)),
+            Some(Datum::Int8(entry.first_page.0 as i64)),
+            Some(Datum::Int8(toast.first_page.0 as i64)),
+            Some(Datum::Int8(previous.page_count as i64)),
+        ];
+        self.update_catalog_row(snap, &PG_RELPAGES, relpages_tid, &relpages_row)
+    }
+
+    fn update_catalog_row(
+        &self,
+        snap: &Snapshot,
+        def: &SystemTableDef,
+        old_tid: Tid,
+        row: &[Value],
+    ) -> Result<()> {
+        let columns = def.column_types();
+        let tuple = encode_tuple(tuple_header(snap.curcid()), &columns, row)?;
+        self.ensure_catalog_room(def, tuple.len())?;
+        self.heap.update(UpdateContext {
+            rel: RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            old_tid,
+            new_tuple: &tuple,
+            out_tid: None,
+            clog: self.clog.as_ref(),
+            hot_eligible: false,
+        })?;
+        Ok(())
+    }
+
+    /// Locate the relpages version visible to the current DDL transaction.
+    fn find_relpages_row(&self, snap: &Snapshot, oid: Oid) -> Result<Tid> {
+        let columns = PG_RELPAGES.column_types();
+        let rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_RELPAGES.oid.raw(),
+                first_page: PG_RELPAGES.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            clog: self.clog.as_ref(),
+        })?;
+        for (tid, values) in rows {
+            if matches!(values.first(), Some(Some(Datum::Int8(value))) if *value == oid.0 as i64) {
+                return Ok(tid);
+            }
+        }
+        Err(EngineError::Corrupted(format!(
+            "pg_rust_relpages has no row for relation OID {}",
+            oid.0
+        )))
+    }
+
     /// Create a table and register it in the system catalog.
     ///
     /// Runs as one auto-commit transaction: allocate an OID, allocate the
     /// first heap page, insert the `pg_class` / `pg_attribute` /
-    /// `pg_rust_relpages` rows **through the heap AM** (WAL-logged, so the
-    /// catalog changes are redo-recoverable), commit, then update the
-    /// in-memory registry.
+    /// `pg_rust_relpages` rows **through the heap AM**, register TOAST before
+    /// commit, and publish the in-memory registry only after a durable commit.
+    /// Registration or commit failure cleans up before table locks release.
     ///
     /// Fails with [`EngineError::TableExists`] if the name is taken, and
     /// with [`EngineError::CatalogFull`] if a system catalog's first page
@@ -1344,34 +1526,59 @@ impl Engine {
         }
 
         let oid = self.catalog.oid_allocator().alloc();
+        let toast_oid = schema
+            .iter()
+            .any(|column| toastable(column.col_type))
+            .then(|| self.catalog.oid_allocator().alloc());
+        if toast_oid.is_some_and(|toast| toast.0 > u32::MAX as u64) {
+            return Err(EngineError::InvalidArgument(
+                "TOAST relation OID exceeds the frozen pointer's u32 range".to_string(),
+            ));
+        }
         // AccessExclusive on the fresh OID (M2c Stage P): ceremonial today
         // — nobody else can reference an OID that was just allocated — but
         // it fixes the DDL lock mode by construction and covers the
-        // catalog-row writes like any other DDL.
-        let first_page = self.auto_commit(|snap| {
-            self.lock_oid(snap.current_xid(), oid, LockMode::AccessExclusive)?;
-            self.create_table_inner(snap, oid, name, schema)
-        });
-        match first_page {
-            Ok(first_page) => {
+        // catalog-row writes like any other DDL. TOAST registration also runs
+        // HERE, before commit: a registration error aborts the table instead
+        // of returning an error after the table has already become durable.
+        let created_metadata = RefCell::new(None);
+        let result = self.auto_commit_with_hooks(
+            |snap| {
+                self.lock_oid(snap.current_xid(), oid, LockMode::AccessExclusive)?;
+                let created = self.create_table_inner(snap, oid, toast_oid, name, schema)?;
+                if let Some(toast) = created.1 {
+                    self.heap.register_toast_relation(oid, toast)?;
+                }
+                *created_metadata.borrow_mut() = Some(created);
+                Ok(())
+            },
+            || {
+                let (first_page, toast) = created_metadata
+                    .borrow()
+                    .expect("successful create_table installs metadata before commit");
                 self.registry.write().insert(
                     name.to_string(),
                     TableEntry {
                         oid,
                         first_page,
                         columns: schema.to_vec(),
+                        toast,
                     },
                 );
-                Ok(oid)
-            }
-            Err(e) => {
-                // The heap page may have been allocated and tracked before
-                // the failure; forget it so the AM cache cannot hand the
-                // (never-committed) page to a later relation of this OID.
+                Ok(())
+            },
+            || {
+                // Runs before lock release on op or commit failure. The pages
+                // themselves may leak after a crash, but no failed relation or
+                // TOAST registration remains visible to later DML.
+                self.heap.unregister_toast_relation(oid);
                 self.heap.drop_relation(oid);
-                Err(e)
-            }
-        }
+                if let Some(toast_oid) = toast_oid {
+                    self.heap.drop_relation(toast_oid);
+                }
+            },
+        );
+        result.map(|()| oid)
     }
 
     /// The catalog-writing half of `create_table`, inside transaction `snap`.
@@ -1379,19 +1586,28 @@ impl Engine {
         &self,
         snap: &Snapshot,
         oid: Oid,
+        toast_oid: Option<Oid>,
         name: &str,
         schema: &[ColumnDef],
-    ) -> Result<PageId> {
+    ) -> Result<(PageId, Option<ToastRelation>)> {
         ensure_float8_storage_supported(self.catalog.type_by_oid(FLOAT8_OID).is_some(), schema)?;
         let first_page = self.heap.create_heap(oid)?;
+        let toast = toast_oid
+            .map(|rel_oid| {
+                let first_page = self.heap.create_heap(rel_oid)?;
+                Ok::<ToastRelation, EngineError>(ToastRelation {
+                    rel_oid,
+                    first_page,
+                })
+            })
+            .transpose()?;
 
         let class_row = vec![
             Some(Datum::Int8(oid.0 as i64)),
             Some(Datum::Text(name.to_string())),
             Some(Datum::Text(RELKIND_TABLE.to_string())),
             Some(Datum::Int4(schema.len() as i32)),
-            // No TOAST table (M2a).
-            Some(Datum::Int8(0)),
+            Some(Datum::Int8(toast.map_or(0, |toast| toast.rel_oid.0) as i64)),
             Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
         ];
         self.insert_catalog_row(snap, &PG_CLASS, &class_row)?;
@@ -1412,18 +1628,21 @@ impl Engine {
             self.insert_catalog_row(snap, &PG_ATTRIBUTE, &attr_row)?;
         }
 
-        // The chain currently has exactly one page; `last_page` /
-        // `page_count` are advisory only (they go stale as the chain grows)
-        // — the on-disk chain walk is authoritative (Stage K wave 1).
+        // For ordinary heap tables `last_page` was advisory and unused. Stage D
+        // freezes it as the hidden TOAST chain head when reltoastrelid != 0;
+        // without TOAST it remains equal to first_page. The on-disk chain walk
+        // stays authoritative for page membership.
         let relpages_row = vec![
             Some(Datum::Int8(oid.0 as i64)),
             Some(Datum::Int8(first_page.0 as i64)),
-            Some(Datum::Int8(first_page.0 as i64)),
+            Some(Datum::Int8(
+                toast.map_or(first_page, |toast| toast.first_page).0 as i64,
+            )),
             Some(Datum::Int8(1)),
         ];
         self.insert_catalog_row(snap, &PG_RELPAGES, &relpages_row)?;
 
-        Ok(first_page)
+        Ok((first_page, toast))
     }
 
     /// Drop a table: write `relkind = 'd'`, then perform physical cleanup
@@ -1471,14 +1690,16 @@ impl Engine {
     /// is deferred until the commit is durable, so a commit failure leaves
     /// the original table and every data page intact.
     fn drop_table_marker(&self, snap: &Snapshot, name: &str, entry: &TableEntry) -> Result<()> {
-        let old_tid = self.find_live_pg_class_row(entry.oid)?;
+        let old_tid = self.find_live_pg_class_row(snap, entry.oid)?;
         let columns = PG_CLASS.column_types();
         let class_row = vec![
             Some(Datum::Int8(entry.oid.0 as i64)),
             Some(Datum::Text(name.to_string())),
             Some(Datum::Text(RELKIND_DROPPED.to_string())),
             Some(Datum::Int4(entry.columns.len() as i32)),
-            Some(Datum::Int8(0)),
+            Some(Datum::Int8(
+                entry.toast.map_or(0, |toast| toast.rel_oid.0) as i64
+            )),
             Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
         ];
         let header = tuple_header(snap.curcid());
@@ -1516,6 +1737,10 @@ impl Engine {
             .map(|index| index.index_oid)
             .collect();
         self.heap.drop_relation(entry.oid);
+        self.heap.unregister_toast_relation(entry.oid);
+        if let Some(toast) = entry.toast {
+            self.heap.drop_relation(toast.rel_oid);
+        }
         self.registry.write().remove(name);
         self.indexes
             .write()
@@ -1523,13 +1748,21 @@ impl Engine {
         self.hnsw_handles
             .lock()
             .retain(|index_oid, _| !index_oids.contains(index_oid));
-        let pages = match self.walk_chain(entry.first_page) {
+        let mut pages = match self.walk_chain(entry.first_page) {
             Ok(pages) => pages,
             Err(error) => {
                 tracing::warn!(%error, table = %name, "post-commit DROP page walk failed; leaving pages leaked");
                 Vec::new()
             }
         };
+        if let Some(toast) = entry.toast {
+            match self.walk_chain(toast.first_page) {
+                Ok(toast_pages) => pages.extend(toast_pages),
+                Err(error) => {
+                    tracing::warn!(%error, table = %name, "post-commit DROP TOAST page walk failed; leaving pages leaked");
+                }
+            }
+        }
         for page_id in pages {
             if let Err(error) = self.storage.page_allocator().lock().free_page(page_id) {
                 tracing::warn!(%error, table = %name, ?page_id, "post-commit DROP page free failed; leaving page leaked");
@@ -2921,6 +3154,176 @@ impl Engine {
         })
     }
 
+    /// Reuse an unchanged old pointer or write a fresh chunk group for one
+    /// attribute. The old pointer is only accepted after its detoasted value
+    /// matches the new value under the current snapshot.
+    fn externalize_or_reuse(
+        &self,
+        snap: &Snapshot,
+        rel: &RelationDesc<'_>,
+        index: usize,
+        column: ColumnType,
+        new_datum: &Datum,
+        old: (Option<&[Value]>, Option<&[Value]>),
+    ) -> Result<Datum> {
+        let old_pointer = match old.0.and_then(|old| old.get(index)) {
+            Some(Some(Datum::External(pointer))) => Some(pointer),
+            _ => None,
+        };
+        if let Some(pointer) = old_pointer {
+            let unchanged = match old.1.and_then(|old| old.get(index)) {
+                Some(old_value) => old_value.as_ref().is_some_and(|old| old == new_datum),
+                None => false,
+            };
+            if unchanged {
+                return Ok(Datum::External(*pointer));
+            }
+        }
+        self.heap
+            .externalize_value(rel, snap, column, new_datum)
+            .map_err(EngineError::from)
+    }
+
+    /// The tuple codec requires all non-NULL VECTOR attributes to use the
+    /// same representation. Once one is external, normalize every remaining
+    /// inline VECTOR before the next encode so no payload tag inspection is
+    /// ever needed to distinguish them.
+    fn externalize_inline_vectors(
+        &self,
+        snap: &Snapshot,
+        rel: &RelationDesc<'_>,
+        col_types: &[ColumnType],
+        working: &mut [Value],
+        old_values: Option<&[Value]>,
+        old_detoasted: Option<&[Value]>,
+    ) -> Result<()> {
+        let has_external = col_types.iter().zip(working.iter()).any(|(column, value)| {
+            matches!(column, ColumnType::Vector(_)) && matches!(value, Some(Datum::External(_)))
+        });
+        if !has_external {
+            return Ok(());
+        }
+        for (index, column) in col_types.iter().enumerate() {
+            if !matches!(column, ColumnType::Vector(_)) {
+                continue;
+            }
+            let datum = match working.get(index) {
+                Some(Some(datum)) if !matches!(datum, Datum::External(_)) => datum.clone(),
+                _ => continue,
+            };
+            let external = self.externalize_or_reuse(
+                snap,
+                rel,
+                index,
+                *column,
+                &datum,
+                (old_values, old_detoasted),
+            )?;
+            working[index] = Some(external);
+        }
+        Ok(())
+    }
+
+    /// Encode a main row, writing oversized attributes as chunk groups first.
+    /// Every above-threshold value is externalized even when the row already
+    /// fits; below-threshold values are then selected largest-first until the
+    /// main row fits a heap page. An unchanged old pointer may be shared after
+    /// its bytes are compared under the current query snapshot.
+    fn encode_row_with_toast(
+        &self,
+        snap: &Snapshot,
+        entry: &TableEntry,
+        col_types: &[ColumnType],
+        values: &[Value],
+        node_id: Option<u32>,
+        old_values: Option<&[Value]>,
+    ) -> Result<Vec<u8>> {
+        if values.len() != entry.columns.len() {
+            return Err(EngineError::InvalidArgument(format!(
+                "table has {} columns but {} values given",
+                entry.columns.len(),
+                values.len()
+            )));
+        }
+        let rel = relation_desc(entry, col_types);
+        let old_detoasted = old_values
+            .map(|old| {
+                self.heap
+                    .detoast_values(&rel, snap, self.clog.as_ref(), old)
+            })
+            .transpose()?;
+        let encode = |values: &[Value]| {
+            match node_id {
+                Some(node_id) => pg_am_heap::tuple::encode_tuple_with_node_id(
+                    tuple_header(snap.curcid()),
+                    col_types,
+                    values,
+                    node_id,
+                ),
+                None => encode_tuple(tuple_header(snap.curcid()), col_types, values),
+            }
+            .map_err(EngineError::from)
+        };
+
+        let mut working = values.to_vec();
+        self.externalize_inline_vectors(
+            snap,
+            &rel,
+            col_types,
+            &mut working,
+            old_values,
+            old_detoasted.as_deref(),
+        )?;
+        let mut tuple = encode(&working)?;
+        loop {
+            let must_fit = tuple.len() > MAX_TUPLE_BYTES;
+            let mut candidate: Option<(usize, usize)> = None;
+            for (index, (column, value)) in col_types.iter().zip(&working).enumerate() {
+                let Some(datum) = value else { continue };
+                if !toastable(*column) || matches!(datum, Datum::External(_)) {
+                    continue;
+                }
+                let size = inline_size(*column, datum)?;
+                if size <= TOAST_TUPLE_THRESHOLD && !must_fit {
+                    continue;
+                }
+                if candidate.is_none_or(|(_, best)| size > best) {
+                    candidate = Some((index, size));
+                }
+            }
+            let Some((index, _)) = candidate else {
+                // No externalizable attribute remains. If this still exceeds
+                // the page bound, HeapAM's existing TupleTooLarge guard is the
+                // authoritative error and no chunk was written for this row.
+                return Ok(tuple);
+            };
+
+            let Some(Some(datum)) = working.get(index).cloned() else {
+                return Err(EngineError::Corrupted(format!(
+                    "TOAST candidate column {index} changed while encoding"
+                )));
+            };
+            let external = self.externalize_or_reuse(
+                snap,
+                &rel,
+                index,
+                col_types[index],
+                &datum,
+                (old_values, old_detoasted.as_deref()),
+            )?;
+            working[index] = Some(external);
+            self.externalize_inline_vectors(
+                snap,
+                &rel,
+                col_types,
+                &mut working,
+                old_values,
+                old_detoasted.as_deref(),
+            )?;
+            tuple = encode(&working)?;
+        }
+    }
+
     /// The shared insert path. Takes the registry `entry` from the caller
     /// (Stage O review): SQL exec already holds it for
     /// `build_insert_values`, so looking it up again here would be a
@@ -2973,15 +3376,7 @@ impl Engine {
             }
         }
 
-        let tuple = match node_id {
-            Some(nid) => pg_am_heap::tuple::encode_tuple_with_node_id(
-                tuple_header(snap.curcid()),
-                &col_types,
-                values,
-                nid,
-            )?,
-            None => encode_row(entry, &col_types, values, snap.curcid())?,
-        };
+        let tuple = self.encode_row_with_toast(snap, entry, &col_types, values, node_id, None)?;
         let mut out_tid = Tid {
             page_id: PageId::INVALID,
             slot_id: 0,
@@ -3086,16 +3481,19 @@ impl Engine {
         let col_types = column_types(&entry);
         let indexes = self.indexes_of(&entry);
 
-        // M6 Stage C: with an HNSW index on the table, read back the old
-        // row's trailing NodeId alongside its values.
+        // Read both forms: raw pointers may be reused by the new version,
+        // while index maintenance and change detection need detoasted values.
         let hnsw = indexes
             .iter()
             .find(|(idx, _)| matches!(idx.key_type, ColumnType::Vector(_)));
-        let (old_values, old_node_id) = if !indexes.is_empty() {
-            self.read_row_by_tid_with_node_id(&entry, &col_types, tid)?
-        } else {
-            (Vec::new(), None)
-        };
+        let (old_raw_values, old_node_id) =
+            self.read_row_by_tid_with_node_id(&entry, &col_types, tid)?;
+        let old_values = self.heap.detoast_values(
+            &relation_desc(&entry, &col_types),
+            snap,
+            self.clog.as_ref(),
+            &old_raw_values,
+        )?;
 
         // Did the vector column change? (HOT eligibility below compares
         // values per indexed column; the vector column participates.)
@@ -3139,15 +3537,14 @@ impl Engine {
             }
         }
 
-        let tuple = match new_node_id {
-            Some(nid) => pg_am_heap::tuple::encode_tuple_with_node_id(
-                tuple_header(snap.curcid()),
-                &col_types,
-                values,
-                nid,
-            )?,
-            None => encode_row(&entry, &col_types, values, snap.curcid())?,
-        };
+        let tuple = self.encode_row_with_toast(
+            snap,
+            &entry,
+            &col_types,
+            values,
+            new_node_id,
+            Some(&old_raw_values),
+        )?;
         let hot_eligible = !indexes.is_empty()
             && indexes
                 .iter()
@@ -3263,13 +3660,16 @@ impl Engine {
         let hnsw = indexes
             .iter()
             .find(|(idx, _)| matches!(idx.key_type, ColumnType::Vector(_)));
-        // M6 Stage C: with an HNSW index the old row's trailing NodeId is
-        // read back alongside its values.
-        let (old_values, old_node_id) = if !indexes.is_empty() {
-            self.read_row_by_tid_with_node_id(&entry, &col_types, tid)?
-        } else {
-            (Vec::new(), None)
-        };
+        // Index keys need values, while the trailing NodeId is read from the
+        // same physical row version before its xmax is stamped.
+        let (old_raw_values, old_node_id) =
+            self.read_row_by_tid_with_node_id(&entry, &col_types, tid)?;
+        let old_values = self.heap.detoast_values(
+            &relation_desc(&entry, &col_types),
+            snap,
+            self.clog.as_ref(),
+            &old_raw_values,
+        )?;
         // The entry to remove belongs to the chain root: `tid` itself may be a
         // HOT descendant, which never got an entry of its own.
         let index_tid = if indexes.is_empty() {
@@ -3396,11 +3796,26 @@ impl Engine {
                 ..VacuumStats::default()
             };
             if dead.is_empty() {
+                // A crash may leave chunks whose main-row WAL never landed.
+                // They still need the reference-driven TOAST pass.
+                stats.toast_chunks_reclaimed = self.heap.vacuum_toast(&rel)?;
                 return Ok(stats);
             }
 
             // Phase 3: read-only key extraction, BEFORE any physical rewrite.
-            let keys = self.heap.collect_index_keys(rel, &dead)?;
+            // Dead/loser rows cannot use query-snapshot detoast; their unique
+            // valueids are resolved by the physical maintenance path instead.
+            let keys = self
+                .heap
+                .collect_index_keys(rel, &dead)?
+                .into_iter()
+                .map(|(tid, values)| {
+                    self.heap
+                        .detoast_values_physical(&rel, &values)
+                        .map(|values| (tid, values))
+                        .map_err(EngineError::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
             stats.index_keys = keys.len();
 
             // Phase 4: push-mode index cleanup, one descent per (key, tid)
@@ -3507,6 +3922,9 @@ impl Engine {
             // Phase 5: compaction + unlink + free (kill set re-derived
             // from `dead` inside reclaim — do not pre-filter it here).
             self.heap.reclaim(rel, &dead)?;
+            // TOAST follows main-row reclamation: any pointer still present
+            // in a physical old/HOT version conservatively pins its group.
+            stats.toast_chunks_reclaimed = self.heap.vacuum_toast(&rel)?;
             Ok(stats)
         })
     }
@@ -3562,18 +3980,38 @@ impl Engine {
             });
     }
 
-    /// Read back the decoded values of the row at `tid` directly from its
-    /// heap page (raw read, no visibility filter: DML uses this to recover
-    /// the OLD key of a row the caller already addressed by TID, before the
-    /// heap mutation runs in the same statement).
+    /// Read and detoast the addressed row version under the caller's snapshot.
+    /// Visibility of the main row is judged by the caller's scan/search path;
+    /// this helper resolves only the pointers carried by that exact version.
     pub(crate) fn read_row_by_tid(
+        &self,
+        snap: &Snapshot,
+        entry: &TableEntry,
+        col_types: &[ColumnType],
+        tid: Tid,
+    ) -> Result<Vec<Value>> {
+        let (values, _) = self.read_row_by_tid_with_node_id(entry, col_types, tid)?;
+        Ok(self.heap.detoast_values(
+            &relation_desc(entry, col_types),
+            snap,
+            self.clog.as_ref(),
+            &values,
+        )?)
+    }
+
+    /// Physical detoast for recovery's loser-index compensation. Aborted
+    /// chunks cannot be read through a query snapshot, but their exact valueid
+    /// is still needed to restore an index delete performed by that loser.
+    fn read_row_by_tid_physical(
         &self,
         entry: &TableEntry,
         col_types: &[ColumnType],
         tid: Tid,
     ) -> Result<Vec<Value>> {
         let (values, _) = self.read_row_by_tid_with_node_id(entry, col_types, tid)?;
-        Ok(values)
+        self.heap
+            .detoast_values_physical(&relation_desc(entry, col_types), &values)
+            .map_err(EngineError::from)
     }
 
     /// Read back a row's values AND its trailing NodeId (M6 Stage C):
@@ -3841,7 +4279,7 @@ impl Engine {
             // The row version's bytes are intact on its page (redo at most
             // stamped the loser's xmax). Same chain-root rule as the online
             // delete/update paths: HOT descendants never own entries.
-            let old_values = self.read_row_by_tid(entry, col_types, tid)?;
+            let old_values = self.read_row_by_tid_physical(entry, col_types, tid)?;
             let index_tid = self.hot_chain_root(tid)?;
             for (idx, col_index) in &indexes {
                 // M6 Stage C: an HNSW index is not a B+Tree key shape — its
@@ -4752,29 +5190,26 @@ impl Engine {
         Ok(())
     }
 
-    /// Locate the live (`relkind = 'r'`) `pg_class` row of `oid` by a raw
-    /// slot scan of the catalog's first page.
-    ///
-    /// Raw, not `HeapAM::scan`: catalog rows written by bootstrap carry the
-    /// synthetic bootstrap XID, which the CLOG has never heard of — a
-    /// visibility-filtered AM scan would see nothing. The registry only
-    /// tracks live tables, so a live row must exist.
-    fn find_live_pg_class_row(&self, oid: Oid) -> Result<Tid> {
-        let guard = self.storage.buffer_pool().pin(PG_CLASS.first_page)?;
-        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+    /// Locate the live (`relkind = 'r'`) `pg_class` version visible to the
+    /// current DDL transaction. TOAST migration and DROP both update this
+    /// catalog row, so a raw first-slot match can address an already-dead
+    /// version and spuriously fail with `TupleConcurrentlyUpdated`.
+    fn find_live_pg_class_row(&self, snap: &Snapshot, oid: Oid) -> Result<Tid> {
         let columns = PG_CLASS.column_types();
-        for slot in 0..SlottedPage::slot_count(page) as u16 {
-            let Some(bytes) = SlottedPage::tuple(page, slot)? else {
-                continue;
-            };
-            let (_header, values) = decode_tuple(bytes, &columns)?;
+        let rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_CLASS.oid.raw(),
+                first_page: PG_CLASS.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            clog: self.clog.as_ref(),
+        })?;
+        for (tid, values) in rows {
             let matches = matches!(&values[0], Some(Datum::Int8(v)) if *v == oid.0 as i64)
                 && matches!(&values[2], Some(Datum::Text(k)) if k == RELKIND_TABLE);
             if matches {
-                return Ok(Tid {
-                    page_id: PG_CLASS.first_page,
-                    slot_id: slot,
-                });
+                return Ok(tid);
             }
         }
         Err(EngineError::Corrupted(format!(
@@ -5002,23 +5437,6 @@ fn relation_desc<'a>(entry: &TableEntry, col_types: &'a [ColumnType]) -> Relatio
         first_page: entry.first_page,
         columns: col_types,
     }
-}
-
-/// Encode `values` as a heap tuple against the entry's schema.
-fn encode_row(
-    entry: &TableEntry,
-    col_types: &[ColumnType],
-    values: &[Value],
-    curcid: u32,
-) -> Result<Vec<u8>> {
-    if values.len() != entry.columns.len() {
-        return Err(EngineError::InvalidArgument(format!(
-            "table has {} columns but {} values given",
-            entry.columns.len(),
-            values.len()
-        )));
-    }
-    Ok(encode_tuple(tuple_header(curcid), col_types, values)?)
 }
 
 /// Check that a predicate's column index is in range for the table.
@@ -6006,14 +6424,16 @@ mod tests {
         assert!(write_result.is_ok(), "{write_result:?}");
         assert!(engine.indexes().is_empty());
         assert!(engine.hnsw_handles.lock().is_empty());
-        // The failed index OID is allocated immediately after the table OID.
-        // Read the physical sidecar directly: MVCC would hide the aborted
-        // relpages row and produce a vacuous `hnsw_map_get == None` result.
-        let map_page = raw_hnsw_map_page(&engine, Oid(table_oid.0 + 1));
+        // The failed index OID follows the table OID and its optional Stage D
+        // TOAST OID. Read the physical sidecar directly: MVCC would hide the
+        // aborted relpages row and produce a vacuous lookup result.
+        let has_toast = engine.describe_table("t").unwrap().toast.is_some();
+        let failed_index_oid = Oid(table_oid.0 + 1 + u64::from(has_toast));
+        let map_page = raw_hnsw_map_page(&engine, failed_index_oid);
         let map = pg_am_btree::BTreeIndex::open(
             Arc::clone(engine.storage.buffer_pool()),
             Arc::clone(engine.storage.wal_writer()),
-            Oid(table_oid.0 + 1),
+            failed_index_oid,
             map_page,
             ColumnType::Int8,
         )

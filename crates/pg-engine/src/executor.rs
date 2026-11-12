@@ -124,7 +124,7 @@ fn execute_hnsw(
         .map(|(tid, _)| {
             // hnsw_search_visible already judged this exact TID against
             // `snap`; the caller's guard keeps that version reclaim-safe.
-            let values = engine.read_row_by_tid(entry, &col_types, tid)?;
+            let values = engine.read_row_by_tid(snap, entry, &col_types, tid)?;
             Ok((tid, values))
         })
         .collect::<Result<ScanRows>>()?;
@@ -515,7 +515,7 @@ fn execute_btree(
         let Some(visible_tid) = engine.heap_tuple_visible(snap, candidate)? else {
             continue;
         };
-        let values = engine.read_row_by_tid(entry, &col_types, visible_tid)?;
+        let values = engine.read_row_by_tid(snap, entry, &col_types, visible_tid)?;
         // Visibility does not prove key identity. Recheck the decoded row,
         // which also enforces strict `>` after the inclusive range start.
         if predicate.matches(&values[predicate.col_index()]) {

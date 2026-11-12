@@ -1213,3 +1213,36 @@ fn distance_row_carries_float8_oid_and_text_value() {
     }
     assert_eq!(values, ["1", "5"]);
 }
+
+#[test]
+fn toasted_text_roundtrip_through_simple_query() {
+    let (_tmp, engine, mut session) = open_session();
+    let mut out = Vec::new();
+    session.handle_query("CREATE TABLE t (id INT4, v TEXT)", &mut out);
+    let large = "z".repeat(9_000);
+    engine
+        .insert(
+            "t",
+            &[Some(Datum::Int4(1)), Some(Datum::Text(large.clone()))],
+        )
+        .unwrap();
+
+    out.clear();
+    session.handle_query("SELECT * FROM t", &mut out);
+    let messages = scan_messages(&out);
+    let rows: Vec<&Msg> = messages.iter().filter(|msg| msg.tag == b'D').collect();
+    assert_eq!(rows.len(), 1);
+    let mut rest = &rows[0].body[2..];
+    let id_len = i32::from_be_bytes(rest[0..4].try_into().unwrap());
+    assert_eq!(id_len, 1);
+    assert_eq!(&rest[4..5], b"1");
+    rest = &rest[5..];
+    let value_len = i32::from_be_bytes(rest[0..4].try_into().unwrap());
+    assert_eq!(value_len, 9_000);
+    assert_eq!(
+        std::str::from_utf8(&rest[4..4 + value_len as usize]).unwrap(),
+        large
+    );
+    assert!(rest[4 + value_len as usize..].is_empty());
+    assert_eq!(command_tags(&out), ["SELECT 1"]);
+}

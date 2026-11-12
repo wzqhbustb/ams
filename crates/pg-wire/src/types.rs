@@ -111,8 +111,9 @@ pub fn expand_format_codes(codes: &[i16], count: usize, what: &str) -> Result<Ve
     }
 }
 
-/// Text-encode one datum. Returns an error for `Datum::External` until
-/// Stage D teaches the engine read path to resolve TOAST pointers.
+/// Text-encode one datum. Engine read paths detoast before values reach the
+/// wire; a raw `Datum::External` still fails loudly rather than exposing its
+/// physical pointer as user data.
 pub fn encode_text(d: &Datum) -> Result<Vec<u8>> {
     let bytes = match d {
         Datum::Int4(v) => v.to_string().into_bytes(),

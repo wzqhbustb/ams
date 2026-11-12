@@ -2,7 +2,7 @@
 //! five-step pipeline pins: committed rows visible, in-flight/aborted/
 //! deleted rows hidden, slot-reuse mismatches discarded, ef-retry rounds.
 
-use pg_am_heap::ColumnType;
+use pg_am_heap::{AccessMethod, ColumnType};
 use pg_am_hnsw::graph::NeighborSelection;
 use pg_am_hnsw::{HnswParams, Metric};
 use pg_engine::{ColumnDef, Engine, EngineConfig};
@@ -670,9 +670,6 @@ fn vacuum_closes_deferred_entries_before_cross_table_page_reuse() {
     }
     assert_eq!(chain.len(), 8, "a must span head + 7 non-head pages");
     let head = chain[0];
-    let mut freed = chain[1..].to_vec();
-    freed.sort();
-    let first_freed = freed[0];
 
     // Hold an old snapshot so every delete's map removal defers.
     let reader = engine.begin_txn().unwrap();
@@ -706,62 +703,71 @@ fn vacuum_closes_deferred_entries_before_cross_table_page_reuse() {
         );
     }
 
-    // Cross-table reuse: b inherits a's freed pages via the global LIFO
-    // freelist.
+    // Cross-table reuse: b's main heap head is allocated immediately after
+    // vacuum, before its TOAST metadata, making it the deterministic
+    // reused-page anchor even with Stage D's extra hidden relation.
     engine.create_table("b", &wide_schema()).unwrap();
-    engine
-        .create_hnsw_index_on(
-            "b",
-            "v",
-            HnswParams::default(),
-            DIM,
-            Metric::L2,
-            NeighborSelection::Heuristic,
-            0xB,
-        )
-        .unwrap();
-    let mut b_on_first_freed: Vec<(u32, Tid)> = Vec::new();
-    for j in 0..12i32 {
-        let tid = engine.insert("b", &row(1000 + j, &pad)).unwrap();
-        if tid.page_id == first_freed {
-            b_on_first_freed.push((j as u32, tid));
-            if b_on_first_freed.len() == 3 {
-                break;
-            }
-        }
-    }
-    assert_eq!(
-        b_on_first_freed.len(),
-        3,
-        "b's spill rows must land on a's first-freed page {first_freed:?}"
-    );
-
-    // a's deleted rows on that page carried nodes `a_nodes`; b's rows now
-    // occupying the same slots carry the same node ids (identical row
-    // sizes ⟹ identical head capacities ⟹ identical numbering offsets).
+    let b_head = engine.describe_table("b").unwrap().first_page;
     let a_on_first_freed: Vec<(u32, Tid)> = deleted
         .iter()
-        .filter(|(_, t)| t.page_id == first_freed)
+        .filter(|(_, t)| t.page_id == b_head)
         .copied()
         .collect();
-    assert_eq!(
-        a_on_first_freed.len(),
-        3,
-        "a filled that page before it died"
+    assert!(
+        !a_on_first_freed.is_empty(),
+        "b's heap head must be a page reclaimed from a"
     );
-    for ((a_node, a_tid), (b_node, b_tid)) in a_on_first_freed.iter().zip(b_on_first_freed.iter()) {
-        assert_eq!(
-            a_tid, b_tid,
-            "same slots: a's residual entries point exactly at b's rows"
-        );
-        assert_eq!(a_node, b_node, "the exact node-id collision at {a_tid:?}");
-    }
+    let (probe_node, a_tid) = a_on_first_freed[0];
+
+    // Insert only b's heap row, carrying the same trailing NodeId as a's old
+    // row. A second graph would consume/replay its own reused directory pages
+    // and is unnecessary for the stale-map visibility probe.
+    let b_entry = engine.describe_table("b").unwrap();
+    let b_columns: Vec<ColumnType> = b_entry.columns.iter().map(|c| c.col_type).collect();
+    let xid = engine.txn_manager().begin_txn();
+    let mut snapshot = Snapshot::everything();
+    snapshot.set_current_xid(xid);
+    let tuple = pg_am_heap::tuple::encode_tuple_with_node_id(
+        pg_am_heap::tuple::TupleHeader::new(
+            pg_storage::types::TxnId::INVALID,
+            pg_storage::types::TxnId::INVALID,
+            0,
+            [0; 16],
+            Tid {
+                page_id: PageId::INVALID,
+                slot_id: 0,
+            },
+            0,
+        ),
+        &b_columns,
+        &row(1000, &pad),
+        probe_node,
+    )
+    .unwrap();
+    let mut b_tid = Tid {
+        page_id: PageId::INVALID,
+        slot_id: 0,
+    };
+    engine
+        .heap()
+        .insert(pg_am_heap::access_method::InsertContext {
+            rel: pg_am_heap::access_method::RelationDesc {
+                rel_oid: b_entry.oid,
+                first_page: b_entry.first_page,
+                columns: &b_columns,
+            },
+            snapshot: &snapshot,
+            tuple: &tuple,
+            out_tid: Some(&mut b_tid),
+        })
+        .unwrap();
+    engine.txn_manager().commit_txn(xid).unwrap();
+    assert_eq!(a_tid, b_tid, "a's residual entry points at b's reused slot");
 
     // a's ANN search for a deleted row's own vector: the tombstoned node
     // still self-recalls, but with the map entry gone the candidate is
     // discarded — pre-fix it resolved through the residual entry to b's
     // row and passed the in-row NodeId re-check (the leak).
-    let (probe_node, _) = a_on_first_freed[0];
     let hits = engine
         .hnsw_search_visible(
             "a",

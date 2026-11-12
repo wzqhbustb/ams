@@ -107,6 +107,8 @@
 
 **验收**：大值与多 attribute 装页全通过；现有指针格式冻结；旧快照不读错、abort/vacuum 不提前回收；崩溃恢复后主行-chunk 一致；TOAST 零新 WAL 记录类。**TOAST 溢出存储不改变 `MAX_VECTOR_DIM` 的类型级上限**——超 dim 的向量声明仍按 M6 的响亮拒绝处理，TOAST 只负责存储容量。
 
+**实现补充**：每个含 TOASTable 列的用户表在 DDL 时分配一个隐藏 heap 和一个 OID，主表既有 `pg_class.reltoastrelid` 记录 OID，既有 `pg_rust_relpages.last_page` 记录隐藏链头（普通表 tail 原本只是 advisory 字段）；隐藏关系自身不新增任何目录行。pre-Stage-D 目录在 open 时经事务迁移，目录行均按当前快照选择 live 版本，relpages 读取取最新物理版本。写入先对全部超阈值值外置，再按最大 inline 值循环外置至装页；TEXT/BYTEA/VECTOR 共用 chunk 编解码，VECTOR 仍以 2000 维为类型上限。`t_infomask2` 新增 `HEAP_VECTOR_EXTERNAL(0x1000)` 统一表示全部非 NULL VECTOR attribute 均为 external；engine 在外置任一 VECTOR 时归一化同元组其他 VECTOR，codec 拒绝混合形态，因此不再根据 f32 payload 猜测指针。建表时 TOAST 注册位于提交前，commit 成功后才发布 table registry；注册失败会中止建表，commit 失败在锁释放前清理，避免“已提交但 API 报错”的幽灵表。valueid 在主表关系内单调分配，open 时扫描全部物理 chunk 恢复高水位，OID 启动校正同时纳入 `reltoastrelid`。普通查询只在主行/回表快照下 detoast；物理 detoast 仅用于 crash-loser 索引补偿和 vacuum，不返回用户结果。合法零长度值也必须存在一个 seq=0 空 chunk，零可见 chunk 一律按 Corrupted 处理，不再将 `va_extsize == 0` 作为合法例外。UPDATE 通过值比较共享未修改 group。vacuum 先回收主行，再回收不再被任何物理主行版本引用的 group，`VacuumStats.toast_chunks_reclaimed` 直接报告本轮回收量。`phase4a_toast.rs` 覆盖大值/多列/VECTOR、重启、旧快照 UPDATE/DELETE、共享引用、abort、损坏 chunk、旧目录迁移以及 chunk-only 和主行未提交两类 crash。当前没有 JSONB Datum/DDL 类型，故以 BYTEA 验证二进制 varlena，真正 JSONB 类型接入后的专项回归留作类型扩展边界，不冒充已验收。
+
 ---
 
 ## Stage E：DataFusion 集成与 TP 适配检查点（2–3 天）
