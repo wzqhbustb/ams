@@ -46,3 +46,12 @@ Final gates: workspace debug tests and release tests for all four changed runtim
 - Post-fix gates: `cargo test --workspace --no-fail-fast` exited 0 with no failures; release tests for `pg-am-heap`, `pg-catalog`, `pg-engine`, and `pg-wire` also exited 0. `cargo check --workspace --all-features`, all eight crate Clippy/rustdoc checks, fmt, and `git diff --check` passed.
 
 These are correctness and recovery acceptance results, not throughput measurements. TOAST detoast currently favors a simple one-chunk-scan-per-main-row implementation; no performance claim is made for large TOAST relations. The current type system has no JSONB Datum/DDL type, so BYTEA covers the binary varlena path; JSONB-specific acceptance remains a follow-up when that type exists.
+
+## Stage E: DataFusion AP integration
+
+- Date: 2026-11-13 (UTC)
+- DataFusion: **50.3.0** (actual resolved version), MSRV-compatible and optional. Default TP/ANN execution does not enable it.
+- `cargo test -p pg-engine --features datafusion --test phase4a_datafusion`: **13 passed, 1 ignored** covering projection/order/limit, zero-column and zero-batch schemas, B+Tree and ordinary filters, in-flight/aborted visibility, old-snapshot UPDATE + vacuum, Arrow types including UUID aliases/JOIN/NULL vectors and string predicates, Guard release on collect/LIMIT/execution error, AccessShare on JOIN, current/multi-thread Tokio sync/async calls, and AND/aliases/aggregates/computed columns/JOIN result conversion.
+- Manual release acceptance: `cargo test -p pg-engine --features datafusion --release --test phase4a_datafusion datafusion_point_lookup_mean_latency_is_below_5ms -- --ignored --nocapture` — **1 passed**. Point lookup mean **0.645ms** over 20 `SELECT id FROM t WHERE id = 2` calls, below the **5ms** gate. The default self-owned TP path remains in place regardless of this result.
+- Feature-off behavior: `exec_datafusion` returns `Unsupported` explicitly, without changing existing TP/ANN semantics.
+- Final gates: `cargo test --workspace --no-fail-fast` exited 0 with no failures; release tests for `pg-am-heap`, `pg-catalog`, `pg-engine`, and `pg-wire` also exited 0. `cargo check --workspace --all-features`, all eight crate Clippy/rustdoc checks, fmt, and `git diff --check` passed.

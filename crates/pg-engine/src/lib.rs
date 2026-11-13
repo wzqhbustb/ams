@@ -25,6 +25,8 @@
 #![warn(rust_2018_idioms)]
 
 pub mod clog_snapshot_migrate;
+#[cfg(feature = "datafusion")]
+pub mod datafusion_provider;
 pub mod diag;
 pub mod engine;
 pub mod error;

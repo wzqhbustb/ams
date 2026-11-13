@@ -4385,6 +4385,107 @@ impl Engine {
         self.exec_parsed(txn, sql, started, stmt, None)
     }
 
+    /// Execute an AP query synchronously without nesting a runtime on the current thread.
+    #[cfg(feature = "datafusion")]
+    pub fn exec_datafusion(
+        self: &Arc<Self>,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+    ) -> Result<QueryResult> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
+                    handle.block_on(self.exec_datafusion_inner(txn, sql))
+                }),
+                tokio::runtime::RuntimeFlavor::CurrentThread => {
+                    Err(EngineError::Unsupported(
+                        "synchronous DataFusion execution inside a current-thread Tokio runtime is not supported; use exec_datafusion_async".to_string(),
+                    ))
+                }
+                _ => Err(EngineError::Unsupported(
+                    "synchronous DataFusion execution is not supported in this Tokio runtime".to_string(),
+                )),
+            },
+            Err(_) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        EngineError::InvalidArgument(format!(
+                            "cannot create DataFusion runtime: {error}"
+                        ))
+                    })?;
+                runtime.block_on(self.exec_datafusion_inner(txn, sql))
+            }
+        }
+    }
+
+    /// Execute an AP query directly in the current async task.
+    #[cfg(feature = "datafusion")]
+    pub async fn exec_datafusion_async(
+        self: &Arc<Self>,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+    ) -> Result<QueryResult> {
+        self.exec_datafusion_inner(txn, sql).await
+    }
+
+    #[cfg(feature = "datafusion")]
+    async fn exec_datafusion_inner(
+        self: &Arc<Self>,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+    ) -> Result<QueryResult> {
+        if let Some(handle) = txn {
+            if handle.instance_id != self.instance_id {
+                return Err(EngineError::InvalidArgument(
+                    "transaction handle belongs to a different Engine instance".to_string(),
+                ));
+            }
+        }
+        let started = Instant::now();
+        let stmt = match sql::parse(sql) {
+            Ok(statement) => statement,
+            Err(_) => Statement::Select {
+                columns: SelectCols::All,
+                table: String::new(),
+                filter: None,
+                order_by: None,
+                limit: None,
+                lock: None,
+            },
+        };
+        let result = crate::datafusion_provider::execute_datafusion(self, txn, sql).await;
+        if self.query_stats.capacity() > 0 {
+            let rows = match &result {
+                Ok(QueryResult::Rows { rows, .. }) => rows.len(),
+                Ok(QueryResult::Affected(n)) => *n,
+                _ => 0,
+            };
+            self.query_stats.record(QueryStatEntry {
+                query: sql.to_string(),
+                latency: started.elapsed(),
+                rows,
+                path: ExecutionPath::of(&stmt),
+                timestamp: SystemTime::now(),
+            });
+        }
+        result
+    }
+
+    /// DataFusion AP is opt-in. Without the feature the request is rejected.
+    #[cfg(not(feature = "datafusion"))]
+    pub fn exec_datafusion(
+        self: &Arc<Self>,
+        _txn: Option<&TxnHandle>,
+        _sql: &str,
+    ) -> Result<QueryResult> {
+        let _ = (self, _txn, _sql);
+        Err(EngineError::Unsupported(
+            "DataFusion AP path requires the 'datafusion' feature".to_string(),
+        ))
+    }
+
     /// Execute a SQL statement with typed `$1..$n` bind parameters.
     ///
     /// Parameters replace [`Literal::Param`] nodes in the parsed AST; they are
@@ -5283,7 +5384,12 @@ impl Engine {
     /// we resolved was dropped while we waited — fail with
     /// [`EngineError::TableNotFound`]; the lock we took on the dead OID is
     /// released by the caller's normal commit/abort path.
-    fn lock_table_entry(&self, xid: TxnId, table: &str, mode: LockMode) -> Result<TableEntry> {
+    pub(crate) fn lock_table_entry(
+        &self,
+        xid: TxnId,
+        table: &str,
+        mode: LockMode,
+    ) -> Result<TableEntry> {
         let entry = self.table_entry(table)?;
         self.lock_table(xid, &entry, mode)?;
         let current = self
@@ -5296,6 +5402,15 @@ impl Engine {
             return Err(EngineError::TableNotFound(table.to_string()));
         }
         Ok(current)
+    }
+
+    /// All live table names and entries, used by the optional AP router.
+    pub fn table_entries(&self) -> Vec<(String, TableEntry)> {
+        self.registry
+            .read()
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect()
     }
 
     /// A cloned registry entry for `table` (testing / advanced use, e.g.

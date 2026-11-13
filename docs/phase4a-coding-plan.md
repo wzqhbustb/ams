@@ -122,6 +122,8 @@
 
 **验收**:DataFusion 适配检查点两项实测通过或备用路径生效并登记实测值；可见性与旧快照 vacuum 防护全绿；普通 TP/AP 查询行集一致，ANN 仅走自研 TP；默认与 `datafusion` feature 构建测试全绿。
 
+**实现补充**：DataFusion 选用 **50.3.0**（MSRV 1.86，实际解析版本），以可选 feature 引入；默认 TP/ANN 不启用。公开入口 `Engine::exec_datafusion` 是显式 AP API，默认 `exec` 不改路由：普通 SELECT 仍走自研执行器，ANN 与 FOR UPDATE/SHARE 明确拒绝。`PgTableProvider` 将 heap schema 转为 Arrow schema，scan 复用自研执行器完成 B+Tree/普通 filter、回表可见性与 TOAST detoast，再转换 RecordBatch 为 `QueryResult`。provider/execution plan 持有 SnapshotGuard 至 execution stream 和派生任务结束，collect、LIMIT 与执行错误均释放 Guard；显式事务复用 TxnHandle 的快照、推进 curcid，并与自研 SELECT 一样先取 AccessShare，DROP 必须等待读者结束。Mini SQL 只负责拦截 ANN、行锁和非 SELECT，复杂 AP 语法交给 DataFusion；所有 live 表均注册以支持 JOIN，结果字段优先匹配原 ColumnType，匹配不到时回退 Arrow DataType，支持 AND、别名、聚合、计算列与 JOIN。Arrow Int4/Int8/Float8/Text/Bytea/Timestamptz/Uuid/Vector 均按原 ColumnType 转换，NULL vector 以 List null 表示。
+
 ---
 
 ## Stage F：Sequence(SERIAL)(2–3 天）
@@ -173,7 +175,7 @@ done
 | 3 | 向量 SQL 语义测试（Stage B) | 同上 | 每 push |
 | 4 | PG Wire Extended Query、Bind/Sync/portal、VECTOR golden bytes 与驱动矩阵（Stage C) | ci.yml 既有 pg-wire test matrix | 每 push |
 | 5 | heap TOAST MVCC/装页/回收测试 + crash rounds(Stage D) | ci.yml 既有 pg-am-heap/pg-engine matrix + crash-rounds 手动/nightly | 每 push（单元）+ 手动/nightly（崩溃轮次） |
-| 6 | DataFusion 适配检查点与默认/feature 双构建（Stage E) | ci.yml 既有 pg-engine matrix（新增默认与 `datafusion` feature 变体） | 每 push |
+| 6 | DataFusion 适配检查点与默认/feature 双构建（Stage E) | ci.yml 独立 `engine-default` job（默认 feature）+ 既有 pg-engine all-features matrix；5ms 点查改 `#[ignore]` 手动 release 验收 | 每 push（双路径功能回归）+ 手动性能验收 |
 | 7 | Sequence 并发/会话测试 + WAL crash rounds(Stage F) | ci.yml 既有 pg-engine test matrix + crash-rounds 手动/nightly | 每 push（单元）+ 手动/nightly（崩溃轮次） |
 | 8 | 既有 HNSW 覆盖率回归 | 既有 coverage job(--fail-under 90，仅 pg-am-hnsw) | 每 push；不得作为 Phase 4a 其他 crate 的覆盖率证明 |
 | 9 | 全量回归 + 对抗审查 | 全量回归 debug+release + 两轮对抗审查 | Stage G 收口时 |

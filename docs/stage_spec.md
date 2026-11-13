@@ -1863,3 +1863,28 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - heap lib **39/39**，wire protocol **36/36**（含 9000B Simple Query DataRow）。
 - 八 crate Clippy `--all-targets --all-features -D warnings`、八 crate rustdoc `-D warnings`、fmt 与 `git diff --check` 全绿。
 - 最新 TOAST 专项 release 亦 **17/17**；`pg-am-heap`/`pg-catalog`/`pg-engine`/`pg-wire` release 全量 EXIT=0。`cargo test --workspace --no-fail-fast` 全量 EXIT=0、零失败；`cargo check --workspace --all-features` 同步通过。
+
+## Phase 4a Stage E：DataFusion 集成与 TP 适配检查点
+
+**状态**：✅ 完成（2026-11-12；DataFusion 集成、AccessShare 修复、专项回归与全量门禁均通过；未 commit——等用户确认）。
+
+### 交付内容
+
+1. **可选 DataFusion 路径**：选用 DataFusion 50.3.0（MSRV 1.86，实际解析版本），`datafusion` feature 引入，默认 TP/ANN 不启用。`Engine::exec_datafusion` 是显式 AP API；默认 `exec` 的路由、TP 与 ANN 行为完全不变。feature 关闭时 AP 响亮返回 `Unsupported`，不静默改语义。
+2. **只读 TableProvider**：`datafusion_provider.rs` 将 heap schema 转为 Arrow schema，保留 projection、filter 与 limit。scan 复用自研执行器完成 B+Tree/普通 filter、可见性回表和 TOAST detoast，支持多过滤条件的 AND 语义；不支持或复杂表达式由 DataFusion 处理。ANN、FOR UPDATE/SHARE 和非 SELECT 语句不进入该路径。
+3. **SnapshotGuard 与表锁生命周期**：provider 与 execution plan 持有 Guard 至 execution stream 和派生读取任务结束，SessionContext 在 collect 后释放；LIMIT 提前结束和执行错误同样释放。显式事务使用 TxnHandle 的快照并推进 curcid，auto-commit 使用 `(Snapshot, SnapshotGuard)`，不使用 `Snapshot::everything()`。显式 AP 事务与自研 SELECT 一样先取 AccessShare，DROP 必须等待读者结束，并有确定性回归。同步 API 在无 runtime 与 multi-thread Tokio 中可用；current-thread 内同步调用返回结构化错误，`exec_datafusion_async` 直接支持 async 调用方，不跨线程移动 TxnHandle。
+4. **Arrow 类型转换**：Int4/Int8/Float8/Text/Bytea/Timestamptz/Uuid/Vector 按原 ColumnType 转换；UUID 使用 `FixedSizeBinary(16)` 与 TEXT 区分，NULL vector 以 List null 保留。结果 schema 在 collect 前从 DataFrame 获取，零 batch 保留列名，零列 batch 通过 `RecordBatchOptions` 保留行数；JOIN、别名和计算列按 Arrow DataType 解码，不按首表或字段名猜类型。默认类型协调前对 Filter/TableScan 中的 UUID 字符串 Eq/NotEq literal 做窄重写，支持正反向比较、嵌套表达式与 JOIN 后 WHERE，非法 UUID 响亮报错，TEXT/BYTEA 与 NULL 语义不变。
+
+### 审查回流
+
+- **复杂 AP 限制**：初版 `execute_datafusion` 强制先过 Mini SQL，导致 AND、COUNT 等无法进入 DataFusion；现 Mini SQL 仅拦截 ANN、行锁和非 SELECT，复杂语法交给 DataFusion，并注册全部 live 表支持 JOIN。
+- **计算列转换**：初版要求结果字段必须存在于原表 schema，别名、聚合和计算列会被误报 Corrupted；现优先匹配原 ColumnType，匹配不到时回退 Arrow DataType，覆盖别名、COUNT(id)、计算列与 JOIN。
+- **P3 回流**：5ms 延迟门改为 `#[ignore]` 手动 release 验收，默认专项不再受并行负载影响；CI 新增独立 `engine-default`（Ubuntu/macOS）并保留 pg-engine all-features matrix，feature-off 回归进入常设覆盖。Arrow 八类 Datum mismatch 均由 panic 改为结构化 `DataFusionError::Execution`，有效值与 NULL 语义不变，provider 私有单测覆盖全部类型。
+
+### 专项验证
+
+- `phase4a_datafusion` 默认 **13/13 + 1 ignored**：projection/order/limit、B+Tree Eq/Lt/Gt、空结果与零 batch schema、常量 projection/COUNT(*)、in-flight/aborted、旧快照 UPDATE+vacuum、collect/LIMIT/执行错误的 Guard 释放、显式 AP 事务 AccessShare 与 DROP 等待、Arrow 全类型及 NULL vector、UUID 别名/JOIN/TEXT 冲突、UUID 字符串正反向/嵌套/JOIN 后 WHERE 与非法输入，以及 current/multi-thread Tokio 同步与异步调用；延迟项改为手动验收。
+- 点查性能：手动 release filtered 执行 1 项，20 次 `SELECT id FROM t WHERE id = 2` 平均 **0.645ms**，低于 5ms 门槛；默认自研 TP 路径不切换。
+- feature 关闭回归：`exec_datafusion` 明确返回 `Unsupported`。
+- 八 crate Clippy `--all-targets --all-features -D warnings`、八 crate rustdoc `-D warnings`、全 feature 编译、fmt 与 `git diff --check` 全绿。
+- `pg-am-heap`/`pg-catalog`/`pg-engine`/`pg-wire` release 全量 EXIT=0；DataFusion 专项 release 默认 **13/13 + 1 ignored**，手动性能验收 **1/1**。`cargo test --workspace --no-fail-fast` 全量 EXIT=0、零失败；`cargo check --workspace --all-features` 同步通过。
