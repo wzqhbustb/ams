@@ -73,7 +73,10 @@ impl ExecutionPath {
             Statement::Insert { .. } => Self::Insert,
             Statement::Update { .. } => Self::Update,
             Statement::Delete { .. } => Self::Delete,
-            Statement::CreateTable { .. } | Statement::CreateIndex { .. } => Self::Ddl,
+            Statement::CreateTable { .. }
+            | Statement::CreateIndex { .. }
+            | Statement::CreateSequence { .. } => Self::Ddl,
+            Statement::SequenceQuery { .. } => Self::SeqScan,
             Statement::Begin | Statement::Commit | Statement::Rollback => Self::TxnControl,
         }
     }

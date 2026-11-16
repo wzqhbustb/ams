@@ -29,10 +29,13 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use pg_engine::sql::{SelectCols, SelectItem, Statement};
-use pg_engine::{ColumnType, Engine, EngineError, QueryResult, TxnHandle, Value};
+use pg_engine::sql::{SelectCols, SelectItem, SequenceFunction, Statement};
+use pg_engine::{ColumnType, Engine, EngineError, QueryResult, SqlSession, TxnHandle, Value};
+
+static NEXT_SQL_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 use crate::codec::{self, FieldDesc, FrontendMessage, ObjectKind, StartupPacket};
 use crate::error::{Result, WireError};
@@ -160,6 +163,7 @@ pub struct Session {
     statements: HashMap<String, Arc<PreparedStatement>>,
     portals: HashMap<String, Portal>,
     extended_error: bool,
+    sql: SqlSession,
 }
 
 impl Session {
@@ -174,6 +178,7 @@ impl Session {
             statements: HashMap::new(),
             portals: HashMap::new(),
             extended_error: false,
+            sql: SqlSession::new(NEXT_SQL_SESSION_ID.fetch_add(1, Ordering::Relaxed)),
         }
     }
 
@@ -823,7 +828,9 @@ impl Session {
             PortalExecution::Ready => {
                 if matches!(
                     stmt.as_ref(),
-                    Statement::CreateTable { .. } | Statement::CreateIndex { .. }
+                    Statement::CreateTable { .. }
+                        | Statement::CreateIndex { .. }
+                        | Statement::CreateSequence { .. }
                 ) {
                     return Err(StatementError::unsupported(
                         "DDL in an extended implicit transaction is not supported",
@@ -832,7 +839,12 @@ impl Session {
                 self.ensure_extended_txn()?;
                 let result = self
                     .engine
-                    .exec_with_params(self.txn.as_ref(), &portal.prepared.sql, &portal.parameters)
+                    .exec_with_params_in_session(
+                        &mut self.sql,
+                        self.txn.as_ref(),
+                        &portal.prepared.sql,
+                        &portal.parameters,
+                    )
                     .map_err(|err| StatementError::engine(&err))?;
                 match result {
                     QueryResult::Rows { rows, .. } => {
@@ -949,7 +961,9 @@ impl Session {
             for (sql, stmt) in &statements {
                 let is_ddl = matches!(
                     stmt,
-                    Statement::CreateTable { .. } | Statement::CreateIndex { .. }
+                    Statement::CreateTable { .. }
+                        | Statement::CreateIndex { .. }
+                        | Statement::CreateSequence { .. }
                 );
                 if is_ddl {
                     if self.failed_txn {
@@ -969,7 +983,7 @@ impl Session {
                             break;
                         }
                     } else {
-                        match self.engine.exec(None, sql) {
+                        match self.engine.exec_in_session(&mut self.sql, None, sql) {
                             Ok(result) => {
                                 if let Err(error) = self.write_result(stmt, result, out) {
                                     had_error = Some(error);
@@ -1032,7 +1046,7 @@ impl Session {
         }
         let result = self
             .engine
-            .exec(self.txn.as_ref(), sql)
+            .exec_in_session(&mut self.sql, self.txn.as_ref(), sql)
             .map_err(|e| StatementError::engine(&e))?;
         self.write_result(&stmt, result, out)
     }
@@ -1195,6 +1209,13 @@ impl Session {
                 format,
             }
         };
+        if let Statement::SequenceQuery { function, .. } = stmt.as_ref() {
+            let name = match function {
+                SequenceFunction::NextVal => "nextval",
+                SequenceFunction::CurrVal => "currval",
+            };
+            return Ok(vec![make_field(name.to_string(), 0, 0, ColumnType::Int8)]);
+        }
         if matches!(stmt.as_ref(), Statement::Explain(_)) {
             return Ok(vec![make_field("plan".to_string(), 0, 0, ColumnType::Text)]);
         }
@@ -1283,6 +1304,9 @@ impl Session {
                 });
                 let (table_oid, attnum, ty) = match resolved {
                     Some((oid, attnum, ty)) => (oid, attnum, ty),
+                    None if matches!(stmt, Statement::SequenceQuery { .. }) => {
+                        (0, 0, pg_engine::ColumnType::Int8)
+                    }
                     None if matches!(
                         select_items.and_then(|items| items.get(i)),
                         Some(SelectItem::Distance(_))
@@ -1330,6 +1354,7 @@ fn ok_tag(stmt: &Statement) -> &'static str {
     match stmt {
         Statement::CreateTable { .. } => "CREATE TABLE",
         Statement::CreateIndex { .. } => "CREATE INDEX",
+        Statement::CreateSequence { .. } => "CREATE SEQUENCE",
         _ => "OK",
     }
 }

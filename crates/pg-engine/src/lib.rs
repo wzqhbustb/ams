@@ -33,6 +33,7 @@ pub mod error;
 pub(crate) mod executor;
 pub mod planner;
 pub mod query_stats;
+pub mod sequence;
 pub mod session;
 pub mod sql;
 
@@ -53,3 +54,4 @@ pub use pg_am_heap::tuple::{ColumnType, Datum};
 // (M2c Stage P) without depending on pg-am-heap directly.
 pub use pg_am_heap::HeapError;
 pub use pg_storage::types::{Oid, PageId, Tid};
+pub use session::SqlSession;

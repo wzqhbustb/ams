@@ -1888,3 +1888,22 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - feature 关闭回归：`exec_datafusion` 明确返回 `Unsupported`。
 - 八 crate Clippy `--all-targets --all-features -D warnings`、八 crate rustdoc `-D warnings`、全 feature 编译、fmt 与 `git diff --check` 全绿。
 - `pg-am-heap`/`pg-catalog`/`pg-engine`/`pg-wire` release 全量 EXIT=0；DataFusion 专项 release 默认 **13/13 + 1 ignored**，手动性能验收 **1/1**。`cargo test --workspace --no-fail-fast` 全量 EXIT=0、零失败；`cargo check --workspace --all-features` 同步通过。
+
+## Phase 4a Stage F：Sequence / SERIAL
+
+**状态**：✅ 完成（2026-11-13；WAL-first 序列、sessionful SQL、SERIAL 与 SIGKILL 验收通过；未 commit——等用户确认）。
+
+### 交付内容
+
+1. **WAL-first 序列**：新增永久固定 `SequenceAdvance(128)`，包含 payload、构造器、完整解码、waldump 和 discriminant 测试。nextval 在单 Engine 全局 sequence mutex 内独立 auto-commit，先 flush 记录 END，再更新 committed 高水位堆行；独立 commit 成功后才记录 currval 并返回，允许崩溃空洞但禁止回退复用。序列高水位属于非事务元数据，按实际新行大小与 1024B 的较大值触发内部 `AccessExclusive` + `HeapCleanup`，避免固定阈值在长名称下失效，也不让每次发号都全量清理。
+2. **动态内部目录**：`pg_rust_sequences(oid,name,high_water)` 与 `pg_rust_attrdefaults(rel_oid,attnum,sequence_oid)` 使用固定内部 OID 和动态 first_page，不占固定系统页。每个 sequence 同时写 `pg_class.relkind='s'` 行，CREATE 与 default 元数据同事务发布，重名、半状态、悬空引用响亮失败。内部关系发现与校验统一使用 fresh MVCC scan，deleted/aborted 目录版本不会被误判为有效状态。
+3. **恢复协议**：redo 按 OID 做高水位 max 合并；open 先创建或校验内部目录，再以 committed 堆行为基线，把 redo-only 较大值通过独立 auto-commit 修复回堆。恢复后立即 checkpoint 也不回退，因此无需 checkpoint hook。
+4. **SQL/session**：新增 `exec_in_session` 与参数化版本，旧 exec 使用临时 session；`CREATE SEQUENCE`、无 FROM 的 `SequenceQuery(nextval/currval)` 返回单行 INT8。pg-wire 每连接一个 SqlSession，Simple/Extended/参数化执行共用，事务结束、Sync、错误和 portal 不清 currval。
+5. **SERIAL**：table、sequence 和 default 行在同一 DDL 事务创建。省略默认列与显式 DEFAULT 每次调用同一 session 的 nextval；显式值和 NULL 不消耗序列，多行 INSERT 连续递增，多个 SERIAL 列各自独立，重启后默认值恢复。生成序列名冲突检查位于 `ddl_lock` 内，避免并发 DDL 通过 TOCTOU 创建同名序列。
+
+### 专项验证
+
+- `phase4a_sequence` **20/20 debug / 20/20 release**：并发唯一且连续、跨 session currval、无 INSERT crash/reopen、redo-only 修复后立即 checkpoint、rollback、CREATE/commit failure 重试、函数查询、SERIAL DEFAULT/省略列/显式值/NULL、多 SERIAL 列、真正 SIGKILL 后恢复、WAL flush/compaction/内部目录写入失败后的重试，以及故障注入 hook 的跨线程隔离。
+- `wire_sequence` **4/4 debug / 4/4 release**：Simple/Extended currval、Sync/rollback 保留、连接隔离、SERIAL 和 INT8 Describe。
+- `wal_record_type_discriminant` 与 `waldump`：SequenceAdvance 固定值、payload 和字段输出通过。
+- 八 crate Clippy/rustdoc、workspace all-features、fmt 与 `git diff --check` 全绿；Wire/DataFusion 既有回归全绿。

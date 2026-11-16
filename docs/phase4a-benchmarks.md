@@ -55,3 +55,11 @@ These are correctness and recovery acceptance results, not throughput measuremen
 - Manual release acceptance: `cargo test -p pg-engine --features datafusion --release --test phase4a_datafusion datafusion_point_lookup_mean_latency_is_below_5ms -- --ignored --nocapture` — **1 passed**. Point lookup mean **0.645ms** over 20 `SELECT id FROM t WHERE id = 2` calls, below the **5ms** gate. The default self-owned TP path remains in place regardless of this result.
 - Feature-off behavior: `exec_datafusion` returns `Unsupported` explicitly, without changing existing TP/ANN semantics.
 - Final gates: `cargo test --workspace --no-fail-fast` exited 0 with no failures; release tests for `pg-am-heap`, `pg-catalog`, `pg-engine`, and `pg-wire` also exited 0. `cargo check --workspace --all-features`, all eight crate Clippy/rustdoc checks, fmt, and `git diff --check` passed.
+
+## Stage F: Sequence / SERIAL
+
+- Date: 2026-11-13 (UTC)
+- `cargo test -p pg-engine --test phase4a_sequence`: **20 passed**, and the same command with `--release`: **20 passed**. Coverage includes concurrent unique/contiguous nextval, per-session currval, no-INSERT crash/reopen, redo-only high-water repair followed by immediate checkpoint, rollback, CREATE/commit-failure retry, SequenceQuery, SERIAL DEFAULT/omitted/explicit/NULL values, multiple SERIAL columns, true SIGKILL after committed SERIAL INSERT, 1000 nextval calls with catalog compaction, deleted/aborted internal catalog recovery through fresh MVCC, deterministic WAL flush/compaction/internal catalog write failure retries, thread-local failure-hook isolation, 3000-character sequence and SERIAL names, and generated-name uniqueness under concurrent DDL.
+- `cargo test -p pg-wire --test wire_sequence`: **4 passed**, and the same command with `--release`: **4 passed**. Simple/Extended currval survives Sync and rollback, connections are isolated, SERIAL defaults work, and SequenceQuery Describe reports INT8.
+- `cargo test -p pg-storage --test wal_record_type_discriminant --test waldump`: **6 passed** total across the two files, including fixed `SequenceAdvance(128)` and `sequence_oid/high_water` dump fields.
+- Final gates: all eight crate Clippy/rustdoc checks, workspace all-features check, fmt, and `git diff --check` passed; existing Wire/DataFusion regression suites also passed.

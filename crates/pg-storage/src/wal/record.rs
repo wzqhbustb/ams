@@ -8,7 +8,7 @@ use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
-use crate::types::{align_up, Lsn, PageId, Tid, TxnId};
+use crate::types::{align_up, Lsn, Oid, PageId, Tid, TxnId};
 
 /// Size of the fixed record header in bytes.
 pub const WAL_RECORD_HEADER_SIZE: usize = 32;
@@ -118,6 +118,8 @@ pub enum WalRecordType {
     /// HNSW publish-live (Phase 2 M5): flips a fully connected node from
     /// INITIALIZING to LIVE (v1.7 — the LIVE flip gets its own record).
     HnswPublishLive = 127,
+    /// Sequence high-water reservation (Phase 4a Stage F).
+    SequenceAdvance = 128,
 }
 
 impl WalRecordType {
@@ -161,6 +163,7 @@ impl WalRecordType {
             125 => Ok(WalRecordType::HnswDirAppend),
             126 => Ok(WalRecordType::HnswDirLink),
             127 => Ok(WalRecordType::HnswPublishLive),
+            128 => Ok(WalRecordType::SequenceAdvance),
             _ => Err(StorageError::WalReadFailed(format!(
                 "unknown WAL record type discriminant {v}"
             ))),
@@ -806,6 +809,24 @@ pub struct BTreeSplitCLRRecord {
 /// index-entry trailer; pg-storage cannot depend on pg-am-btree, so the
 /// formula is re-derived from [`PAGE_SIZE`](crate::types::PAGE_SIZE) here.
 pub const MAX_CLR_SEPARATOR_KEY_BYTES: usize = (crate::types::PAGE_SIZE - 32 - 16) / 3;
+
+/// Payload for a `SequenceAdvance` record: the last value reserved by a sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceAdvanceRecord {
+    /// Sequence whose high-water mark advanced.
+    pub sequence_oid: Oid,
+    /// Last value reserved for callers, not the next value to issue.
+    pub high_water: i64,
+}
+
+impl SequenceAdvanceRecord {
+    /// Decode a sequence high-water payload.
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
 
 /// Payload for a `TxnCommit` record: the transaction whose commit is durable.
 ///
@@ -1691,6 +1712,27 @@ impl WalRecord {
         let payload = bincode::serde::encode_to_vec(TxnAbortRecord { xid }, bincode_config())
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
         let mut rec = Self::new(WalRecordType::TxnAbort, payload);
+        rec.txn_id = xid;
+        Ok(rec)
+    }
+
+    /// Create a sequence high-water reservation record.
+    pub fn sequence_advance(sequence_oid: Oid, high_water: i64, xid: TxnId) -> Result<Self> {
+        if sequence_oid == Oid::INVALID || high_water < 0 {
+            return Err(StorageError::Serialize(
+                "SequenceAdvance requires a valid sequence OID and non-negative high water"
+                    .to_string(),
+            ));
+        }
+        let payload = bincode::serde::encode_to_vec(
+            SequenceAdvanceRecord {
+                sequence_oid,
+                high_water,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        let mut rec = Self::new(WalRecordType::SequenceAdvance, payload);
         rec.txn_id = xid;
         Ok(rec)
     }

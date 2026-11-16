@@ -20,7 +20,7 @@ use std::path::Path;
 use std::process::Command;
 
 use pg_storage::config::StorageConfig;
-use pg_storage::types::{Lsn, PageId, Tid, TxnId};
+use pg_storage::types::{Lsn, Oid, PageId, Tid, TxnId};
 use pg_storage::wal::record::{BTreeSplitCLRRecord, WalRecord, WalRecordType};
 use pg_storage::wal::writer::WalWriter;
 use tempfile::TempDir;
@@ -110,6 +110,7 @@ fn write_full_family_wal(tmp: &TempDir) -> Vec<Lsn> {
         WalRecord::hnsw_dir_append(PageId(32), 7, PageId(31), 2).unwrap(),
         WalRecord::hnsw_dir_link(PageId(32), PageId(33)).unwrap(),
         WalRecord::hnsw_publish_live(PageId(30), PageId(31), 2, 7, 4).unwrap(),
+        WalRecord::sequence_advance(Oid(16_400), 42, TxnId(45)).unwrap(),
         reserved_record(WalRecordType::SegmentSeal, vec![0xDE, 0xAD, 0xBE, 0xEF]),
         reserved_record(WalRecordType::SegmentMerge, vec![0x01, 0x02]),
     ];
@@ -199,6 +200,7 @@ fn dump_covers_every_record_family() {
         "type=HnswDirAppend(125)",
         "type=HnswDirLink(126)",
         "type=HnswPublishLive(127)",
+        "type=SequenceAdvance(128)",
         "type=SegmentSeal(110)",
         "type=SegmentMerge(111)",
     ];
@@ -258,6 +260,14 @@ fn dump_covers_every_record_family() {
         .find(|l| l.contains("HnswPublishLive"))
         .unwrap();
     assert!(publish.contains("page=31 slot=2 node=7 dim=4"), "{publish}");
+    let sequence = lines
+        .iter()
+        .find(|l| l.contains("SequenceAdvance"))
+        .unwrap();
+    assert!(
+        sequence.contains("sequence_oid=16400 high_water=42"),
+        "{sequence}"
+    );
 
     // Reserved types: raw payload bytes, no error (§6.1).
     let seal = lines.iter().find(|l| l.contains("SegmentSeal")).unwrap();

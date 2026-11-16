@@ -840,6 +840,7 @@ mod tests {
                     name: "value".to_string(),
                     col_type,
                 }],
+                defaults: vec![None],
                 toast: None,
             };
             let datum = if col_type == ColumnType::Int4 {

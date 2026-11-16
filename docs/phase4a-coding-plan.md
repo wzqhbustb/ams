@@ -137,6 +137,8 @@
 
 **验收**：并发、rollback、checkpoint 和 SIGKILL 恢复后均不重发已发放值；currval 严格 per-session；SERIAL 展开正确。
 
+**实现补充**：内部目录采用固定内部 OID、动态 first_page 的 `pg_rust_sequences` 与 `pg_rust_attrdefaults`，不占固定系统页，避免旧目录冲突；每个 sequence 另有 `pg_class.relkind='s'` 行保证 OID 恢复，内部关系发现与校验统一使用 fresh MVCC scan，deleted/aborted 目录版本不会被误判为有效状态。nextval 在单 Engine 全局 sequence mutex 内独立 auto-commit：先 append/flush `SequenceAdvance(128)` 到记录 END，再更新 committed 高水位堆行，独立 commit 成功后才记录 currval 并返回值。高水位是非事务元数据，按实际新行大小与 1024B 的较大值触发内部 `AccessExclusive` + `HeapCleanup`，避免固定阈值在长名称下失效，也不让每次发号都全量清理；生成序列名冲突检查位于 `ddl_lock` 内，避免并发 DDL 的 TOCTOU 重名。redo 按 OID 做 max 合并，open 返回前将 redo-only 较大值提交回堆，因此无需 checkpoint hook，也不会在恢复后立即 checkpoint 时回退。CREATE SEQUENCE、SERIAL table、sequence 和 default 行同事务发布。SQL 使用专用 `SequenceQuery` 支持无 FROM 的 nextval/currval；旧 exec 用临时 session，新增 sessionful API，pg-wire 每连接一个 SqlSession。SERIAL 省略列与显式 DEFAULT 每次各取一次 nextval，显式 NULL 不消耗序列，多 SERIAL 列分别独立。
+
 ---
 
 ## Stage G：验收 + 对抗审查 ×2 + 归档（1–2 天）

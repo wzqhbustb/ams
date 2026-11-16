@@ -162,9 +162,15 @@ use pg_txn::{
 
 use crate::error::{EngineError, Result};
 use crate::query_stats::{ExecutionPath, QueryStatEntry, QueryStats, DEFAULT_QUERY_STATS_CAPACITY};
+use crate::sequence::{
+    attrdefaults_table, sequence_class_row, sequences_table, SequenceManager,
+    PG_RUST_ATTRDEFAULTS_NAME, PG_RUST_ATTRDEFAULTS_OID, PG_RUST_SEQUENCES_NAME,
+    PG_RUST_SEQUENCES_OID, RELKIND_INTERNAL, RELKIND_SEQUENCE,
+};
+use crate::session::SqlSession;
 use crate::sql::{
     self, CmpOp, Expr, Filter, Literal, LockClause, OrderByExpr, OrderByKind, SelectCols,
-    SelectItem, Statement,
+    SelectItem, SequenceFunction, Statement,
 };
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
@@ -185,6 +191,7 @@ pub const DEFAULT_CLOG_BUFFER_FRAMES: usize = 8;
 /// takes a unique instance ID at open, and [`TxnHandle`]s carry it so a
 /// handle created by one engine cannot be executed against another.
 static NEXT_ENGINE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SQL_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// What a transaction did to one index entry, for undo purposes (Stage O
 /// review: index maintenance is not MVCC-covered by heap headers, so the
@@ -368,6 +375,8 @@ pub struct TableEntry {
     pub first_page: PageId,
     /// Column schema in `attnum` order.
     pub columns: Vec<ColumnDef>,
+    /// Optional sequence OID used as each column's default value.
+    pub defaults: Vec<Option<Oid>>,
     /// Hidden chunk heap for TOASTable columns. Its first page is persisted
     /// in the main table's `pg_rust_relpages.last_page` slot; no catalog row
     /// is added for the hidden relation.
@@ -552,6 +561,7 @@ pub struct Engine {
     /// [`Self::exec`] and [`Self::exec_with_params`] record one entry per
     /// statement — see [`Self::query_stats`].
     query_stats: QueryStats,
+    sequences: SequenceManager,
 }
 
 /// A handle to an explicit transaction (§21 M2b API).
@@ -992,10 +1002,12 @@ impl Engine {
         //    Phase 2 M5 Stage C slice 1: the seven HNSW handlers (121–127)
         //    register through pg_am_hnsw::redo::hnsw_redo_handlers
         //    (tech-selection §2).
+        let sequences = SequenceManager::default();
         let mut redo_handlers = heap_redo_handlers();
         redo_handlers.extend(txn_redo_handlers());
         redo_handlers.extend(btree_redo_handlers());
         redo_handlers.extend(pg_am_hnsw::redo::hnsw_redo_handlers());
+        redo_handlers.push(Box::new(sequences.redo_handler()));
         let undo_handlers: Vec<Box<dyn UndoHandler>> =
             vec![Box::new(HeapUndoHandler), Box::new(BTreeUndoHandler)];
         let storage = StorageEngine::open_with_redo_and_clog(
@@ -1077,7 +1089,7 @@ impl Engine {
 
         // 7. Table registry from the catalog, index registry from the
         //    `pg_index` heap chain.
-        let registry = Self::build_registry(&catalog, &heap, &txn, clog.as_ref())?;
+        let registry = Self::build_registry(&catalog, &heap, &txn, clog.as_ref(), &HashMap::new())?;
         let indexes = Self::build_index_registry(&catalog, &heap, clog.as_ref(), &registry)?;
 
         // 8. Lock manager (sharing the victim registry) and the deadlock
@@ -1107,7 +1119,9 @@ impl Engine {
             instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             index_undo: Arc::new(Mutex::new(HashMap::new())),
             query_stats: QueryStats::new(config.query_stats_capacity),
+            sequences,
         };
+        engine.initialize_sequences()?;
 
         // 7b. Stage D migration for pre-TOAST directories. New tables already
         //     carry reltoastrelid; legacy TOASTable tables get the hidden heap
@@ -1138,11 +1152,75 @@ impl Engine {
     /// Rebuild the table registry through a fresh MVCC heap scan. Raw
     /// last-version-wins cannot distinguish an aborted DROP marker from a
     /// committed one, so recovery must use visibility rather than slot order.
+    fn default_map(&self) -> Result<HashMap<(i64, i32), Oid>> {
+        let Some(first_page) = self
+            .sequences
+            .relation_pages
+            .lock()
+            .get(&PG_RUST_ATTRDEFAULTS_OID)
+            .copied()
+        else {
+            return Ok(HashMap::new());
+        };
+        let def = attrdefaults_table(first_page);
+        let columns = def.column_types();
+        let rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page,
+                columns: &columns,
+            },
+            snapshot: &Snapshot::everything(),
+            clog: self.clog.as_ref(),
+        })?;
+        let mut defaults = HashMap::new();
+        for (_tid, values) in rows {
+            let (
+                Some(Some(Datum::Int8(rel_oid))),
+                Some(Some(Datum::Int4(attnum))),
+                Some(Some(Datum::Int8(sequence_oid))),
+            ) = (values.first(), values.get(1), values.get(2))
+            else {
+                return Err(EngineError::Corrupted(
+                    "malformed pg_rust_attrdefaults row".to_string(),
+                ));
+            };
+            if *attnum <= 0 {
+                return Err(EngineError::Corrupted(format!(
+                    "invalid default attnum {attnum} for relation {rel_oid}"
+                )));
+            }
+            let sequence_oid = u64::try_from(*sequence_oid).map_err(|_| {
+                EngineError::Corrupted(format!("negative default sequence OID {sequence_oid}"))
+            })?;
+            if !self
+                .sequences
+                .states
+                .lock()
+                .contains_key(&Oid(sequence_oid))
+            {
+                return Err(EngineError::Corrupted(format!(
+                    "default for relation {rel_oid} references missing sequence {sequence_oid}"
+                )));
+            }
+            if defaults
+                .insert((*rel_oid, *attnum), Oid(sequence_oid))
+                .is_some()
+            {
+                return Err(EngineError::Corrupted(format!(
+                    "duplicate default for relation {rel_oid} attnum {attnum}"
+                )));
+            }
+        }
+        Ok(defaults)
+    }
+
     fn build_registry(
         catalog: &Catalog,
         heap: &HeapAM,
         txn: &TxnManager,
         clog: &dyn ClogAccessor,
+        default_map: &HashMap<(i64, i32), Oid>,
     ) -> Result<HashMap<String, TableEntry>> {
         let (snapshot, _guard) = txn.snapshot(TxnId::INVALID);
         let columns = PG_CLASS.column_types();
@@ -1245,6 +1323,9 @@ impl Engine {
                     TableEntry {
                         oid: Oid(oid),
                         first_page: relpages.first_page,
+                        defaults: (0..columns.len())
+                            .map(|index| default_map.get(&(raw_oid, index as i32 + 1)).copied())
+                            .collect(),
                         columns,
                         toast,
                     },
@@ -1355,6 +1436,486 @@ impl Engine {
         // victim while storage is tearing down underneath a wait loop.
         self.deadlock_detector.stop();
         self.storage.shutdown();
+    }
+
+    fn initialize_sequences(&self) -> Result<()> {
+        self.ensure_sequence_relation(
+            PG_RUST_SEQUENCES_OID,
+            PG_RUST_SEQUENCES_NAME,
+            sequences_table,
+        )?;
+        self.ensure_sequence_relation(
+            PG_RUST_ATTRDEFAULTS_OID,
+            PG_RUST_ATTRDEFAULTS_NAME,
+            attrdefaults_table,
+        )?;
+        self.recover_sequences()?;
+        let defaults = self.default_map()?;
+        let registry = Self::build_registry(
+            &self.catalog,
+            &self.heap,
+            &self.txn,
+            self.clog.as_ref(),
+            &defaults,
+        )?;
+        *self.registry.write() = registry;
+        Ok(())
+    }
+
+    fn live_sequence_relation_page(&self, oid: Oid, name: &str) -> Result<Option<PageId>> {
+        let (snapshot, _guard) = self.txn.snapshot(TxnId::INVALID);
+        let class_columns = PG_CLASS.column_types();
+        let class_rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_CLASS.oid.raw(),
+                first_page: PG_CLASS.first_page,
+                columns: &class_columns,
+            },
+            snapshot: &snapshot,
+            clog: self.clog.as_ref(),
+        })?;
+        let mut live_class = false;
+        for (_, values) in class_rows {
+            let (
+                Some(Some(Datum::Int8(row_oid))),
+                Some(Some(Datum::Text(row_name))),
+                Some(Some(Datum::Text(kind))),
+            ) = (values.first(), values.get(1), values.get(2))
+            else {
+                continue;
+            };
+            if *row_oid == oid.0 as i64 {
+                if row_name != name || kind != RELKIND_INTERNAL {
+                    return Err(EngineError::Corrupted(format!(
+                        "sequence catalog {name} has inconsistent pg_class metadata"
+                    )));
+                }
+                live_class = true;
+            }
+        }
+        let relpages_columns = PG_RELPAGES.column_types();
+        let relpages_rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_RELPAGES.oid.raw(),
+                first_page: PG_RELPAGES.first_page,
+                columns: &relpages_columns,
+            },
+            snapshot: &snapshot,
+            clog: self.clog.as_ref(),
+        })?;
+        let first_page = relpages_rows.into_iter().find_map(|(_, values)| {
+            if values.first() == Some(&Some(Datum::Int8(oid.0 as i64))) {
+                let Some(Some(Datum::Int8(first_page))) = values.get(1) else {
+                    return None;
+                };
+                return Some(PageId(*first_page as u64));
+            }
+            None
+        });
+        match (live_class, first_page) {
+            (true, Some(first_page)) => Ok(Some(first_page)),
+            (false, None) => Ok(None),
+            _ => Err(EngineError::Corrupted(format!(
+                "sequence catalog {name} is only partially present"
+            ))),
+        }
+    }
+
+    fn ensure_sequence_relation(
+        &self,
+        oid: Oid,
+        name: &str,
+        make_def: fn(PageId) -> SystemTableDef,
+    ) -> Result<()> {
+        if let Some(first_page) = self.live_sequence_relation_page(oid, name)? {
+            self.sequences.relation_pages.lock().insert(oid, first_page);
+            return Ok(());
+        }
+
+        let first_page = self.heap.create_heap(oid)?;
+        let def = make_def(first_page);
+        self.auto_commit_with_hooks(
+            |snap| {
+                self.lock_oid(snap.current_xid(), oid, LockMode::AccessExclusive)?;
+                let class_row = vec![
+                    Some(Datum::Int8(oid.0 as i64)),
+                    Some(Datum::Text(name.to_string())),
+                    Some(Datum::Text(RELKIND_INTERNAL.to_string())),
+                    Some(Datum::Int4(def.columns.len() as i32)),
+                    Some(Datum::Int8(0)),
+                    Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
+                ];
+                self.insert_catalog_row(snap, &PG_CLASS, &class_row)?;
+                if crate::sequence::test_hooks::fail_internal_catalog_write() {
+                    return Err(EngineError::InvalidArgument(
+                        "injected internal sequence catalog write failure".to_string(),
+                    ));
+                }
+                for (index, column) in def.columns.iter().enumerate() {
+                    self.insert_catalog_row(
+                        snap,
+                        &PG_ATTRIBUTE,
+                        &[
+                            Some(Datum::Int8(oid.0 as i64)),
+                            Some(Datum::Text(column.name.to_string())),
+                            Some(Datum::Int8(column.type_oid.raw().0 as i64)),
+                            Some(Datum::Int4(column.len)),
+                            Some(Datum::Int4(index as i32 + 1)),
+                            Some(Datum::Int4(0)),
+                            Some(Datum::Int4(1)),
+                        ],
+                    )?;
+                }
+                self.insert_catalog_row(
+                    snap,
+                    &PG_RELPAGES,
+                    &[
+                        Some(Datum::Int8(oid.0 as i64)),
+                        Some(Datum::Int8(first_page.0 as i64)),
+                        Some(Datum::Int8(first_page.0 as i64)),
+                        Some(Datum::Int8(1)),
+                    ],
+                )
+            },
+            || {
+                self.sequences.relation_pages.lock().insert(oid, first_page);
+                Ok(())
+            },
+            || {},
+        )
+    }
+
+    fn sequence_relation(&self) -> Result<SystemTableDef> {
+        let first_page = self
+            .sequences
+            .relation_pages
+            .lock()
+            .get(&PG_RUST_SEQUENCES_OID)
+            .copied()
+            .ok_or_else(|| {
+                EngineError::Corrupted("pg_rust_sequences is not registered".to_string())
+            })?;
+        Ok(sequences_table(first_page))
+    }
+
+    fn attrdefaults_relation(&self) -> Result<SystemTableDef> {
+        let first_page = self
+            .sequences
+            .relation_pages
+            .lock()
+            .get(&PG_RUST_ATTRDEFAULTS_OID)
+            .copied()
+            .ok_or_else(|| {
+                EngineError::Corrupted("pg_rust_attrdefaults is not registered".to_string())
+            })?;
+        Ok(attrdefaults_table(first_page))
+    }
+
+    fn recover_sequences(&self) -> Result<()> {
+        let def = self.sequence_relation()?;
+        let columns = def.column_types();
+        let rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            snapshot: &Snapshot::everything(),
+            clog: self.clog.as_ref(),
+        })?;
+        let recovered = self.sequences.recovered_high_water();
+        for (_tid, values) in rows {
+            let (
+                Some(Some(Datum::Int8(raw_oid))),
+                Some(Some(Datum::Text(name))),
+                Some(Some(Datum::Int8(high_water))),
+            ) = (values.first(), values.get(1), values.get(2))
+            else {
+                return Err(EngineError::Corrupted(
+                    "malformed pg_rust_sequences row".to_string(),
+                ));
+            };
+            let oid = u64::try_from(*raw_oid)
+                .map_err(|_| EngineError::Corrupted(format!("negative sequence OID {raw_oid}")))?;
+            if *high_water < 0 {
+                return Err(EngineError::Corrupted(format!(
+                    "sequence {name} has negative high water {high_water}"
+                )));
+            }
+            let class = self
+                .catalog
+                .relation(TableOid::new(Oid(oid)))
+                .ok_or_else(|| {
+                    EngineError::Corrupted(format!("sequence {name} has no pg_class row"))
+                })?;
+            if class.name != *name || class.kind != RELKIND_SEQUENCE {
+                return Err(EngineError::Corrupted(format!(
+                    "sequence {name} has inconsistent pg_class metadata"
+                )));
+            }
+            let oid = Oid(oid);
+            self.sequences.states.lock().insert(
+                oid,
+                crate::sequence::SequenceState {
+                    name: name.clone(),
+                    high_water: *high_water,
+                },
+            );
+            if let Some(recovered_high_water) = recovered.get(&oid).copied() {
+                if recovered_high_water > *high_water {
+                    self.advance_sequence_to(oid, recovered_high_water)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Create one sequence with an initial high-water mark of zero.
+    pub fn create_sequence(&self, name: &str) -> Result<Oid> {
+        if name.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "sequence name must not be empty".to_string(),
+            ));
+        }
+        let _ddl = self.ddl_lock.lock();
+        if self.relation_name_exists(name)?
+            || self
+                .sequences
+                .states
+                .lock()
+                .values()
+                .any(|state| state.name == name)
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "sequence {name:?} already exists"
+            )));
+        }
+        let oid = self.catalog.oid_allocator().alloc();
+        let mut states = self.sequences.states.lock();
+        self.auto_commit_with_hooks(
+            |snap| {
+                self.lock_oid(snap.current_xid(), oid, LockMode::AccessExclusive)?;
+                self.insert_catalog_row(snap, &PG_CLASS, &sequence_class_row(oid, name))?;
+                let def = self.sequence_relation()?;
+                self.insert_catalog_row(
+                    snap,
+                    &def,
+                    &[
+                        Some(Datum::Int8(oid.0 as i64)),
+                        Some(Datum::Text(name.to_string())),
+                        Some(Datum::Int8(0)),
+                    ],
+                )
+            },
+            || {
+                states.insert(
+                    oid,
+                    crate::sequence::SequenceState {
+                        name: name.to_string(),
+                        high_water: 0,
+                    },
+                );
+                Ok(())
+            },
+            || {},
+        )?;
+        Ok(oid)
+    }
+
+    /// Return and record the next value of a named sequence in this session.
+    pub fn nextval(&self, session: &mut SqlSession, name: &str) -> Result<i64> {
+        let oid = self.sequence_oid(name)?;
+        let value = self.nextval_oid(oid)?;
+        session.record_nextval(oid, value);
+        Ok(value)
+    }
+
+    /// Return this session's current value of a named sequence.
+    pub fn currval(&self, session: &SqlSession, name: &str) -> Result<i64> {
+        let oid = self.sequence_oid(name)?;
+        session.currval(oid)
+    }
+
+    fn sequence_oid(&self, name: &str) -> Result<Oid> {
+        self.sequences
+            .states
+            .lock()
+            .iter()
+            .find_map(|(oid, state)| (state.name == name).then_some(*oid))
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("sequence {name:?} does not exist"))
+            })
+    }
+
+    fn nextval_oid(&self, oid: Oid) -> Result<i64> {
+        let mut states = self.sequences.states.lock();
+        let current = states
+            .get(&oid)
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("sequence OID {oid} does not exist"))
+            })?
+            .high_water;
+        let next = current.checked_add(1).ok_or_else(|| {
+            EngineError::InvalidArgument(format!("sequence OID {oid} exhausted Int64 values"))
+        })?;
+        self.advance_sequence_to_locked(&mut states, oid, next)
+    }
+
+    fn advance_sequence_to(&self, oid: Oid, high_water: i64) -> Result<i64> {
+        let mut states = self.sequences.states.lock();
+        self.advance_sequence_to_locked(&mut states, oid, high_water)
+    }
+
+    fn advance_sequence_to_locked(
+        &self,
+        states: &mut HashMap<Oid, crate::sequence::SequenceState>,
+        oid: Oid,
+        high_water: i64,
+    ) -> Result<i64> {
+        if high_water < 0 {
+            return Err(EngineError::InvalidArgument(
+                "sequence high water must be non-negative".to_string(),
+            ));
+        }
+        let current = states.get(&oid).ok_or_else(|| {
+            EngineError::InvalidArgument(format!("sequence OID {oid} does not exist"))
+        })?;
+        if high_water <= current.high_water {
+            return Ok(current.high_water);
+        }
+        let name = current.name.clone();
+        self.auto_commit_with_hooks(
+            |snap| {
+                let record = WalRecord::sequence_advance(oid, high_water, snap.current_xid())?;
+                let record_len = record.record_size() as u64;
+                let lsn = self.storage.wal_writer().append(record)?;
+                if crate::sequence::test_hooks::fail_nextval_flush() {
+                    return Err(EngineError::InvalidArgument(
+                        "injected sequence WAL flush failure".to_string(),
+                    ));
+                }
+                self.storage
+                    .wal_writer()
+                    .flush_to(Lsn(lsn.0 + record_len))?;
+                let def = self.sequence_relation()?;
+                let needed = self.sequence_row_len(&def, oid, &name, high_water)?;
+                if self.sequence_catalog_needs_compaction(&def, needed)? {
+                    self.lock_oid(snap.current_xid(), def.oid.raw(), LockMode::AccessExclusive)?;
+                    self.compact_sequence_catalog(&def)?;
+                }
+                let (tid, _) = self.find_sequence_row(snap, &def, oid)?;
+                self.update_catalog_row(
+                    snap,
+                    &def,
+                    tid,
+                    &[
+                        Some(Datum::Int8(oid.0 as i64)),
+                        Some(Datum::Text(name.clone())),
+                        Some(Datum::Int8(high_water)),
+                    ],
+                )
+            },
+            || {
+                if let Some(state) = states.get_mut(&oid) {
+                    state.high_water = high_water;
+                }
+                Ok(())
+            },
+            || {},
+        )?;
+        Ok(high_water)
+    }
+
+    fn sequence_row_len(
+        &self,
+        def: &SystemTableDef,
+        oid: Oid,
+        name: &str,
+        high_water: i64,
+    ) -> Result<usize> {
+        let columns = def.column_types();
+        let row = vec![
+            Some(Datum::Int8(oid.0 as i64)),
+            Some(Datum::Text(name.to_string())),
+            Some(Datum::Int8(high_water)),
+        ];
+        Ok(encode_tuple(tuple_header(0), &columns, &row)?.len() + LINE_POINTER_SIZE)
+    }
+
+    fn sequence_catalog_needs_compaction(
+        &self,
+        def: &SystemTableDef,
+        needed: usize,
+    ) -> Result<bool> {
+        let guard = self.storage.buffer_pool().pin(def.first_page)?;
+        let page: &[u8; PAGE_SIZE] = guard
+            .page()
+            .try_into()
+            .expect("buffer pool pages are PAGE_SIZE bytes");
+        Ok(SlottedPage::free_space(page) < needed.max(1024))
+    }
+
+    fn compact_sequence_catalog(&self, def: &SystemTableDef) -> Result<()> {
+        let columns = def.column_types();
+        let dead = self.heap.scan_dead_tuples(
+            RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            TxnId(u64::MAX),
+            self.clog.as_ref(),
+        )?;
+        if dead.is_empty() {
+            return Ok(());
+        }
+        // Sequence high water is non-transactional metadata: only the latest
+        // committed row is needed, so obsolete versions may be physically pruned.
+        if crate::sequence::test_hooks::fail_compaction() {
+            return Err(EngineError::InvalidArgument(
+                "injected sequence catalog compaction failure".to_string(),
+            ));
+        }
+        self.heap.reclaim(
+            RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            &dead,
+        )?;
+        Ok(())
+    }
+
+    fn find_sequence_row(
+        &self,
+        snap: &Snapshot,
+        def: &SystemTableDef,
+        oid: Oid,
+    ) -> Result<(Tid, i64)> {
+        let columns = def.column_types();
+        let rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            clog: self.clog.as_ref(),
+        })?;
+        for (tid, values) in rows {
+            if values.first() == Some(&Some(Datum::Int8(oid.0 as i64))) {
+                let Some(Some(Datum::Int8(high_water))) = values.get(2) else {
+                    return Err(EngineError::Corrupted(
+                        "malformed pg_rust_sequences high water".to_string(),
+                    ));
+                };
+                return Ok((tid, *high_water));
+            }
+        }
+        Err(EngineError::Corrupted(format!(
+            "sequence OID {oid} has no committed high-water row"
+        )))
     }
 
     /// Add hidden TOAST heaps to pre-Stage-D tables. Catalog updates and the
@@ -1509,7 +2070,50 @@ impl Engine {
     /// Fails with [`EngineError::TableExists`] if the name is taken, and
     /// with [`EngineError::CatalogFull`] if a system catalog's first page
     /// has no room (module-level M2a limitation).
+    fn create_table_from_spec(
+        &self,
+        name: &str,
+        columns: Vec<crate::sql::ColumnSpec>,
+    ) -> Result<Oid> {
+        let mut defaults = Vec::with_capacity(columns.len());
+        let mut sequences = Vec::new();
+        for column in &columns {
+            if column.serial {
+                let sequence_oid = self.catalog.oid_allocator().alloc();
+                let sequence_name = format!("{name}_{}_seq", column.name);
+                defaults.push(Some(sequence_oid));
+                sequences.push((sequence_oid, sequence_name));
+            } else {
+                defaults.push(None);
+            }
+        }
+        let schema = columns
+            .into_iter()
+            .map(|column| ColumnDef {
+                name: column.name,
+                col_type: column.col_type,
+            })
+            .collect::<Vec<_>>();
+        self.create_table_with_defaults(name, &schema, &defaults, &sequences)
+    }
+
+    /// Create a table and persist its schema in the catalog.
     pub fn create_table(&self, name: &str, schema: &[ColumnDef]) -> Result<Oid> {
+        self.create_table_with_defaults(name, schema, &vec![None; schema.len()], &[])
+    }
+
+    fn create_table_with_defaults(
+        &self,
+        name: &str,
+        schema: &[ColumnDef],
+        defaults: &[Option<Oid>],
+        sequences: &[(Oid, String)],
+    ) -> Result<Oid> {
+        if defaults.len() != schema.len() {
+            return Err(EngineError::InvalidArgument(
+                "defaults must align with table columns".to_string(),
+            ));
+        }
         if name.is_empty() {
             return Err(EngineError::InvalidArgument(
                 "table name must not be empty".to_string(),
@@ -1521,6 +2125,13 @@ impl Engine {
             ));
         }
         let _ddl = self.ddl_lock.lock();
+        for (_, sequence_name) in sequences {
+            if self.relation_name_exists(sequence_name)? {
+                return Err(EngineError::InvalidArgument(format!(
+                    "sequence {sequence_name:?} already exists"
+                )));
+            }
+        }
         if self.registry.read().contains_key(name) || self.relation_name_exists(name)? {
             return Err(EngineError::TableExists(name.to_string()));
         }
@@ -1550,17 +2161,65 @@ impl Engine {
                     self.heap.register_toast_relation(oid, toast)?;
                 }
                 *created_metadata.borrow_mut() = Some(created);
+                let sequence_def = self.sequence_relation()?;
+                let default_def = self.attrdefaults_relation()?;
+                for (sequence_oid, sequence_name) in sequences {
+                    self.insert_catalog_row(
+                        snap,
+                        &PG_CLASS,
+                        &sequence_class_row(*sequence_oid, sequence_name),
+                    )?;
+                    self.insert_catalog_row(
+                        snap,
+                        &sequence_def,
+                        &[
+                            Some(Datum::Int8(sequence_oid.0 as i64)),
+                            Some(Datum::Text(sequence_name.clone())),
+                            Some(Datum::Int8(0)),
+                        ],
+                    )?;
+                    let default_index = defaults
+                        .iter()
+                        .position(|candidate| candidate.as_ref() == Some(sequence_oid))
+                        .ok_or_else(|| {
+                            EngineError::Corrupted(
+                                "SERIAL default has no sequence mapping".to_string(),
+                            )
+                        })?;
+                    self.insert_catalog_row(
+                        snap,
+                        &default_def,
+                        &[
+                            Some(Datum::Int8(oid.0 as i64)),
+                            Some(Datum::Int4(default_index as i32 + 1)),
+                            Some(Datum::Int8(defaults[default_index].unwrap().0 as i64)),
+                        ],
+                    )?;
+                }
                 Ok(())
             },
             || {
                 let (first_page, toast) = created_metadata
                     .borrow()
                     .expect("successful create_table installs metadata before commit");
+                {
+                    let mut states = self.sequences.states.lock();
+                    for (sequence_oid, sequence_name) in sequences {
+                        states.insert(
+                            *sequence_oid,
+                            crate::sequence::SequenceState {
+                                name: sequence_name.clone(),
+                                high_water: 0,
+                            },
+                        );
+                    }
+                }
                 self.registry.write().insert(
                     name.to_string(),
                     TableEntry {
                         oid,
                         first_page,
+                        defaults: defaults.to_vec(),
                         columns: schema.to_vec(),
                         toast,
                     },
@@ -2092,7 +2751,11 @@ impl Engine {
         // snapshot: its user rows may be stale after DROP, while system
         // relations are immutable for this stage.
         if self.catalog.relation_by_name(name).is_some_and(|row| {
-            row.oid.raw().is_system() && (row.kind == RELKIND_TABLE || row.kind == RELKIND_INDEX)
+            row.oid.raw().is_system()
+                && (row.kind == RELKIND_TABLE
+                    || row.kind == RELKIND_INDEX
+                    || row.kind == RELKIND_SEQUENCE
+                    || row.kind == RELKIND_INTERNAL)
         }) {
             return Ok(true);
         }
@@ -2140,7 +2803,7 @@ impl Engine {
             if existing != name {
                 return false;
             }
-            if kind == RELKIND_TABLE {
+            if kind == RELKIND_TABLE || kind == RELKIND_SEQUENCE || kind == RELKIND_INTERNAL {
                 return true;
             }
             if kind != RELKIND_INDEX {
@@ -4380,9 +5043,20 @@ impl Engine {
     /// `delete` / `index_lookup`) never passes through here and produces
     /// NO entries (§6.3 另注).
     pub fn exec(&self, txn: Option<&TxnHandle>, sql: &str) -> Result<QueryResult> {
+        let mut session = SqlSession::new(NEXT_SQL_SESSION_ID.fetch_add(1, Ordering::Relaxed));
+        self.exec_in_session(&mut session, txn, sql)
+    }
+
+    /// Execute SQL with a persistent per-connection sequence context.
+    pub fn exec_in_session(
+        &self,
+        session: &mut SqlSession,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+    ) -> Result<QueryResult> {
         let started = Instant::now();
         let stmt = sql::parse(sql)?;
-        self.exec_parsed(txn, sql, started, stmt, None)
+        self.exec_parsed(session, txn, sql, started, stmt, None)
     }
 
     /// Execute an AP query synchronously without nesting a runtime on the current thread.
@@ -4501,9 +5175,21 @@ impl Engine {
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult> {
+        let mut session = SqlSession::new(NEXT_SQL_SESSION_ID.fetch_add(1, Ordering::Relaxed));
+        self.exec_with_params_in_session(&mut session, txn, sql, params)
+    }
+
+    /// Execute parameterized SQL with a persistent per-connection sequence context.
+    pub fn exec_with_params_in_session(
+        &self,
+        session: &mut SqlSession,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult> {
         let started = Instant::now();
         let stmt = sql::parse(sql)?;
-        self.exec_parsed(txn, sql, started, stmt, Some(params))
+        self.exec_parsed(session, txn, sql, started, stmt, Some(params))
     }
 
     /// Infer the schema type of every parameter slot in `$1..$max` order.
@@ -4524,6 +5210,7 @@ impl Engine {
 
     fn exec_parsed(
         &self,
+        session: &mut SqlSession,
         txn: Option<&TxnHandle>,
         sql: &str,
         started: Instant,
@@ -4535,12 +5222,12 @@ impl Engine {
             Some(params) => self
                 .bind_parameters(stmt, params)
                 .and_then(|stmt| match txn {
-                    None => self.exec_auto(stmt, &mut path),
-                    Some(handle) => self.exec_txn(handle, stmt, &mut path),
+                    None => self.exec_auto(session, stmt, &mut path),
+                    Some(handle) => self.exec_txn(session, handle, stmt, &mut path),
                 }),
             None => match txn {
-                None => self.exec_auto(stmt, &mut path),
-                Some(handle) => self.exec_txn(handle, stmt, &mut path),
+                None => self.exec_auto(session, stmt, &mut path),
+                Some(handle) => self.exec_txn(session, handle, stmt, &mut path),
             },
         };
         // F2 (Stage E review): capacity 0 means "stats off" — skip the
@@ -4586,7 +5273,28 @@ impl Engine {
         Ok(stmt)
     }
 
-    fn exec_auto(&self, stmt: Statement, path: &mut ExecutionPath) -> Result<QueryResult> {
+    fn sequence_query(
+        &self,
+        session: &mut SqlSession,
+        function: SequenceFunction,
+        sequence: &str,
+    ) -> Result<QueryResult> {
+        let (name, value) = match function {
+            SequenceFunction::NextVal => ("nextval", self.nextval(session, sequence)?),
+            SequenceFunction::CurrVal => ("currval", self.currval(session, sequence)?),
+        };
+        Ok(QueryResult::Rows {
+            columns: vec![name.to_string()],
+            rows: vec![vec![Some(Datum::Int8(value))]],
+        })
+    }
+
+    fn exec_auto(
+        &self,
+        session: &mut SqlSession,
+        stmt: Statement,
+        path: &mut ExecutionPath,
+    ) -> Result<QueryResult> {
         match stmt {
             // Transaction control is programmatic only (Stage O review):
             // auto-commit mode has no transaction to begin or end, so these
@@ -4597,6 +5305,12 @@ impl Engine {
             Statement::Commit | Statement::Rollback => Err(EngineError::InvalidArgument(
                 "no transaction in progress".to_string(),
             )),
+            Statement::CreateSequence { name } => {
+                self.create_sequence(&name).map(|_| QueryResult::Ok)
+            }
+            Statement::SequenceQuery { function, sequence } => {
+                self.sequence_query(session, function, &sequence)
+            }
             Statement::Explain(inner) => {
                 let Statement::Select {
                     table,
@@ -4622,14 +5336,7 @@ impl Engine {
                 )
             }
             Statement::CreateTable { name, columns } => {
-                let defs: Vec<ColumnDef> = columns
-                    .into_iter()
-                    .map(|c| ColumnDef {
-                        name: c.name,
-                        col_type: c.col_type,
-                    })
-                    .collect();
-                self.create_table(&name, &defs)?;
+                self.create_table_from_spec(&name, columns)?;
                 Ok(QueryResult::Ok)
             }
             Statement::CreateIndex {
@@ -4708,7 +5415,7 @@ impl Engine {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                     let mut count = 0;
                     for row in &rows {
-                        let values = build_insert_values(&entry, &columns, row)?;
+                        let values = self.build_insert_values(session, &entry, &columns, row)?;
                         self.insert_inner(snap, &entry, &values)?;
                         count += 1;
                     }
@@ -4809,6 +5516,7 @@ impl Engine {
 
     fn exec_txn(
         &self,
+        session: &mut SqlSession,
         handle: &TxnHandle,
         stmt: Statement,
         path: &mut ExecutionPath,
@@ -4833,6 +5541,9 @@ impl Engine {
             Statement::Rollback => Err(EngineError::InvalidArgument(
                 "ROLLBACK via exec is not supported; call TxnHandle::abort() instead".to_string(),
             )),
+            Statement::SequenceQuery { function, sequence } => {
+                self.sequence_query(session, function, &sequence)
+            }
             Statement::Explain(inner) => {
                 let Statement::Select {
                     table,
@@ -4852,7 +5563,9 @@ impl Engine {
                     self, &snap, &table, &entry, &columns, &filter, &order_by, &limit,
                 )
             }
-            Statement::CreateTable { .. } | Statement::CreateIndex { .. } => {
+            Statement::CreateTable { .. }
+            | Statement::CreateIndex { .. }
+            | Statement::CreateSequence { .. } => {
                 drop(snap);
                 Err(EngineError::InvalidArgument(
                     "DDL inside explicit transactions is not supported in M2b; run DDL in auto-commit mode (exec(None, ...))".to_string(),
@@ -4866,7 +5579,7 @@ impl Engine {
                 let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                 let mut count = 0;
                 for row in &rows {
-                    let values = build_insert_values(&entry, &columns, row)?;
+                    let values = self.build_insert_values(session, &entry, &columns, row)?;
                     self.insert_inner(&snap, &entry, &values)?;
                     count += 1;
                 }
@@ -5658,49 +6371,103 @@ fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
     }
 }
 
-/// Build the full `values` vector for an INSERT, matching the table schema.
-fn build_insert_values(
-    entry: &TableEntry,
-    columns: &Option<Vec<String>>,
-    row: &[Literal],
-) -> Result<Vec<Value>> {
-    let n = entry.columns.len();
-    let values = match columns {
-        Some(cols) => {
-            if cols.len() != row.len() {
-                return Err(EngineError::InvalidArgument(format!(
-                    "column list has {} entries but {} values given",
-                    cols.len(),
-                    row.len()
-                )));
+impl Engine {
+    fn build_insert_values(
+        &self,
+        session: &mut SqlSession,
+        entry: &TableEntry,
+        columns: &Option<Vec<String>>,
+        row: &[Literal],
+    ) -> Result<Vec<Value>> {
+        let n = entry.columns.len();
+        let mut values = match columns {
+            Some(cols) => {
+                if cols.len() != row.len() {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "column list has {} entries but {} values given",
+                        cols.len(),
+                        row.len()
+                    )));
+                }
+                let mut v = vec![None; n];
+                for (col_name, lit) in cols.iter().zip(row.iter()) {
+                    let idx = entry
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                        .ok_or_else(|| {
+                            EngineError::InvalidArgument(format!("no column {col_name:?} in table"))
+                        })?;
+                    v[idx] = if matches!(lit, Literal::Default) {
+                        None
+                    } else {
+                        literal_to_value(lit, entry.columns[idx].col_type)?
+                    };
+                }
+                v
             }
-            let mut v = vec![None; n];
-            for (col_name, lit) in cols.iter().zip(row.iter()) {
-                let idx = entry
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                    .ok_or_else(|| {
-                        EngineError::InvalidArgument(format!("no column {col_name:?} in table"))
-                    })?;
-                v[idx] = literal_to_value(lit, entry.columns[idx].col_type)?;
+            None => {
+                if row.len() != n {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "table has {n} columns but {} values given",
+                        row.len()
+                    )));
+                }
+                row.iter()
+                    .zip(entry.columns.iter())
+                    .map(|(lit, col)| {
+                        if matches!(lit, Literal::Default) {
+                            Ok(None)
+                        } else {
+                            literal_to_value(lit, col.col_type)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?
             }
-            v
+        };
+
+        for (index, default) in entry.defaults.iter().enumerate() {
+            let is_default = match columns {
+                Some(cols) => {
+                    let provided = cols
+                        .iter()
+                        .position(|name| name.eq_ignore_ascii_case(&entry.columns[index].name));
+                    provided.is_none()
+                        || matches!(row.get(provided.unwrap()), Some(Literal::Default))
+                }
+                None => matches!(row.get(index), Some(Literal::Default)),
+            };
+            if !is_default {
+                continue;
+            }
+            let sequence_oid = default.ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "column {:?} has no DEFAULT",
+                    entry.columns[index].name
+                ))
+            })?;
+            let sequence = self.sequence_name(sequence_oid)?;
+            let next = self.nextval(session, &sequence)?;
+            let value = i32::try_from(next).map_err(|_| {
+                EngineError::InvalidArgument(format!(
+                    "sequence {sequence:?} value {next} is out of range for INT4"
+                ))
+            })?;
+            values[index] = Some(Datum::Int4(value));
         }
-        None => {
-            if row.len() != n {
-                return Err(EngineError::InvalidArgument(format!(
-                    "table has {n} columns but {} values given",
-                    row.len()
-                )));
-            }
-            row.iter()
-                .zip(entry.columns.iter())
-                .map(|(lit, col)| literal_to_value(lit, col.col_type))
-                .collect::<Result<Vec<_>>>()?
-        }
-    };
-    Ok(values)
+        Ok(values)
+    }
+
+    fn sequence_name(&self, oid: Oid) -> Result<String> {
+        self.sequences
+            .states
+            .lock()
+            .get(&oid)
+            .map(|state| state.name.clone())
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("sequence OID {oid} does not exist"))
+            })
+    }
 }
 
 /// Build a `Predicate` from a parsed `Filter`, resolving the column name
@@ -5757,6 +6524,11 @@ pub(crate) fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result
         Literal::Null => {
             return Err(EngineError::InvalidPredicate(
                 "NULL in WHERE is not supported".to_string(),
+            ))
+        }
+        Literal::Default => {
+            return Err(EngineError::InvalidPredicate(
+                "DEFAULT is only valid in INSERT VALUES".to_string(),
             ))
         }
         Literal::Param(index) => {
@@ -5890,7 +6662,9 @@ fn infer_statement_parameters(
         | Statement::Commit
         | Statement::Rollback
         | Statement::CreateTable { .. }
-        | Statement::CreateIndex { .. } => {}
+        | Statement::CreateIndex { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::SequenceQuery { .. } => {}
     }
     Ok(())
 }
@@ -6029,7 +6803,9 @@ fn replace_parameters(stmt: &mut Statement, literals: &[Literal]) -> Result<()> 
         | Statement::Commit
         | Statement::Rollback
         | Statement::CreateTable { .. }
-        | Statement::CreateIndex { .. } => {}
+        | Statement::CreateIndex { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::SequenceQuery { .. } => {}
     }
     Ok(())
 }

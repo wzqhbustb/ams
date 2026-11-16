@@ -42,7 +42,8 @@ use pg_storage::wal::record::{
     HeapCleanupRecord, HeapDeleteRecord, HeapHotUpdateRecord, HeapInsertRecord, HeapUpdateRecord,
     HnswDirAppendRecord, HnswDirLinkRecord, HnswMetaUpdateRecord, HnswNodeInitRecord,
     HnswNodeTombstoneRecord, HnswPublishLiveRecord, HnswSetNeighborsRecord, PageAllocRecord,
-    PageFreeRecord, TxnAbortRecord, TxnCommitRecord, WalRecord, WalRecordType,
+    PageFreeRecord, SequenceAdvanceRecord, TxnAbortRecord, TxnCommitRecord, WalRecord,
+    WalRecordType,
 };
 
 fn main() -> ExitCode {
@@ -337,6 +338,13 @@ fn payload_fields(record: &WalRecord) -> String {
         },
         WalRecordType::TxnAbort => match TxnAbortRecord::decode(p) {
             Ok(r) => format!("abort_xid={}", r.xid.0),
+            Err(e) => undecodable(p, &e),
+        },
+        WalRecordType::SequenceAdvance => match SequenceAdvanceRecord::decode(p) {
+            Ok(r) => format!(
+                "sequence_oid={} high_water={}",
+                r.sequence_oid.0, r.high_water
+            ),
             Err(e) => undecodable(p, &e),
         },
         WalRecordType::CheckpointBegin => String::new(),

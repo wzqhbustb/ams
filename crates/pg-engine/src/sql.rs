@@ -45,6 +45,13 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnSpec>,
     },
+    CreateSequence {
+        name: String,
+    },
+    SequenceQuery {
+        function: SequenceFunction,
+        sequence: String,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,
@@ -79,6 +86,13 @@ pub enum Statement {
         /// The vector operator class (Phase 4a §5.1). Required for HNSW.
         opclass: Option<VectorOpclass>,
     },
+}
+
+/// A sequence function evaluated as a single-row, no-FROM query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceFunction {
+    NextVal,
+    CurrVal,
 }
 
 /// The index method (PG's `USING <method>` family).
@@ -154,6 +168,7 @@ pub enum LockClause {
 pub struct ColumnSpec {
     pub name: String,
     pub col_type: ColumnType,
+    pub serial: bool,
 }
 
 /// Which columns a SELECT returns.
@@ -202,6 +217,7 @@ pub enum Literal {
     Float(f64),
     Str(String),
     Null,
+    Default,
     /// M6 Stage C: a vector literal `[0.1, 2.5, ...]` (INSERT path).
     Vector(Vec<f32>),
     /// A 1-based bind parameter (`$1`, `$2`, ...).
@@ -237,6 +253,9 @@ enum Token {
     Delete,
     Index,
     On,
+    Sequence,
+    Serial,
+    Default,
     Null,
     // Type names
     Type(ColumnType),
@@ -520,6 +539,9 @@ impl<'a> Tokenizer<'a> {
             "INDEX" => Token::Index,
             "ON" => Token::On,
             "USING" => Token::Using,
+            "SEQUENCE" => Token::Sequence,
+            "SERIAL" => Token::Serial,
+            "DEFAULT" => Token::Default,
             "NULL" => Token::Null,
             "INT" | "INT4" | "INTEGER" => Token::Type(ColumnType::Int4),
             "BIGINT" | "INT8" => Token::Type(ColumnType::Int8),
@@ -655,10 +677,18 @@ impl Parser {
         match self.peek().clone() {
             Token::Table => self.parse_create_table(),
             Token::Index => self.parse_create_index(),
+            Token::Sequence => self.parse_create_sequence(),
             other => Err(EngineError::InvalidArgument(format!(
-                "expected TABLE or INDEX after CREATE, got {other:?}"
+                "expected TABLE, INDEX or SEQUENCE after CREATE, got {other:?}"
             ))),
         }
+    }
+
+    fn parse_create_sequence(&mut self) -> Result<Statement> {
+        self.bump(); // SEQUENCE
+        let name = self.eat_ident()?;
+        self.eat(&Token::Eof)?;
+        Ok(Statement::CreateSequence { name })
     }
 
     fn parse_create_table(&mut self) -> Result<Statement> {
@@ -668,8 +698,9 @@ impl Parser {
         let mut columns = Vec::new();
         loop {
             let col_name = self.eat_ident()?;
-            let col_type = match self.bump() {
-                Token::Type(t) => t,
+            let (col_type, serial) = match self.bump() {
+                Token::Type(t) => (t, false),
+                Token::Serial => (ColumnType::Int4, true),
                 other => {
                     return Err(EngineError::InvalidArgument(format!(
                         "expected column type, got {other:?}"
@@ -679,6 +710,7 @@ impl Parser {
             columns.push(ColumnSpec {
                 name: col_name,
                 col_type,
+                serial,
             });
             match self.peek() {
                 Token::Comma => {
@@ -836,6 +868,7 @@ impl Parser {
             Token::Int(n) => Ok(Literal::Int(n)),
             Token::Float(f) => Ok(Literal::Float(f)),
             Token::Str(s) => Ok(Literal::Str(s)),
+            Token::Default => Ok(Literal::Default),
             Token::Null => Ok(Literal::Null),
             Token::Param(index) => Ok(Literal::Param(index)),
             // M6 Stage C: `[1.0, 2.5, ...]` vector literal.
@@ -875,6 +908,11 @@ impl Parser {
 
     fn parse_select(&mut self) -> Result<Statement> {
         self.bump(); // SELECT
+        if matches!(self.peek(), Token::Ident(name) if name == "nextval" || name == "currval")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            return self.parse_sequence_query();
+        }
         let columns = self.parse_select_cols()?;
         self.eat(&Token::From)?;
         let table = self.eat_ident()?;
@@ -891,6 +929,30 @@ impl Parser {
             limit,
             lock,
         })
+    }
+
+    fn parse_sequence_query(&mut self) -> Result<Statement> {
+        let function = match self.bump() {
+            Token::Ident(name) if name == "nextval" => SequenceFunction::NextVal,
+            Token::Ident(name) if name == "currval" => SequenceFunction::CurrVal,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "expected nextval or currval, got {other:?}"
+                )))
+            }
+        };
+        self.eat(&Token::LParen)?;
+        let sequence = match self.bump() {
+            Token::Str(name) => name,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "sequence name must be a string literal, got {other:?}"
+                )))
+            }
+        };
+        self.eat(&Token::RParen)?;
+        self.eat(&Token::Eof)?;
+        Ok(Statement::SequenceQuery { function, sequence })
     }
 
     /// The M2c row-lock clause (§9.1): `FOR UPDATE` / `FOR SHARE`, after
@@ -1145,7 +1207,9 @@ pub(crate) fn max_parameter_index(stmt: &Statement) -> usize {
         | Statement::Commit
         | Statement::Rollback
         | Statement::CreateTable { .. }
-        | Statement::CreateIndex { .. } => 0,
+        | Statement::CreateIndex { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::SequenceQuery { .. } => 0,
     }
 }
 
