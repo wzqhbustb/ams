@@ -1837,7 +1837,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 
 ## Phase 4a Stage D：heap TOAST chunk I/O
 
-**状态**：✅ 完成（2026-11-11；VECTOR 边界、建表注册原子性及零长度缺块修复、专项回归与全量门禁均通过；未 commit——等用户确认）。
+**状态**：✅ 完成（2026-11-11；VECTOR 边界、建表注册原子性及零长度缺块修复、专项回归与全量门禁均通过；commit `99aa23e`）。
 
 ### 交付内容
 
@@ -1866,7 +1866,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 
 ## Phase 4a Stage E：DataFusion 集成与 TP 适配检查点
 
-**状态**：✅ 完成（2026-11-12；DataFusion 集成、AccessShare 修复、专项回归与全量门禁均通过；未 commit——等用户确认）。
+**状态**：✅ 完成（2026-11-12；DataFusion 集成、AccessShare 修复、专项回归与全量门禁均通过；commit `bfb4164`）。
 
 ### 交付内容
 
@@ -1891,7 +1891,7 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 
 ## Phase 4a Stage F：Sequence / SERIAL
 
-**状态**：✅ 完成（2026-11-13；WAL-first 序列、sessionful SQL、SERIAL 与 SIGKILL 验收通过；未 commit——等用户确认）。
+**状态**：✅ 完成（2026-11-13；WAL-first 序列、sessionful SQL、SERIAL 与 SIGKILL 验收通过；commit `aefd8b8`）。
 
 ### 交付内容
 
@@ -1907,3 +1907,27 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - `wire_sequence` **4/4 debug / 4/4 release**：Simple/Extended currval、Sync/rollback 保留、连接隔离、SERIAL 和 INT8 Describe。
 - `wal_record_type_discriminant` 与 `waldump`：SequenceAdvance 固定值、payload 和字段输出通过。
 - 八 crate Clippy/rustdoc、workspace all-features、fmt 与 `git diff --check` 全绿；Wire/DataFusion 既有回归全绿。
+
+## Phase 4a Stage G：全量验收与两轮对抗审查
+
+**状态**：✅ 完成（2026-11-17；两轮审查与本地全量验收闭合；CI 待提交后执行；未 commit——等用户确认）。
+
+### 第一轮审查与修复
+
+1. **scratch 清理与正式回归**：三个未跟踪的 Stage E/F 临时探针已移出测试树并保留于 `target/tmp/stageg-scratch/`。有效场景并入正式套件：DataFusion 增加 timestamp/反向比较、旧快照 B+Tree 回退、LIMIT 0/空表 COUNT、跨 Engine 事务拒绝、OR/JOIN 重名列五组测试；Sequence 增加参数化 nextval 响亮拒绝和并发 DDL/nextval 两组测试。无断言的 DROP 竞态观察探针不作为验收证据。
+2. **SERIAL 所有权生命周期**：修复 `DROP TABLE` 后旧 SERIAL 序列仍存在并阻止同名重建的问题。现在序列 `pg_class` 与父表在同一事务标记 dropped，对应 `pg_rust_sequences` / `pg_rust_attrdefaults` 行同事务删除，committed 状态在锁释放前从内存移除；standalone sequence 不受影响。失败 DROP 保留原序列，成功 DROP 可立即或重启后复名。旧版遗留的孤立 default/sequence 元数据通过 fresh MVCC 父表检查忽略，不阻止升级后的复名。
+3. **锁顺序**：DROP 先取父表 AccessExclusive，再取 sequence mutex，与 SERIAL INSERT 的 RowExclusive → nextval 顺序一致；mutex 覆盖 commit 和锁释放前的内存清理，避免 DROP × SERIAL INSERT 的锁顺序反转，同时禁止 nextval 与序列删除并发。
+4. **MSRV 传递依赖**：DataFusion 保持 50.3.0，统一将 ICU 系列回退到 2.2.0，并将 `psm` 回退到 0.1.28（对应 `ar_archive_writer` 0.2.0 / `object` 0.32.2），避免 Rust 1.88 的 let-chain 与 ICU 1.88 门槛。未改业务依赖声明。
+
+### 第二轮复核
+
+- 对照 PostgreSQL `OWNED BY` 语义、SERIAL INSERT 锁顺序和 `auto_commit_with_hooks` 的锁释放点复核通过；成功 DROP、commit-failure、立即/重启复名及旧版孤立元数据升级路径均有正式回归。
+- AP residual filter × LIMIT、aborted CREATE reopen、Wire DDL/session 边界无新增问题；无遗留 `zz_*` 临时探针、TODO/FIXME 或调试输出。第二轮未发现新增 P1/P2/P3。
+
+### 最终验收证据
+
+- DataFusion 专项 **18/18 + 1 ignored**，Sequence 专项 **23/23**，均覆盖 debug/release；新增旧版孤立 SERIAL 元数据升级回归通过。
+- `cargo test --workspace` 与 `cargo test --workspace --release` 均 EXIT=0、零失败；`cargo test -p pg-engine --features datafusion` 的 debug/release 亦均 EXIT=0、零失败。
+- `cargo +1.86.0 check --workspace --all-features`、当前工具链全 feature 编译、八 crate Clippy/rustdoc、fmt 与 `git diff --check` 均通过。
+- DataFusion 点查 20 次均值 **0.598ms**（最终依赖版本，<5ms）；自研 B+Tree 点查 **10.693µs**。siftsmall SQL ANN **recall@10 = 0.9990**，均值 **0.298ms**、p95 **0.413ms**，每次查询仍断言 `ExecutionPath::IndexLookup`。
+- 覆盖率口径不变：既有 coverage job 仅覆盖 pg-am-hnsw 的 `--fail-under 90`，未将其宣称为 pg-engine/pg-wire/pg-am-heap 的 Phase 4a 覆盖率；本机不伪造该 CI 报告。

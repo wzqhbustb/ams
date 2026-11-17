@@ -691,3 +691,122 @@ fn sequence_internal_catalog_names_are_reserved() {
     }
     engine.shutdown();
 }
+
+#[test]
+fn parameterized_nextval_is_loudly_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine.create_sequence("s").unwrap();
+    let error = engine
+        .exec_with_params(None, "SELECT nextval($1)", &[Some(Datum::Text("s".into()))])
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("sequence name must be a string literal"));
+    engine.shutdown();
+}
+
+#[test]
+fn concurrent_sequence_creation_and_nextval_do_not_deadlock() {
+    let tmp = TempDir::new().unwrap();
+    let engine = Arc::new(open(tmp.path()));
+    engine.create_sequence("s").unwrap();
+
+    let mut workers = Vec::new();
+    for worker in 0..4 {
+        let engine = Arc::clone(&engine);
+        workers.push(std::thread::spawn(move || {
+            let mut session = SqlSession::new(100 + worker);
+            let mut values = Vec::new();
+            for _ in 0..50 {
+                let result = engine
+                    .exec_in_session(&mut session, None, "SELECT nextval('s')")
+                    .unwrap();
+                match int8_rows(result)[0][0] {
+                    Some(Datum::Int8(value)) => values.push(value),
+                    ref other => panic!("expected INT8 nextval, got {other:?}"),
+                }
+            }
+            values
+        }));
+    }
+    let engine2 = Arc::clone(&engine);
+    workers.push(std::thread::spawn(move || {
+        for id in 0..5 {
+            engine2
+                .create_sequence(&format!("s{id}"))
+                .unwrap_or_else(|error| panic!("create_sequence s{id}: {error}"));
+        }
+        Vec::new()
+    }));
+
+    let mut values = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    assert_eq!(values, (1..=200).collect::<Vec<_>>());
+    let mut session = SqlSession::new(200);
+    for id in 0..5 {
+        assert_eq!(engine.nextval(&mut session, &format!("s{id}")).unwrap(), 1);
+    }
+    engine.shutdown();
+}
+
+#[test]
+fn serial_drop_is_transactional_and_allows_recreate() {
+    let _serialization = COMMIT_FAIL_LOCK.lock().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine.exec(None, "CREATE TABLE t (id SERIAL)").unwrap();
+    let mut session = SqlSession::new(1);
+    assert_eq!(engine.nextval(&mut session, "t_id_seq").unwrap(), 1);
+
+    pg_txn::manager::test_hooks::set_commit_txn_force_fail(true);
+    assert!(engine.drop_table("t").is_err());
+    pg_txn::manager::test_hooks::set_commit_txn_force_fail(false);
+    assert_eq!(engine.nextval(&mut session, "t_id_seq").unwrap(), 2);
+    engine.shutdown();
+
+    // Aborted DROP markers and metadata deletes must not hide the sequence.
+    let engine = open(tmp.path());
+    assert_eq!(engine.nextval(&mut session, "t_id_seq").unwrap(), 3);
+    engine.drop_table("t").unwrap();
+
+    // Name reuse is immediate, and the replacement starts its own sequence.
+    engine.exec(None, "CREATE TABLE t (id SERIAL)").unwrap();
+    engine
+        .exec_in_session(&mut session, None, "INSERT INTO t VALUES (DEFAULT)")
+        .unwrap();
+    assert_eq!(
+        engine.scan("t", None).unwrap()[0].1[0],
+        Some(Datum::Int4(1))
+    );
+    engine.drop_table("t").unwrap();
+    engine.shutdown();
+
+    // A committed DROP must not resurrect the old sequence on reopen.
+    let engine = open(tmp.path());
+    assert!(engine
+        .nextval(&mut session, "t_id_seq")
+        .unwrap_err()
+        .to_string()
+        .contains("does not exist"));
+    engine.exec(None, "CREATE TABLE t (id SERIAL)").unwrap();
+    engine
+        .exec_in_session(&mut session, None, "INSERT INTO t VALUES (DEFAULT)")
+        .unwrap();
+    assert_eq!(
+        engine.scan("t", None).unwrap()[0].1[0],
+        Some(Datum::Int4(1))
+    );
+    engine.shutdown();
+
+    let engine = open(tmp.path());
+    engine
+        .exec_in_session(&mut session, None, "INSERT INTO t VALUES (DEFAULT)")
+        .unwrap();
+    let rows = engine.scan("t", None).unwrap();
+    assert_eq!(rows.last().unwrap().1[0], Some(Datum::Int4(2)));
+    engine.shutdown();
+}

@@ -166,6 +166,8 @@ for crate in pg-storage pg-txn pg-catalog pg-am-heap pg-am-btree pg-am-hnsw pg-e
 done
 ```
 
+**Stage G 实现补充（已完成）**：第一轮审查将有效 scratch 场景并入正式 DataFusion/Sequence 回归，并修复 SERIAL 所有权生命周期。DROP TABLE 现在将 SERIAL 序列的 `pg_class` drop marker、`pg_rust_sequences` / `pg_rust_attrdefaults` 删除与父表放在同一事务，committed 状态在锁释放前清理；standalone sequence 不受影响。旧版孤立元数据通过 fresh MVCC 父表检查忽略，允许升级后复名。DROP 先取父表 AccessExclusive 再取 sequence mutex，与 SERIAL INSERT 的锁顺序一致，mutex 覆盖 commit 和锁释放前清理。MSRV 验收实际运行 `cargo +1.86.0 check --workspace --all-features`，DataFusion 保持 50.3.0，ICU 统一为 2.2.0，`psm` 为 0.1.28，避免高版本传递依赖破坏 1.86 门槛。
+
 ---
 
 ## CI 注册清单（逐项：进哪个 workflow、什么条件下跑）

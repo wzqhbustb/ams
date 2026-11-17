@@ -746,6 +746,188 @@ fn ann_and_row_locks_are_rejected() {
     ));
 }
 
+#[cfg(feature = "datafusion")]
+#[test]
+fn timestamp_literals_and_reversed_comparisons_work() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table(
+            "t",
+            &[
+                column("id", ColumnType::Int8),
+                column("ts", ColumnType::Timestamptz),
+            ],
+        )
+        .unwrap();
+    for (id, ts) in [
+        (1, 1_700_000_000_000_000),
+        (2, 1_800_000_000_000_000),
+        (3, 1_900_000_000_000_000),
+    ] {
+        engine
+            .insert("t", &[Some(Datum::Int8(id)), Some(Datum::Timestamptz(ts))])
+            .unwrap();
+    }
+    for (sql, expected) in [
+        (
+            "SELECT id FROM t WHERE ts > '2024-01-01 00:00:00'",
+            vec![2, 3],
+        ),
+        ("SELECT id FROM t WHERE ts = '2023-11-14 22:13:20'", vec![1]),
+        ("SELECT id FROM t WHERE 2 > id", vec![1]),
+        ("SELECT id FROM t WHERE 1 < id", vec![2, 3]),
+    ] {
+        assert_eq!(
+            ids(engine.exec_datafusion(None, sql).unwrap()),
+            expected,
+            "{sql}"
+        );
+    }
+    engine.shutdown();
+}
+
+#[cfg(feature = "datafusion")]
+#[test]
+fn old_snapshot_ap_with_in_flight_writer_uses_btree_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table("t", &[column("id", ColumnType::Int8)])
+        .unwrap();
+    engine.create_index("t", "id").unwrap();
+    for id in 1..=3 {
+        engine.insert("t", &[Some(Datum::Int8(id))]).unwrap();
+    }
+
+    let reader = engine.begin_txn().unwrap();
+    let writer = engine.begin_txn().unwrap();
+    engine
+        .exec(Some(&writer), "INSERT INTO t VALUES (4)")
+        .unwrap();
+    assert_eq!(
+        ids(engine
+            .exec_datafusion(Some(&reader), "SELECT id FROM t WHERE id >= 1")
+            .unwrap()),
+        [1, 2, 3]
+    );
+    writer.abort().unwrap();
+    reader.abort().unwrap();
+    engine.shutdown();
+}
+
+#[cfg(feature = "datafusion")]
+#[test]
+fn limit_zero_and_count_on_empty_table() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    create_items(&engine);
+    let result = engine
+        .exec_datafusion(None, "SELECT id FROM t LIMIT 0")
+        .unwrap();
+    let QueryResult::Rows { columns, rows } = result else {
+        panic!("expected rows");
+    };
+    assert_eq!(columns, ["id"]);
+    assert!(rows.is_empty());
+
+    engine
+        .create_table("empty", &[column("id", ColumnType::Int8)])
+        .unwrap();
+    assert_eq!(
+        ids(engine
+            .exec_datafusion(None, "SELECT COUNT(*) FROM empty")
+            .unwrap()),
+        [0]
+    );
+    engine.shutdown();
+}
+
+#[cfg(feature = "datafusion")]
+#[test]
+fn wrong_instance_txn_is_rejected() {
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let engine_a = open(tmp_a.path());
+    let engine_b = open(tmp_b.path());
+    let txn_b = engine_b.begin_txn().unwrap();
+    let error = engine_a
+        .exec_datafusion(Some(&txn_b), "SELECT * FROM x")
+        .unwrap_err();
+    assert!(matches!(error, EngineError::InvalidArgument(_)));
+    assert!(error.to_string().contains("different Engine"));
+    txn_b.abort().unwrap();
+    engine_a.shutdown();
+    engine_b.shutdown();
+}
+
+#[cfg(feature = "datafusion")]
+#[test]
+fn or_filter_and_join_duplicate_columns_preserve_rows() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table(
+            "t",
+            &[
+                column("id", ColumnType::Int8),
+                column("v", ColumnType::Int8),
+            ],
+        )
+        .unwrap();
+    for (id, value) in [(1, 10), (2, 20), (3, 30)] {
+        engine
+            .insert("t", &[Some(Datum::Int8(id)), Some(Datum::Int8(value))])
+            .unwrap();
+    }
+    assert_eq!(
+        ids(engine
+            .exec_datafusion(None, "SELECT id FROM t WHERE id = 1 OR id = 3")
+            .unwrap()),
+        [1, 3]
+    );
+
+    engine
+        .create_table(
+            "u",
+            &[
+                column("id", ColumnType::Int8),
+                column("w", ColumnType::Int8),
+            ],
+        )
+        .unwrap();
+    for (id, value) in [(1, 100), (2, 200)] {
+        engine
+            .insert("u", &[Some(Datum::Int8(id)), Some(Datum::Int8(value))])
+            .unwrap();
+    }
+    let joined = engine
+        .exec_datafusion(None, "SELECT * FROM t JOIN u ON t.id = u.id ORDER BY t.id")
+        .unwrap();
+    let QueryResult::Rows { columns, rows } = joined else {
+        panic!("expected rows");
+    };
+    assert_eq!(columns, ["id", "v", "id", "w"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some(Datum::Int8(1)),
+                Some(Datum::Int8(10)),
+                Some(Datum::Int8(1)),
+                Some(Datum::Int8(100)),
+            ],
+            vec![
+                Some(Datum::Int8(2)),
+                Some(Datum::Int8(20)),
+                Some(Datum::Int8(2)),
+                Some(Datum::Int8(200)),
+            ],
+        ]
+    );
+    engine.shutdown();
+}
+
 #[cfg(not(feature = "datafusion"))]
 #[test]
 fn datafusion_is_explicitly_unsupported_without_feature() {

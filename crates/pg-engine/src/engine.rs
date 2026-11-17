@@ -1162,6 +1162,7 @@ impl Engine {
         else {
             return Ok(HashMap::new());
         };
+        let (snapshot, _guard) = self.txn.snapshot(TxnId::INVALID);
         let def = attrdefaults_table(first_page);
         let columns = def.column_types();
         let rows = self.heap.scan(ScanContext {
@@ -1170,9 +1171,30 @@ impl Engine {
                 first_page,
                 columns: &columns,
             },
-            snapshot: &Snapshot::everything(),
+            snapshot: &snapshot,
             clog: self.clog.as_ref(),
         })?;
+        let class_columns = PG_CLASS.column_types();
+        let class_rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_CLASS.oid.raw(),
+                first_page: PG_CLASS.first_page,
+                columns: &class_columns,
+            },
+            snapshot: &snapshot,
+            clog: self.clog.as_ref(),
+        })?;
+        let live_tables: HashSet<i64> = class_rows
+            .into_iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(2)) {
+                (Some(Some(Datum::Int8(oid))), Some(Some(Datum::Text(kind))))
+                    if kind == RELKIND_TABLE =>
+                {
+                    Some(*oid)
+                }
+                _ => None,
+            })
+            .collect();
         let mut defaults = HashMap::new();
         for (_tid, values) in rows {
             let (
@@ -1185,6 +1207,11 @@ impl Engine {
                     "malformed pg_rust_attrdefaults row".to_string(),
                 ));
             };
+            // A pre-fix DROP could leave SERIAL metadata behind. Orphaned
+            // defaults are ignored just like orphaned index catalog rows.
+            if !live_tables.contains(rel_oid) {
+                continue;
+            }
             if *attnum <= 0 {
                 return Err(EngineError::Corrupted(format!(
                     "invalid default attnum {attnum} for relation {rel_oid}"
@@ -1612,17 +1639,49 @@ impl Engine {
     }
 
     fn recover_sequences(&self) -> Result<()> {
-        let def = self.sequence_relation()?;
-        let columns = def.column_types();
-        let rows = self.heap.scan(ScanContext {
-            rel: RelationDesc {
-                rel_oid: def.oid.raw(),
-                first_page: def.first_page,
-                columns: &columns,
-            },
-            snapshot: &Snapshot::everything(),
-            clog: self.clog.as_ref(),
-        })?;
+        let (snapshot, _guard) = self.txn.snapshot(TxnId::INVALID);
+        let scan = |def: &SystemTableDef| -> Result<Vec<(Tid, Vec<Value>)>> {
+            let columns = def.column_types();
+            Ok(self.heap.scan(ScanContext {
+                rel: RelationDesc {
+                    rel_oid: def.oid.raw(),
+                    first_page: def.first_page,
+                    columns: &columns,
+                },
+                snapshot: &snapshot,
+                clog: self.clog.as_ref(),
+            })?)
+        };
+        let rows = scan(&self.sequence_relation()?)?;
+        let class_rows = scan(&PG_CLASS)?;
+        let default_rows = scan(&self.attrdefaults_relation()?)?;
+        let live_tables: HashSet<i64> = class_rows
+            .iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(2)) {
+                (Some(Some(Datum::Int8(oid))), Some(Some(Datum::Text(kind))))
+                    if kind == RELKIND_TABLE =>
+                {
+                    Some(*oid)
+                }
+                _ => None,
+            })
+            .collect();
+        let sequence_parents: HashMap<i64, i64> = default_rows
+            .into_iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(2)) {
+                (Some(Some(Datum::Int8(rel_oid))), Some(Some(Datum::Int8(sequence_oid)))) => {
+                    Some((*sequence_oid, *rel_oid))
+                }
+                _ => None,
+            })
+            .collect();
+        let live_classes: HashMap<i64, Vec<Value>> = class_rows
+            .into_iter()
+            .filter_map(|(_, values)| match values.first() {
+                Some(Some(Datum::Int8(oid))) => Some((*oid, values)),
+                _ => None,
+            })
+            .collect();
         let recovered = self.sequences.recovered_high_water();
         for (_tid, values) in rows {
             let (
@@ -1642,13 +1701,24 @@ impl Engine {
                     "sequence {name} has negative high water {high_water}"
                 )));
             }
-            let class = self
-                .catalog
-                .relation(TableOid::new(Oid(oid)))
-                .ok_or_else(|| {
-                    EngineError::Corrupted(format!("sequence {name} has no pg_class row"))
-                })?;
-            if class.name != *name || class.kind != RELKIND_SEQUENCE {
+            // Pre-fix DROP TABLE left the owned sequence and default rows
+            // behind. They must not resurrect or block name reuse on reopen.
+            if sequence_parents
+                .get(raw_oid)
+                .is_some_and(|parent| !live_tables.contains(parent))
+            {
+                continue;
+            }
+            let class = live_classes.get(raw_oid).ok_or_else(|| {
+                EngineError::Corrupted(format!("sequence {name} has no live pg_class row"))
+            })?;
+            let class_kind = class.get(2);
+            if matches!(class_kind, Some(Some(Datum::Text(kind))) if kind == RELKIND_DROPPED) {
+                continue;
+            }
+            if class.get(1) != Some(&Some(Datum::Text(name.clone())))
+                || !matches!(class_kind, Some(Some(Datum::Text(kind))) if kind == RELKIND_SEQUENCE)
+            {
                 return Err(EngineError::Corrupted(format!(
                     "sequence {name} has inconsistent pg_class metadata"
                 )));
@@ -2036,6 +2106,21 @@ impl Engine {
         Ok(())
     }
 
+    fn delete_catalog_row(&self, snap: &Snapshot, def: &SystemTableDef, tid: Tid) -> Result<()> {
+        let columns = def.column_types();
+        self.heap.delete(DeleteContext {
+            rel: RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            tid,
+            clog: self.clog.as_ref(),
+        })?;
+        Ok(())
+    }
+
     /// Locate the relpages version visible to the current DDL transaction.
     fn find_relpages_row(&self, snap: &Snapshot, oid: Oid) -> Result<Tid> {
         let columns = PG_RELPAGES.column_types();
@@ -2331,18 +2416,111 @@ impl Engine {
             .get(name)
             .cloned()
             .ok_or_else(|| EngineError::TableNotFound(name.to_string()))?;
+        let sequence_states = RefCell::new(None);
+        let serial_sequences = RefCell::new(Vec::new());
 
         self.auto_commit_with_hooks(
             |snap| {
-                // AccessExclusive (§9.2): blocks — and is blocked by — every
-                // other lock mode on this table, so a DROP waits for in-flight
-                // readers/writers and new ones queue behind it (M2c Stage P).
+                // Acquire the table lock BEFORE the sequence mutex, matching
+                // SERIAL INSERT's RowExclusive -> nextval order. The mutex is
+                // then held through commit and pre-unlock in-memory cleanup.
                 self.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
+                let states = self.sequences.states.lock();
+                let sequences = entry
+                    .defaults
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, sequence_oid)| {
+                        sequence_oid.map(|sequence_oid| {
+                            let state = states.get(&sequence_oid).ok_or_else(|| {
+                                EngineError::Corrupted(format!(
+                                    "SERIAL default references missing sequence {sequence_oid}"
+                                ))
+                            })?;
+                            Ok((index as i32 + 1, sequence_oid, state.name.clone()))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.drop_serial_sequences(snap, &entry, &sequences)?;
+                *serial_sequences.borrow_mut() = sequences;
+                *sequence_states.borrow_mut() = Some(states);
                 self.drop_table_marker(snap, name, &entry)
             },
-            || self.drop_table_storage(name, &entry),
+            || {
+                self.drop_table_storage(name, &entry)?;
+                let mut states = sequence_states.borrow_mut();
+                let states = states
+                    .as_mut()
+                    .expect("successful DROP holds its sequence mutex");
+                for (_, sequence_oid, _) in serial_sequences.borrow().iter() {
+                    states.remove(sequence_oid);
+                }
+                Ok(())
+            },
             || {},
         )
+    }
+
+    /// Delete SERIAL-owned metadata and mark each sequence dropped in the
+    /// same transaction as the parent table. Standalone sequences are not
+    /// listed in pg_rust_attrdefaults and are therefore unaffected.
+    fn drop_serial_sequences(
+        &self,
+        snap: &Snapshot,
+        entry: &TableEntry,
+        serial_sequences: &[(i32, Oid, String)],
+    ) -> Result<()> {
+        if serial_sequences.is_empty() {
+            return Ok(());
+        }
+        let default_def = self.attrdefaults_relation()?;
+        let columns = default_def.column_types();
+        let default_rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: default_def.oid.raw(),
+                first_page: default_def.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            clog: self.clog.as_ref(),
+        })?;
+        let parent_rows = default_rows
+            .iter()
+            .filter(|(_, values)| values.first() == Some(&Some(Datum::Int8(entry.oid.0 as i64))))
+            .collect::<Vec<_>>();
+        if parent_rows.len() != serial_sequences.len() {
+            return Err(EngineError::Corrupted(format!(
+                "SERIAL default count mismatch for table OID {}",
+                entry.oid.0
+            )));
+        }
+        let sequence_def = self.sequence_relation()?;
+        for (attnum, sequence_oid, sequence_name) in serial_sequences {
+            let mut matching = parent_rows.iter().filter(|(_, values)| {
+                values.get(1) == Some(&Some(Datum::Int4(*attnum)))
+                    && values.get(2) == Some(&Some(Datum::Int8(sequence_oid.0 as i64)))
+            });
+            let (default_tid, _) = matching.next().ok_or_else(|| {
+                EngineError::Corrupted(format!(
+                    "missing SERIAL default for table OID {} attnum {attnum}",
+                    entry.oid.0
+                ))
+            })?;
+            if matching.next().is_some() {
+                return Err(EngineError::Corrupted(format!(
+                    "duplicate SERIAL default for table OID {} attnum {attnum}",
+                    entry.oid.0
+                )));
+            }
+            let (sequence_tid, _) = self.find_sequence_row(snap, &sequence_def, *sequence_oid)?;
+            let class_tid = self.find_live_class_row(snap, *sequence_oid, RELKIND_SEQUENCE)?;
+            let mut class_row = sequence_class_row(*sequence_oid, sequence_name);
+            class_row[2] = Some(Datum::Text(RELKIND_DROPPED.to_string()));
+            self.update_catalog_row(snap, &PG_CLASS, class_tid, &class_row)?;
+            self.delete_catalog_row(snap, &sequence_def, sequence_tid)?;
+            self.delete_catalog_row(snap, &default_def, *default_tid)?;
+        }
+        Ok(())
     }
 
     /// Write only the drop marker inside the transaction. Physical cleanup
@@ -2741,10 +2919,11 @@ impl Engine {
         Ok((index_oid, meta_page))
     }
 
-    /// Whether a committed live table or index already owns `name`.
+    /// Whether a committed live table, index, or sequence already owns `name`.
     /// `Catalog`'s open-time snapshot cannot see relations created later in
     /// this process, so name validation reads `pg_class` through a fresh
-    /// MVCC snapshot. Drop markers (`relkind='d'`) do not block reuse.
+    /// MVCC snapshot. Drop markers (`relkind='d'`) and relations whose parent
+    /// table is dropped do not block reuse.
     fn relation_name_exists(&self, name: &str) -> Result<bool> {
         // Bootstrap catalog rows use a synthetic XID that an ordinary MVCC
         // heap scan cannot see. Only system relations use the open-time
@@ -2774,11 +2953,21 @@ impl Engine {
         };
         let class_rows = scan(&PG_CLASS)?;
         let index_rows = scan(&PG_INDEX)?;
+        let default_rows = scan(&self.attrdefaults_relation()?)?;
         let index_parents: HashMap<i64, i64> = index_rows
             .into_iter()
             .filter_map(|(_, values)| match (values.first(), values.get(1)) {
                 (Some(Some(Datum::Int8(index_oid))), Some(Some(Datum::Int8(parent_oid)))) => {
                     Some((*index_oid, *parent_oid))
+                }
+                _ => None,
+            })
+            .collect();
+        let sequence_parents: HashMap<i64, i64> = default_rows
+            .into_iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(2)) {
+                (Some(Some(Datum::Int8(rel_oid))), Some(Some(Datum::Int8(sequence_oid)))) => {
+                    Some((*sequence_oid, *rel_oid))
                 }
                 _ => None,
             })
@@ -2803,8 +2992,18 @@ impl Engine {
             if existing != name {
                 return false;
             }
-            if kind == RELKIND_TABLE || kind == RELKIND_SEQUENCE || kind == RELKIND_INTERNAL {
+            if kind == RELKIND_TABLE || kind == RELKIND_INTERNAL {
                 return true;
+            }
+            if kind == RELKIND_SEQUENCE {
+                // A SERIAL sequence has the same lifetime as its parent
+                // table. Pre-fix orphaned rows must not block name reuse.
+                let Some(Some(Datum::Int8(sequence_oid))) = values.first() else {
+                    return false;
+                };
+                return sequence_parents
+                    .get(sequence_oid)
+                    .is_none_or(|parent_oid| live_tables.contains(parent_oid));
             }
             if kind != RELKIND_INDEX {
                 return false;
@@ -6009,6 +6208,10 @@ impl Engine {
     /// catalog row, so a raw first-slot match can address an already-dead
     /// version and spuriously fail with `TupleConcurrentlyUpdated`.
     fn find_live_pg_class_row(&self, snap: &Snapshot, oid: Oid) -> Result<Tid> {
+        self.find_live_class_row(snap, oid, RELKIND_TABLE)
+    }
+
+    fn find_live_class_row(&self, snap: &Snapshot, oid: Oid, kind: &str) -> Result<Tid> {
         let columns = PG_CLASS.column_types();
         let rows = self.heap.scan(ScanContext {
             rel: RelationDesc {
@@ -6021,15 +6224,22 @@ impl Engine {
         })?;
         for (tid, values) in rows {
             let matches = matches!(&values[0], Some(Datum::Int8(v)) if *v == oid.0 as i64)
-                && matches!(&values[2], Some(Datum::Text(k)) if k == RELKIND_TABLE);
+                && matches!(&values[2], Some(Datum::Text(k)) if k == kind);
             if matches {
                 return Ok(tid);
             }
         }
-        Err(EngineError::Corrupted(format!(
-            "pg_class has no live row for table OID {}",
-            oid.0
-        )))
+        if kind == RELKIND_TABLE {
+            Err(EngineError::Corrupted(format!(
+                "pg_class has no live row for table OID {}",
+                oid.0
+            )))
+        } else {
+            Err(EngineError::Corrupted(format!(
+                "pg_class has no live {kind} row for relation OID {}",
+                oid.0
+            )))
+        }
     }
 
     /// Walk the on-disk page chain from `first_page` (same rules as the
@@ -7246,6 +7456,39 @@ mod tests {
         assert!(engine.hnsw_handles.lock().is_empty());
         create_l2_table(&engine);
         assert_eq!(engine.indexes().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn legacy_orphaned_serial_metadata_does_not_block_recreate() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (id SERIAL)").unwrap();
+        let entry = engine.describe_table("t").unwrap();
+        // Reproduce the pre-Stage-G DROP shape: only the table was marked and
+        // cleaned, leaving its SERIAL sequence/default metadata behind.
+        engine
+            .auto_commit_with_hooks(
+                |snap| {
+                    engine.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
+                    engine.drop_table_marker(snap, "t", &entry)
+                },
+                || engine.drop_table_storage("t", &entry),
+                || {},
+            )
+            .unwrap();
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (id SERIAL)").unwrap();
+        let mut session = SqlSession::new(1);
+        engine
+            .exec_in_session(&mut session, None, "INSERT INTO t VALUES (DEFAULT)")
+            .unwrap();
+        assert_eq!(
+            engine.scan("t", None).unwrap()[0].1[0],
+            Some(Datum::Int4(1))
+        );
         engine.shutdown();
     }
 

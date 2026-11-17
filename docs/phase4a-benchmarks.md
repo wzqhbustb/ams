@@ -63,3 +63,14 @@ These are correctness and recovery acceptance results, not throughput measuremen
 - `cargo test -p pg-wire --test wire_sequence`: **4 passed**, and the same command with `--release`: **4 passed**. Simple/Extended currval survives Sync and rollback, connections are isolated, SERIAL defaults work, and SequenceQuery Describe reports INT8.
 - `cargo test -p pg-storage --test wal_record_type_discriminant --test waldump`: **6 passed** total across the two files, including fixed `SequenceAdvance(128)` and `sequence_oid/high_water` dump fields.
 - Final gates: all eight crate Clippy/rustdoc checks, workspace all-features check, fmt, and `git diff --check` passed; existing Wire/DataFusion regression suites also passed.
+
+## Stage G: Final acceptance
+
+- Date: 2026-11-17 (UTC)
+- Review cleanup: three scratch probe files were removed from the test tree. Their useful cases are now formal regressions: **18 passed + 1 ignored** in `phase4a_datafusion` and **23 passed** in `phase4a_sequence`, in both debug and release.
+- Stage G round 1 fixed SERIAL ownership across DROP, including immediate/reopen name reuse, commit-failure preservation, and pre-fix orphaned metadata recovery. It also fixed the table-lock/sequence-mutex acquisition order. Round 2 found no additional P1/P2/P3 issues.
+- Manual release point lookups: self-owned B+Tree **10.693µs mean**; DataFusion **0.598ms mean** over 20 calls with the final dependency set, both below the 5ms gate.
+- Manual siftsmall SQL ANN: **recall@10 = 0.9990** with every query asserting `ExecutionPath::IndexLookup`; bulk insert 21.42s, query latency **0.298ms mean, 0.296ms p50, 0.413ms p95, 0.633ms max**.
+- MSRV: `CARGO_TARGET_DIR=target/msrv-stage-g cargo +1.86.0 check --workspace --all-features` passed with DataFusion 50.3.0, ICU 2.2.0, and psm 0.1.28 (`ar_archive_writer` 0.2.0 / `object` 0.32.2).
+- Full test matrix: `cargo test --workspace` and `cargo test --workspace --release` exited 0 with no failures; DataFusion-feature pg-engine debug and release also exited 0.
+- Static gates: all eight crate Clippy/rustdoc checks, current-toolchain `cargo check --workspace --all-features`, fmt, and `git diff --check` passed. Coverage reporting remains limited to the existing pg-am-hnsw-only CI job; no Phase 4a coverage claim is made for other crates.
