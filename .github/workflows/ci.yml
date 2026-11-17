@@ -73,6 +73,19 @@ jobs:
         if: matrix.crate != 'pg-storage' && matrix.crate != 'pg-am-btree' && matrix.crate != 'pg-am-hnsw'
         run: cargo test -p ${{ matrix.crate }} --all-features
 
+  engine-default:
+    name: Test (pg-engine / default features)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p pg-engine
+
   loom:
     name: Loom model tests
     runs-on: ubuntu-latest

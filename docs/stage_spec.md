@@ -1785,3 +1785,149 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 **F-5 二轮对抗复核回流(2026-10-26,agent-23 verdict PASS,P1/P2/P3 零;2 nano 闭合)**:一轮 3 nano 修复全部核验正确;新攻击面全闭合——quiesce 介入顺序(checkpoint 线程先停后 vacuum,无死等面)、恢复计时口径(open 含 WAL replay + catalog/registry 重建,<30s 余量大)、双向优先替换二阶效应(候选恒为 T 的活邻居,recall 三处独立实证无退化,loom 断言与排序正交)、benchmark 映射与计分(pre/post 恒等是机制非巧合)、pgvector harness 解析(裸 SELECT,正则不误吞)、24h 运行时形态(watchdog 不误触)、stage_spec 逐句互洽。**nano ①**:mid 轮 expectation 文件存在性竞态(慢首写 panic)——修复 = 文件缺失按空集处理(与"单连接单未记录 op"上界兼容;缺失 = 未提交或首写未落盘,均被 mid 上界覆盖)。**nano ②**:clippy/doc 补票由主线闭合(双口径 + doc 全绿)。
 
 **F-5 三轮外部复核回流(2026-10-27,外部 review:P3×2 + nano×2 闭合)**:**P3-1(pgvector ef_search=64 未作用于查询会话)**:GUC 不跨 psql 会话,初版在独立进程 SET 后另起会话查询,实际跑默认 ef=40——修复:每个查询文件内 `LOAD 'vector' + SET hnsw.ef_search = 64`,另加 SHOW 一次性实证;复测 recall@10 仍 0.9940(我方略优未被推翻),延迟/吞吐全部重跑回填(bulk 3414 rows/s、index build 2.37s、auto-commit 527 rows/s、延迟 mean 2.503ms / p50 1.165ms / p95 1.856ms / max 128.664ms(单查询离群))。**P3-2(修复腿 .abs() 误杀 >1pp 改善)**:m6_concurrent_stress.rs 与 index.rs 对称率预算测试的 `(C-B).abs()` 改为**有向** `C-B < 0.01`——预算是单侧增量上限,>1pp 的改善不再被判红(与 crash"下界非缺陷信号"同口径)。**nano-1(候选侧越界 panic)**:redirect 候选节点的 `adjs[c][l]` 改 `.get()` + 结构化 `HnswError::Corrupted`(与目标侧同型),for 循环替代迭代链避免闭包返回类型推断问题。**nano-2(文档漂移)**:benchmarks.md 的 release 待回填行同步为 debug+release 均 EXIT=0。复跑:lib redirect/symmetry/stress 全绿,fmt/clippy --all-features 绿。
+
+## Phase 4a Stage B：向量 SQL 语义与审查边界登记
+
+- **ANN 近似检索的结果数口径**：可见非 NULL 行数 ≥ k 时，ANN 仍可能因近似召回或可见性过滤返回不足 k 行；若表内没有 NULL 向量行，最终 LIMIT 结果也可少于 k。**不为此补非 NULL 行**——这是近似检索的固有边界，不是结果完整性缺陷。仅当命中不足 k 时，才在同一 snapshot 下用 heap 扫描补足可见 NULL 向量行，以满足 ASC NULLS LAST 与 FOR UPDATE 行锁语义；不得以“补足 k 行”为由另起精确召回路径。
+- **FLOAT8 文本编码归 Stage C 类型映射验收**：Simple Query 当前以 Rust `f64::to_string` 输出距离，其科学计数法阈值和尾零形态与 PostgreSQL `float8_out` 可能有细微差异（如 `1e30`、`1.0`）。Stage C 必须把 PG 兼容文本格式及 golden bytes 纳入验收，不能只覆盖 `5.0 → "5"`；二进制 f64 继续按 network byte order。
+- **性能备忘（非缺陷）**：`execute` 入口的向量预检与 `execute_hnsw` / `sort_by_distance` 内的 `prepare_distance` 会重复解码一次 query 向量。当前点查与 siftsmall 验收无性能压力，后续热路径优化时可把验证后的 `DistanceEvaluator` 直接下传，避免重复解析。
+- **规划器与错误语义正面登记**：`btree_matches` 对 distance `Expr` ORDER BY 显式让路给 HNSW handler，ExtraWhere 回退责任归属清晰；`IndexExists` 使用 `index {name} already exists`，兼容自定义索引名与 `(table,column)` 重复，避免旧文案误读。
+- **配套 CI 修复**：已提交的 M6 `snapshot_roundtrip` 并发测试存在 3 处 `needless_borrow`（两处 `snapshot::save`、一处 `assert_identical`），已做最小修复并复跑 `pg-am-hnsw` 全 feature Clippy 与并发 snapshot 测试；不改变测试语义。
+
+### P3 边界登记（非 Stage B 引入，不阻塞）
+
+- **P3-1 WHERE 比较算子缺口**：当前仅支持 `=`、`<`、`>`；`>=`、`<=`、`<>` 尚不支持，且 `>=` 会被拆成 `>`、`=` 后报出偏晦涩的 `expected literal, got Eq`。补齐比较算子及对应错误诊断归 Phase 6 SQL 完整性工作，不纳入 Phase 4a 当前最小语法承诺。
+- **P3-2 标识符大小写语义不统一**：表/索引名及 `relation_name_exists` 使用精确匹配，查询侧列名使用 `eq_ignore_ascii_case`，DDL 的列名查找又是精确匹配，因此 `CREATE INDEX … (V …)` 与 `ORDER BY V <-> …` 的行为可能不同。当前无错误结果，但存在易用性不一致；PostgreSQL 的标识符折叠规则及 typed API/SQL 的统一归 Phase 6，不在 Stage B 扩大改动面。
+- **P3-3 wire 距离查询全链路覆盖（已闭合）**：`empty_distance_result_still_reports_float8` 覆盖空结果 OID 701；`distance_row_carries_float8_oid_and_text_value` 进一步联合验证非空行的 RowDescription OID 701 与 DataRow 文本 `5`。Stage C 驱动矩阵继续保留两种形态的回归，不再将该项描述为仅缺空结果覆盖。
+- **P3-4 正面确认**：`USING btree (v)` 作用于 VECTOR 列会响亮报 `not an indexable M2b key type`，符合 Stage 0 规格，无需修改。`ensure_float8_storage_supported` 位于 `create_table_inner` 顶部、`create_heap` 之前，不存在该路径的孤儿页；当前改动无 TODO/FIXME 残留或新增不可达 `unwrap`。
+
+### 第二轮功能修复与验收证据
+
+- **超大 LIMIT 与 ScanSpec**：候选数/ef 受图 HWM 约束，结果容量 `min(k,hwm)`，空图早退；`HnswScanSpec` 的 column/candidates/max_retry_rounds 直接驱动内部 policy，M6 默认 2k/3 wrapper 行为不变。
+- **名称与事务回滚**：索引仅在自身及父表均 live 时占用名称，drop 后 HNSW/B+Tree 均可复名（含 reopen）；commit 失败回滚 registry/handle，op Err 清理 pending_hnsw。回退先排除 ExtraWhere、缺 LIMIT、DESC 和其他列，再 lazy-open 目标索引。
+- **排序与旧目录**：普通 VECTOR ORDER BY 响亮拒绝；FLOAT8 按 PG 规则处理 NaN 和 ±0。真实旧目录通过物理删除 OID 701 + checkpoint + reopen 构造，验证打开兼容与建表拒绝；当前版本目录若同样缺行，无法与合法旧目录区分，作为兼容边界登记。
+- **验收证据与 scratch**：siftsmall 每次查询同时断言 `ExecutionPath::IndexLookup`，避免精确 SeqScan 以 recall=1.0 冒充 ANN；非空 wire 距离行联合验证 OID 701 与文本值。`zz_review_probes.rs` 已排除，不将“ANN 必须始终等于精确 SeqScan”的近似语义错误 oracle 纳入交付。
+
+### DROP 事务、回滚并发与 NaN 等值
+
+- **DROP 顺序**：事务 op 只写 drop marker，物理页面释放、heap/table/index registry 和 HNSW handle 清理一律推迟到 commit 成功的 `on_success` 钩子；commit 失败不释放页面、不删除内存项，原表可读且可重试 DROP。`build_registry` 使用 fresh MVCC scan 过滤 aborted marker，`build_index_registry` 只登记父表仍 live 的索引，成功 DROP 后及 reopen 均无孤儿索引。清理时先删除所有 live 入口，再释放页面，post-commit free 失败也只泄漏页面而不会复活 live table；HNSW handle 按 `index_oid` 集合清除，而非误用父表 OID。
+- **回滚并发窗口**：`auto_commit_with_hooks` 在锁释放前执行失败回滚，B+Tree/HNSW 的 registry/handle 清理不再落到锁释放之后。确定性回归在创建线程持 Exclusive 后启动等待写者，commit 失败时写者继续，最终 registry/handle 为空。
+- **FLOAT8 等值与排序**：`Datum` 手写 `PartialEq`，NaN 与 NaN 相等、±0 相等，和 `PartialOrd` 规则一致；typed `Predicate::Eq` 覆盖 NaN、±0、±Infinity，ORDER BY 继续采用 NaN 大于非 NaN 的规则。
+
+### 相邻并发边界与 post-commit 错误契约
+
+- **lazy-open × DROP**：`hnsw_handle` 在首次 liveness 检查、图 open、publish 前复查及 handle 插入期间持续持有 table registry 与 index registry 的读锁；DROP 清理对应写锁，因此不能在注册表清空后又被 lazy-open 插回旧 handle。open 前后任一检查失败均返回 `IndexNotFound`。确定性交错测试 `lazy_open_cannot_reinsert_a_handle_after_drop` 先把 ANN 停在 publish 前，等 DROP 提交并进入 post-commit cleanup；放行前直接断言两个 registry 的 `try_write` 均被 ANN 的读锁排除（无同步实现与此线程时序无关地失败），随后才放行 ANN 并验证最终 registry/handle 均为空。
+- **post-commit cleanup 错误契约**：drop marker 已 durable 且 live 入口删除后，`walk_chain` / `free_page` 失败只通过 `tracing::warn!` 报告并保留未释放页面，DROP 返回成功；调用方不会把“已提交但清理不完整”误当成“未提交、可直接重试”。重试已提交的 DROP 得到 `TableNotFound`，泄漏优先于复活或损坏。`drop_cleanup_error_never_resurrects_a_live_table` 覆盖 double-free，`drop_page_walk_error_after_commit_is_only_a_warning` 以自环链覆盖 walk 失败，两者均验证当前进程与 reopen 后表和索引入口保持删除。
+- **无锁 reader × DROP 非目标**：typed `Engine::scan`、普通 auto-commit SELECT 及相应无锁 ANN 路径不取 `AccessShare`，仍可能已解析旧 `TableEntry` 后与 DROP 的 post-commit 页面释放/复用交错。本轮的 post-commit free 与 lazy-open 同步不消除该既有 DDL-vs-DML 窗口，不得宣称此边界已闭合；读取锁、关系生命周期 lease 或按读者/快照 horizon 延迟释放留待后续专门设计。
+- **本轮验证（2026-11-09）**：`pg-engine` 全套件与 workspace debug 全量回归均 EXIT=0；`pg-am-heap`/`pg-catalog`/`pg-engine`/`pg-wire` release 全套件 EXIT=0；八个 crate 的 Clippy `--all-targets --all-features -D warnings`、相关 crate rustdoc `-D warnings`、fmt 与 `git diff --check` 全绿。siftsmall SQL ANN release 基准通过：recall@10 = **0.9990**，bulk 10000 行 **13.91s**，查询 mean/p50/p95/max = **0.305/0.297/0.412/0.645ms**，每次查询均断言 `ExecutionPath::IndexLookup`。最终独立只读复核提出的交错测试与 walk-error 覆盖缺口均已修复并复审闭合，无遗留 P1/P2/P3。
+
+## Phase 4a Stage C：Extended Query 与参数化类型协议
+
+- **协议状态机**：`pg-wire` 覆盖 Parse/Bind/Describe/Execute/Close/Flush/Sync；prepared statement 与 portal 分离管理，unnamed 可替换、named 重复响亮拒绝。Describe Statement 返回 ParameterDescription + 文本 RowDescription/NoData，Describe Portal 使用 Bind 选定的结果格式；Execute 不重复发送 RowDescription，支持 max_rows、PortalSuspended 和续传。错误后忽略至 Sync，Flush 不代替 Sync，事务结束清理 portal 而保留 prepared statement。
+- **参数化执行**：SQL tokenizer 接受 `$1..$n`，engine 通过 `Literal::Param` 在 AST 内完成类型化绑定，不做 SQL 字符串替换。`Engine::parameter_types` 按 schema 推断 INSERT/UPDATE/DELETE/SELECT/EXPLAIN 与两种距离表达式位置的参数类型；`Engine::exec_with_params` 复用原执行路径与 query stats。缺失/多余参数、跨行或重复参数类型冲突均响亮拒绝。
+- **类型与 golden bytes**：Bind parameter/result format codes 均按 0/1/N 展开。Int4/Int8/Float8 二进制使用 network byte order；FLOAT8 文本按 PG16 默认 shortest-roundtrip 记数法覆盖固定/科学计数法阈值、指数符号与补零、NaN/±Infinity/−0。VECTOR 使用 catalog OID 9877，文本为 pgvector 数组，二进制为 `dim:u16 + unused:u16(0) + dim 个 BE f32`，文本/二进制共用维度与 finite 校验。
+- **范围与错误分类**：FLOAT8 文本溢出/下溢返回 22003；非法文本值、二进制长度/表示、非法 format code 分别返回 22P02、22P03、22023，不再统一归类为 08P01。engine 公共参数和 SQL literal 写入口径同步拒绝 NaN/±Inf VECTOR 分量，避免 wire 读写契约不对称。
+- **驱动验收发现的语法缺口**：`FLOAT8` 已注册为 DDL 类型名；普通小数 literal 改为 `Literal::Float`，不再误当单元素 VECTOR。psycopg2 的公开 cursor API 默认客户端插值，验收不将其谎报为服务端 Bind；其原始向量字面量使用 `AsIs`，Extended Query 服务端 Bind 由 psql、node-postgres 与 rust-postgres 实证。
+- **已验证**：pg-wire 全套件 **79/79**（35 协议/类型 + 23 Extended 状态/golden + 11 rust-postgres 实 socket + 10 复审探针）；engine 参数专项 **10/10** 与 pg-engine 全套件通过。psql `\parse`/`\bind_named`、node-postgres 服务端参数、psycopg2 CRUD/事务/ANN 均通过。真实 rust-postgres typed CRUD（含 UPDATE/DELETE）、ANN、EXPLAIN、NULL、错误恢复与 malformed Bind/Sync 恢复均经 TCP 实证。`scripts/phase4a_stagec_psql.sh` 以 golden 文件逐行 diff 输出，不再只依赖 ON_ERROR_STOP。第三方驱动仅安装于 `target/tmp` 隔离环境。
+- **解码失败与 failed 状态**：malformed Sync 先置 extended_error 再执行恢复，隐式事务回滚；其他消息体解码错误同步触发显式事务 abort/failed 状态，Unsupported 与 FunctionCall 同样进入 failed。failed 状态下 Parse、Bind、Simple DDL 均返回 25P02，但 COMMIT/ROLLBACK 的 Parse/Bind/Execute 仍被允许并按 ROLLBACK 清理，且 failed COMMIT/ROLLBACK 也发送 25P01 WARNING。
+- **事务退出与 portal 生命周期**：`ended_transaction` 仅由语句是否为 COMMIT/ROLLBACK 决定，不再依赖 `txn.is_some()`；failed 状态下执行 COMMIT 后当前 portal 不会被重新插回，重复 Execute 返回 34000。重复 BEGIN 与空闲 COMMIT/ROLLBACK 使用 NoticeResponse/WARNING，不触发 abort/failed。
+- **事务与失败语义**：显式事务出错立即 abort 并进入 failed 状态，ReadyForQuery 为 `E`；后续普通语句返回 25P02，ROLLBACK 清理，COMMIT 按 ROLLBACK 返回。Simple Query 先完整解析，DML 使用统一隐式事务，错误后回滚。extended 隐式事务中的 DDL 一律响亮拒绝，避免 auto-commit DDL 穿透 Sync 回滚；**DDL 在 Simple Query 中仍是 auto-commit 的已知非目标，多语句原子性承诺仅覆盖非 DDL 语句**。`Execute(max_rows)` 的消息语义正确，但当前先物化全部结果再截取，不是执行或内存边界，登记为已知限制。
+- **独立复核回流**：参数索引以 `u16::MAX` 为硬上限，杜绝短 Parse 触发超大推断分配；extended 隐式事务在 Sync 按成功/失败提交或回滚；EXPLAIN 有 TEXT `plan` 描述，空 Parse 合法，缺失关系在 Parse 报错；失败 Parse 与 Simple Query 正确失效 unnamed 对象；FunctionCall 返回 ErrorResponse + ReadyForQuery，消息体错误可在 Sync 恢复；Close 幂等，恰好整页 Execute 先 PortalSuspended；前端 count 按 u16 解码。TEXT OID 到 inferred VECTOR 的输入转换保留 pgvector 文本语义，Binary format 的 TEXT 载荷也按文本解析，不引入 catalog 探针依赖。
+- **最终验收（2026-11-10）**：workspace debug 全量回归 EXIT=0；`pg-am-heap`/`pg-catalog`/`pg-engine`/`pg-wire` release 全套件 EXIT=0；八 crate Clippy、相关 crate rustdoc、fmt 与 `git diff --check` 全绿。最终独立复核确认全部审查项闭合，无剩余 P1/P2/P3。
+
+## Phase 4a Stage D：heap TOAST chunk I/O
+
+**状态**：✅ 完成（2026-11-11；VECTOR 边界、建表注册原子性及零长度缺块修复、专项回归与全量门禁均通过；commit `99aa23e`）。
+
+### 交付内容
+
+1. **隐藏 chunk heap 与目录**：每个含 TOASTable 列的用户表在 DDL 时获得一个隐藏 heap，OID 仅由 catalog `oid_allocator` 分配。主表既有 `pg_class.reltoastrelid` 记录 OID，`pg_rust_relpages.last_page` 记录隐藏链头；普通表 tail 原本只是 advisory 字段，隐藏关系自身不新增任何系统目录行。pre-Stage-D 目录在 open 时通过事务补建并更新两条既有目录行，失败不发布内存状态；二次 reopen 仍正确。chunk 行是 `(valueid Int8, chunk_seq Int4, payload Bytea)` 的标准 heap tuple，payload ≤2000B，seq 从 0 连续递增。
+2. **写入与装页**：`encode_row_with_toast` 先外置所有超过 2048B 的值，再按最大 inline 值循环外置并重编主行，直至满足 `MAX_TUPLE_BYTES`；无法继续外置时仍由 HeapAM 返回 `TupleTooLarge`。TEXT/BYTEA/VECTOR 共用 20B 指针和 chunk 编解码；VECTOR 的 `MAX_VECTOR_DIM=2000` 类型上限不变。chunk 使用普通 `HeapInsert`，与主行同 XID、同 curcid，并严格先于主行 WAL；没有新增 WAL 记录类型。
+3. **快照读取**：HeapAM scan、B+Tree/HNSW 回表和 SQL/wire 都在主行版本及其查询快照下 detoast，一次主行至多一次可见性 chunk 扫描。拼接前检查缺块、重块、seq 连续性和 rawsize/extsize；尺寸先按实际 chunk 合计核对，再 `try_reserve`，不让 corrupted size 直接触发巨额分配。物理 detoast 仅用于 crash-loser 索引补偿和 vacuum，不作为用户查询路径，也未引入 `Snapshot::everything()` detoast。
+4. **UPDATE 共享与 valueid**：修改值创建新 group；未修改值经当前快照下的字节比较后继续共享旧 group。valueid 在主表关系内单调分配，open 时扫描包括 aborted/loser 在内的全部物理 chunk 恢复高水位，重复注册不倒退。catalog 的 OID 启动校正同时纳入 `reltoastrelid`，避免 checkpointless restart 重发隐藏 OID。
+5. **回收与 DROP**：vacuum 先按既有 horizon 回收主行，再回收不再被任何物理主行版本引用的 chunk group；旧快照和部分死亡 HOT 链通过保留的物理指针自然钉住 group，aborted 和无主行 loser group 也能回收。`VacuumStats.toast_chunks_reclaimed` 直接报告本轮回收量，第二次 pass 应归零。DROP 在 commit 成功后同时释放主堆和隐藏 TOAST 链，并清理注册信息。
+6. **目录版本兼容**：TOAST 迁移与 DROP 均按当前快照寻找 live `pg_class` 版本，relpages 同样按快照定位迁移目标；`Catalog::relpages_of` 取最新物理版本，避免把首次 slot 的旧版本用于更新或 reopen。
+
+### 审查回流
+
+- **VECTOR 误识别与修复**：初版“首 u32 精确等于 external tag + 20B”仍与合法 f32 位模式冲突，最小探针 `f32::from_bits(0x4000_0014)` 实证 inline 行被截断误读。现以 `HEAP_VECTOR_EXTERNAL(0x1000)` 统一标记全部非 NULL VECTOR attribute 外置，engine 在外置任一 VECTOR 时归一化同元组其他 VECTOR，codec 拒绝混合形态，不再根据 payload 猜指针；新增精确位模式、混合 TEXT sibling、混合 VECTOR 拒绝及全 VECTOR reopen 回归。
+- **建表注册原子性**：初版在 commit 后才注册隐藏 TOAST，注册失败会形成“表已提交但 API 报错且无完整 registry”的幽灵状态。现注册移到提交前，commit 成功后才发布 table registry；op/commit 失败均在锁释放前清理。新增冲突注册失败与 commit 失败后的重试/reopen 回归。
+- **零长度缺块**：初版 `va_extsize == 0` 时即使没有可见 chunk 也会拼出空值，违反“缺块必须 Corrupted”。现零可见 chunk 一律报错；合法空值仍保留一个 seq=0 空 chunk，TEXT/BYTEA 均覆盖删除唯一空 chunk 的负例。
+- **恢复与目录**：OID 校正原先只看主关系 OID，已补隐藏 OID；迁移初版 raw first-slot 会更新已死亡目录版本，已统一改为当前快照下的 live 版本。
+- **既有页布局探针**：HNSW 跨表复用测试原先硬编码页号与三行布局，在隐藏 TOAST 页加入后失效；现直接构造携带目标 NodeId 的堆行，保留精确 TID + NodeId 碰撞及“不得返回他表行”的断言，不改变生产可见性逻辑。
+- **已知边界**：detoast 以简单、正确为先，当前一个主行至多一次完整可见 chunk 扫描，未声明大 TOAST 关系的性能指标；压缩仍归 Phase 7b，超 dim VECTOR 声明仍响亮拒绝。当前类型系统没有 `Jsonb`/`JSONB` Datum 或 DDL 类型，本 Stage 不伪造 JSONB 映射；以 BYTEA 覆盖二进制 varlena 路径，未来接入 JSONB 类型时必须补其 TOAST 回归。
+
+### 专项验证
+
+- `phase4a_toast` **17/17**：大 TEXT/BYTEA、多列合计超页、外部 VECTOR、reopen、旧快照 UPDATE/DELETE、共享引用、aborted INSERT/UPDATE、缺/重 chunk（含零长度唯一空 chunk）、旧目录迁移、精确 f32 位模式与全 VECTOR 归一化、注册失败/commit 失败重试，以及 chunk-only 和主行未提交两类 crash。
+- heap lib **39/39**，wire protocol **36/36**（含 9000B Simple Query DataRow）。
+- 八 crate Clippy `--all-targets --all-features -D warnings`、八 crate rustdoc `-D warnings`、fmt 与 `git diff --check` 全绿。
+- 最新 TOAST 专项 release 亦 **17/17**；`pg-am-heap`/`pg-catalog`/`pg-engine`/`pg-wire` release 全量 EXIT=0。`cargo test --workspace --no-fail-fast` 全量 EXIT=0、零失败；`cargo check --workspace --all-features` 同步通过。
+
+## Phase 4a Stage E：DataFusion 集成与 TP 适配检查点
+
+**状态**：✅ 完成（2026-11-12；DataFusion 集成、AccessShare 修复、专项回归与全量门禁均通过；commit `bfb4164`）。
+
+### 交付内容
+
+1. **可选 DataFusion 路径**：选用 DataFusion 50.3.0（MSRV 1.86，实际解析版本），`datafusion` feature 引入，默认 TP/ANN 不启用。`Engine::exec_datafusion` 是显式 AP API；默认 `exec` 的路由、TP 与 ANN 行为完全不变。feature 关闭时 AP 响亮返回 `Unsupported`，不静默改语义。
+2. **只读 TableProvider**：`datafusion_provider.rs` 将 heap schema 转为 Arrow schema，保留 projection、filter 与 limit。scan 复用自研执行器完成 B+Tree/普通 filter、可见性回表和 TOAST detoast，支持多过滤条件的 AND 语义；不支持或复杂表达式由 DataFusion 处理。ANN、FOR UPDATE/SHARE 和非 SELECT 语句不进入该路径。
+3. **SnapshotGuard 与表锁生命周期**：provider 与 execution plan 持有 Guard 至 execution stream 和派生读取任务结束，SessionContext 在 collect 后释放；LIMIT 提前结束和执行错误同样释放。显式事务使用 TxnHandle 的快照并推进 curcid，auto-commit 使用 `(Snapshot, SnapshotGuard)`，不使用 `Snapshot::everything()`。显式 AP 事务与自研 SELECT 一样先取 AccessShare，DROP 必须等待读者结束，并有确定性回归。同步 API 在无 runtime 与 multi-thread Tokio 中可用；current-thread 内同步调用返回结构化错误，`exec_datafusion_async` 直接支持 async 调用方，不跨线程移动 TxnHandle。
+4. **Arrow 类型转换**：Int4/Int8/Float8/Text/Bytea/Timestamptz/Uuid/Vector 按原 ColumnType 转换；UUID 使用 `FixedSizeBinary(16)` 与 TEXT 区分，NULL vector 以 List null 保留。结果 schema 在 collect 前从 DataFrame 获取，零 batch 保留列名，零列 batch 通过 `RecordBatchOptions` 保留行数；JOIN、别名和计算列按 Arrow DataType 解码，不按首表或字段名猜类型。默认类型协调前对 Filter/TableScan 中的 UUID 字符串 Eq/NotEq literal 做窄重写，支持正反向比较、嵌套表达式与 JOIN 后 WHERE，非法 UUID 响亮报错，TEXT/BYTEA 与 NULL 语义不变。
+
+### 审查回流
+
+- **复杂 AP 限制**：初版 `execute_datafusion` 强制先过 Mini SQL，导致 AND、COUNT 等无法进入 DataFusion；现 Mini SQL 仅拦截 ANN、行锁和非 SELECT，复杂语法交给 DataFusion，并注册全部 live 表支持 JOIN。
+- **计算列转换**：初版要求结果字段必须存在于原表 schema，别名、聚合和计算列会被误报 Corrupted；现优先匹配原 ColumnType，匹配不到时回退 Arrow DataType，覆盖别名、COUNT(id)、计算列与 JOIN。
+- **P3 回流**：5ms 延迟门改为 `#[ignore]` 手动 release 验收，默认专项不再受并行负载影响；CI 新增独立 `engine-default`（Ubuntu/macOS）并保留 pg-engine all-features matrix，feature-off 回归进入常设覆盖。Arrow 八类 Datum mismatch 均由 panic 改为结构化 `DataFusionError::Execution`，有效值与 NULL 语义不变，provider 私有单测覆盖全部类型。
+
+### 专项验证
+
+- `phase4a_datafusion` 默认 **13/13 + 1 ignored**：projection/order/limit、B+Tree Eq/Lt/Gt、空结果与零 batch schema、常量 projection/COUNT(*)、in-flight/aborted、旧快照 UPDATE+vacuum、collect/LIMIT/执行错误的 Guard 释放、显式 AP 事务 AccessShare 与 DROP 等待、Arrow 全类型及 NULL vector、UUID 别名/JOIN/TEXT 冲突、UUID 字符串正反向/嵌套/JOIN 后 WHERE 与非法输入，以及 current/multi-thread Tokio 同步与异步调用；延迟项改为手动验收。
+- 点查性能：手动 release filtered 执行 1 项，20 次 `SELECT id FROM t WHERE id = 2` 平均 **0.645ms**，低于 5ms 门槛；默认自研 TP 路径不切换。
+- feature 关闭回归：`exec_datafusion` 明确返回 `Unsupported`。
+- 八 crate Clippy `--all-targets --all-features -D warnings`、八 crate rustdoc `-D warnings`、全 feature 编译、fmt 与 `git diff --check` 全绿。
+- `pg-am-heap`/`pg-catalog`/`pg-engine`/`pg-wire` release 全量 EXIT=0；DataFusion 专项 release 默认 **13/13 + 1 ignored**，手动性能验收 **1/1**。`cargo test --workspace --no-fail-fast` 全量 EXIT=0、零失败；`cargo check --workspace --all-features` 同步通过。
+
+## Phase 4a Stage F：Sequence / SERIAL
+
+**状态**：✅ 完成（2026-11-13；WAL-first 序列、sessionful SQL、SERIAL 与 SIGKILL 验收通过；commit `aefd8b8`）。
+
+### 交付内容
+
+1. **WAL-first 序列**：新增永久固定 `SequenceAdvance(128)`，包含 payload、构造器、完整解码、waldump 和 discriminant 测试。nextval 在单 Engine 全局 sequence mutex 内独立 auto-commit，先 flush 记录 END，再更新 committed 高水位堆行；独立 commit 成功后才记录 currval 并返回，允许崩溃空洞但禁止回退复用。序列高水位属于非事务元数据，按实际新行大小与 1024B 的较大值触发内部 `AccessExclusive` + `HeapCleanup`，避免固定阈值在长名称下失效，也不让每次发号都全量清理。
+2. **动态内部目录**：`pg_rust_sequences(oid,name,high_water)` 与 `pg_rust_attrdefaults(rel_oid,attnum,sequence_oid)` 使用固定内部 OID 和动态 first_page，不占固定系统页。每个 sequence 同时写 `pg_class.relkind='s'` 行，CREATE 与 default 元数据同事务发布，重名、半状态、悬空引用响亮失败。内部关系发现与校验统一使用 fresh MVCC scan，deleted/aborted 目录版本不会被误判为有效状态。
+3. **恢复协议**：redo 按 OID 做高水位 max 合并；open 先创建或校验内部目录，再以 committed 堆行为基线，把 redo-only 较大值通过独立 auto-commit 修复回堆。恢复后立即 checkpoint 也不回退，因此无需 checkpoint hook。
+4. **SQL/session**：新增 `exec_in_session` 与参数化版本，旧 exec 使用临时 session；`CREATE SEQUENCE`、无 FROM 的 `SequenceQuery(nextval/currval)` 返回单行 INT8。pg-wire 每连接一个 SqlSession，Simple/Extended/参数化执行共用，事务结束、Sync、错误和 portal 不清 currval。
+5. **SERIAL**：table、sequence 和 default 行在同一 DDL 事务创建。省略默认列与显式 DEFAULT 每次调用同一 session 的 nextval；显式值和 NULL 不消耗序列，多行 INSERT 连续递增，多个 SERIAL 列各自独立，重启后默认值恢复。生成序列名冲突检查位于 `ddl_lock` 内，避免并发 DDL 通过 TOCTOU 创建同名序列。
+
+### 专项验证
+
+- `phase4a_sequence` **20/20 debug / 20/20 release**：并发唯一且连续、跨 session currval、无 INSERT crash/reopen、redo-only 修复后立即 checkpoint、rollback、CREATE/commit failure 重试、函数查询、SERIAL DEFAULT/省略列/显式值/NULL、多 SERIAL 列、真正 SIGKILL 后恢复、WAL flush/compaction/内部目录写入失败后的重试，以及故障注入 hook 的跨线程隔离。
+- `wire_sequence` **4/4 debug / 4/4 release**：Simple/Extended currval、Sync/rollback 保留、连接隔离、SERIAL 和 INT8 Describe。
+- `wal_record_type_discriminant` 与 `waldump`：SequenceAdvance 固定值、payload 和字段输出通过。
+- 八 crate Clippy/rustdoc、workspace all-features、fmt 与 `git diff --check` 全绿；Wire/DataFusion 既有回归全绿。
+
+## Phase 4a Stage G：全量验收与两轮对抗审查
+
+**状态**：✅ 完成（2026-11-17；两轮审查与本地全量验收闭合；CI 待提交后执行；未 commit——等用户确认）。
+
+### 第一轮审查与修复
+
+1. **scratch 清理与正式回归**：三个未跟踪的 Stage E/F 临时探针已移出测试树并保留于 `target/tmp/stageg-scratch/`。有效场景并入正式套件：DataFusion 增加 timestamp/反向比较、旧快照 B+Tree 回退、LIMIT 0/空表 COUNT、跨 Engine 事务拒绝、OR/JOIN 重名列五组测试；Sequence 增加参数化 nextval 响亮拒绝和并发 DDL/nextval 两组测试。无断言的 DROP 竞态观察探针不作为验收证据。
+2. **SERIAL 所有权生命周期**：修复 `DROP TABLE` 后旧 SERIAL 序列仍存在并阻止同名重建的问题。现在序列 `pg_class` 与父表在同一事务标记 dropped，对应 `pg_rust_sequences` / `pg_rust_attrdefaults` 行同事务删除，committed 状态在锁释放前从内存移除；standalone sequence 不受影响。失败 DROP 保留原序列，成功 DROP 可立即或重启后复名。旧版遗留的孤立 default/sequence 元数据通过 fresh MVCC 父表检查忽略，不阻止升级后的复名。
+3. **锁顺序**：DROP 先取父表 AccessExclusive，再取 sequence mutex，与 SERIAL INSERT 的 RowExclusive → nextval 顺序一致；mutex 覆盖 commit 和锁释放前的内存清理，避免 DROP × SERIAL INSERT 的锁顺序反转，同时禁止 nextval 与序列删除并发。
+4. **MSRV 传递依赖**：DataFusion 保持 50.3.0，统一将 ICU 系列回退到 2.2.0，并将 `psm` 回退到 0.1.28（对应 `ar_archive_writer` 0.2.0 / `object` 0.32.2），避免 Rust 1.88 的 let-chain 与 ICU 1.88 门槛。未改业务依赖声明。
+
+### 第二轮复核
+
+- 对照 PostgreSQL `OWNED BY` 语义、SERIAL INSERT 锁顺序和 `auto_commit_with_hooks` 的锁释放点复核通过；成功 DROP、commit-failure、立即/重启复名及旧版孤立元数据升级路径均有正式回归。
+- AP residual filter × LIMIT、aborted CREATE reopen、Wire DDL/session 边界无新增问题；无遗留 `zz_*` 临时探针、TODO/FIXME 或调试输出。第二轮未发现新增 P1/P2/P3。
+
+### 最终验收证据
+
+- DataFusion 专项 **18/18 + 1 ignored**，Sequence 专项 **23/23**，均覆盖 debug/release；新增旧版孤立 SERIAL 元数据升级回归通过。
+- `cargo test --workspace` 与 `cargo test --workspace --release` 均 EXIT=0、零失败；`cargo test -p pg-engine --features datafusion` 的 debug/release 亦均 EXIT=0、零失败。
+- `cargo +1.86.0 check --workspace --all-features`、当前工具链全 feature 编译、八 crate Clippy/rustdoc、fmt 与 `git diff --check` 均通过。
+- DataFusion 点查 20 次均值 **0.598ms**（最终依赖版本，<5ms）；自研 B+Tree 点查 **10.693µs**。siftsmall SQL ANN **recall@10 = 0.9990**，均值 **0.298ms**、p95 **0.413ms**，每次查询仍断言 `ExecutionPath::IndexLookup`。
+- 覆盖率口径不变：既有 coverage job 仅覆盖 pg-am-hnsw 的 `--fail-under 90`，未将其宣称为 pg-engine/pg-wire/pg-am-heap 的 Phase 4a 覆盖率；本机不伪造该 CI 报告。

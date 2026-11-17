@@ -147,6 +147,7 @@ use crate::error::{HeapError, Result};
 use crate::line_pointer::{LpFlags, LINE_POINTER_SIZE};
 use crate::redo::heap_redo_handlers;
 use crate::slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
+use crate::toast::ToastRelation;
 use crate::tuple::{
     decode_tuple, Datum, TupleHeader, HEAP_HOT_UPDATED, HEAP_ONLY_TUPLE, HEAP_UPDATED,
     HEAP_XMAX_IS_SHARE, HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE,
@@ -154,7 +155,11 @@ use crate::tuple::{
 
 /// Largest tuple that can ever fit on a heap page (page minus special space,
 /// header, and one LP).
-const MAX_TUPLE_BYTES: usize = PAGE_SIZE - HEAP_SPECIAL_SIZE - PAGE_HEADER_SIZE - LINE_POINTER_SIZE;
+pub const MAX_TUPLE_BYTES: usize =
+    PAGE_SIZE - HEAP_SPECIAL_SIZE - PAGE_HEADER_SIZE - LINE_POINTER_SIZE;
+
+/// A tuple decoded without applying snapshot visibility, for TOAST maintenance.
+pub(crate) type PhysicalTuple = (Tid, TupleHeader, Vec<Option<Datum>>);
 
 /// Heap access method over the shared data file.
 ///
@@ -190,6 +195,12 @@ pub struct HeapAM {
     /// a holder's transaction end does not remove it, the next gate pass on
     /// that tuple does.
     share_locks: Mutex<HashMap<(PageId, u16), std::collections::BTreeSet<TxnId>>>,
+    /// Main relation OID → hidden TOAST relation descriptor. Registration is
+    /// driven by pg-engine after DDL commits and during registry recovery.
+    toast_relations: Mutex<HashMap<Oid, RelationDesc<'static>>>,
+    /// Next candidate valueid per MAIN relation OID. Values are monotonic in
+    /// process and seeded from every physical chunk after recovery.
+    toast_valueids: Mutex<HashMap<Oid, u64>>,
     /// Page allocator handle for vacuum's page release (M3 Stage C),
     /// installed by the engine via [`Self::set_page_allocator`]. `reclaim`
     /// needs it only when a compacted page turns fully empty and is returned
@@ -210,6 +221,8 @@ impl HeapAM {
             extend_lock: Mutex::new(()),
             row_waiter: None,
             share_locks: Mutex::new(HashMap::new()),
+            toast_relations: Mutex::new(HashMap::new()),
+            toast_valueids: Mutex::new(HashMap::new()),
             page_allocator: None,
         }
     }
@@ -226,6 +239,140 @@ impl HeapAM {
     /// Same install-once-before-sharing shape as [`Self::set_row_waiter`].
     pub fn set_page_allocator(&mut self, allocator: Arc<StorageMutex<PageAllocator>>) {
         self.page_allocator = Some(allocator);
+    }
+
+    /// Register a committed hidden TOAST relation and seed its valueid clock
+    /// from every physical chunk left by recovery, including aborted groups.
+    pub fn register_toast_relation(&self, main_oid: Oid, toast: ToastRelation) -> Result<()> {
+        if toast.rel_oid == main_oid || toast.rel_oid.0 > u32::MAX as u64 {
+            return Err(HeapError::InvalidArgument(format!(
+                "invalid TOAST relation OID {} for main relation {main_oid}",
+                toast.rel_oid.0
+            )));
+        }
+        let desc = toast.relation_desc();
+        if let Some(existing) = self
+            .toast_relations
+            .lock()
+            .expect("TOAST relation map poisoned")
+            .get(&main_oid)
+            .copied()
+        {
+            if existing.rel_oid != desc.rel_oid || existing.first_page != desc.first_page {
+                return Err(HeapError::InvalidArgument(format!(
+                    "conflicting TOAST relation registration for main relation {main_oid}"
+                )));
+            }
+            return Ok(());
+        }
+        let next = crate::toast::max_valueid(self, &desc)?.saturating_add(1);
+        self.toast_relations
+            .lock()
+            .expect("TOAST relation map poisoned")
+            .insert(main_oid, desc);
+        // Re-registering an already used relation must never rewind its clock.
+        self.toast_valueids
+            .lock()
+            .expect("TOAST valueid map poisoned")
+            .entry(main_oid)
+            .or_insert(next);
+        Ok(())
+    }
+
+    /// Forget a dropped main relation's TOAST metadata.
+    pub fn unregister_toast_relation(&self, main_oid: Oid) {
+        self.toast_relations
+            .lock()
+            .expect("TOAST relation map poisoned")
+            .remove(&main_oid);
+        self.toast_valueids
+            .lock()
+            .expect("TOAST valueid map poisoned")
+            .remove(&main_oid);
+    }
+
+    pub(crate) fn toast_relation_optional(&self, main_oid: Oid) -> Option<ToastRelation> {
+        self.toast_relations
+            .lock()
+            .expect("TOAST relation map poisoned")
+            .get(&main_oid)
+            .map(|desc| ToastRelation {
+                rel_oid: desc.rel_oid,
+                first_page: desc.first_page,
+            })
+    }
+
+    pub(crate) fn toast_relation(&self, main_oid: Oid) -> Result<ToastRelation> {
+        self.toast_relation_optional(main_oid).ok_or_else(|| {
+            HeapError::Corrupted(format!(
+                "main relation {main_oid} has an external value but no registered TOAST relation"
+            ))
+        })
+    }
+
+    pub(crate) fn allocate_toast_valueid(&self, main_oid: Oid) -> Result<u32> {
+        let mut clocks = self
+            .toast_valueids
+            .lock()
+            .expect("TOAST valueid map poisoned");
+        let next = clocks.get_mut(&main_oid).ok_or_else(|| {
+            HeapError::InvalidArgument(format!(
+                "main relation {main_oid} has no registered TOAST relation"
+            ))
+        })?;
+        if *next > u32::MAX as u64 {
+            return Err(HeapError::InvalidArgument(format!(
+                "TOAST valueid space exhausted for main relation {main_oid}"
+            )));
+        }
+        let allocated = *next as u32;
+        *next += 1;
+        Ok(allocated)
+    }
+
+    /// Write one value as a fresh chunk group before its main row.
+    pub fn externalize_value(
+        &self,
+        main: &RelationDesc<'_>,
+        snapshot: &Snapshot,
+        column: crate::tuple::ColumnType,
+        datum: &Datum,
+    ) -> Result<Datum> {
+        crate::toast::externalize_value(self, main, snapshot, column, datum)
+    }
+
+    /// Resolve external values using the query's own snapshot and CLOG.
+    pub fn detoast_values(
+        &self,
+        main: &RelationDesc<'_>,
+        snapshot: &Snapshot,
+        clog: &dyn ClogAccessor,
+        values: &[Option<Datum>],
+    ) -> Result<Vec<Option<Datum>>> {
+        crate::toast::detoast_values(self, main, snapshot, clog, values)
+    }
+
+    /// Resolve pointers for recovery-time physical index maintenance only.
+    pub fn detoast_values_physical(
+        &self,
+        main: &RelationDesc<'_>,
+        values: &[Option<Datum>],
+    ) -> Result<Vec<Option<Datum>>> {
+        crate::toast::detoast_values_physical(self, main, values)
+    }
+
+    /// Reclaim chunk groups no longer referenced by any physical main row.
+    pub fn vacuum_toast(&self, main: &RelationDesc<'_>) -> Result<usize> {
+        crate::toast::vacuum_toast(self, main)
+    }
+
+    /// Number of physical chunks, including dead/aborted rows not yet vacuumed.
+    /// Intended for diagnostics and reclamation tests.
+    pub fn toast_chunk_count(&self, main_oid: Oid) -> Result<usize> {
+        let Some(toast) = self.toast_relation_optional(main_oid) else {
+            return Ok(0);
+        };
+        Ok(self.scan_physical(&toast.relation_desc())?.len())
     }
 
     /// Allocate and initialize a relation's first heap page, tracking it as a
@@ -291,6 +438,35 @@ impl HeapAM {
         // at least as fresh as anything readable from disk.
         let mut map = self.pages.lock().expect("heap page map poisoned");
         Ok(map.entry(rel.rel_oid).or_insert(seeded).clone())
+    }
+
+    /// Read every physically present tuple without applying visibility.
+    /// Reserved for TOAST valueid recovery, reference accounting and physical
+    /// maintenance; query paths must use `scan` with their own snapshot.
+    pub(crate) fn scan_physical(&self, rel: &RelationDesc<'_>) -> Result<Vec<PhysicalTuple>> {
+        let mut out = Vec::new();
+        for page_id in self.relation_pages(rel)? {
+            let guard = self.buffer_pool.pin(page_id)?;
+            let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+            if SlottedPage::header(page).pd_upper == 0 {
+                continue;
+            }
+            for slot in 0..SlottedPage::slot_count(page) as u16 {
+                let Some(bytes) = SlottedPage::tuple(page, slot)? else {
+                    continue;
+                };
+                let (header, values) = decode_tuple(bytes, rel.columns)?;
+                out.push((
+                    Tid {
+                        page_id,
+                        slot_id: slot,
+                    },
+                    header,
+                    values,
+                ));
+            }
+        }
+        Ok(out)
     }
 
     /// Walk the on-disk page chain from `first_page`, collecting the
@@ -1631,6 +1807,7 @@ impl AccessMethod for HeapAM {
                     ctx.snapshot,
                     clog,
                 ) {
+                    let values = self.detoast_values(&ctx.rel, ctx.snapshot, clog, &values)?;
                     out.push((self_tid, values));
                 } else if header.t_infomask2 & HEAP_HOT_UPDATED != 0 && header.t_ctid != self_tid {
                     // HOT chain: old version is invisible but t_ctid may
@@ -1646,6 +1823,8 @@ impl AccessMethod for HeapAM {
                         let chain_bytes = SlottedPage::tuple(page, visible_tid.slot_id)?
                             .expect("follow_hot_chain only returns readable slots");
                         let (_, chain_values) = decode_tuple(chain_bytes, ctx.rel.columns)?;
+                        let chain_values =
+                            self.detoast_values(&ctx.rel, ctx.snapshot, clog, &chain_values)?;
                         out.push((visible_tid, chain_values));
                     }
                 }

@@ -931,6 +931,7 @@ mod tests {
             LogicalTimeSeries,
             SegmentSeal,
             SegmentMerge,
+            SequenceAdvance,
         ];
 
         let mut all = std::collections::HashSet::new();

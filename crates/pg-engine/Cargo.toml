@@ -42,6 +42,15 @@ parking_lot = "0.12"
 # serialization
 serde = { version = "1", features = ["derive"] }
 
+uuid = { version = "1", optional = true }
+
+# Phase 4a Stage E: optional DataFusion AP path. The default TP/ANN build
+# stays dependency-free; opt in with `--features datafusion`.
+datafusion = { version = "50.0.0", optional = true }
+async-trait = { version = "0.1", optional = true }
+futures = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"], optional = true }
+
 [dev-dependencies]
 # integration tests drive a real engine on a temp data dir
 tempfile = "3"
@@ -50,7 +59,6 @@ tempfile = "3"
 # crash-window probe — enable the test-harness feature (unified with the
 # plain dependency above on dev builds).
 pg-am-hnsw = { path = "../pg-am-hnsw", features = ["test-harness"] }
-
 
 # benchmarks
 criterion = "0.5"
@@ -74,3 +82,6 @@ harness = false
 [[bench]]
 name = "m2c_100_conn"
 harness = false
+
+[features]
+datafusion = ["dep:datafusion", "dep:async-trait", "dep:futures", "dep:tokio", "dep:uuid"]

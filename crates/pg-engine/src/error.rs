@@ -76,8 +76,8 @@ pub enum EngineError {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
-    /// `create_index` named a (table, column) pair that already has an index.
-    #[error("index on {0} already exists")]
+    /// `create_index` named an existing index name or (table, column) pair.
+    #[error("index {0} already exists")]
     IndexExists(String),
 
     /// `index_lookup` named a (table, column) pair with no index.

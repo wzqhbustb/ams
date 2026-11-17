@@ -12,17 +12,38 @@ pub enum WireError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The peer sent bytes that violate the v3 framing rules (bad length
-    /// word, missing NUL terminator, unknown startup code, ...). The
-    /// session reports it and closes — framing is no longer trustworthy.
+    /// The frame length itself is invalid. Framing is no longer trustworthy,
+    /// so the session must close rather than attempt Sync recovery.
+    #[error("framing violation: {0}")]
+    Framing(String),
+
+    /// A fully framed extended-protocol message body is malformed. The
+    /// session reports 08P01 and can recover at the next Sync boundary.
     #[error("protocol violation: {0}")]
     Protocol(String),
 
-    /// A value cannot be text-encoded for the wire (currently only the
-    /// unresolved-TOAST `Datum::External` case; M3 does not resolve
-    /// out-of-line values on the read path).
+    /// A fully framed Simple Query body is malformed. Its own command cycle
+    /// ends immediately with ErrorResponse + ReadyForQuery, never with Sync.
+    #[error("simple-query protocol violation: {0}")]
+    SimpleQuery(String),
+
+    /// A fully framed Sync body is malformed. Sync still performs normal
+    /// error recovery and emits exactly one ReadyForQuery.
+    #[error("sync protocol violation: {0}")]
+    Sync(String),
+
+    /// A value cannot be encoded, or a parameter type is unsupported.
     #[error("encoding error: {0}")]
     Encode(String),
+
+    /// A parameter value is invalid in its declared text or binary format.
+    #[error("{message}")]
+    Value {
+        /// PostgreSQL SQLSTATE describing the value failure.
+        sqlstate: &'static str,
+        /// Human-readable description of the invalid value.
+        message: String,
+    },
 }
 
 impl WireError {

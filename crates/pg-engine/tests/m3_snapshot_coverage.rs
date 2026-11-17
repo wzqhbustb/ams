@@ -153,12 +153,18 @@ fn auto_commit_dml_registers_before_lock_wait() {
     let engine = Arc::new(open(tmp.path()));
     engine.exec(None, "CREATE TABLE t (k INT, v INT)").unwrap();
 
-    // Holder A takes the table's RowExclusive lock and stays open.
+    // Holder A upgrades to Exclusive and stays open. RowExclusive alone is
+    // intentionally compatible with itself, so it cannot make B block.
     let holder = engine.begin_txn().unwrap();
     engine
         .exec(Some(&holder), "INSERT INTO t VALUES (1, 10)")
         .unwrap();
     let holder_xid = holder.xid();
+    let table_oid = engine.describe_table("t").unwrap().oid;
+    engine
+        .lock_manager()
+        .acquire(holder_xid, table_oid, pg_txn::LockMode::Exclusive)
+        .unwrap();
     assert_eq!(registry(&engine).get(&holder_xid), Some(&1));
 
     // B's auto-commit INSERT: begins (XID into the active set), snapshots

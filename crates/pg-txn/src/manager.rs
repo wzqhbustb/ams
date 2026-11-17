@@ -631,6 +631,11 @@ impl TxnManager {
         }
     }
 
+    /// The first XID not yet assigned by the transaction clock.
+    pub fn current_xid(&self) -> TxnId {
+        self.txn_id_clock.current()
+    }
+
     /// Snapshot of the currently active XIDs (test/observability helper).
     pub fn active_xids(&self) -> Vec<TxnId> {
         let mut v: Vec<TxnId> = self.shared.lock().active.iter().copied().collect();

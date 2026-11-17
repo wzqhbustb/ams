@@ -166,3 +166,99 @@ fn m6_benchmark_siftsmall() {
 
     engine.shutdown();
 }
+
+/// Phase 4a Stage B: the same corpus and frozen seed through SQL DDL/DML and
+/// the self-owned ANN executor. Manual release-only acceptance run.
+#[test]
+#[ignore = "manual Phase 4a SQL ANN benchmark (10k build); run with --ignored"]
+fn phase4a_sql_ann_benchmark_siftsmall() {
+    let dir = dataset_dir();
+    let base = read_fvecs(dir.join("siftsmall_base.fvecs")).unwrap();
+    let queries = read_fvecs(dir.join("siftsmall_query.fvecs")).unwrap();
+    let gt = read_ivecs(dir.join("siftsmall_groundtruth.ivecs")).unwrap();
+    assert_eq!(base.len(), 10_000);
+    assert_eq!(queries.len(), 100);
+
+    let tmp = TempDir::new().unwrap();
+    let engine = Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap();
+    engine
+        .exec(None, "CREATE TABLE t (id INT4, v VECTOR(128))")
+        .unwrap();
+    engine
+        .exec(
+            None,
+            "CREATE INDEX ann_idx ON t USING hnsw (v vector_l2_ops)",
+        )
+        .unwrap();
+
+    let bulk_started = Instant::now();
+    let txn = engine.begin_txn().unwrap();
+    for (i, vector) in base.iter().enumerate() {
+        let values = vector
+            .iter()
+            .map(|x| format!("{x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        engine
+            .exec(
+                Some(&txn),
+                &format!("INSERT INTO t VALUES ({i}, [{values}])"),
+            )
+            .unwrap();
+    }
+    txn.commit().unwrap();
+    eprintln!(
+        "PHASE4A-BENCH bulk_insert: {} rows in {:.2}s (single txn, SQL DDL seed=42)",
+        base.len(),
+        bulk_started.elapsed().as_secs_f64()
+    );
+
+    let mut retrieved = Vec::with_capacity(queries.len());
+    let mut latencies = Vec::with_capacity(queries.len());
+    for query in &queries {
+        let values = query
+            .iter()
+            .map(|x| format!("{x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let started = Instant::now();
+        let result = engine
+            .exec(
+                None,
+                &format!("SELECT id FROM t ORDER BY v <-> '[{values}]' ASC LIMIT 10"),
+            )
+            .unwrap();
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            pg_engine::ExecutionPath::IndexLookup,
+            "SQL ANN query silently fell back to SeqScan"
+        );
+        latencies.push(started.elapsed());
+        let pg_engine::QueryResult::Rows { rows, .. } = result else {
+            panic!("expected SQL ANN rows")
+        };
+        retrieved.push(
+            rows.into_iter()
+                .map(|row| match row[0] {
+                    Some(pg_engine::Datum::Int4(id)) => NodeId(id as u32),
+                    ref other => panic!("unexpected SQL id datum: {other:?}"),
+                })
+                .collect(),
+        );
+    }
+    let recall = recall_at_k(&gt, &retrieved, 10, base.len() as u32).unwrap();
+    let mut micros: Vec<f64> = latencies
+        .iter()
+        .map(|duration| duration.as_secs_f64() * 1000.0)
+        .collect();
+    micros.sort_by(|a, b| a.total_cmp(b));
+    let mean = micros.iter().sum::<f64>() / micros.len() as f64;
+    eprintln!(
+        "PHASE4A-BENCH sql_ann: recall@10={recall:.4}; query latency mean={mean:.3}ms p50={:.3}ms p95={:.3}ms max={:.3}ms (ef=64)",
+        micros[micros.len() / 2],
+        micros[(micros.len() as f64 * 0.95) as usize],
+        micros[micros.len() - 1]
+    );
+    assert!(recall >= 0.9990, "SQL ANN recall@10 {recall:.4} < 0.9990");
+    engine.shutdown();
+}

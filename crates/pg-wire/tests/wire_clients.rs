@@ -57,13 +57,17 @@
 //!
 //! Acceptance: `cargo test -p pg-wire --test wire_clients`
 
+use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use pg_engine::{Datum, Engine, EngineConfig};
-use pg_wire::Server;
+use pg_wire::codec::{FrontendMessage, STATUS_FAILED, STATUS_IDLE};
+use pg_wire::types::FORMAT_BINARY;
+use pg_wire::{Server, Session};
+use postgres::types::Type;
 use postgres::{Client, NoTls, SimpleQueryMessage};
 use tempfile::TempDir;
 
@@ -312,3 +316,371 @@ fn rust_postgres_four_concurrent_clients() {
         }
     });
 }
+
+#[test]
+fn rust_postgres_extended_typed_crud_ann_explain_and_recovery() {
+    run_with_watchdog("extended typed driver", || {
+        let (_tmp, engine, port) = spawn_server();
+        let mut client = connect(port);
+        client
+            .batch_execute("CREATE TABLE typed (id INT, big BIGINT, score FLOAT8, name TEXT)")
+            .unwrap();
+        let insert = client
+            .prepare("INSERT INTO typed VALUES ($1, $2, $3, $4)")
+            .unwrap();
+        assert_eq!(
+            client
+                .execute(&insert, &[&1i32, &10i64, &1.25f64, &"one"])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            client
+                .execute(&insert, &[&2i32, &20i64, &-2.5f64, &Option::<&str>::None])
+                .unwrap(),
+            1
+        );
+
+        let select = client
+            .prepare("SELECT id, big, score, name FROM typed WHERE id = $1")
+            .unwrap();
+        let rows = client.query(&select, &[&2i32]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<_, i32>(0), 2);
+        assert_eq!(rows[0].get::<_, i64>(1), 20);
+        assert_eq!(rows[0].get::<_, f64>(2), -2.5);
+        assert_eq!(rows[0].get::<_, Option<String>>(3), None);
+
+        let update = client
+            .prepare("UPDATE typed SET name = $1 WHERE id = $2")
+            .unwrap();
+        assert_eq!(client.execute(&update, &[&"updated", &1i32]).unwrap(), 1);
+        let updated = client
+            .prepare("SELECT name FROM typed WHERE id = $1")
+            .unwrap();
+        assert_eq!(
+            client.query(&updated, &[&1i32]).unwrap()[0].get::<_, String>(0),
+            "updated"
+        );
+        let delete = client.prepare("DELETE FROM typed WHERE id = $1").unwrap();
+        assert_eq!(client.execute(&delete, &[&1i32]).unwrap(), 1);
+        let remaining = client.prepare("SELECT id FROM typed").unwrap();
+        assert_eq!(client.query(&remaining, &[]).unwrap().len(), 1);
+
+        let explain = client.prepare("EXPLAIN SELECT * FROM typed").unwrap();
+        let plans = client.query(&explain, &[]).unwrap();
+        assert!(!plans.is_empty());
+        assert!(!plans[0].get::<_, String>(0).is_empty());
+
+        assert!(client.prepare("SELECT * FROM missing").is_err());
+        let after_error = client
+            .simple_query("SELECT id FROM typed ORDER BY id")
+            .unwrap();
+        assert_eq!(completions_of(&after_error), [1]);
+
+        client
+            .batch_execute("CREATE TABLE ann (id INT, v VECTOR(2))")
+            .unwrap();
+        client
+            .batch_execute("CREATE INDEX ann_idx ON ann USING hnsw (v vector_l2_ops)")
+            .unwrap();
+        let insert_ann = client
+            .prepare_typed("INSERT INTO ann VALUES ($1, $2)", &[Type::INT4, Type::TEXT])
+            .unwrap();
+        client.execute(&insert_ann, &[&1i32, &"[1,0]"]).unwrap();
+        client.execute(&insert_ann, &[&2i32, &"[0,1]"]).unwrap();
+
+        let ann_query = client
+            .prepare_typed(
+                "SELECT id FROM ann ORDER BY v <-> $1 ASC LIMIT 1",
+                &[Type::TEXT],
+            )
+            .unwrap();
+        let ann_rows = client.query(&ann_query, &[&"[1,0]"]).unwrap();
+        assert_eq!(ann_rows[0].get::<_, i32>(0), 1);
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            pg_engine::ExecutionPath::IndexLookup
+        );
+    });
+}
+
+fn read_backend_frame(stream: &mut std::net::TcpStream) -> (u8, Vec<u8>) {
+    let mut tag = [0u8; 1];
+    stream.read_exact(&mut tag).unwrap();
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).unwrap();
+    let len = u32::from_be_bytes(len) as usize;
+    assert!(len >= 4);
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).unwrap();
+    (tag[0], body)
+}
+
+fn write_frontend_frame(stream: &mut std::net::TcpStream, tag: u8, body: &[u8]) {
+    stream.write_all(&[tag]).unwrap();
+    stream
+        .write_all(&((body.len() + 4) as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(body).unwrap();
+}
+
+#[test]
+fn malformed_bind_body_recovers_at_sync_over_real_socket() {
+    run_with_watchdog("malformed Bind recovery", || {
+        let (_tmp, _engine, port) = spawn_server();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut startup = Vec::new();
+        startup.extend_from_slice(b"user\0pg_rust\0database\0pg_rust\0\0");
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&((startup.len() + 8) as u32).to_be_bytes());
+        packet.extend_from_slice(&196_608u32.to_be_bytes());
+        packet.extend_from_slice(&startup);
+        stream.write_all(&packet).unwrap();
+        loop {
+            let (tag, _) = read_backend_frame(&mut stream);
+            if tag == b'Z' {
+                break;
+            }
+        }
+
+        let mut bind = Vec::new();
+        bind.extend_from_slice(b"p\0s\0");
+        bind.extend_from_slice(&0u16.to_be_bytes()); // parameter format count
+        bind.extend_from_slice(&1u16.to_be_bytes()); // parameter count
+        bind.extend_from_slice(&(-2i32).to_be_bytes()); // invalid length
+        bind.extend_from_slice(&0u16.to_be_bytes()); // result format count
+        write_frontend_frame(&mut stream, b'B', &bind);
+        write_frontend_frame(&mut stream, b'S', &[]);
+
+        let mut saw_error = false;
+        let mut saw_ready = false;
+        while !saw_ready {
+            let (tag, body) = read_backend_frame(&mut stream);
+            match tag {
+                b'E' => {
+                    saw_error = true;
+                    assert!(body.windows(5).any(|window| window == b"08P01"));
+                }
+                b'Z' => {
+                    saw_ready = true;
+                    assert_eq!(body, [b'I']);
+                }
+                other => panic!("unexpected backend message {}", other as char),
+            }
+        }
+        assert!(saw_error);
+    });
+}
+
+#[test]
+fn malformed_simple_query_completes_without_sync_over_real_socket() {
+    run_with_watchdog("malformed Simple Query recovery", || {
+        let (_tmp, _engine, port) = spawn_server();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut startup = Vec::new();
+        startup.extend_from_slice(b"user\0pg_rust\0database\0pg_rust\0\0");
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&((startup.len() + 8) as u32).to_be_bytes());
+        packet.extend_from_slice(&196_608u32.to_be_bytes());
+        packet.extend_from_slice(&startup);
+        stream.write_all(&packet).unwrap();
+        loop {
+            let (tag, _) = read_backend_frame(&mut stream);
+            if tag == b'Z' {
+                break;
+            }
+        }
+
+        write_frontend_frame(&mut stream, b'Q', b"SELECT 1\0junk");
+        let mut saw_error = false;
+        let mut saw_ready = false;
+        while !saw_ready {
+            let (tag, body) = read_backend_frame(&mut stream);
+            match tag {
+                b'E' => {
+                    saw_error = true;
+                    assert!(body.windows(5).any(|window| window == b"08P01"));
+                }
+                b'Z' => {
+                    saw_ready = true;
+                    assert_eq!(body, [b'I']);
+                }
+                other => panic!("unexpected backend message {}", other as char),
+            }
+        }
+        assert!(saw_error);
+    });
+}
+
+#[test]
+fn malformed_simple_query_is_discarded_during_extended_error() {
+    run_with_watchdog("malformed Q during extended error", || {
+        let (_tmp, _engine, port) = spawn_server();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut startup = Vec::new();
+        startup.extend_from_slice(b"user\0pg_rust\0database\0pg_rust\0\0");
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&((startup.len() + 8) as u32).to_be_bytes());
+        packet.extend_from_slice(&196_608u32.to_be_bytes());
+        packet.extend_from_slice(&startup);
+        stream.write_all(&packet).unwrap();
+        loop {
+            let (tag, _) = read_backend_frame(&mut stream);
+            if tag == b'Z' {
+                break;
+            }
+        }
+
+        let mut execute = Vec::new();
+        execute.extend_from_slice(b"missing\0");
+        execute.extend_from_slice(&0u32.to_be_bytes());
+        write_frontend_frame(&mut stream, b'E', &execute);
+        let (tag, body) = read_backend_frame(&mut stream);
+        assert_eq!(tag, b'E');
+        assert!(body.windows(5).any(|window| window == b"34000"));
+
+        write_frontend_frame(&mut stream, b'Q', b"SELECT 1\0junk");
+        write_frontend_frame(&mut stream, b'S', &[]);
+        let (tag, body) = read_backend_frame(&mut stream);
+        assert_eq!(tag, b'Z', "malformed Q must be discarded until Sync");
+        assert_eq!(body, [b'I']);
+    });
+}
+
+#[test]
+fn malformed_sync_emits_error_and_exactly_one_ready_for_query() {
+    run_with_watchdog("malformed Sync recovery", || {
+        let (_tmp, _engine, port) = spawn_server();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut startup = Vec::new();
+        startup.extend_from_slice(b"user\0pg_rust\0database\0pg_rust\0\0");
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&((startup.len() + 8) as u32).to_be_bytes());
+        packet.extend_from_slice(&196_608u32.to_be_bytes());
+        packet.extend_from_slice(&startup);
+        stream.write_all(&packet).unwrap();
+        loop {
+            let (tag, _) = read_backend_frame(&mut stream);
+            if tag == b'Z' {
+                break;
+            }
+        }
+
+        write_frontend_frame(&mut stream, b'S', b"x");
+        let (tag, body) = read_backend_frame(&mut stream);
+        assert_eq!(tag, b'E');
+        assert!(body.windows(5).any(|window| window == b"08P01"));
+        let (tag, body) = read_backend_frame(&mut stream);
+        assert_eq!(tag, b'Z');
+        assert_eq!(body, [b'I']);
+    });
+}
+
+#[test]
+fn malformed_sync_rolls_back_implicit_transaction() {
+    let tmp = TempDir::new().unwrap();
+    let engine = Arc::new(Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap());
+    let mut session = Session::new(Arc::clone(&engine));
+    let mut out = Vec::new();
+    session.handle_query("CREATE TABLE t (id INT)", &mut out);
+    session.handle_message(
+        FrontendMessage::Parse {
+            name: "i".to_string(),
+            query: "INSERT INTO t VALUES (1)".to_string(),
+            parameter_type_oids: vec![],
+        },
+        &mut out,
+    );
+    session.handle_message(
+        FrontendMessage::Bind {
+            portal: "p".to_string(),
+            statement: "i".to_string(),
+            parameter_formats: vec![],
+            parameters: vec![],
+            result_formats: vec![],
+        },
+        &mut out,
+    );
+    session.handle_message(
+        FrontendMessage::Execute {
+            portal: "p".to_string(),
+            max_rows: 0,
+        },
+        &mut out,
+    );
+    // A malformed Sync sets extended_error before recovery. Simulate that
+    // same failed state with an ordinary extended error, then Sync.
+    session.handle_message(
+        FrontendMessage::Parse {
+            name: "bad".to_string(),
+            query: "SELECT * FROM missing".to_string(),
+            parameter_type_oids: vec![],
+        },
+        &mut out,
+    );
+    out.clear();
+    session.handle_message(FrontendMessage::Sync, &mut out);
+    assert_eq!(out.last(), Some(&STATUS_IDLE));
+
+    out.clear();
+    session.handle_query("SELECT * FROM t", &mut out);
+    assert!(out.windows(8).any(|window| window == b"SELECT 0"));
+}
+
+#[test]
+fn malformed_bind_enters_explicit_failed_state() {
+    let tmp = TempDir::new().unwrap();
+    let engine = Arc::new(Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap());
+    let mut session = Session::new(Arc::clone(&engine));
+    let mut out = Vec::new();
+    session.handle_query("CREATE TABLE t (id INT)", &mut out);
+    session.handle_query("BEGIN", &mut out);
+    session.handle_message(
+        FrontendMessage::Parse {
+            name: "s".to_string(),
+            query: "SELECT * FROM t WHERE id = $1".to_string(),
+            parameter_type_oids: vec![23],
+        },
+        &mut out,
+    );
+    session.handle_message(
+        FrontendMessage::Bind {
+            portal: "p".to_string(),
+            statement: "s".to_string(),
+            parameter_formats: vec![FORMAT_BINARY],
+            parameters: vec![Some(b"1".to_vec())],
+            result_formats: vec![],
+        },
+        &mut out,
+    );
+    assert!(out.windows(5).any(|window| window == b"22P03"));
+    out.clear();
+    session.handle_message(FrontendMessage::Sync, &mut out);
+    assert_eq!(out.last(), Some(&STATUS_FAILED));
+
+    out.clear();
+    session.handle_query("INSERT INTO t VALUES (2)", &mut out);
+    assert!(out.windows(5).any(|window| window == b"25P02"));
+    assert_eq!(out.last(), Some(&STATUS_FAILED));
+
+    out.clear();
+    session.handle_query("COMMIT", &mut out);
+    assert!(out.windows(8).any(|window| window == b"ROLLBACK"));
+    assert_eq!(out.last(), Some(&STATUS_IDLE));
+}
+
+// FunctionCall failure semantics are covered by the Session-level regression
+// `function_call_enters_failed_state` in wire_extended.rs.

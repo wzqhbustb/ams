@@ -10,13 +10,13 @@
 //!   excluding the tag) + body.
 //! - All integers big-endian; strings are NUL-terminated (`cstring`).
 //!
-//! Only the minimal closed set is decoded (`Q` / `X`); every other tag is
-//! surfaced as [`FrontendMessage::Unsupported`] so the session can reject it
-//! without losing framing sync (each message is self-delimiting).
+//! The decoder covers Simple Query plus the Stage C Extended Query messages
+//! (`P/B/D/E/C/H/S`). Unknown tags surface as
+//! [`FrontendMessage::Unsupported`] without losing framing sync.
 //!
-//! Encode side produces the backend messages of the §7.2 minimal set. All
-//! encoders append to a caller-owned buffer so a whole response batch (one
-//! `ReadyForQuery` cycle) can be flushed with a single `write_all`.
+//! Encode side produces the corresponding backend messages. All encoders
+//! append to a caller-owned buffer so a whole response batch can be flushed
+//! with a single `write_all`.
 
 use std::io::Read;
 
@@ -35,6 +35,8 @@ pub const CANCEL_REQUEST_CODE: u32 = 80877102;
 pub const STATUS_IDLE: u8 = b'I';
 /// `ReadyForQuery` status: inside an explicit transaction block.
 pub const STATUS_IN_TXN: u8 = b'T';
+/// `ReadyForQuery` status: failed explicit transaction block.
+pub const STATUS_FAILED: u8 = b'E';
 
 /// Hard cap on any regular-phase message: 64 MiB. The SQL subset has no
 /// large-object literals, so a legitimate simple-query string or its biggest
@@ -58,7 +60,7 @@ pub const MAX_STARTUP_PACKET_LEN: u32 = 10000;
 /// bytes the peer has actually sent (plus one chunk of slack).
 fn read_body<R: Read>(r: &mut R, len: u32, min: u32, max: u32) -> Result<Vec<u8>> {
     if !(min..=max).contains(&len) {
-        return Err(WireError::Protocol(format!(
+        return Err(WireError::Framing(format!(
             "invalid message length {len} (allowed {min}..={max})"
         )));
     }
@@ -103,16 +105,72 @@ pub enum StartupPacket {
     },
 }
 
-/// A regular-phase frontend message of the minimal closed set.
+/// Object kind shared by Describe and Close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// A prepared statement (`'S'`).
+    Statement,
+    /// A bound portal (`'P'`).
+    Portal,
+}
+
+/// A regular-phase frontend message of the supported closed set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontendMessage {
     /// Simple Query (`'Q'`): the query string (may hold multiple
     /// `;`-separated statements; splitting is the session's job).
     Query(String),
+    /// Parse (`'P'`): create or replace a prepared statement.
+    Parse {
+        /// Statement name; empty selects the unnamed statement.
+        name: String,
+        /// SQL containing optional `$1..$n` placeholders.
+        query: String,
+        /// Client-supplied parameter type OIDs; zero means infer at Parse.
+        parameter_type_oids: Vec<u32>,
+    },
+    /// Bind (`'B'`): bind parameters and result formats into a portal.
+    Bind {
+        /// Portal name; empty selects the unnamed portal.
+        portal: String,
+        /// Source prepared-statement name.
+        statement: String,
+        /// Parameter format codes, expanded using PostgreSQL's 0/1/N rule.
+        parameter_formats: Vec<i16>,
+        /// Parameter payloads; `None` is SQL NULL.
+        parameters: Vec<Option<Vec<u8>>>,
+        /// Result-column format codes, expanded using PostgreSQL's 0/1/N rule.
+        result_formats: Vec<i16>,
+    },
+    /// Describe (`'D'`): describe a statement or portal.
+    Describe {
+        /// Whether to describe a statement or portal.
+        kind: ObjectKind,
+        /// Object name.
+        name: String,
+    },
+    /// Execute (`'E'`): execute a portal.
+    Execute {
+        /// Portal name.
+        portal: String,
+        /// Maximum rows to return before PortalSuspended; zero means all.
+        max_rows: u32,
+    },
+    /// Close (`'C'`): close a statement or portal.
+    Close {
+        /// Whether to close a statement or portal.
+        kind: ObjectKind,
+        /// Object name.
+        name: String,
+    },
+    /// Flush (`'H'`): flush buffered backend output.
+    Flush,
+    /// Sync (`'S'`): end an extended-query error/recovery cycle.
+    Sync,
     /// Terminate (`'X'`): the session closes the connection cleanly.
     Terminate,
-    /// Any other tag (extended query protocol, FunctionCall, ...). The
-    /// payload is discarded — the length word keeps framing in sync.
+    /// Any other tag (FunctionCall, ...). The payload is discarded — the
+    /// length word keeps framing in sync.
     Unsupported {
         /// The raw message type byte.
         tag: u8,
@@ -134,7 +192,7 @@ pub struct FieldDesc {
     pub type_len: i16,
     /// Type modifier; always -1 in this subset.
     pub type_modifier: i32,
-    /// Format code: 0 = text (the only format this server speaks).
+    /// Format code: 0 = text, 1 = binary.
     pub format: i16,
 }
 
@@ -231,6 +289,92 @@ pub fn parse_startup_body(body: &[u8]) -> Result<Vec<(String, String)>> {
     }
 }
 
+/// Bounds-checked cursor for one already-framed message body.
+struct BodyReader<'a> {
+    body: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BodyReader<'a> {
+    fn new(body: &'a [u8]) -> Self {
+        Self { body, pos: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| WireError::Protocol("message-body offset overflow".to_string()))?;
+        if end > self.body.len() {
+            return Err(WireError::Protocol(format!(
+                "truncated message body: need {len} bytes at offset {}",
+                self.pos
+            )));
+        }
+        let bytes = &self.body[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn byte(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn i16(&mut self) -> Result<i16> {
+        Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn i32(&mut self) -> Result<i32> {
+        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn count(&mut self, _what: &str) -> Result<usize> {
+        Ok(self.u16()? as usize)
+    }
+
+    fn cstring(&mut self, what: &str) -> Result<String> {
+        let rest = &self.body[self.pos..];
+        let Some(nul) = rest.iter().position(|&b| b == 0) else {
+            return Err(WireError::Protocol(format!(
+                "{what} missing NUL terminator"
+            )));
+        };
+        let value = std::str::from_utf8(&rest[..nul])
+            .map_err(|_| WireError::Protocol(format!("{what} is not UTF-8")))?
+            .to_string();
+        self.pos += nul + 1;
+        Ok(value)
+    }
+
+    fn finish(self) -> Result<()> {
+        if self.pos != self.body.len() {
+            return Err(WireError::Protocol(format!(
+                "{} trailing bytes after message body",
+                self.body.len() - self.pos
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn object_kind(byte: u8) -> Result<ObjectKind> {
+    match byte {
+        b'S' => Ok(ObjectKind::Statement),
+        b'P' => Ok(ObjectKind::Portal),
+        other => Err(WireError::Protocol(format!(
+            "invalid Describe/Close object kind 0x{other:02x}"
+        ))),
+    }
+}
+
 /// Read one regular-phase frontend message. Returns `Ok(None)` on a clean
 /// EOF before the tag byte (client closed the socket).
 pub fn read_message<R: Read>(r: &mut R) -> Result<Option<FrontendMessage>> {
@@ -242,27 +386,105 @@ pub fn read_message<R: Read>(r: &mut R) -> Result<Option<FrontendMessage>> {
     r.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf);
     let body = read_body(r, len, 4, MAX_MESSAGE_LEN)?;
+    let mut reader = BodyReader::new(&body);
     let msg = match tag[0] {
         b'Q' => {
-            let Some(nul) = body.iter().position(|&b| b == 0) else {
-                return Err(WireError::Protocol(
-                    "query string missing NUL terminator".to_string(),
-                ));
-            };
-            // F4 (Stage F review): the cstring must fill the whole frame —
-            // trailing bytes after the NUL are a framing bug in the peer,
-            // not payload to silently drop (PG: "invalid string in message").
-            if nul != body.len() - 1 {
-                return Err(WireError::Protocol(
-                    "trailing bytes after query string terminator".to_string(),
-                ));
-            }
-            let sql = std::str::from_utf8(&body[..nul])
-                .map_err(|_| WireError::Protocol("query string is not UTF-8".to_string()))?
-                .to_string();
+            let sql = (|| -> Result<String> {
+                let sql = reader.cstring("query string")?;
+                reader.finish()?;
+                Ok(sql)
+            })()
+            .map_err(|error| match error {
+                WireError::Protocol(message) => WireError::SimpleQuery(message),
+                other => other,
+            })?;
             FrontendMessage::Query(sql)
         }
-        b'X' => FrontendMessage::Terminate,
+        b'P' => {
+            let name = reader.cstring("statement name")?;
+            let query = reader.cstring("query string")?;
+            let count = reader.count("parameter type")?;
+            let mut parameter_type_oids = Vec::with_capacity(count);
+            for _ in 0..count {
+                parameter_type_oids.push(reader.u32()?);
+            }
+            reader.finish()?;
+            FrontendMessage::Parse {
+                name,
+                query,
+                parameter_type_oids,
+            }
+        }
+        b'B' => {
+            let portal = reader.cstring("portal name")?;
+            let statement = reader.cstring("statement name")?;
+            let format_count = reader.count("parameter format")?;
+            let mut parameter_formats = Vec::with_capacity(format_count);
+            for _ in 0..format_count {
+                parameter_formats.push(reader.i16()?);
+            }
+            let parameter_count = reader.count("parameter")?;
+            let mut parameters = Vec::with_capacity(parameter_count);
+            for _ in 0..parameter_count {
+                let len = reader.i32()?;
+                let value = match len {
+                    -1 => None,
+                    0.. => Some(reader.take(len as usize)?.to_vec()),
+                    _ => {
+                        return Err(WireError::Protocol(format!(
+                            "invalid parameter length {len}"
+                        )))
+                    }
+                };
+                parameters.push(value);
+            }
+            let result_count = reader.count("result format")?;
+            let mut result_formats = Vec::with_capacity(result_count);
+            for _ in 0..result_count {
+                result_formats.push(reader.i16()?);
+            }
+            reader.finish()?;
+            FrontendMessage::Bind {
+                portal,
+                statement,
+                parameter_formats,
+                parameters,
+                result_formats,
+            }
+        }
+        b'D' => {
+            let kind = object_kind(reader.byte()?)?;
+            let name = reader.cstring("Describe object name")?;
+            reader.finish()?;
+            FrontendMessage::Describe { kind, name }
+        }
+        b'E' => {
+            let portal = reader.cstring("portal name")?;
+            let max_rows = reader.u32()?;
+            reader.finish()?;
+            FrontendMessage::Execute { portal, max_rows }
+        }
+        b'C' => {
+            let kind = object_kind(reader.byte()?)?;
+            let name = reader.cstring("Close object name")?;
+            reader.finish()?;
+            FrontendMessage::Close { kind, name }
+        }
+        b'H' => {
+            reader.finish()?;
+            FrontendMessage::Flush
+        }
+        b'S' => {
+            reader.finish().map_err(|error| match error {
+                WireError::Protocol(message) => WireError::Sync(message),
+                other => other,
+            })?;
+            FrontendMessage::Sync
+        }
+        b'X' => {
+            reader.finish()?;
+            FrontendMessage::Terminate
+        }
         other => FrontendMessage::Unsupported { tag: other },
     };
     Ok(Some(msg))
@@ -298,12 +520,47 @@ pub fn parameter_status(buf: &mut Vec<u8>, name: &str, value: &str) {
     put_msg(buf, b'S', &body);
 }
 
-/// `ReadyForQuery(status)` — `status` is [`STATUS_IDLE`] or
-/// [`STATUS_IN_TXN`]. There is no failed-transaction state in M2b/M3 (a
-/// failed statement leaves the explicit txn usable-then-abortable), so `'E'`
-/// is never emitted.
+/// `ReadyForQuery(status)` — `status` is [`STATUS_IDLE`],
+/// [`STATUS_IN_TXN`], or [`STATUS_FAILED`] after an explicit-transaction
+/// statement error has aborted the engine handle.
 pub fn ready_for_query(buf: &mut Vec<u8>, status: u8) {
     put_msg(buf, b'Z', &[status]);
+}
+
+/// `ParseComplete` — acknowledges a Parse message.
+pub fn parse_complete(buf: &mut Vec<u8>) {
+    put_msg(buf, b'1', &[]);
+}
+
+/// `BindComplete` — acknowledges a Bind message.
+pub fn bind_complete(buf: &mut Vec<u8>) {
+    put_msg(buf, b'2', &[]);
+}
+
+/// `CloseComplete` — acknowledges a Close message.
+pub fn close_complete(buf: &mut Vec<u8>) {
+    put_msg(buf, b'3', &[]);
+}
+
+/// `ParameterDescription` — the inferred or client-specified statement
+/// parameter OIDs, in `$1..$n` order.
+pub fn parameter_description(buf: &mut Vec<u8>, type_oids: &[u32]) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(type_oids.len() as i16).to_be_bytes());
+    for oid in type_oids {
+        body.extend_from_slice(&oid.to_be_bytes());
+    }
+    put_msg(buf, b't', &body);
+}
+
+/// `NoData` — a Describe target has no result rows.
+pub fn no_data(buf: &mut Vec<u8>) {
+    put_msg(buf, b'n', &[]);
+}
+
+/// `PortalSuspended` — Execute reached its nonzero row limit.
+pub fn portal_suspended(buf: &mut Vec<u8>) {
+    put_msg(buf, b's', &[]);
 }
 
 /// `RowDescription` for a SELECT result set.
@@ -359,6 +616,21 @@ pub fn error_response(buf: &mut Vec<u8>, severity: &str, sqlstate: &str, message
     put_cstring(&mut body, message);
     body.push(0);
     put_msg(buf, b'E', &body);
+}
+
+/// `NoticeResponse` for non-fatal warnings (`S`/`V`, SQLSTATE `C`, message `M`).
+pub fn notice_response(buf: &mut Vec<u8>, severity: &str, sqlstate: &str, message: &str) {
+    let mut body = Vec::new();
+    body.push(b'S');
+    put_cstring(&mut body, severity);
+    body.push(b'V');
+    put_cstring(&mut body, severity);
+    body.push(b'C');
+    put_cstring(&mut body, sqlstate);
+    body.push(b'M');
+    put_cstring(&mut body, message);
+    body.push(0);
+    put_msg(buf, b'N', &body);
 }
 
 /// `EmptyQueryResponse` — answer to an all-whitespace query string.

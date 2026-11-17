@@ -255,7 +255,10 @@ impl Worker {
         while Instant::now() < deadline {
             self.iterate(false)?;
             if std::env::var("M6_STRESS_LOG_PROGRESS").is_ok() && self.iterations % 100 == 0 {
-                eprintln!("worker progress: iterations={} next_insert={}", self.iterations, self.next_insert);
+                eprintln!(
+                    "worker progress: iterations={} next_insert={}",
+                    self.iterations, self.next_insert
+                );
             }
         }
         if std::env::var("M6_STRESS_LOG_PROGRESS").is_ok() {

@@ -30,6 +30,8 @@
 use pg_storage::types::{PageId, Tid, TxnId};
 
 use crate::error::{HeapError, Result};
+#[cfg(test)]
+use crate::toast::VARLENA_EXTERNAL_FLAG;
 use crate::toast::{is_external, ToastPointer, TOAST_POINTER_SIZE, VARLENA_LEN_MASK};
 
 /// Size of the fixed tuple header in bytes (§三).
@@ -87,6 +89,11 @@ pub const HEAP_ONLY_TUPLE: u16 = 0x8000;
 /// without one pay zero bytes. The trailing placement keeps every user
 /// column offset and the 64-byte header untouched.
 pub const HEAP_HAS_NODEID: u16 = 0x0800;
+/// Every non-NULL VECTOR attribute in this tuple is external (Phase 4a
+/// Stage D). Fixed-width f32 payloads can otherwise collide with the 20-byte
+/// TOAST pointer header. The codec rejects mixed inline/external VECTOR
+/// columns, so this single bit is sufficient and no payload tag is inspected.
+pub const HEAP_VECTOR_EXTERNAL: u16 = 0x1000;
 
 // `t_flags` (§三): low 4 bits hold the tuple encoding version.
 /// Mask for the tuple encoding version in `t_flags` (low 4 bits).
@@ -207,11 +214,10 @@ impl TupleHeader {
     }
 }
 
-/// Maximum dimension of an inline vector column (M6 tech-selection §11).
-/// 2000 keeps a single-column vector tuple inside an 8 KiB page:
-/// 64-byte header + 2000 × 4 = 8064 B ≤ `MAX_TUPLE_BYTES` (8140 B on 8 KiB
-/// pages). Larger dimensions belong to the M5 O1 out-of-line window, not
-/// the inline tuple format.
+/// Maximum dimension of a vector column (M6 tech-selection §11).
+/// 2000 keeps a single inline vector tuple inside an 8 KiB page: 64-byte
+/// header + 2000 × 4 = 8064 B ≤ `MAX_TUPLE_BYTES` (8140 B). Stage D may move
+/// a large vector out of line, but TOAST does not raise this type-level cap.
 pub const MAX_VECTOR_DIM: u32 = 2000;
 
 /// Column type descriptor needed to split the attribute area at decode time.
@@ -221,6 +227,8 @@ pub enum ColumnType {
     Int4,
     /// 8-byte integer.
     Int8,
+    /// 8-byte IEEE-754 floating-point value.
+    Float8,
     /// 8-byte timestamp (microseconds since epoch).
     Timestamptz,
     /// 16-byte UUID.
@@ -254,7 +262,7 @@ impl ColumnType {
     fn fixed_width(self) -> Option<usize> {
         match self {
             ColumnType::Int4 => Some(4),
-            ColumnType::Int8 | ColumnType::Timestamptz => Some(8),
+            ColumnType::Int8 | ColumnType::Float8 | ColumnType::Timestamptz => Some(8),
             ColumnType::Uuid => Some(16),
             ColumnType::Text | ColumnType::Bytea => None,
             ColumnType::Vector(dim) => Some(dim as usize * 4),
@@ -273,12 +281,14 @@ fn check_vector_dim(dim: u32) -> Result<()> {
 }
 
 /// A single column value. `None` at the `values` level encodes SQL NULL.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Datum {
     /// 4-byte integer.
     Int4(i32),
     /// 8-byte integer.
     Int8(i64),
+    /// 8-byte IEEE-754 floating-point value.
+    Float8(f64),
     /// 8-byte timestamp (microseconds since epoch).
     Timestamptz(i64),
     /// 16-byte UUID.
@@ -292,8 +302,30 @@ pub enum Datum {
     /// datum/column match.
     Vector(Vec<f32>),
     /// Out-of-line (TOASTed) value: the 20-byte pointer stored in the main
-    /// tuple (§四). Resolving it is Stage I's job.
+    /// tuple (§四). Stage D resolves it through the owning relation's hidden
+    /// chunk heap and the reader's snapshot.
     External(ToastPointer),
+}
+
+impl PartialEq for Datum {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Datum::Int4(a), Datum::Int4(b)) => a == b,
+            (Datum::Int8(a), Datum::Int8(b)) => a == b,
+            (Datum::Float8(a), Datum::Float8(b)) => {
+                // PostgreSQL: NaN equals NaN; positive and negative zero are
+                // also equal. This intentionally matches PartialOrd.
+                (a.is_nan() && b.is_nan()) || a == b
+            }
+            (Datum::Timestamptz(a), Datum::Timestamptz(b)) => a == b,
+            (Datum::Uuid(a), Datum::Uuid(b)) => a == b,
+            (Datum::Text(a), Datum::Text(b)) => a == b,
+            (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
+            (Datum::Vector(a), Datum::Vector(b)) => a == b,
+            (Datum::External(a), Datum::External(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl PartialOrd for Datum {
@@ -301,6 +333,14 @@ impl PartialOrd for Datum {
         match (self, other) {
             (Datum::Int4(a), Datum::Int4(b)) => Some(a.cmp(b)),
             (Datum::Int8(a), Datum::Int8(b)) => Some(a.cmp(b)),
+            (Datum::Float8(a), Datum::Float8(b)) => match (a.is_nan(), b.is_nan()) {
+                // PostgreSQL: NaN sorts after every non-NaN, NaNs compare
+                // equal, and positive/negative zero compare equal.
+                (true, true) => Some(std::cmp::Ordering::Equal),
+                (true, false) => Some(std::cmp::Ordering::Greater),
+                (false, true) => Some(std::cmp::Ordering::Less),
+                (false, false) => a.partial_cmp(b),
+            },
             (Datum::Timestamptz(a), Datum::Timestamptz(b)) => Some(a.cmp(b)),
             (Datum::Uuid(a), Datum::Uuid(b)) => Some(a.cmp(b)),
             (Datum::Text(a), Datum::Text(b)) => Some(a.cmp(b)),
@@ -322,13 +362,14 @@ impl Datum {
         match self {
             Datum::Int4(_) => ColumnType::Int4,
             Datum::Int8(_) => ColumnType::Int8,
+            Datum::Float8(_) => ColumnType::Float8,
             Datum::Timestamptz(_) => ColumnType::Timestamptz,
             Datum::Uuid(_) => ColumnType::Uuid,
             Datum::Text(_) => ColumnType::Text,
             Datum::Bytea(_) => ColumnType::Bytea,
             Datum::Vector(v) => ColumnType::Vector(v.len() as u32),
-            // An external pointer stands in for a varlena column; the schema
-            // (Text or Bytea) decides how the detoasted bytes are read.
+            // An external pointer stands in for a TOASTable column; the schema
+            // (Text, Bytea, or Vector) decides how detoasted bytes are read.
             Datum::External(_) => ColumnType::Bytea,
         }
     }
@@ -387,6 +428,8 @@ fn encode_tuple_impl(
     let mut has_null = false;
     let mut has_varwidth = false;
     let mut has_external = false;
+    let mut has_vector_external = false;
+    let mut has_inline_vector = false;
     for (col, val) in columns.iter().zip(values.iter()) {
         // A Vector schema column carries its own validity domain. The
         // `ColumnType::vector` constructor enforces it, but the enum is
@@ -398,10 +441,10 @@ fn encode_tuple_impl(
         match val {
             None => has_null = true,
             Some(datum) => {
-                // External pointers stand in for either varlena type; a
-                // vector datum must match the column's dim exactly.
+                // External pointers stand in for any TOASTable type; an
+                // inline vector datum must match the column's dim exactly.
                 let matches = match (col, datum) {
-                    (_, Datum::External(_)) => col.fixed_width().is_none(),
+                    (_, Datum::External(_)) => crate::toast::toastable(*col),
                     (ColumnType::Vector(dim), Datum::Vector(v)) => v.len() == *dim as usize,
                     (col, datum) => *col == datum.column_type(),
                 };
@@ -410,7 +453,14 @@ fn encode_tuple_impl(
                         "datum {datum:?} does not match column type {col:?}"
                     )));
                 }
-                if col.fixed_width().is_none() {
+                if matches!(col, ColumnType::Vector(_)) {
+                    if matches!(datum, Datum::External(_)) {
+                        has_vector_external = true;
+                    } else {
+                        has_inline_vector = true;
+                    }
+                }
+                if col.fixed_width().is_none() || matches!(datum, Datum::External(_)) {
                     has_varwidth = true;
                 }
                 if matches!(datum, Datum::External(_)) {
@@ -418,6 +468,11 @@ fn encode_tuple_impl(
                 }
             }
         }
+    }
+    if has_vector_external && has_inline_vector {
+        return Err(HeapError::InvalidArgument(
+            "mixed inline and external VECTOR columns are not supported".to_string(),
+        ));
     }
 
     let bitmap_len = if has_null { natts.div_ceil(8) } else { 0 };
@@ -430,6 +485,12 @@ fn encode_tuple_impl(
         | (if has_varwidth { HEAP_HASVARWIDTH } else { 0 })
         | (if has_external { HEAP_HASEXTERNAL } else { 0 });
     header.t_infomask2 = (header.t_infomask2 & !HEAP_NATTS_MASK) | natts as u16;
+    header.t_infomask2 = (header.t_infomask2 & !HEAP_VECTOR_EXTERNAL)
+        | if has_vector_external {
+            HEAP_VECTOR_EXTERNAL
+        } else {
+            0
+        };
     // The trailing-NodeId signal is driven by the argument, never by a
     // caller-set bit (defense in depth: a stale bit without the payload —
     // or vice versa — would mis-size every later read).
@@ -465,6 +526,7 @@ fn encode_tuple_impl(
         match val {
             Datum::Int4(v) => out.extend_from_slice(&v.to_le_bytes()),
             Datum::Int8(v) | Datum::Timestamptz(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Datum::Float8(v) => out.extend_from_slice(&v.to_le_bytes()),
             Datum::Uuid(v) => out.extend_from_slice(v.as_bytes()),
             Datum::Text(s) => write_inline_varlena(&mut out, s.as_bytes())?,
             Datum::Bytea(b) => write_inline_varlena(&mut out, b)?,
@@ -567,27 +629,43 @@ pub fn decode_tuple(
         }
         let datum = match col.fixed_width() {
             Some(width) => {
-                let field = take(bytes, &mut pos, width)?;
-                match col {
-                    ColumnType::Int4 => Datum::Int4(i32::from_le_bytes(field.try_into().unwrap())),
-                    ColumnType::Int8 => Datum::Int8(i64::from_le_bytes(field.try_into().unwrap())),
-                    ColumnType::Timestamptz => {
-                        Datum::Timestamptz(i64::from_le_bytes(field.try_into().unwrap()))
-                    }
-                    ColumnType::Uuid => {
-                        Datum::Uuid(uuid::Uuid::from_bytes(field.try_into().unwrap()))
-                    }
-                    ColumnType::Vector(dim) => {
-                        // `field` is exactly `dim × 4` bytes (the fixed
-                        // width); dim was range-checked above, so this
-                        // allocation is bounded by MAX_VECTOR_DIM.
-                        let mut v = Vec::with_capacity(*dim as usize);
-                        for chunk in field.chunks_exact(4) {
-                            v.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                // VECTOR uses the tuple-level all-external bit, never payload
+                // bytes: every f32 bit pattern is legal inline data.
+                let vector_external = matches!(col, ColumnType::Vector(_))
+                    && header.t_infomask2 & HEAP_VECTOR_EXTERNAL != 0;
+                if vector_external {
+                    let raw = take(bytes, &mut pos, TOAST_POINTER_SIZE)?;
+                    Datum::External(ToastPointer::decode(raw)?)
+                } else {
+                    let field = take(bytes, &mut pos, width)?;
+                    match col {
+                        ColumnType::Int4 => {
+                            Datum::Int4(i32::from_le_bytes(field.try_into().unwrap()))
                         }
-                        Datum::Vector(v)
+                        ColumnType::Int8 => {
+                            Datum::Int8(i64::from_le_bytes(field.try_into().unwrap()))
+                        }
+                        ColumnType::Float8 => {
+                            Datum::Float8(f64::from_le_bytes(field.try_into().unwrap()))
+                        }
+                        ColumnType::Timestamptz => {
+                            Datum::Timestamptz(i64::from_le_bytes(field.try_into().unwrap()))
+                        }
+                        ColumnType::Uuid => {
+                            Datum::Uuid(uuid::Uuid::from_bytes(field.try_into().unwrap()))
+                        }
+                        ColumnType::Vector(dim) => {
+                            // `field` is exactly `dim × 4` bytes (the fixed
+                            // width); dim was range-checked above, so this
+                            // allocation is bounded by MAX_VECTOR_DIM.
+                            let mut v = Vec::with_capacity(*dim as usize);
+                            for chunk in field.chunks_exact(4) {
+                                v.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                            }
+                            Datum::Vector(v)
+                        }
+                        ColumnType::Text | ColumnType::Bytea => unreachable!(),
                     }
-                    ColumnType::Text | ColumnType::Bytea => unreachable!(),
                 }
             }
             None => {
@@ -818,6 +896,77 @@ mod tests {
         assert_ne!(header.t_infomask & HEAP_HASNULL, 0);
     }
 
+    #[test]
+    fn vector_external_pointer_roundtrip_and_float_tag_is_not_misread() {
+        let pointer = ToastPointer {
+            va_rawsize: 8,
+            va_extsize: 8,
+            va_valueid: 7,
+            va_toastrelid: 16_400,
+        };
+        let columns = [ColumnType::vector(2).unwrap()];
+        let external = vec![Some(Datum::External(pointer))];
+        let bytes = encode_tuple(sample_header(), &columns, &external).unwrap();
+        assert_eq!(bytes.len(), 64 + TOAST_POINTER_SIZE);
+        assert_eq!(
+            u32::from_le_bytes(bytes[64..68].try_into().unwrap()),
+            TOAST_POINTER_SIZE as u32 | VARLENA_EXTERNAL_FLAG
+        );
+        let (header, decoded) = decode_tuple(&bytes, &columns).unwrap();
+        assert_eq!(decoded, external);
+        assert_ne!(header.t_infomask2 & HEAP_VECTOR_EXTERNAL, 0);
+
+        // The exact pointer header is also a legal f32 bit pattern. With no
+        // all-external VECTOR flag it must remain inline regardless of bytes.
+        let inline = vec![Some(Datum::Vector(vec![f32::from_bits(0x4000_0014), 0.0]))];
+        let bytes = encode_tuple(sample_header(), &columns, &inline).unwrap();
+        let (header, decoded) = decode_tuple(&bytes, &columns).unwrap();
+        assert_eq!(decoded, inline);
+        assert_eq!(header.t_infomask2 & HEAP_VECTOR_EXTERNAL, 0);
+    }
+
+    #[test]
+    fn inline_vector_header_bits_survive_an_external_text_sibling() {
+        let pointer = ToastPointer {
+            va_rawsize: 4,
+            va_extsize: 4,
+            va_valueid: 9,
+            va_toastrelid: 16_400,
+        };
+        let columns = [ColumnType::vector(1).unwrap(), ColumnType::Text];
+        let values = vec![
+            Some(Datum::Vector(vec![f32::from_bits(0x4000_0014)])),
+            Some(Datum::External(pointer)),
+        ];
+        let bytes = encode_tuple(sample_header(), &columns, &values).unwrap();
+        let (header, decoded) = decode_tuple(&bytes, &columns).unwrap();
+        assert_eq!(decoded, values);
+        assert_eq!(header.t_infomask2 & HEAP_VECTOR_EXTERNAL, 0);
+        assert_ne!(header.t_infomask & HEAP_HASEXTERNAL, 0);
+    }
+
+    #[test]
+    fn mixed_inline_and_external_vector_columns_are_rejected() {
+        let pointer = ToastPointer {
+            va_rawsize: 4,
+            va_extsize: 4,
+            va_valueid: 9,
+            va_toastrelid: 16_400,
+        };
+        let columns = [
+            ColumnType::vector(1).unwrap(),
+            ColumnType::vector(1).unwrap(),
+        ];
+        let values = vec![
+            Some(Datum::External(pointer)),
+            Some(Datum::Vector(vec![0.5])),
+        ];
+        assert!(matches!(
+            encode_tuple(sample_header(), &columns, &values),
+            Err(HeapError::InvalidArgument(_))
+        ));
+    }
+
     /// Boundary dims: 1 and MAX_VECTOR_DIM round-trip; 0 and
     /// MAX_VECTOR_DIM + 1 are rejected by the constructor. The dim-2000
     /// tuple is 64 + 8000 = 8064 bytes — under the 8 KiB page's
@@ -978,5 +1127,43 @@ mod tests {
         let (h2, _) = decode_tuple(&clean, &columns).unwrap();
         assert_eq!(h2.t_infomask2 & HEAP_HAS_NODEID, 0);
         assert_eq!(tuple_node_id(&clean, &columns).unwrap(), None);
+    }
+
+    #[test]
+    fn float8_roundtrip_preserves_value_bits() {
+        let columns = [ColumnType::Float8, ColumnType::Float8];
+        let values = vec![Some(Datum::Float8(-0.0)), Some(Datum::Float8(1.25))];
+        let bytes = encode_tuple(sample_header(), &columns, &values).unwrap();
+        let (_, decoded) = decode_tuple(&bytes, &columns).unwrap();
+        let [Some(Datum::Float8(negative_zero)), Some(Datum::Float8(value))] = &decoded[..] else {
+            panic!("unexpected FLOAT8 decode: {decoded:?}")
+        };
+        assert_eq!(negative_zero.to_bits(), (-0.0f64).to_bits());
+        assert_eq!(value.to_bits(), 1.25f64.to_bits());
+    }
+
+    #[test]
+    fn float8_nan_ordering_matches_postgresql() {
+        let nan = Datum::Float8(f64::NAN);
+        let one = Datum::Float8(1.0);
+        assert_eq!(nan.partial_cmp(&one), Some(std::cmp::Ordering::Greater));
+        assert_eq!(one.partial_cmp(&nan), Some(std::cmp::Ordering::Less));
+        assert_eq!(nan.partial_cmp(&nan), Some(std::cmp::Ordering::Equal));
+        assert_eq!(
+            Datum::Float8(0.0).partial_cmp(&Datum::Float8(-0.0)),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn float8_equality_matches_postgresql() {
+        assert_eq!(Datum::Float8(f64::NAN), Datum::Float8(f64::NAN));
+        assert_eq!(Datum::Float8(0.0), Datum::Float8(-0.0));
+        assert_eq!(Datum::Float8(f64::INFINITY), Datum::Float8(f64::INFINITY));
+        assert_eq!(
+            Datum::Float8(f64::NEG_INFINITY),
+            Datum::Float8(f64::NEG_INFINITY)
+        );
+        assert_ne!(Datum::Float8(f64::NAN), Datum::Float8(1.0));
     }
 }

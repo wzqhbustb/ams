@@ -1,6 +1,5 @@
 //! M6 Stage C slice C-4: the SQL minimum — `VECTOR(n)` column type in
-//! CREATE TABLE and `[v0, v1, ...]` vector literals in INSERT (selection
-//! §11). The ANN operator and CREATE INDEX are Phase 4b (not here).
+//! CREATE TABLE and `[v0, v1, ...]` vector literals in INSERT (selection §11).
 
 use pg_am_heap::Datum;
 use pg_engine::{Engine, EngineConfig, QueryResult};

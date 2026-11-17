@@ -132,17 +132,19 @@ use pg_am_btree::{
 use pg_am_heap::access_method::{
     DeleteContext, InsertContext, RelationDesc, ScanContext, UpdateContext, Vacuumable,
 };
+use pg_am_heap::heap_am::MAX_TUPLE_BYTES;
 use pg_am_heap::line_pointer::LINE_POINTER_SIZE;
+use pg_am_heap::toast::{inline_size, toastable, ToastRelation, TOAST_TUPLE_THRESHOLD};
 use pg_am_heap::tuple::{decode_tuple, encode_tuple, ColumnType, Datum, TupleHeader};
 use pg_am_heap::{
     heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM,
 };
-use pg_catalog::builtin_types::{column_type_of_attr, BUILTIN_TYPES, VECTOR_OID};
+use pg_catalog::builtin_types::{column_type_of_attr, BUILTIN_TYPES, FLOAT8_OID, VECTOR_OID};
 use pg_catalog::system_tables::{
     SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, PG_ATTRIBUTE, PG_CLASS, PG_INDEX, PG_RELPAGES,
     RELKIND_INDEX, RELKIND_TABLE,
 };
-use pg_catalog::{Catalog, RelationRow, TypeOid};
+use pg_catalog::{Catalog, TableOid, TypeOid};
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::clog::ClogFlush;
 use pg_storage::config::StorageConfig;
@@ -160,7 +162,16 @@ use pg_txn::{
 
 use crate::error::{EngineError, Result};
 use crate::query_stats::{ExecutionPath, QueryStatEntry, QueryStats, DEFAULT_QUERY_STATS_CAPACITY};
-use crate::sql::{self, CmpOp, Filter, Literal, LockClause, OrderBy, SelectCols, Statement};
+use crate::sequence::{
+    attrdefaults_table, sequence_class_row, sequences_table, SequenceManager,
+    PG_RUST_ATTRDEFAULTS_NAME, PG_RUST_ATTRDEFAULTS_OID, PG_RUST_SEQUENCES_NAME,
+    PG_RUST_SEQUENCES_OID, RELKIND_INTERNAL, RELKIND_SEQUENCE,
+};
+use crate::session::SqlSession;
+use crate::sql::{
+    self, CmpOp, Expr, Filter, Literal, LockClause, OrderByExpr, OrderByKind, SelectCols,
+    SelectItem, SequenceFunction, Statement,
+};
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
 ///
@@ -180,6 +191,7 @@ pub const DEFAULT_CLOG_BUFFER_FRAMES: usize = 8;
 /// takes a unique instance ID at open, and [`TxnHandle`]s carry it so a
 /// handle created by one engine cannot be executed against another.
 static NEXT_ENGINE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SQL_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// What a transaction did to one index entry, for undo purposes (Stage O
 /// review: index maintenance is not MVCC-covered by heap headers, so the
@@ -278,7 +290,7 @@ pub struct ColumnDef {
 /// exists between the engine API and the AM.
 pub type Value = Option<Datum>;
 
-/// The outcome of an [`Engine::exec`] call.
+/// The outcome of an [`Engine::exec`] or [`Engine::exec_with_params`] call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryResult {
     /// A SELECT result set.
@@ -363,6 +375,12 @@ pub struct TableEntry {
     pub first_page: PageId,
     /// Column schema in `attnum` order.
     pub columns: Vec<ColumnDef>,
+    /// Optional sequence OID used as each column's default value.
+    pub defaults: Vec<Option<Oid>>,
+    /// Hidden chunk heap for TOASTable columns. Its first page is persisted
+    /// in the main table's `pg_rust_relpages.last_page` slot; no catalog row
+    /// is added for the hidden relation.
+    pub toast: Option<ToastRelation>,
 }
 
 /// One entry of the engine's in-memory index registry (M2b Stage M wave 2).
@@ -411,6 +429,9 @@ pub struct VacuumStats {
     /// (`EntryNotFound` → Ok at the vacuum call site): eager online index
     /// maintenance had removed them.
     pub index_entries_already_gone: usize,
+    /// Physical TOAST chunk rows reclaimed after main-row reclamation. This
+    /// directly proves that the pass performed out-of-line garbage collection.
+    pub toast_chunks_reclaimed: usize,
 }
 
 /// The default leak-ratio threshold for [`Engine::hnsw_leak_report`] (M6
@@ -537,9 +558,10 @@ pub struct Engine {
     /// commit AND abort, so the map never leaks committed transactions.
     index_undo: Arc<Mutex<HashMap<TxnId, Vec<IndexUndo>>>>,
     /// Query statistics ring buffer (M3 Stage E, tech-selection §6.3):
-    /// [`Self::exec`] records one entry per statement — see
-    /// [`Self::query_stats`].
+    /// [`Self::exec`] and [`Self::exec_with_params`] record one entry per
+    /// statement — see [`Self::query_stats`].
     query_stats: QueryStats,
+    sequences: SequenceManager,
 }
 
 /// A handle to an explicit transaction (§21 M2b API).
@@ -950,6 +972,16 @@ fn pending_map_remove(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_AUTO_COMMIT_HOOK: std::cell::Cell<Option<fn()>> =
+        std::cell::Cell::new(None);
+    static BEFORE_HNSW_PUBLISH_HOOK: std::cell::Cell<Option<fn()>> =
+        std::cell::Cell::new(None);
+    static BEFORE_DROP_CLEANUP_HOOK: std::cell::Cell<Option<fn()>> =
+        std::cell::Cell::new(None);
+}
+
 impl Engine {
     /// Open (or create) a database at `data_dir`, assembling all layers.
     ///
@@ -970,10 +1002,12 @@ impl Engine {
         //    Phase 2 M5 Stage C slice 1: the seven HNSW handlers (121–127)
         //    register through pg_am_hnsw::redo::hnsw_redo_handlers
         //    (tech-selection §2).
+        let sequences = SequenceManager::default();
         let mut redo_handlers = heap_redo_handlers();
         redo_handlers.extend(txn_redo_handlers());
         redo_handlers.extend(btree_redo_handlers());
         redo_handlers.extend(pg_am_hnsw::redo::hnsw_redo_handlers());
+        redo_handlers.push(Box::new(sequences.redo_handler()));
         let undo_handlers: Vec<Box<dyn UndoHandler>> =
             vec![Box::new(HeapUndoHandler), Box::new(BTreeUndoHandler)];
         let storage = StorageEngine::open_with_redo_and_clog(
@@ -1055,8 +1089,8 @@ impl Engine {
 
         // 7. Table registry from the catalog, index registry from the
         //    `pg_index` heap chain.
-        let registry = Self::build_registry(&catalog)?;
-        let indexes = Self::build_index_registry(&catalog, &heap, clog.as_ref())?;
+        let registry = Self::build_registry(&catalog, &heap, &txn, clog.as_ref(), &HashMap::new())?;
+        let indexes = Self::build_index_registry(&catalog, &heap, clog.as_ref(), &registry)?;
 
         // 8. Lock manager (sharing the victim registry) and the deadlock
         //    detector thread (M2c Stage R, §9.3). Started LAST, once both
@@ -1085,7 +1119,14 @@ impl Engine {
             instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             index_undo: Arc::new(Mutex::new(HashMap::new())),
             query_stats: QueryStats::new(config.query_stats_capacity),
+            sequences,
         };
+        engine.initialize_sequences()?;
+
+        // 7b. Stage D migration for pre-TOAST directories. New tables already
+        //     carry reltoastrelid; legacy TOASTable tables get the hidden heap
+        //     and catalog metadata once, transactionally, before any DML.
+        engine.install_missing_toast_relations()?;
 
         // 7c. Recovery-time index compensation for loser transactions
         //     (Stage T stress finding): index maintenance WAL records are
@@ -1108,52 +1149,168 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Rebuild the table registry from the catalog snapshot.
-    ///
-    /// `pg_class` rows are folded **last-version-wins per OID** in slot
-    /// order: `drop_table` appends a `relkind = 'd'` version after the live
-    /// one, and a fresh insert always appends, so the last row for an OID is
-    /// its current state. System catalogs (OID < `FIRST_USER`) are not user
-    /// tables and are skipped.
-    fn build_registry(catalog: &Catalog) -> Result<HashMap<String, TableEntry>> {
-        let mut live: HashMap<u64, &RelationRow> = HashMap::new();
-        for row in catalog.relations() {
-            if row.kind == RELKIND_DROPPED {
-                live.remove(&row.oid.raw().0);
+    /// Rebuild the table registry through a fresh MVCC heap scan. Raw
+    /// last-version-wins cannot distinguish an aborted DROP marker from a
+    /// committed one, so recovery must use visibility rather than slot order.
+    fn default_map(&self) -> Result<HashMap<(i64, i32), Oid>> {
+        let Some(first_page) = self
+            .sequences
+            .relation_pages
+            .lock()
+            .get(&PG_RUST_ATTRDEFAULTS_OID)
+            .copied()
+        else {
+            return Ok(HashMap::new());
+        };
+        let (snapshot, _guard) = self.txn.snapshot(TxnId::INVALID);
+        let def = attrdefaults_table(first_page);
+        let columns = def.column_types();
+        let rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page,
+                columns: &columns,
+            },
+            snapshot: &snapshot,
+            clog: self.clog.as_ref(),
+        })?;
+        let class_columns = PG_CLASS.column_types();
+        let class_rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_CLASS.oid.raw(),
+                first_page: PG_CLASS.first_page,
+                columns: &class_columns,
+            },
+            snapshot: &snapshot,
+            clog: self.clog.as_ref(),
+        })?;
+        let live_tables: HashSet<i64> = class_rows
+            .into_iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(2)) {
+                (Some(Some(Datum::Int8(oid))), Some(Some(Datum::Text(kind))))
+                    if kind == RELKIND_TABLE =>
+                {
+                    Some(*oid)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut defaults = HashMap::new();
+        for (_tid, values) in rows {
+            let (
+                Some(Some(Datum::Int8(rel_oid))),
+                Some(Some(Datum::Int4(attnum))),
+                Some(Some(Datum::Int8(sequence_oid))),
+            ) = (values.first(), values.get(1), values.get(2))
+            else {
+                return Err(EngineError::Corrupted(
+                    "malformed pg_rust_attrdefaults row".to_string(),
+                ));
+            };
+            // A pre-fix DROP could leave SERIAL metadata behind. Orphaned
+            // defaults are ignored just like orphaned index catalog rows.
+            if !live_tables.contains(rel_oid) {
+                continue;
+            }
+            if *attnum <= 0 {
+                return Err(EngineError::Corrupted(format!(
+                    "invalid default attnum {attnum} for relation {rel_oid}"
+                )));
+            }
+            let sequence_oid = u64::try_from(*sequence_oid).map_err(|_| {
+                EngineError::Corrupted(format!("negative default sequence OID {sequence_oid}"))
+            })?;
+            if !self
+                .sequences
+                .states
+                .lock()
+                .contains_key(&Oid(sequence_oid))
+            {
+                return Err(EngineError::Corrupted(format!(
+                    "default for relation {rel_oid} references missing sequence {sequence_oid}"
+                )));
+            }
+            if defaults
+                .insert((*rel_oid, *attnum), Oid(sequence_oid))
+                .is_some()
+            {
+                return Err(EngineError::Corrupted(format!(
+                    "duplicate default for relation {rel_oid} attnum {attnum}"
+                )));
+            }
+        }
+        Ok(defaults)
+    }
+
+    fn build_registry(
+        catalog: &Catalog,
+        heap: &HeapAM,
+        txn: &TxnManager,
+        clog: &dyn ClogAccessor,
+        default_map: &HashMap<(i64, i32), Oid>,
+    ) -> Result<HashMap<String, TableEntry>> {
+        let (snapshot, _guard) = txn.snapshot(TxnId::INVALID);
+        let columns = PG_CLASS.column_types();
+        let rows = heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_CLASS.oid.raw(),
+                first_page: PG_CLASS.first_page,
+                columns: &columns,
+            },
+            snapshot: &snapshot,
+            clog,
+        })?;
+        let mut live: HashMap<i64, Vec<Value>> = HashMap::new();
+        for (_, values) in rows {
+            let (Some(Some(Datum::Int8(oid))), Some(Some(Datum::Text(kind)))) =
+                (values.first(), values.get(2))
+            else {
+                continue;
+            };
+            if kind == RELKIND_DROPPED {
+                live.remove(oid);
             } else {
-                live.insert(row.oid.raw().0, row);
+                live.insert(*oid, values);
             }
         }
 
         let mut registry = HashMap::new();
-        for row in live.into_values() {
-            let oid = row.oid.raw();
-            if oid.0 < Oid::FIRST_USER.0 {
+        for (raw_oid, values) in live {
+            let oid = u64::try_from(raw_oid)
+                .map_err(|_| EngineError::Corrupted(format!("negative pg_class OID {raw_oid}")))?;
+            if oid < Oid::FIRST_USER.0 {
                 continue;
             }
-            if row.kind != RELKIND_TABLE {
-                // Index relations (`relkind = 'i'`, Stage M wave 2) are NOT
-                // tables: they carry no heap chain and must never be reached
-                // through the DML API. They live in the index registry
-                // (`build_index_registry`), keyed by (table, column).
+            let kind = match values.get(2) {
+                Some(Some(Datum::Text(kind))) => kind,
+                _ => continue,
+            };
+            if kind != RELKIND_TABLE {
                 continue;
             }
-            let Some(relpages) = catalog.relpages_of(row.oid) else {
-                // Half-created table from a crash mid-create_table (module
-                // docs, "DDL crash atomicity"): leak the pages, skip the row.
+            let name = match values.get(1) {
+                Some(Some(Datum::Text(name))) => name.clone(),
+                _ => continue,
+            };
+            let natts = match values.get(3) {
+                Some(Some(Datum::Int4(natts))) => *natts,
+                _ => continue,
+            };
+            let table_oid = TableOid::new(Oid(oid));
+            let Some(relpages) = catalog.relpages_of(table_oid) else {
                 tracing::warn!(
-                    table = %row.name,
-                    oid = oid.0,
+                    table = %name,
+                    oid = oid,
                     "pg_class row without pg_rust_relpages entry; skipping half-created table"
                 );
                 continue;
             };
-            let mut columns = Vec::with_capacity(row.natts as usize);
-            for attr in catalog.attributes_of(row.oid) {
+            let mut columns = Vec::with_capacity(natts as usize);
+            for attr in catalog.attributes_of(table_oid) {
                 let col_type = column_type_of_attr(attr.type_oid, attr.len).ok_or_else(|| {
                     EngineError::Corrupted(format!(
                         "{}.{}: unknown type OID {:?} or malformed vector len {}",
-                        row.name, attr.name, attr.type_oid, attr.len
+                        name, attr.name, attr.type_oid, attr.len
                     ))
                 })?;
                 columns.push(ColumnDef {
@@ -1161,20 +1318,50 @@ impl Engine {
                     col_type,
                 });
             }
+            let toast = match values.get(4) {
+                Some(Some(Datum::Int8(raw_toast_oid))) if *raw_toast_oid != 0 => {
+                    let toast_oid = u64::try_from(*raw_toast_oid).map_err(|_| {
+                        EngineError::Corrupted(format!(
+                            "negative reltoastrelid {raw_toast_oid} for table {name:?}"
+                        ))
+                    })?;
+                    if toast_oid > u32::MAX as u64 {
+                        return Err(EngineError::Corrupted(format!(
+                            "reltoastrelid {toast_oid} exceeds the 20-byte pointer's u32 range"
+                        )));
+                    }
+                    let toast = ToastRelation {
+                        rel_oid: Oid(toast_oid),
+                        first_page: relpages.last_page,
+                    };
+                    heap.register_toast_relation(Oid(oid), toast)?;
+                    Some(toast)
+                }
+                Some(Some(Datum::Int8(_))) => None,
+                _ => {
+                    return Err(EngineError::Corrupted(format!(
+                        "table {name:?} has malformed pg_class.reltoastrelid"
+                    )))
+                }
+            };
             if registry
                 .insert(
-                    row.name.clone(),
+                    name.clone(),
                     TableEntry {
-                        oid,
+                        oid: Oid(oid),
                         first_page: relpages.first_page,
+                        defaults: (0..columns.len())
+                            .map(|index| default_map.get(&(raw_oid, index as i32 + 1)).copied())
+                            .collect(),
                         columns,
+                        toast,
                     },
                 )
                 .is_some()
             {
                 return Err(EngineError::Corrupted(format!(
                     "duplicate live pg_class rows for table {:?}",
-                    row.name
+                    name
                 )));
             }
         }
@@ -1196,6 +1383,7 @@ impl Engine {
         catalog: &Catalog,
         heap: &HeapAM,
         clog: &dyn ClogAccessor,
+        tables: &HashMap<String, TableEntry>,
     ) -> Result<Vec<IndexEntry>> {
         let columns = PG_INDEX.column_types();
         let rows = heap.scan(ScanContext {
@@ -1217,6 +1405,12 @@ impl Engine {
                 ));
             };
             let index_oid = Oid(*indexrelid as u64);
+            let table_oid = Oid(*indrelid as u64);
+            if !tables.values().any(|entry| entry.oid == table_oid) {
+                // DROP TABLE leaves index rows behind, but an index whose
+                // parent is dropped is unreachable and must not be rebuilt.
+                continue;
+            }
             let attrs = catalog.attributes_of(pg_catalog::TableOid(index_oid));
             let relpages = catalog.relpages_of(pg_catalog::TableOid(index_oid));
             let (Some(attr), Some(relpages)) = (attrs.first(), relpages) else {
@@ -1271,18 +1465,740 @@ impl Engine {
         self.storage.shutdown();
     }
 
+    fn initialize_sequences(&self) -> Result<()> {
+        self.ensure_sequence_relation(
+            PG_RUST_SEQUENCES_OID,
+            PG_RUST_SEQUENCES_NAME,
+            sequences_table,
+        )?;
+        self.ensure_sequence_relation(
+            PG_RUST_ATTRDEFAULTS_OID,
+            PG_RUST_ATTRDEFAULTS_NAME,
+            attrdefaults_table,
+        )?;
+        self.recover_sequences()?;
+        let defaults = self.default_map()?;
+        let registry = Self::build_registry(
+            &self.catalog,
+            &self.heap,
+            &self.txn,
+            self.clog.as_ref(),
+            &defaults,
+        )?;
+        *self.registry.write() = registry;
+        Ok(())
+    }
+
+    fn live_sequence_relation_page(&self, oid: Oid, name: &str) -> Result<Option<PageId>> {
+        let (snapshot, _guard) = self.txn.snapshot(TxnId::INVALID);
+        let class_columns = PG_CLASS.column_types();
+        let class_rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_CLASS.oid.raw(),
+                first_page: PG_CLASS.first_page,
+                columns: &class_columns,
+            },
+            snapshot: &snapshot,
+            clog: self.clog.as_ref(),
+        })?;
+        let mut live_class = false;
+        for (_, values) in class_rows {
+            let (
+                Some(Some(Datum::Int8(row_oid))),
+                Some(Some(Datum::Text(row_name))),
+                Some(Some(Datum::Text(kind))),
+            ) = (values.first(), values.get(1), values.get(2))
+            else {
+                continue;
+            };
+            if *row_oid == oid.0 as i64 {
+                if row_name != name || kind != RELKIND_INTERNAL {
+                    return Err(EngineError::Corrupted(format!(
+                        "sequence catalog {name} has inconsistent pg_class metadata"
+                    )));
+                }
+                live_class = true;
+            }
+        }
+        let relpages_columns = PG_RELPAGES.column_types();
+        let relpages_rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_RELPAGES.oid.raw(),
+                first_page: PG_RELPAGES.first_page,
+                columns: &relpages_columns,
+            },
+            snapshot: &snapshot,
+            clog: self.clog.as_ref(),
+        })?;
+        let first_page = relpages_rows.into_iter().find_map(|(_, values)| {
+            if values.first() == Some(&Some(Datum::Int8(oid.0 as i64))) {
+                let Some(Some(Datum::Int8(first_page))) = values.get(1) else {
+                    return None;
+                };
+                return Some(PageId(*first_page as u64));
+            }
+            None
+        });
+        match (live_class, first_page) {
+            (true, Some(first_page)) => Ok(Some(first_page)),
+            (false, None) => Ok(None),
+            _ => Err(EngineError::Corrupted(format!(
+                "sequence catalog {name} is only partially present"
+            ))),
+        }
+    }
+
+    fn ensure_sequence_relation(
+        &self,
+        oid: Oid,
+        name: &str,
+        make_def: fn(PageId) -> SystemTableDef,
+    ) -> Result<()> {
+        if let Some(first_page) = self.live_sequence_relation_page(oid, name)? {
+            self.sequences.relation_pages.lock().insert(oid, first_page);
+            return Ok(());
+        }
+
+        let first_page = self.heap.create_heap(oid)?;
+        let def = make_def(first_page);
+        self.auto_commit_with_hooks(
+            |snap| {
+                self.lock_oid(snap.current_xid(), oid, LockMode::AccessExclusive)?;
+                let class_row = vec![
+                    Some(Datum::Int8(oid.0 as i64)),
+                    Some(Datum::Text(name.to_string())),
+                    Some(Datum::Text(RELKIND_INTERNAL.to_string())),
+                    Some(Datum::Int4(def.columns.len() as i32)),
+                    Some(Datum::Int8(0)),
+                    Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
+                ];
+                self.insert_catalog_row(snap, &PG_CLASS, &class_row)?;
+                if crate::sequence::test_hooks::fail_internal_catalog_write() {
+                    return Err(EngineError::InvalidArgument(
+                        "injected internal sequence catalog write failure".to_string(),
+                    ));
+                }
+                for (index, column) in def.columns.iter().enumerate() {
+                    self.insert_catalog_row(
+                        snap,
+                        &PG_ATTRIBUTE,
+                        &[
+                            Some(Datum::Int8(oid.0 as i64)),
+                            Some(Datum::Text(column.name.to_string())),
+                            Some(Datum::Int8(column.type_oid.raw().0 as i64)),
+                            Some(Datum::Int4(column.len)),
+                            Some(Datum::Int4(index as i32 + 1)),
+                            Some(Datum::Int4(0)),
+                            Some(Datum::Int4(1)),
+                        ],
+                    )?;
+                }
+                self.insert_catalog_row(
+                    snap,
+                    &PG_RELPAGES,
+                    &[
+                        Some(Datum::Int8(oid.0 as i64)),
+                        Some(Datum::Int8(first_page.0 as i64)),
+                        Some(Datum::Int8(first_page.0 as i64)),
+                        Some(Datum::Int8(1)),
+                    ],
+                )
+            },
+            || {
+                self.sequences.relation_pages.lock().insert(oid, first_page);
+                Ok(())
+            },
+            || {},
+        )
+    }
+
+    fn sequence_relation(&self) -> Result<SystemTableDef> {
+        let first_page = self
+            .sequences
+            .relation_pages
+            .lock()
+            .get(&PG_RUST_SEQUENCES_OID)
+            .copied()
+            .ok_or_else(|| {
+                EngineError::Corrupted("pg_rust_sequences is not registered".to_string())
+            })?;
+        Ok(sequences_table(first_page))
+    }
+
+    fn attrdefaults_relation(&self) -> Result<SystemTableDef> {
+        let first_page = self
+            .sequences
+            .relation_pages
+            .lock()
+            .get(&PG_RUST_ATTRDEFAULTS_OID)
+            .copied()
+            .ok_or_else(|| {
+                EngineError::Corrupted("pg_rust_attrdefaults is not registered".to_string())
+            })?;
+        Ok(attrdefaults_table(first_page))
+    }
+
+    fn recover_sequences(&self) -> Result<()> {
+        let (snapshot, _guard) = self.txn.snapshot(TxnId::INVALID);
+        let scan = |def: &SystemTableDef| -> Result<Vec<(Tid, Vec<Value>)>> {
+            let columns = def.column_types();
+            Ok(self.heap.scan(ScanContext {
+                rel: RelationDesc {
+                    rel_oid: def.oid.raw(),
+                    first_page: def.first_page,
+                    columns: &columns,
+                },
+                snapshot: &snapshot,
+                clog: self.clog.as_ref(),
+            })?)
+        };
+        let rows = scan(&self.sequence_relation()?)?;
+        let class_rows = scan(&PG_CLASS)?;
+        let default_rows = scan(&self.attrdefaults_relation()?)?;
+        let live_tables: HashSet<i64> = class_rows
+            .iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(2)) {
+                (Some(Some(Datum::Int8(oid))), Some(Some(Datum::Text(kind))))
+                    if kind == RELKIND_TABLE =>
+                {
+                    Some(*oid)
+                }
+                _ => None,
+            })
+            .collect();
+        let sequence_parents: HashMap<i64, i64> = default_rows
+            .into_iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(2)) {
+                (Some(Some(Datum::Int8(rel_oid))), Some(Some(Datum::Int8(sequence_oid)))) => {
+                    Some((*sequence_oid, *rel_oid))
+                }
+                _ => None,
+            })
+            .collect();
+        let live_classes: HashMap<i64, Vec<Value>> = class_rows
+            .into_iter()
+            .filter_map(|(_, values)| match values.first() {
+                Some(Some(Datum::Int8(oid))) => Some((*oid, values)),
+                _ => None,
+            })
+            .collect();
+        let recovered = self.sequences.recovered_high_water();
+        for (_tid, values) in rows {
+            let (
+                Some(Some(Datum::Int8(raw_oid))),
+                Some(Some(Datum::Text(name))),
+                Some(Some(Datum::Int8(high_water))),
+            ) = (values.first(), values.get(1), values.get(2))
+            else {
+                return Err(EngineError::Corrupted(
+                    "malformed pg_rust_sequences row".to_string(),
+                ));
+            };
+            let oid = u64::try_from(*raw_oid)
+                .map_err(|_| EngineError::Corrupted(format!("negative sequence OID {raw_oid}")))?;
+            if *high_water < 0 {
+                return Err(EngineError::Corrupted(format!(
+                    "sequence {name} has negative high water {high_water}"
+                )));
+            }
+            // Pre-fix DROP TABLE left the owned sequence and default rows
+            // behind. They must not resurrect or block name reuse on reopen.
+            if sequence_parents
+                .get(raw_oid)
+                .is_some_and(|parent| !live_tables.contains(parent))
+            {
+                continue;
+            }
+            let class = live_classes.get(raw_oid).ok_or_else(|| {
+                EngineError::Corrupted(format!("sequence {name} has no live pg_class row"))
+            })?;
+            let class_kind = class.get(2);
+            if matches!(class_kind, Some(Some(Datum::Text(kind))) if kind == RELKIND_DROPPED) {
+                continue;
+            }
+            if class.get(1) != Some(&Some(Datum::Text(name.clone())))
+                || !matches!(class_kind, Some(Some(Datum::Text(kind))) if kind == RELKIND_SEQUENCE)
+            {
+                return Err(EngineError::Corrupted(format!(
+                    "sequence {name} has inconsistent pg_class metadata"
+                )));
+            }
+            let oid = Oid(oid);
+            self.sequences.states.lock().insert(
+                oid,
+                crate::sequence::SequenceState {
+                    name: name.clone(),
+                    high_water: *high_water,
+                },
+            );
+            if let Some(recovered_high_water) = recovered.get(&oid).copied() {
+                if recovered_high_water > *high_water {
+                    self.advance_sequence_to(oid, recovered_high_water)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Create one sequence with an initial high-water mark of zero.
+    pub fn create_sequence(&self, name: &str) -> Result<Oid> {
+        if name.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "sequence name must not be empty".to_string(),
+            ));
+        }
+        let _ddl = self.ddl_lock.lock();
+        if self.relation_name_exists(name)?
+            || self
+                .sequences
+                .states
+                .lock()
+                .values()
+                .any(|state| state.name == name)
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "sequence {name:?} already exists"
+            )));
+        }
+        let oid = self.catalog.oid_allocator().alloc();
+        let mut states = self.sequences.states.lock();
+        self.auto_commit_with_hooks(
+            |snap| {
+                self.lock_oid(snap.current_xid(), oid, LockMode::AccessExclusive)?;
+                self.insert_catalog_row(snap, &PG_CLASS, &sequence_class_row(oid, name))?;
+                let def = self.sequence_relation()?;
+                self.insert_catalog_row(
+                    snap,
+                    &def,
+                    &[
+                        Some(Datum::Int8(oid.0 as i64)),
+                        Some(Datum::Text(name.to_string())),
+                        Some(Datum::Int8(0)),
+                    ],
+                )
+            },
+            || {
+                states.insert(
+                    oid,
+                    crate::sequence::SequenceState {
+                        name: name.to_string(),
+                        high_water: 0,
+                    },
+                );
+                Ok(())
+            },
+            || {},
+        )?;
+        Ok(oid)
+    }
+
+    /// Return and record the next value of a named sequence in this session.
+    pub fn nextval(&self, session: &mut SqlSession, name: &str) -> Result<i64> {
+        let oid = self.sequence_oid(name)?;
+        let value = self.nextval_oid(oid)?;
+        session.record_nextval(oid, value);
+        Ok(value)
+    }
+
+    /// Return this session's current value of a named sequence.
+    pub fn currval(&self, session: &SqlSession, name: &str) -> Result<i64> {
+        let oid = self.sequence_oid(name)?;
+        session.currval(oid)
+    }
+
+    fn sequence_oid(&self, name: &str) -> Result<Oid> {
+        self.sequences
+            .states
+            .lock()
+            .iter()
+            .find_map(|(oid, state)| (state.name == name).then_some(*oid))
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("sequence {name:?} does not exist"))
+            })
+    }
+
+    fn nextval_oid(&self, oid: Oid) -> Result<i64> {
+        let mut states = self.sequences.states.lock();
+        let current = states
+            .get(&oid)
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("sequence OID {oid} does not exist"))
+            })?
+            .high_water;
+        let next = current.checked_add(1).ok_or_else(|| {
+            EngineError::InvalidArgument(format!("sequence OID {oid} exhausted Int64 values"))
+        })?;
+        self.advance_sequence_to_locked(&mut states, oid, next)
+    }
+
+    fn advance_sequence_to(&self, oid: Oid, high_water: i64) -> Result<i64> {
+        let mut states = self.sequences.states.lock();
+        self.advance_sequence_to_locked(&mut states, oid, high_water)
+    }
+
+    fn advance_sequence_to_locked(
+        &self,
+        states: &mut HashMap<Oid, crate::sequence::SequenceState>,
+        oid: Oid,
+        high_water: i64,
+    ) -> Result<i64> {
+        if high_water < 0 {
+            return Err(EngineError::InvalidArgument(
+                "sequence high water must be non-negative".to_string(),
+            ));
+        }
+        let current = states.get(&oid).ok_or_else(|| {
+            EngineError::InvalidArgument(format!("sequence OID {oid} does not exist"))
+        })?;
+        if high_water <= current.high_water {
+            return Ok(current.high_water);
+        }
+        let name = current.name.clone();
+        self.auto_commit_with_hooks(
+            |snap| {
+                let record = WalRecord::sequence_advance(oid, high_water, snap.current_xid())?;
+                let record_len = record.record_size() as u64;
+                let lsn = self.storage.wal_writer().append(record)?;
+                if crate::sequence::test_hooks::fail_nextval_flush() {
+                    return Err(EngineError::InvalidArgument(
+                        "injected sequence WAL flush failure".to_string(),
+                    ));
+                }
+                self.storage
+                    .wal_writer()
+                    .flush_to(Lsn(lsn.0 + record_len))?;
+                let def = self.sequence_relation()?;
+                let needed = self.sequence_row_len(&def, oid, &name, high_water)?;
+                if self.sequence_catalog_needs_compaction(&def, needed)? {
+                    self.lock_oid(snap.current_xid(), def.oid.raw(), LockMode::AccessExclusive)?;
+                    self.compact_sequence_catalog(&def)?;
+                }
+                let (tid, _) = self.find_sequence_row(snap, &def, oid)?;
+                self.update_catalog_row(
+                    snap,
+                    &def,
+                    tid,
+                    &[
+                        Some(Datum::Int8(oid.0 as i64)),
+                        Some(Datum::Text(name.clone())),
+                        Some(Datum::Int8(high_water)),
+                    ],
+                )
+            },
+            || {
+                if let Some(state) = states.get_mut(&oid) {
+                    state.high_water = high_water;
+                }
+                Ok(())
+            },
+            || {},
+        )?;
+        Ok(high_water)
+    }
+
+    fn sequence_row_len(
+        &self,
+        def: &SystemTableDef,
+        oid: Oid,
+        name: &str,
+        high_water: i64,
+    ) -> Result<usize> {
+        let columns = def.column_types();
+        let row = vec![
+            Some(Datum::Int8(oid.0 as i64)),
+            Some(Datum::Text(name.to_string())),
+            Some(Datum::Int8(high_water)),
+        ];
+        Ok(encode_tuple(tuple_header(0), &columns, &row)?.len() + LINE_POINTER_SIZE)
+    }
+
+    fn sequence_catalog_needs_compaction(
+        &self,
+        def: &SystemTableDef,
+        needed: usize,
+    ) -> Result<bool> {
+        let guard = self.storage.buffer_pool().pin(def.first_page)?;
+        let page: &[u8; PAGE_SIZE] = guard
+            .page()
+            .try_into()
+            .expect("buffer pool pages are PAGE_SIZE bytes");
+        Ok(SlottedPage::free_space(page) < needed.max(1024))
+    }
+
+    fn compact_sequence_catalog(&self, def: &SystemTableDef) -> Result<()> {
+        let columns = def.column_types();
+        let dead = self.heap.scan_dead_tuples(
+            RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            TxnId(u64::MAX),
+            self.clog.as_ref(),
+        )?;
+        if dead.is_empty() {
+            return Ok(());
+        }
+        // Sequence high water is non-transactional metadata: only the latest
+        // committed row is needed, so obsolete versions may be physically pruned.
+        if crate::sequence::test_hooks::fail_compaction() {
+            return Err(EngineError::InvalidArgument(
+                "injected sequence catalog compaction failure".to_string(),
+            ));
+        }
+        self.heap.reclaim(
+            RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            &dead,
+        )?;
+        Ok(())
+    }
+
+    fn find_sequence_row(
+        &self,
+        snap: &Snapshot,
+        def: &SystemTableDef,
+        oid: Oid,
+    ) -> Result<(Tid, i64)> {
+        let columns = def.column_types();
+        let rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            clog: self.clog.as_ref(),
+        })?;
+        for (tid, values) in rows {
+            if values.first() == Some(&Some(Datum::Int8(oid.0 as i64))) {
+                let Some(Some(Datum::Int8(high_water))) = values.get(2) else {
+                    return Err(EngineError::Corrupted(
+                        "malformed pg_rust_sequences high water".to_string(),
+                    ));
+                };
+                return Ok((tid, *high_water));
+            }
+        }
+        Err(EngineError::Corrupted(format!(
+            "sequence OID {oid} has no committed high-water row"
+        )))
+    }
+
+    /// Add hidden TOAST heaps to pre-Stage-D tables. Catalog updates and the
+    /// in-memory publication use the same success/failure hooks as other DDL;
+    /// a failed commit leaves only an unreachable, leaked empty heap.
+    fn install_missing_toast_relations(&self) -> Result<()> {
+        let pending: Vec<(String, TableEntry)> = self
+            .registry
+            .read()
+            .iter()
+            .filter(|(_, entry)| entry.toast.is_none())
+            .filter(|(_, entry)| {
+                entry
+                    .columns
+                    .iter()
+                    .any(|column| toastable(column.col_type))
+            })
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect();
+        for (name, entry) in pending {
+            let toast_oid = self.catalog.oid_allocator().alloc();
+            if toast_oid.0 > u32::MAX as u64 {
+                return Err(EngineError::InvalidArgument(
+                    "TOAST relation OID exceeds the frozen pointer's u32 range".to_string(),
+                ));
+            }
+            let toast = ToastRelation {
+                rel_oid: toast_oid,
+                first_page: self.heap.create_heap(toast_oid)?,
+            };
+            self.heap.register_toast_relation(entry.oid, toast)?;
+            self.auto_commit_with_hooks(
+                |snap| {
+                    self.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
+                    self.write_toast_catalog_metadata(snap, &name, &entry, toast)
+                },
+                || {
+                    let mut registry = self.registry.write();
+                    let live = registry.get_mut(&name).ok_or_else(|| {
+                        EngineError::Corrupted(format!(
+                            "table {name:?} disappeared during TOAST migration"
+                        ))
+                    })?;
+                    live.toast = Some(toast);
+                    Ok(())
+                },
+                || {
+                    self.heap.unregister_toast_relation(entry.oid);
+                    self.heap.drop_relation(toast_oid);
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Persist a legacy table's hidden relation in the two existing catalog
+    /// rows. The hidden relation itself gets no pg_class/pg_attribute row.
+    fn write_toast_catalog_metadata(
+        &self,
+        snap: &Snapshot,
+        name: &str,
+        entry: &TableEntry,
+        toast: ToastRelation,
+    ) -> Result<()> {
+        let class_tid = self.find_live_pg_class_row(snap, entry.oid)?;
+        let class_row = vec![
+            Some(Datum::Int8(entry.oid.0 as i64)),
+            Some(Datum::Text(name.to_string())),
+            Some(Datum::Text(RELKIND_TABLE.to_string())),
+            Some(Datum::Int4(entry.columns.len() as i32)),
+            Some(Datum::Int8(toast.rel_oid.0 as i64)),
+            Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
+        ];
+        self.update_catalog_row(snap, &PG_CLASS, class_tid, &class_row)?;
+
+        let relpages_tid = self.find_relpages_row(snap, entry.oid)?;
+        let previous = self
+            .catalog
+            .relpages_of(TableOid::new(entry.oid))
+            .ok_or_else(|| {
+                EngineError::Corrupted(format!(
+                    "table OID {} has no pg_rust_relpages row",
+                    entry.oid.0
+                ))
+            })?;
+        let relpages_row = vec![
+            Some(Datum::Int8(entry.oid.0 as i64)),
+            Some(Datum::Int8(entry.first_page.0 as i64)),
+            Some(Datum::Int8(toast.first_page.0 as i64)),
+            Some(Datum::Int8(previous.page_count as i64)),
+        ];
+        self.update_catalog_row(snap, &PG_RELPAGES, relpages_tid, &relpages_row)
+    }
+
+    fn update_catalog_row(
+        &self,
+        snap: &Snapshot,
+        def: &SystemTableDef,
+        old_tid: Tid,
+        row: &[Value],
+    ) -> Result<()> {
+        let columns = def.column_types();
+        let tuple = encode_tuple(tuple_header(snap.curcid()), &columns, row)?;
+        self.ensure_catalog_room(def, tuple.len())?;
+        self.heap.update(UpdateContext {
+            rel: RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            old_tid,
+            new_tuple: &tuple,
+            out_tid: None,
+            clog: self.clog.as_ref(),
+            hot_eligible: false,
+        })?;
+        Ok(())
+    }
+
+    fn delete_catalog_row(&self, snap: &Snapshot, def: &SystemTableDef, tid: Tid) -> Result<()> {
+        let columns = def.column_types();
+        self.heap.delete(DeleteContext {
+            rel: RelationDesc {
+                rel_oid: def.oid.raw(),
+                first_page: def.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            tid,
+            clog: self.clog.as_ref(),
+        })?;
+        Ok(())
+    }
+
+    /// Locate the relpages version visible to the current DDL transaction.
+    fn find_relpages_row(&self, snap: &Snapshot, oid: Oid) -> Result<Tid> {
+        let columns = PG_RELPAGES.column_types();
+        let rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_RELPAGES.oid.raw(),
+                first_page: PG_RELPAGES.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            clog: self.clog.as_ref(),
+        })?;
+        for (tid, values) in rows {
+            if matches!(values.first(), Some(Some(Datum::Int8(value))) if *value == oid.0 as i64) {
+                return Ok(tid);
+            }
+        }
+        Err(EngineError::Corrupted(format!(
+            "pg_rust_relpages has no row for relation OID {}",
+            oid.0
+        )))
+    }
+
     /// Create a table and register it in the system catalog.
     ///
     /// Runs as one auto-commit transaction: allocate an OID, allocate the
     /// first heap page, insert the `pg_class` / `pg_attribute` /
-    /// `pg_rust_relpages` rows **through the heap AM** (WAL-logged, so the
-    /// catalog changes are redo-recoverable), commit, then update the
-    /// in-memory registry.
+    /// `pg_rust_relpages` rows **through the heap AM**, register TOAST before
+    /// commit, and publish the in-memory registry only after a durable commit.
+    /// Registration or commit failure cleans up before table locks release.
     ///
     /// Fails with [`EngineError::TableExists`] if the name is taken, and
     /// with [`EngineError::CatalogFull`] if a system catalog's first page
     /// has no room (module-level M2a limitation).
+    fn create_table_from_spec(
+        &self,
+        name: &str,
+        columns: Vec<crate::sql::ColumnSpec>,
+    ) -> Result<Oid> {
+        let mut defaults = Vec::with_capacity(columns.len());
+        let mut sequences = Vec::new();
+        for column in &columns {
+            if column.serial {
+                let sequence_oid = self.catalog.oid_allocator().alloc();
+                let sequence_name = format!("{name}_{}_seq", column.name);
+                defaults.push(Some(sequence_oid));
+                sequences.push((sequence_oid, sequence_name));
+            } else {
+                defaults.push(None);
+            }
+        }
+        let schema = columns
+            .into_iter()
+            .map(|column| ColumnDef {
+                name: column.name,
+                col_type: column.col_type,
+            })
+            .collect::<Vec<_>>();
+        self.create_table_with_defaults(name, &schema, &defaults, &sequences)
+    }
+
+    /// Create a table and persist its schema in the catalog.
     pub fn create_table(&self, name: &str, schema: &[ColumnDef]) -> Result<Oid> {
+        self.create_table_with_defaults(name, schema, &vec![None; schema.len()], &[])
+    }
+
+    fn create_table_with_defaults(
+        &self,
+        name: &str,
+        schema: &[ColumnDef],
+        defaults: &[Option<Oid>],
+        sequences: &[(Oid, String)],
+    ) -> Result<Oid> {
+        if defaults.len() != schema.len() {
+            return Err(EngineError::InvalidArgument(
+                "defaults must align with table columns".to_string(),
+            ));
+        }
         if name.is_empty() {
             return Err(EngineError::InvalidArgument(
                 "table name must not be empty".to_string(),
@@ -1294,39 +2210,119 @@ impl Engine {
             ));
         }
         let _ddl = self.ddl_lock.lock();
-        if self.registry.read().contains_key(name) {
+        for (_, sequence_name) in sequences {
+            if self.relation_name_exists(sequence_name)? {
+                return Err(EngineError::InvalidArgument(format!(
+                    "sequence {sequence_name:?} already exists"
+                )));
+            }
+        }
+        if self.registry.read().contains_key(name) || self.relation_name_exists(name)? {
             return Err(EngineError::TableExists(name.to_string()));
         }
 
         let oid = self.catalog.oid_allocator().alloc();
+        let toast_oid = schema
+            .iter()
+            .any(|column| toastable(column.col_type))
+            .then(|| self.catalog.oid_allocator().alloc());
+        if toast_oid.is_some_and(|toast| toast.0 > u32::MAX as u64) {
+            return Err(EngineError::InvalidArgument(
+                "TOAST relation OID exceeds the frozen pointer's u32 range".to_string(),
+            ));
+        }
         // AccessExclusive on the fresh OID (M2c Stage P): ceremonial today
         // — nobody else can reference an OID that was just allocated — but
         // it fixes the DDL lock mode by construction and covers the
-        // catalog-row writes like any other DDL.
-        let first_page = self.auto_commit(|snap| {
-            self.lock_oid(snap.current_xid(), oid, LockMode::AccessExclusive)?;
-            self.create_table_inner(snap, oid, name, schema)
-        });
-        match first_page {
-            Ok(first_page) => {
+        // catalog-row writes like any other DDL. TOAST registration also runs
+        // HERE, before commit: a registration error aborts the table instead
+        // of returning an error after the table has already become durable.
+        let created_metadata = RefCell::new(None);
+        let result = self.auto_commit_with_hooks(
+            |snap| {
+                self.lock_oid(snap.current_xid(), oid, LockMode::AccessExclusive)?;
+                let created = self.create_table_inner(snap, oid, toast_oid, name, schema)?;
+                if let Some(toast) = created.1 {
+                    self.heap.register_toast_relation(oid, toast)?;
+                }
+                *created_metadata.borrow_mut() = Some(created);
+                let sequence_def = self.sequence_relation()?;
+                let default_def = self.attrdefaults_relation()?;
+                for (sequence_oid, sequence_name) in sequences {
+                    self.insert_catalog_row(
+                        snap,
+                        &PG_CLASS,
+                        &sequence_class_row(*sequence_oid, sequence_name),
+                    )?;
+                    self.insert_catalog_row(
+                        snap,
+                        &sequence_def,
+                        &[
+                            Some(Datum::Int8(sequence_oid.0 as i64)),
+                            Some(Datum::Text(sequence_name.clone())),
+                            Some(Datum::Int8(0)),
+                        ],
+                    )?;
+                    let default_index = defaults
+                        .iter()
+                        .position(|candidate| candidate.as_ref() == Some(sequence_oid))
+                        .ok_or_else(|| {
+                            EngineError::Corrupted(
+                                "SERIAL default has no sequence mapping".to_string(),
+                            )
+                        })?;
+                    self.insert_catalog_row(
+                        snap,
+                        &default_def,
+                        &[
+                            Some(Datum::Int8(oid.0 as i64)),
+                            Some(Datum::Int4(default_index as i32 + 1)),
+                            Some(Datum::Int8(defaults[default_index].unwrap().0 as i64)),
+                        ],
+                    )?;
+                }
+                Ok(())
+            },
+            || {
+                let (first_page, toast) = created_metadata
+                    .borrow()
+                    .expect("successful create_table installs metadata before commit");
+                {
+                    let mut states = self.sequences.states.lock();
+                    for (sequence_oid, sequence_name) in sequences {
+                        states.insert(
+                            *sequence_oid,
+                            crate::sequence::SequenceState {
+                                name: sequence_name.clone(),
+                                high_water: 0,
+                            },
+                        );
+                    }
+                }
                 self.registry.write().insert(
                     name.to_string(),
                     TableEntry {
                         oid,
                         first_page,
+                        defaults: defaults.to_vec(),
                         columns: schema.to_vec(),
+                        toast,
                     },
                 );
-                Ok(oid)
-            }
-            Err(e) => {
-                // The heap page may have been allocated and tracked before
-                // the failure; forget it so the AM cache cannot hand the
-                // (never-committed) page to a later relation of this OID.
+                Ok(())
+            },
+            || {
+                // Runs before lock release on op or commit failure. The pages
+                // themselves may leak after a crash, but no failed relation or
+                // TOAST registration remains visible to later DML.
+                self.heap.unregister_toast_relation(oid);
                 self.heap.drop_relation(oid);
-                Err(e)
-            }
-        }
+                if let Some(toast_oid) = toast_oid {
+                    self.heap.drop_relation(toast_oid);
+                }
+            },
+        );
+        result.map(|()| oid)
     }
 
     /// The catalog-writing half of `create_table`, inside transaction `snap`.
@@ -1334,18 +2330,28 @@ impl Engine {
         &self,
         snap: &Snapshot,
         oid: Oid,
+        toast_oid: Option<Oid>,
         name: &str,
         schema: &[ColumnDef],
-    ) -> Result<PageId> {
+    ) -> Result<(PageId, Option<ToastRelation>)> {
+        ensure_float8_storage_supported(self.catalog.type_by_oid(FLOAT8_OID).is_some(), schema)?;
         let first_page = self.heap.create_heap(oid)?;
+        let toast = toast_oid
+            .map(|rel_oid| {
+                let first_page = self.heap.create_heap(rel_oid)?;
+                Ok::<ToastRelation, EngineError>(ToastRelation {
+                    rel_oid,
+                    first_page,
+                })
+            })
+            .transpose()?;
 
         let class_row = vec![
             Some(Datum::Int8(oid.0 as i64)),
             Some(Datum::Text(name.to_string())),
             Some(Datum::Text(RELKIND_TABLE.to_string())),
             Some(Datum::Int4(schema.len() as i32)),
-            // No TOAST table (M2a).
-            Some(Datum::Int8(0)),
+            Some(Datum::Int8(toast.map_or(0, |toast| toast.rel_oid.0) as i64)),
             Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
         ];
         self.insert_catalog_row(snap, &PG_CLASS, &class_row)?;
@@ -1366,48 +2372,39 @@ impl Engine {
             self.insert_catalog_row(snap, &PG_ATTRIBUTE, &attr_row)?;
         }
 
-        // The chain currently has exactly one page; `last_page` /
-        // `page_count` are advisory only (they go stale as the chain grows)
-        // — the on-disk chain walk is authoritative (Stage K wave 1).
+        // For ordinary heap tables `last_page` was advisory and unused. Stage D
+        // freezes it as the hidden TOAST chain head when reltoastrelid != 0;
+        // without TOAST it remains equal to first_page. The on-disk chain walk
+        // stays authoritative for page membership.
         let relpages_row = vec![
             Some(Datum::Int8(oid.0 as i64)),
             Some(Datum::Int8(first_page.0 as i64)),
-            Some(Datum::Int8(first_page.0 as i64)),
+            Some(Datum::Int8(
+                toast.map_or(first_page, |toast| toast.first_page).0 as i64,
+            )),
             Some(Datum::Int8(1)),
         ];
         self.insert_catalog_row(snap, &PG_RELPAGES, &relpages_row)?;
 
-        Ok(first_page)
+        Ok((first_page, toast))
     }
 
-    /// Drop a table: mark its `pg_class` row `relkind = 'd'`, free its data
-    /// pages, and remove it from the registry.
+    /// Drop a table: write `relkind = 'd'`, then perform physical cleanup
+    /// only after the commit is durable.
     ///
     /// The marker is an MVCC **update through the heap AM**, not a physical
-    /// row removal: the old version stays in the page (invisible to scans
-    /// once the drop commits), and the registry rebuild's last-version-wins
-    /// fold reads the drop. A physical removal would need either slot
-    /// recycling (breaks TID stability) or a raw in-place rewrite that
-    /// reaches past the AM into tuple internals — both worse than one extra
-    /// dead version per dropped table in M2a.
+    /// row removal. Physical page freeing, heap/table/index registry removal
+    /// and HNSW handle cleanup run in `auto_commit_with_hooks`'s
+    /// `on_success` hook, before the AccessExclusive lock is released. A DML
+    /// statement queued behind that lock therefore observes the completed
+    /// drop, while a commit failure performs none of those destructive steps.
+    /// The `pg_rust_relpages` row is left behind; it is keyed by the table's
+    /// never-reused OID and ignored by the rebuild (leaked row, documented
+    /// M2a simplification).
     ///
-    /// Ordering inside the transaction (module docs, "DDL crash
-    /// atomicity"): the `'d'` marker is written **first**, then the data
-    /// pages are walked and freed (`PageFree` WAL + redo, Stage E), then
-    /// the heap AM's cached page list is dropped. The `pg_rust_relpages`
-    /// row is left behind; it is keyed by the table's never-reused OID and
-    /// ignored by the rebuild (leaked row, documented M2a simplification).
-    ///
-    /// The registry entry is removed INSIDE the transaction, before commit
-    /// releases the AccessExclusive lock (M2c Stage P review): a DML
-    /// statement that resolved the table before the drop and queued behind
-    /// its lock must observe the removal the moment its own lock is
-    /// granted — `lock_table_entry`'s post-lock registry re-check relies on
-    /// this ordering. If the commit itself fails (WAL-fatal, process
-    /// teardown territory) the in-memory removal has already happened while
-    /// the durable pg_class row is not marked 'd': the two diverge until
-    /// restart, when the rebuild resurrects the table consistent with the
-    /// durable state.
+    /// Recovery rebuilds the table registry through a fresh MVCC scan, not a
+    /// raw last-version-wins fold, so an aborted marker cannot hide the
+    /// original table after restart.
     ///
     /// Fails with [`EngineError::TableNotFound`] if the table does not
     /// exist.
@@ -1419,31 +2416,127 @@ impl Engine {
             .get(name)
             .cloned()
             .ok_or_else(|| EngineError::TableNotFound(name.to_string()))?;
+        let sequence_states = RefCell::new(None);
+        let serial_sequences = RefCell::new(Vec::new());
 
-        self.auto_commit(|snap| {
-            // AccessExclusive (§9.2): blocks — and is blocked by — every
-            // other lock mode on this table, so a DROP waits for in-flight
-            // readers/writers and new ones queue behind it (M2c Stage P).
-            self.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
-            self.drop_table_inner(snap, name, &entry)?;
-            // Remove BEFORE commit releases the lock (see the fn docs).
-            self.registry.write().remove(name);
-            Ok(())
-        })
+        self.auto_commit_with_hooks(
+            |snap| {
+                // Acquire the table lock BEFORE the sequence mutex, matching
+                // SERIAL INSERT's RowExclusive -> nextval order. The mutex is
+                // then held through commit and pre-unlock in-memory cleanup.
+                self.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
+                let states = self.sequences.states.lock();
+                let sequences = entry
+                    .defaults
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, sequence_oid)| {
+                        sequence_oid.map(|sequence_oid| {
+                            let state = states.get(&sequence_oid).ok_or_else(|| {
+                                EngineError::Corrupted(format!(
+                                    "SERIAL default references missing sequence {sequence_oid}"
+                                ))
+                            })?;
+                            Ok((index as i32 + 1, sequence_oid, state.name.clone()))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.drop_serial_sequences(snap, &entry, &sequences)?;
+                *serial_sequences.borrow_mut() = sequences;
+                *sequence_states.borrow_mut() = Some(states);
+                self.drop_table_marker(snap, name, &entry)
+            },
+            || {
+                self.drop_table_storage(name, &entry)?;
+                let mut states = sequence_states.borrow_mut();
+                let states = states
+                    .as_mut()
+                    .expect("successful DROP holds its sequence mutex");
+                for (_, sequence_oid, _) in serial_sequences.borrow().iter() {
+                    states.remove(sequence_oid);
+                }
+                Ok(())
+            },
+            || {},
+        )
     }
 
-    /// The page-freeing half of `drop_table`, inside transaction `snap`.
-    fn drop_table_inner(&self, snap: &Snapshot, name: &str, entry: &TableEntry) -> Result<()> {
-        // 1. Mark relkind = 'd' (before freeing pages — see the fn docs).
-        let old_tid = self.find_live_pg_class_row(entry.oid)?;
+    /// Delete SERIAL-owned metadata and mark each sequence dropped in the
+    /// same transaction as the parent table. Standalone sequences are not
+    /// listed in pg_rust_attrdefaults and are therefore unaffected.
+    fn drop_serial_sequences(
+        &self,
+        snap: &Snapshot,
+        entry: &TableEntry,
+        serial_sequences: &[(i32, Oid, String)],
+    ) -> Result<()> {
+        if serial_sequences.is_empty() {
+            return Ok(());
+        }
+        let default_def = self.attrdefaults_relation()?;
+        let columns = default_def.column_types();
+        let default_rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: default_def.oid.raw(),
+                first_page: default_def.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            clog: self.clog.as_ref(),
+        })?;
+        let parent_rows = default_rows
+            .iter()
+            .filter(|(_, values)| values.first() == Some(&Some(Datum::Int8(entry.oid.0 as i64))))
+            .collect::<Vec<_>>();
+        if parent_rows.len() != serial_sequences.len() {
+            return Err(EngineError::Corrupted(format!(
+                "SERIAL default count mismatch for table OID {}",
+                entry.oid.0
+            )));
+        }
+        let sequence_def = self.sequence_relation()?;
+        for (attnum, sequence_oid, sequence_name) in serial_sequences {
+            let mut matching = parent_rows.iter().filter(|(_, values)| {
+                values.get(1) == Some(&Some(Datum::Int4(*attnum)))
+                    && values.get(2) == Some(&Some(Datum::Int8(sequence_oid.0 as i64)))
+            });
+            let (default_tid, _) = matching.next().ok_or_else(|| {
+                EngineError::Corrupted(format!(
+                    "missing SERIAL default for table OID {} attnum {attnum}",
+                    entry.oid.0
+                ))
+            })?;
+            if matching.next().is_some() {
+                return Err(EngineError::Corrupted(format!(
+                    "duplicate SERIAL default for table OID {} attnum {attnum}",
+                    entry.oid.0
+                )));
+            }
+            let (sequence_tid, _) = self.find_sequence_row(snap, &sequence_def, *sequence_oid)?;
+            let class_tid = self.find_live_class_row(snap, *sequence_oid, RELKIND_SEQUENCE)?;
+            let mut class_row = sequence_class_row(*sequence_oid, sequence_name);
+            class_row[2] = Some(Datum::Text(RELKIND_DROPPED.to_string()));
+            self.update_catalog_row(snap, &PG_CLASS, class_tid, &class_row)?;
+            self.delete_catalog_row(snap, &sequence_def, sequence_tid)?;
+            self.delete_catalog_row(snap, &default_def, *default_tid)?;
+        }
+        Ok(())
+    }
+
+    /// Write only the drop marker inside the transaction. Physical cleanup
+    /// is deferred until the commit is durable, so a commit failure leaves
+    /// the original table and every data page intact.
+    fn drop_table_marker(&self, snap: &Snapshot, name: &str, entry: &TableEntry) -> Result<()> {
+        let old_tid = self.find_live_pg_class_row(snap, entry.oid)?;
         let columns = PG_CLASS.column_types();
         let class_row = vec![
             Some(Datum::Int8(entry.oid.0 as i64)),
-            // The name is repeated so the row stays self-describing.
             Some(Datum::Text(name.to_string())),
             Some(Datum::Text(RELKIND_DROPPED.to_string())),
             Some(Datum::Int4(entry.columns.len() as i32)),
-            Some(Datum::Int8(0)),
+            Some(Datum::Int8(
+                entry.toast.map_or(0, |toast| toast.rel_oid.0) as i64
+            )),
             Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
         ];
         let header = tuple_header(snap.curcid());
@@ -1462,15 +2555,59 @@ impl Engine {
             clog: self.clog.as_ref(),
             hot_eligible: false,
         })?;
+        Ok(())
+    }
 
-        // 2. Free the data pages along the chain.
-        for page_id in self.walk_chain(entry.first_page)? {
-            self.storage.page_allocator().lock().free_page(page_id)?;
-        }
-
-        // 3. Forget the relation in the AM cache: the freed page IDs can be
-        //    handed out again and must never be reached through this OID.
+    /// Post-commit physical and in-memory cleanup, before the table lock is
+    /// released. No part of this runs when the commit fails.
+    fn drop_table_storage(&self, name: &str, entry: &TableEntry) -> Result<()> {
+        // Remove every live entry point BEFORE freeing any page. If a later
+        // page walk/free fails, the table is already unreachable and pages
+        // merely leak; no DML can observe a live table with reclaimed pages.
+        #[cfg(test)]
+        Self::run_before_drop_cleanup_hook();
+        let index_oids: HashSet<Oid> = self
+            .indexes
+            .read()
+            .iter()
+            .filter(|index| index.table_oid == entry.oid)
+            .map(|index| index.index_oid)
+            .collect();
         self.heap.drop_relation(entry.oid);
+        self.heap.unregister_toast_relation(entry.oid);
+        if let Some(toast) = entry.toast {
+            self.heap.drop_relation(toast.rel_oid);
+        }
+        self.registry.write().remove(name);
+        self.indexes
+            .write()
+            .retain(|index| index.table_oid != entry.oid);
+        self.hnsw_handles
+            .lock()
+            .retain(|index_oid, _| !index_oids.contains(index_oid));
+        let mut pages = match self.walk_chain(entry.first_page) {
+            Ok(pages) => pages,
+            Err(error) => {
+                tracing::warn!(%error, table = %name, "post-commit DROP page walk failed; leaving pages leaked");
+                Vec::new()
+            }
+        };
+        if let Some(toast) = entry.toast {
+            match self.walk_chain(toast.first_page) {
+                Ok(toast_pages) => pages.extend(toast_pages),
+                Err(error) => {
+                    tracing::warn!(%error, table = %name, "post-commit DROP TOAST page walk failed; leaving pages leaked");
+                }
+            }
+        }
+        for page_id in pages {
+            if let Err(error) = self.storage.page_allocator().lock().free_page(page_id) {
+                tracing::warn!(%error, table = %name, ?page_id, "post-commit DROP page free failed; leaving page leaked");
+            }
+        }
+        // The marker is already durable and every live entry is gone. These
+        // cleanup failures are warnings, not a DROP failure: the table is
+        // dropped, and any unfreed pages are leaks by design.
         Ok(())
     }
 
@@ -1525,6 +2662,10 @@ impl Engine {
         {
             return Err(EngineError::IndexExists(format!("{table}({column})")));
         }
+        let index_name = format!("{}_{column}_idx", entry.oid.0);
+        if self.relation_name_exists(&index_name)? {
+            return Err(EngineError::IndexExists(index_name));
+        }
 
         // Catalog-room pre-check BEFORE the expensive scan + bulk load
         // (~1s and ~20MB of WAL for a large table): the four catalog rows
@@ -1544,67 +2685,79 @@ impl Engine {
         // transaction, leaving only unreachable pages — the documented
         // "leak, never corruption" policy.
         let col_types = column_types(&entry);
-        self.auto_commit(|snap| {
-            let entry = self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
-            // Re-take the snapshot AFTER the lock wait (M2c Stage P
-            // review): `auto_commit`'s snapshot was taken before we queued
-            // on Exclusive, so a writer we blocked behind would be stuck in
-            // its `xip` and its rows would silently never enter the index.
-            // The lock guarantees no writer can be in flight now, so a
-            // fresh snapshot sees exactly the committed contents the index
-            // must cover. `_re_guard` keeps the re-snapshot registered
-            // until this auto-commit closure ends (M3 Stage A, §3.3).
-            let (mut snap, _re_guard) = self.txn.snapshot(snap.current_xid());
-            snap.advance_curcid();
+        let result = self.auto_commit_with_hooks(
+            |snap| {
+                let entry =
+                    self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
+                // Re-take the snapshot AFTER the lock wait (M2c Stage P
+                // review): `auto_commit`'s snapshot was taken before we queued
+                // on Exclusive, so a writer we blocked behind would be stuck in
+                // its `xip` and its rows would silently never enter the index.
+                // The lock guarantees no writer can be in flight now, so a
+                // fresh snapshot sees exactly the committed contents the index
+                // must cover. `_re_guard` keeps the re-snapshot registered
+                // until this auto-commit closure ends (M3 Stage A, §3.3).
+                let (mut snap, _re_guard) = self.txn.snapshot(snap.current_xid());
+                snap.advance_curcid();
 
-            // Collect (key_bytes, tid) from a full heap scan (M2b: simple
-            // scan, no ordering assumption on the source).
-            let rows = self.heap.scan(ScanContext {
-                rel: relation_desc(&entry, &col_types),
-                snapshot: &snap,
-                clog: self.clog.as_ref(),
-            })?;
-            let mut entries = Vec::with_capacity(rows.len());
-            for (tid, values) in rows {
-                // NULL keys are not indexed (see the fn docs).
-                if let Some(datum) = &values[col_index] {
-                    // Post-Stage-S review H2: the scan yields the VISIBLE
-                    // version, which for a HOT chain is a `HEAP_ONLY_TUPLE`
-                    // tail that never gets index entries of its own. Build
-                    // the entry against the chain ROOT instead, so a later
-                    // key-changing update or delete — which retires entries
-                    // via `hot_chain_root` — finds it (`EntryNotFound`
-                    // otherwise, and the index would leak the deleted row
-                    // forever). Safe under the build's Exclusive table lock:
-                    // no writer can be mutating the chains mid-scan.
-                    let index_tid = self.hot_chain_root(tid)?;
-                    entries.push((encode_key(datum)?, index_tid));
+                // Collect (key_bytes, tid) from a full heap scan (M2b: simple
+                // scan, no ordering assumption on the source).
+                let rows = self.heap.scan(ScanContext {
+                    rel: relation_desc(&entry, &col_types),
+                    snapshot: &snap,
+                    clog: self.clog.as_ref(),
+                })?;
+                let mut entries = Vec::with_capacity(rows.len());
+                for (tid, values) in rows {
+                    // NULL keys are not indexed (see the fn docs).
+                    if let Some(datum) = &values[col_index] {
+                        // Post-Stage-S review H2: the scan yields the VISIBLE
+                        // version, which for a HOT chain is a `HEAP_ONLY_TUPLE`
+                        // tail that never gets index entries of its own. Build
+                        // the entry against the chain ROOT instead, so a later
+                        // key-changing update or delete — which retires entries
+                        // via `hot_chain_root` — finds it (`EntryNotFound`
+                        // otherwise, and the index would leak the deleted row
+                        // forever). Safe under the build's Exclusive table lock:
+                        // no writer can be mutating the chains mid-scan.
+                        let index_tid = self.hot_chain_root(tid)?;
+                        entries.push((encode_key(datum)?, index_tid));
+                    }
                 }
-            }
 
-            let btree = BTreeAM::new(
-                Arc::clone(self.storage.buffer_pool()),
-                Arc::clone(self.storage.wal_writer()),
-            );
-            let index = btree.build_index(index_oid, key_type, entries)?;
-            let meta_page = index.meta_page();
+                let btree = BTreeAM::new(
+                    Arc::clone(self.storage.buffer_pool()),
+                    Arc::clone(self.storage.wal_writer()),
+                );
+                let index = btree.build_index(index_oid, key_type, entries)?;
+                let meta_page = index.meta_page();
 
-            self.create_index_catalog_rows(&snap, &entry, column, index_oid, meta_page)?;
-            // Registry push INSIDE the lock-holding transaction (round-4
-            // P3-C): pushing after the lock released left a residual window
-            // where a concurrent INSERT saw no index and wrote rows without
-            // index maintenance. The registry is in-memory (crash-rebuilt
-            // from the catalog), so the in-transaction push is safe.
-            self.indexes.write().push(IndexEntry {
-                index_oid,
-                table_oid: entry.oid,
-                column: column.to_string(),
-                key_type,
-                meta_page,
-                map_page: None,
-            });
-            Ok(())
-        })?;
+                self.create_index_catalog_rows(&snap, &entry, column, index_oid, meta_page)?;
+                // Registry push INSIDE the lock-holding transaction (round-4
+                // P3-C): pushing after the lock released left a residual window
+                // where a concurrent INSERT saw no index and wrote rows without
+                // index maintenance. The registry is in-memory (crash-rebuilt
+                // from the catalog), so the in-transaction push is safe.
+                self.indexes.write().push(IndexEntry {
+                    index_oid,
+                    table_oid: entry.oid,
+                    column: column.to_string(),
+                    key_type,
+                    meta_page,
+                    map_page: None,
+                });
+                Ok(())
+            },
+            || Ok(()),
+            || {
+                // Registry publication is in-memory and OID-scoped: a failed
+                // commit must not leave a usable ghost index behind.
+                self.indexes
+                    .write()
+                    .retain(|index| index.index_oid != index_oid);
+            },
+        );
+        result?;
         Ok(index_oid)
     }
 
@@ -1619,6 +2772,25 @@ impl Engine {
         &self,
         table: &str,
         column: &str,
+        params: pg_am_hnsw::HnswParams,
+        dim: u16,
+        metric: pg_am_hnsw::Metric,
+        selection: pg_am_hnsw::NeighborSelection,
+        rng_seed: u64,
+    ) -> Result<(Oid, PageId)> {
+        self.create_hnsw_index_on_named(
+            table, column, None, params, dim, metric, selection, rng_seed,
+        )
+    }
+
+    /// Phase 4a Stage B named SQL form. The public M6 wrapper above keeps its
+    /// signature and automatic name; SQL supplies `index_name` here.
+    #[allow(clippy::too_many_arguments)]
+    fn create_hnsw_index_on_named(
+        &self,
+        table: &str,
+        column: &str,
+        index_name: Option<&str>,
         params: pg_am_hnsw::HnswParams,
         dim: u16,
         metric: pg_am_hnsw::Metric,
@@ -1667,6 +2839,12 @@ impl Engine {
                 "table {table:?} already has an HNSW index (one per table: the row carries a single NodeId)"
             )));
         }
+        let index_name = index_name
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}_{column}_hnsw_idx", entry.oid.0));
+        if self.relation_name_exists(&index_name)? {
+            return Err(EngineError::IndexExists(index_name));
+        }
         // M6 Stage C review P2-1 (+ round-3 P2-1): index creation does NOT
         // backfill existing rows — non-empty tables are refused loudly. The
         // WHOLE creation (emptiness check + graph + map + catalog rows) runs
@@ -1674,10 +2852,10 @@ impl Engine {
         // create_index's exact precedent): without this, a concurrent insert
         // in the window between the check and the registry push would
         // encode rows with no NodeId, permanently invisible to ANN search.
-        // The registry push happens right after the lock releases (the
-        // registry is in-memory; a crash rebuilds it from the catalog).
+        // The registry is published inside that lock-holding transaction.
         let index_oid = self.catalog.oid_allocator().alloc();
-        let meta_page = self.auto_commit(|snap| {
+        self.ensure_hnsw_index_catalog_room(&entry, column, &index_name, index_oid, dim)?;
+        let result = self.auto_commit_with_hooks(|snap| {
             let _locked = self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
             // Re-take the snapshot AFTER the lock wait (the auto-commit
             // snapshot predates it — btree create_index's precedent).
@@ -1706,7 +2884,14 @@ impl Engine {
             )?;
             let map_page = map.meta_page();
             self.create_hnsw_index_catalog_rows(
-                &snap, &entry, column, index_oid, meta_page, map_page, dim,
+                &snap,
+                &entry,
+                column,
+                &index_name,
+                index_oid,
+                meta_page,
+                map_page,
+                dim,
             )?;
             // Registry push + handle cache INSIDE the lock-holding
             // transaction (round-4 P3-C): pushing outside left a residual
@@ -1724,64 +2909,222 @@ impl Engine {
                 map_page: Some(map_page),
             });
             Ok(meta_page)
-        })?;
+        }, || Ok(()), || {
+            self.hnsw_handles.lock().remove(&index_oid);
+            self.indexes
+                .write()
+                .retain(|index| index.index_oid != index_oid);
+        });
+        let meta_page = result?;
         Ok((index_oid, meta_page))
     }
 
-    /// The catalog rows of a table-linked HNSW index (M6 Stage C): same
-    /// four-row shape as [`Self::create_index_catalog_rows`] but the AM row
-    /// is HNSW_AM_OID, the attribute carries VECTOR_OID with len = dim × 4,
-    /// and the relpages row's `last_page` records the sidecar map's meta
-    /// page. Runs inside the caller's auto-commit.
+    /// Whether a committed live table, index, or sequence already owns `name`.
+    /// `Catalog`'s open-time snapshot cannot see relations created later in
+    /// this process, so name validation reads `pg_class` through a fresh
+    /// MVCC snapshot. Drop markers (`relkind='d'`) and relations whose parent
+    /// table is dropped do not block reuse.
+    fn relation_name_exists(&self, name: &str) -> Result<bool> {
+        // Bootstrap catalog rows use a synthetic XID that an ordinary MVCC
+        // heap scan cannot see. Only system relations use the open-time
+        // snapshot: its user rows may be stale after DROP, while system
+        // relations are immutable for this stage.
+        if self.catalog.relation_by_name(name).is_some_and(|row| {
+            row.oid.raw().is_system()
+                && (row.kind == RELKIND_TABLE
+                    || row.kind == RELKIND_INDEX
+                    || row.kind == RELKIND_SEQUENCE
+                    || row.kind == RELKIND_INTERNAL)
+        }) {
+            return Ok(true);
+        }
+        let (snapshot, _guard) = self.txn.snapshot(TxnId::INVALID);
+        let scan = |def: &SystemTableDef| -> Result<Vec<(Tid, Vec<Value>)>> {
+            let columns = def.column_types();
+            Ok(self.heap.scan(ScanContext {
+                rel: RelationDesc {
+                    rel_oid: def.oid.raw(),
+                    first_page: def.first_page,
+                    columns: &columns,
+                },
+                snapshot: &snapshot,
+                clog: self.clog.as_ref(),
+            })?)
+        };
+        let class_rows = scan(&PG_CLASS)?;
+        let index_rows = scan(&PG_INDEX)?;
+        let default_rows = scan(&self.attrdefaults_relation()?)?;
+        let index_parents: HashMap<i64, i64> = index_rows
+            .into_iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(1)) {
+                (Some(Some(Datum::Int8(index_oid))), Some(Some(Datum::Int8(parent_oid)))) => {
+                    Some((*index_oid, *parent_oid))
+                }
+                _ => None,
+            })
+            .collect();
+        let sequence_parents: HashMap<i64, i64> = default_rows
+            .into_iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(2)) {
+                (Some(Some(Datum::Int8(rel_oid))), Some(Some(Datum::Int8(sequence_oid)))) => {
+                    Some((*sequence_oid, *rel_oid))
+                }
+                _ => None,
+            })
+            .collect();
+        let live_tables: HashSet<i64> = class_rows
+            .iter()
+            .filter_map(|(_, values)| match (values.first(), values.get(2)) {
+                (Some(Some(Datum::Int8(oid))), Some(Some(Datum::Text(kind))))
+                    if kind == RELKIND_TABLE =>
+                {
+                    Some(*oid)
+                }
+                _ => None,
+            })
+            .collect();
+        Ok(class_rows.into_iter().any(|(_, values)| {
+            let (Some(Some(Datum::Text(existing))), Some(Some(Datum::Text(kind)))) =
+                (values.get(1), values.get(2))
+            else {
+                return false;
+            };
+            if existing != name {
+                return false;
+            }
+            if kind == RELKIND_TABLE || kind == RELKIND_INTERNAL {
+                return true;
+            }
+            if kind == RELKIND_SEQUENCE {
+                // A SERIAL sequence has the same lifetime as its parent
+                // table. Pre-fix orphaned rows must not block name reuse.
+                let Some(Some(Datum::Int8(sequence_oid))) = values.first() else {
+                    return false;
+                };
+                return sequence_parents
+                    .get(sequence_oid)
+                    .is_none_or(|parent_oid| live_tables.contains(parent_oid));
+            }
+            if kind != RELKIND_INDEX {
+                return false;
+            }
+            // An index relation is live only while its parent table is live.
+            // DROP TABLE deliberately leaves index catalog pages/rows behind,
+            // but those orphans must not block a name's reuse.
+            let Some(Some(Datum::Int8(index_oid))) = values.first() else {
+                return false;
+            };
+            index_parents
+                .get(index_oid)
+                .is_some_and(|parent_oid| live_tables.contains(parent_oid))
+        }))
+    }
+
+    /// Write the four catalog rows of a table-linked HNSW index inside the
+    /// caller's auto-commit. Their shape is shared with the build-time room
+    /// precheck by [`Self::hnsw_index_catalog_rows`].
     #[allow(clippy::too_many_arguments)]
     fn create_hnsw_index_catalog_rows(
         &self,
         snap: &Snapshot,
         entry: &TableEntry,
         column: &str,
+        index_name: &str,
         index_oid: Oid,
         meta_page: PageId,
         map_page: PageId,
         dim: u16,
     ) -> Result<()> {
-        let class_row = vec![
-            Some(Datum::Int8(index_oid.0 as i64)),
-            Some(Datum::Text(format!("{}_{column}_hnsw_idx", entry.oid.0))),
-            Some(Datum::Text(RELKIND_INDEX.to_string())),
-            Some(Datum::Int4(1)),
-            Some(Datum::Int8(0)),
-            Some(Datum::Int8(pg_catalog::system_tables::HNSW_AM_OID.0 as i64)),
-        ];
-        self.insert_catalog_row(snap, &PG_CLASS, &class_row)?;
-
-        let attr_row = vec![
-            Some(Datum::Int8(index_oid.0 as i64)),
-            Some(Datum::Text(column.to_string())),
-            Some(Datum::Int8(VECTOR_OID.raw().0 as i64)),
-            Some(Datum::Int4(dim as i32 * 4)),
-            Some(Datum::Int4(1)),
-            Some(Datum::Int4(0)),
-            Some(Datum::Int4(1)),
-        ];
-        self.insert_catalog_row(snap, &PG_ATTRIBUTE, &attr_row)?;
-
-        let index_row = vec![
-            Some(Datum::Int8(index_oid.0 as i64)),
-            Some(Datum::Int8(entry.oid.0 as i64)),
-            Some(Datum::Int4(1)),
-            Some(Datum::Int4(0)),
-            Some(Datum::Int4(0)),
-        ];
-        self.insert_catalog_row(snap, &PG_INDEX, &index_row)?;
-
-        let relpages_row = vec![
-            Some(Datum::Int8(index_oid.0 as i64)),
-            Some(Datum::Int8(meta_page.0 as i64)),
-            Some(Datum::Int8(map_page.0 as i64)),
-            Some(Datum::Int8(1)),
-        ];
-        self.insert_catalog_row(snap, &PG_RELPAGES, &relpages_row)?;
+        for (def, row) in Self::hnsw_index_catalog_rows(
+            entry, column, index_name, index_oid, meta_page, map_page, dim,
+        ) {
+            self.insert_catalog_row(snap, def, &row)?;
+        }
         Ok(())
+    }
+
+    /// Fail before allocating any graph/map pages when the catalog rows
+    /// cannot fit. Page ids are zero placeholders: they have the same
+    /// fixed-width encoding as the real meta/map pages.
+    fn ensure_hnsw_index_catalog_room(
+        &self,
+        entry: &TableEntry,
+        column: &str,
+        index_name: &str,
+        index_oid: Oid,
+        dim: u16,
+    ) -> Result<()> {
+        let rows = Self::hnsw_index_catalog_rows(
+            entry,
+            column,
+            index_name,
+            index_oid,
+            PageId(0),
+            PageId(0),
+            dim,
+        );
+        for (def, row) in &rows {
+            let columns = def.column_types();
+            let tuple = encode_tuple(tuple_header(0), &columns, row)?;
+            self.ensure_catalog_room(def, tuple.len())?;
+        }
+        Ok(())
+    }
+
+    /// The single source of HNSW catalog-row shape for writes and prechecks.
+    fn hnsw_index_catalog_rows(
+        entry: &TableEntry,
+        column: &str,
+        index_name: &str,
+        index_oid: Oid,
+        meta_page: PageId,
+        map_page: PageId,
+        dim: u16,
+    ) -> [(&'static SystemTableDef, Vec<Value>); 4] {
+        [
+            (
+                &PG_CLASS,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Text(index_name.to_string())),
+                    Some(Datum::Text(RELKIND_INDEX.to_string())),
+                    Some(Datum::Int4(1)),
+                    Some(Datum::Int8(0)),
+                    Some(Datum::Int8(pg_catalog::system_tables::HNSW_AM_OID.0 as i64)),
+                ],
+            ),
+            (
+                &PG_ATTRIBUTE,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Text(column.to_string())),
+                    Some(Datum::Int8(VECTOR_OID.raw().0 as i64)),
+                    Some(Datum::Int4(dim as i32 * 4)),
+                    Some(Datum::Int4(1)),
+                    Some(Datum::Int4(0)),
+                    Some(Datum::Int4(1)),
+                ],
+            ),
+            (
+                &PG_INDEX,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Int8(entry.oid.0 as i64)),
+                    Some(Datum::Int4(1)),
+                    Some(Datum::Int4(0)),
+                    Some(Datum::Int4(0)),
+                ],
+            ),
+            (
+                &PG_RELPAGES,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Int8(meta_page.0 as i64)),
+                    Some(Datum::Int8(map_page.0 as i64)),
+                    Some(Datum::Int8(1)),
+                ],
+            ),
+        ]
     }
 
     /// Create an HNSW vector index and register its meta page in
@@ -1999,8 +3342,41 @@ impl Engine {
     /// The shared HNSW handle for an index OID (M6 Stage C): cache-hit
     /// returns it; a miss opens the index from its meta page with
     /// self-evidencing parameters ([`pg_am_hnsw::index::expected_params_of`])
-    /// and caches the handle.
-    fn hnsw_handle(&self, idx: &IndexEntry) -> Result<Arc<pg_am_hnsw::HnswIndex>> {
+    /// and caches the handle. Registry read locks cover open + publish, so a
+    /// concurrent DROP cannot clear the registry and then see a stale insert.
+    #[cfg(test)]
+    fn run_before_hnsw_publish_hook() {
+        BEFORE_HNSW_PUBLISH_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook();
+            }
+        });
+    }
+
+    #[cfg(test)]
+    fn run_before_drop_cleanup_hook() {
+        BEFORE_DROP_CLEANUP_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook();
+            }
+        });
+    }
+
+    pub(crate) fn hnsw_handle(&self, idx: &IndexEntry) -> Result<Arc<pg_am_hnsw::HnswIndex>> {
+        let table_registry = self.registry.read();
+        let indexes = self.indexes.read();
+        let live = || {
+            table_registry
+                .values()
+                .any(|entry| entry.oid == idx.table_oid)
+                && indexes.iter().any(|entry| entry.index_oid == idx.index_oid)
+        };
+        if !live() {
+            return Err(EngineError::IndexNotFound(format!(
+                "index {} is no longer live",
+                idx.index_oid.0
+            )));
+        }
         if let Some(h) = self.hnsw_handles.lock().get(&idx.index_oid) {
             return Ok(Arc::clone(h));
         }
@@ -2012,6 +3388,14 @@ impl Engine {
             idx.meta_page,
             &expected,
         )?;
+        #[cfg(test)]
+        Self::run_before_hnsw_publish_hook();
+        if !live() {
+            return Err(EngineError::IndexNotFound(format!(
+                "index {} is no longer live",
+                idx.index_oid.0
+            )));
+        }
         let handle = Arc::new(outcome.index);
         self.hnsw_handles
             .lock()
@@ -2108,12 +3492,15 @@ impl Engine {
     ///
     /// `snap` is the caller's transaction snapshot (visibility is judged
     /// against it). Returns `(tid, distance)` of visible rows, ascending.
-    pub fn hnsw_search_visible(
+    #[allow(clippy::too_many_arguments)] // public M6 parameters + ScanSpec's two policy knobs
+    pub(crate) fn hnsw_search_visible_with_policy(
         &self,
         table: &str,
         query: &[f32],
         k: usize,
         ef: Option<usize>,
+        candidates: usize,
+        max_retry_rounds: u8,
         snap: &Snapshot,
     ) -> Result<Vec<(Tid, f64)>> {
         let entry = self.table_entry(table)?;
@@ -2136,18 +3523,29 @@ impl Engine {
         if k == 0 {
             return Ok(Vec::new());
         }
+        if max_retry_rounds == 0 {
+            return Err(EngineError::InvalidArgument(
+                "HNSW search requires at least one candidate round".to_string(),
+            ));
+        }
+        let hwm = handle.hwm();
+        if hwm == 0 {
+            return Ok(Vec::new());
+        }
+        let hwm = usize::try_from(hwm).unwrap_or(usize::MAX);
+        let result_capacity = k.min(hwm);
         let ef_base = ef.unwrap_or(handle.params().ef_search_default as usize);
-        for round in 0..3u32 {
-            // Round 0: 2k candidates (§7 initial 2x); each retry WIDENS
-            // the candidate pool (round-3 review nano: saturating shift —
-            // a pathological k must clamp, never wrap). The ef passed is
-            // max(ef_base, want): when ef_base already exceeds the want the
-            // beam stays put while the pool still doubles.
-            let want = k.saturating_mul(2usize.saturating_pow(round + 1));
+        for round in 0..u32::from(max_retry_rounds) {
+            // Candidate counts are capped by the graph's actual node count,
+            // so a user-controlled huge k cannot force a capacity overflow
+            // or an oversized allocation. `ef` still satisfies ef >= want.
+            let want = candidates
+                .saturating_mul(2usize.saturating_pow(round))
+                .min(hwm);
             let ef_round = ef_base.max(want);
             let candidates =
                 handle.search(self.storage.buffer_pool(), query, want, Some(ef_round))?;
-            let mut results: Vec<(Tid, f64)> = Vec::with_capacity(k);
+            let mut results: Vec<(Tid, f64)> = Vec::with_capacity(result_capacity);
             for (node_id, dist) in candidates {
                 // 2. Map forward lookup — a miss IS the tombstone path.
                 //    lookup_ALL (round-7 P1): a non-HOT non-vector update
@@ -2183,11 +3581,25 @@ impl Engine {
                     break;
                 }
             }
-            if results.len() == k || round == 2 {
+            if results.len() == k || round + 1 == u32::from(max_retry_rounds) {
                 return Ok(results);
             }
         }
         unreachable!("the loop returns on the last round")
+    }
+
+    /// Visibility-filtered ANN search with the M6 default policy (2k initial
+    /// candidates and at most three rounds). This is the public compatibility
+    /// wrapper; Phase 4a's ScanSpec supplies the same values explicitly.
+    pub fn hnsw_search_visible(
+        &self,
+        table: &str,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+        snap: &Snapshot,
+    ) -> Result<Vec<(Tid, f64)>> {
+        self.hnsw_search_visible_with_policy(table, query, k, ef, k.saturating_mul(2), 3, snap)
     }
 
     /// The leak ledger for the table's HNSW index (M6 Stage E,
@@ -2510,7 +3922,7 @@ impl Engine {
     /// as `EntryNotFound`. A stale entry resolving to an unrelated row in
     /// a recycled slot therefore requires a phase-ordering violation, not
     /// just bad luck.
-    fn heap_tuple_visible(&self, snap: &Snapshot, tid: Tid) -> Result<Option<Tid>> {
+    pub(crate) fn heap_tuple_visible(&self, snap: &Snapshot, tid: Tid) -> Result<Option<Tid>> {
         let guard = self.storage.buffer_pool().pin(tid.page_id)?;
         let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
         let Some(bytes) = SlottedPage::tuple(page, tid.slot_id)? else {
@@ -2572,7 +3984,7 @@ impl Engine {
             .indexes
             .read()
             .iter()
-            .find(|e| e.table_oid == entry.oid && e.column == column)
+            .find(|e| e.table_oid == entry.oid && e.column.eq_ignore_ascii_case(column))
             .cloned()
             .ok_or_else(|| EngineError::IndexNotFound(format!("{table}({column})")))?;
         let btree = BTreeAM::new(
@@ -2602,6 +4014,176 @@ impl Engine {
             let entry = self.lock_table_entry(snap.current_xid(), table, LockMode::RowExclusive)?;
             self.insert_inner(snap, &entry, values)
         })
+    }
+
+    /// Reuse an unchanged old pointer or write a fresh chunk group for one
+    /// attribute. The old pointer is only accepted after its detoasted value
+    /// matches the new value under the current snapshot.
+    fn externalize_or_reuse(
+        &self,
+        snap: &Snapshot,
+        rel: &RelationDesc<'_>,
+        index: usize,
+        column: ColumnType,
+        new_datum: &Datum,
+        old: (Option<&[Value]>, Option<&[Value]>),
+    ) -> Result<Datum> {
+        let old_pointer = match old.0.and_then(|old| old.get(index)) {
+            Some(Some(Datum::External(pointer))) => Some(pointer),
+            _ => None,
+        };
+        if let Some(pointer) = old_pointer {
+            let unchanged = match old.1.and_then(|old| old.get(index)) {
+                Some(old_value) => old_value.as_ref().is_some_and(|old| old == new_datum),
+                None => false,
+            };
+            if unchanged {
+                return Ok(Datum::External(*pointer));
+            }
+        }
+        self.heap
+            .externalize_value(rel, snap, column, new_datum)
+            .map_err(EngineError::from)
+    }
+
+    /// The tuple codec requires all non-NULL VECTOR attributes to use the
+    /// same representation. Once one is external, normalize every remaining
+    /// inline VECTOR before the next encode so no payload tag inspection is
+    /// ever needed to distinguish them.
+    fn externalize_inline_vectors(
+        &self,
+        snap: &Snapshot,
+        rel: &RelationDesc<'_>,
+        col_types: &[ColumnType],
+        working: &mut [Value],
+        old_values: Option<&[Value]>,
+        old_detoasted: Option<&[Value]>,
+    ) -> Result<()> {
+        let has_external = col_types.iter().zip(working.iter()).any(|(column, value)| {
+            matches!(column, ColumnType::Vector(_)) && matches!(value, Some(Datum::External(_)))
+        });
+        if !has_external {
+            return Ok(());
+        }
+        for (index, column) in col_types.iter().enumerate() {
+            if !matches!(column, ColumnType::Vector(_)) {
+                continue;
+            }
+            let datum = match working.get(index) {
+                Some(Some(datum)) if !matches!(datum, Datum::External(_)) => datum.clone(),
+                _ => continue,
+            };
+            let external = self.externalize_or_reuse(
+                snap,
+                rel,
+                index,
+                *column,
+                &datum,
+                (old_values, old_detoasted),
+            )?;
+            working[index] = Some(external);
+        }
+        Ok(())
+    }
+
+    /// Encode a main row, writing oversized attributes as chunk groups first.
+    /// Every above-threshold value is externalized even when the row already
+    /// fits; below-threshold values are then selected largest-first until the
+    /// main row fits a heap page. An unchanged old pointer may be shared after
+    /// its bytes are compared under the current query snapshot.
+    fn encode_row_with_toast(
+        &self,
+        snap: &Snapshot,
+        entry: &TableEntry,
+        col_types: &[ColumnType],
+        values: &[Value],
+        node_id: Option<u32>,
+        old_values: Option<&[Value]>,
+    ) -> Result<Vec<u8>> {
+        if values.len() != entry.columns.len() {
+            return Err(EngineError::InvalidArgument(format!(
+                "table has {} columns but {} values given",
+                entry.columns.len(),
+                values.len()
+            )));
+        }
+        let rel = relation_desc(entry, col_types);
+        let old_detoasted = old_values
+            .map(|old| {
+                self.heap
+                    .detoast_values(&rel, snap, self.clog.as_ref(), old)
+            })
+            .transpose()?;
+        let encode = |values: &[Value]| {
+            match node_id {
+                Some(node_id) => pg_am_heap::tuple::encode_tuple_with_node_id(
+                    tuple_header(snap.curcid()),
+                    col_types,
+                    values,
+                    node_id,
+                ),
+                None => encode_tuple(tuple_header(snap.curcid()), col_types, values),
+            }
+            .map_err(EngineError::from)
+        };
+
+        let mut working = values.to_vec();
+        self.externalize_inline_vectors(
+            snap,
+            &rel,
+            col_types,
+            &mut working,
+            old_values,
+            old_detoasted.as_deref(),
+        )?;
+        let mut tuple = encode(&working)?;
+        loop {
+            let must_fit = tuple.len() > MAX_TUPLE_BYTES;
+            let mut candidate: Option<(usize, usize)> = None;
+            for (index, (column, value)) in col_types.iter().zip(&working).enumerate() {
+                let Some(datum) = value else { continue };
+                if !toastable(*column) || matches!(datum, Datum::External(_)) {
+                    continue;
+                }
+                let size = inline_size(*column, datum)?;
+                if size <= TOAST_TUPLE_THRESHOLD && !must_fit {
+                    continue;
+                }
+                if candidate.is_none_or(|(_, best)| size > best) {
+                    candidate = Some((index, size));
+                }
+            }
+            let Some((index, _)) = candidate else {
+                // No externalizable attribute remains. If this still exceeds
+                // the page bound, HeapAM's existing TupleTooLarge guard is the
+                // authoritative error and no chunk was written for this row.
+                return Ok(tuple);
+            };
+
+            let Some(Some(datum)) = working.get(index).cloned() else {
+                return Err(EngineError::Corrupted(format!(
+                    "TOAST candidate column {index} changed while encoding"
+                )));
+            };
+            let external = self.externalize_or_reuse(
+                snap,
+                &rel,
+                index,
+                col_types[index],
+                &datum,
+                (old_values, old_detoasted.as_deref()),
+            )?;
+            working[index] = Some(external);
+            self.externalize_inline_vectors(
+                snap,
+                &rel,
+                col_types,
+                &mut working,
+                old_values,
+                old_detoasted.as_deref(),
+            )?;
+            tuple = encode(&working)?;
+        }
     }
 
     /// The shared insert path. Takes the registry `entry` from the caller
@@ -2656,15 +4238,7 @@ impl Engine {
             }
         }
 
-        let tuple = match node_id {
-            Some(nid) => pg_am_heap::tuple::encode_tuple_with_node_id(
-                tuple_header(snap.curcid()),
-                &col_types,
-                values,
-                nid,
-            )?,
-            None => encode_row(entry, &col_types, values, snap.curcid())?,
-        };
+        let tuple = self.encode_row_with_toast(snap, entry, &col_types, values, node_id, None)?;
         let mut out_tid = Tid {
             page_id: PageId::INVALID,
             slot_id: 0,
@@ -2725,7 +4299,7 @@ impl Engine {
         self.scan_inner(&snap, table, predicate.as_ref())
     }
 
-    fn scan_inner(
+    pub(crate) fn scan_inner(
         &self,
         snap: &Snapshot,
         table: &str,
@@ -2769,16 +4343,19 @@ impl Engine {
         let col_types = column_types(&entry);
         let indexes = self.indexes_of(&entry);
 
-        // M6 Stage C: with an HNSW index on the table, read back the old
-        // row's trailing NodeId alongside its values.
+        // Read both forms: raw pointers may be reused by the new version,
+        // while index maintenance and change detection need detoasted values.
         let hnsw = indexes
             .iter()
             .find(|(idx, _)| matches!(idx.key_type, ColumnType::Vector(_)));
-        let (old_values, old_node_id) = if !indexes.is_empty() {
-            self.read_row_by_tid_with_node_id(&entry, &col_types, tid)?
-        } else {
-            (Vec::new(), None)
-        };
+        let (old_raw_values, old_node_id) =
+            self.read_row_by_tid_with_node_id(&entry, &col_types, tid)?;
+        let old_values = self.heap.detoast_values(
+            &relation_desc(&entry, &col_types),
+            snap,
+            self.clog.as_ref(),
+            &old_raw_values,
+        )?;
 
         // Did the vector column change? (HOT eligibility below compares
         // values per indexed column; the vector column participates.)
@@ -2822,15 +4399,14 @@ impl Engine {
             }
         }
 
-        let tuple = match new_node_id {
-            Some(nid) => pg_am_heap::tuple::encode_tuple_with_node_id(
-                tuple_header(snap.curcid()),
-                &col_types,
-                values,
-                nid,
-            )?,
-            None => encode_row(&entry, &col_types, values, snap.curcid())?,
-        };
+        let tuple = self.encode_row_with_toast(
+            snap,
+            &entry,
+            &col_types,
+            values,
+            new_node_id,
+            Some(&old_raw_values),
+        )?;
         let hot_eligible = !indexes.is_empty()
             && indexes
                 .iter()
@@ -2946,13 +4522,16 @@ impl Engine {
         let hnsw = indexes
             .iter()
             .find(|(idx, _)| matches!(idx.key_type, ColumnType::Vector(_)));
-        // M6 Stage C: with an HNSW index the old row's trailing NodeId is
-        // read back alongside its values.
-        let (old_values, old_node_id) = if !indexes.is_empty() {
-            self.read_row_by_tid_with_node_id(&entry, &col_types, tid)?
-        } else {
-            (Vec::new(), None)
-        };
+        // Index keys need values, while the trailing NodeId is read from the
+        // same physical row version before its xmax is stamped.
+        let (old_raw_values, old_node_id) =
+            self.read_row_by_tid_with_node_id(&entry, &col_types, tid)?;
+        let old_values = self.heap.detoast_values(
+            &relation_desc(&entry, &col_types),
+            snap,
+            self.clog.as_ref(),
+            &old_raw_values,
+        )?;
         // The entry to remove belongs to the chain root: `tid` itself may be a
         // HOT descendant, which never got an entry of its own.
         let index_tid = if indexes.is_empty() {
@@ -3079,11 +4658,26 @@ impl Engine {
                 ..VacuumStats::default()
             };
             if dead.is_empty() {
+                // A crash may leave chunks whose main-row WAL never landed.
+                // They still need the reference-driven TOAST pass.
+                stats.toast_chunks_reclaimed = self.heap.vacuum_toast(&rel)?;
                 return Ok(stats);
             }
 
             // Phase 3: read-only key extraction, BEFORE any physical rewrite.
-            let keys = self.heap.collect_index_keys(rel, &dead)?;
+            // Dead/loser rows cannot use query-snapshot detoast; their unique
+            // valueids are resolved by the physical maintenance path instead.
+            let keys = self
+                .heap
+                .collect_index_keys(rel, &dead)?
+                .into_iter()
+                .map(|(tid, values)| {
+                    self.heap
+                        .detoast_values_physical(&rel, &values)
+                        .map(|values| (tid, values))
+                        .map_err(EngineError::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
             stats.index_keys = keys.len();
 
             // Phase 4: push-mode index cleanup, one descent per (key, tid)
@@ -3190,13 +4784,16 @@ impl Engine {
             // Phase 5: compaction + unlink + free (kill set re-derived
             // from `dead` inside reclaim — do not pre-filter it here).
             self.heap.reclaim(rel, &dead)?;
+            // TOAST follows main-row reclamation: any pointer still present
+            // in a physical old/HOT version conservatively pins its group.
+            stats.toast_chunks_reclaimed = self.heap.vacuum_toast(&rel)?;
             Ok(stats)
         })
     }
 
     /// Every index registered on `entry`'s table, joined with the position
     /// of its indexed column in the table's schema.
-    fn indexes_of(&self, entry: &TableEntry) -> Vec<(IndexEntry, usize)> {
+    pub(crate) fn indexes_of(&self, entry: &TableEntry) -> Vec<(IndexEntry, usize)> {
         self.indexes
             .read()
             .iter()
@@ -3245,18 +4842,38 @@ impl Engine {
             });
     }
 
-    /// Read back the decoded values of the row at `tid` directly from its
-    /// heap page (raw read, no visibility filter: DML uses this to recover
-    /// the OLD key of a row the caller already addressed by TID, before the
-    /// heap mutation runs in the same statement).
-    fn read_row_by_tid(
+    /// Read and detoast the addressed row version under the caller's snapshot.
+    /// Visibility of the main row is judged by the caller's scan/search path;
+    /// this helper resolves only the pointers carried by that exact version.
+    pub(crate) fn read_row_by_tid(
+        &self,
+        snap: &Snapshot,
+        entry: &TableEntry,
+        col_types: &[ColumnType],
+        tid: Tid,
+    ) -> Result<Vec<Value>> {
+        let (values, _) = self.read_row_by_tid_with_node_id(entry, col_types, tid)?;
+        Ok(self.heap.detoast_values(
+            &relation_desc(entry, col_types),
+            snap,
+            self.clog.as_ref(),
+            &values,
+        )?)
+    }
+
+    /// Physical detoast for recovery's loser-index compensation. Aborted
+    /// chunks cannot be read through a query snapshot, but their exact valueid
+    /// is still needed to restore an index delete performed by that loser.
+    fn read_row_by_tid_physical(
         &self,
         entry: &TableEntry,
         col_types: &[ColumnType],
         tid: Tid,
     ) -> Result<Vec<Value>> {
         let (values, _) = self.read_row_by_tid_with_node_id(entry, col_types, tid)?;
-        Ok(values)
+        self.heap
+            .detoast_values_physical(&relation_desc(entry, col_types), &values)
+            .map_err(EngineError::from)
     }
 
     /// Read back a row's values AND its trailing NodeId (M6 Stage C):
@@ -3524,7 +5141,7 @@ impl Engine {
             // The row version's bytes are intact on its page (redo at most
             // stamped the loser's xmax). Same chain-root rule as the online
             // delete/update paths: HOT descendants never own entries.
-            let old_values = self.read_row_by_tid(entry, col_types, tid)?;
+            let old_values = self.read_row_by_tid_physical(entry, col_types, tid)?;
             let index_tid = self.hot_chain_root(tid)?;
             for (idx, col_index) in &indexes {
                 // M6 Stage C: an HNSW index is not a B+Tree key shape — its
@@ -3625,12 +5242,192 @@ impl Engine {
     /// `delete` / `index_lookup`) never passes through here and produces
     /// NO entries (§6.3 另注).
     pub fn exec(&self, txn: Option<&TxnHandle>, sql: &str) -> Result<QueryResult> {
+        let mut session = SqlSession::new(NEXT_SQL_SESSION_ID.fetch_add(1, Ordering::Relaxed));
+        self.exec_in_session(&mut session, txn, sql)
+    }
+
+    /// Execute SQL with a persistent per-connection sequence context.
+    pub fn exec_in_session(
+        &self,
+        session: &mut SqlSession,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+    ) -> Result<QueryResult> {
         let started = Instant::now();
         let stmt = sql::parse(sql)?;
-        let path = ExecutionPath::of(&stmt);
-        let result = match txn {
-            None => self.exec_auto(stmt),
-            Some(h) => self.exec_txn(h, stmt),
+        self.exec_parsed(session, txn, sql, started, stmt, None)
+    }
+
+    /// Execute an AP query synchronously without nesting a runtime on the current thread.
+    #[cfg(feature = "datafusion")]
+    pub fn exec_datafusion(
+        self: &Arc<Self>,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+    ) -> Result<QueryResult> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
+                    handle.block_on(self.exec_datafusion_inner(txn, sql))
+                }),
+                tokio::runtime::RuntimeFlavor::CurrentThread => {
+                    Err(EngineError::Unsupported(
+                        "synchronous DataFusion execution inside a current-thread Tokio runtime is not supported; use exec_datafusion_async".to_string(),
+                    ))
+                }
+                _ => Err(EngineError::Unsupported(
+                    "synchronous DataFusion execution is not supported in this Tokio runtime".to_string(),
+                )),
+            },
+            Err(_) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        EngineError::InvalidArgument(format!(
+                            "cannot create DataFusion runtime: {error}"
+                        ))
+                    })?;
+                runtime.block_on(self.exec_datafusion_inner(txn, sql))
+            }
+        }
+    }
+
+    /// Execute an AP query directly in the current async task.
+    #[cfg(feature = "datafusion")]
+    pub async fn exec_datafusion_async(
+        self: &Arc<Self>,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+    ) -> Result<QueryResult> {
+        self.exec_datafusion_inner(txn, sql).await
+    }
+
+    #[cfg(feature = "datafusion")]
+    async fn exec_datafusion_inner(
+        self: &Arc<Self>,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+    ) -> Result<QueryResult> {
+        if let Some(handle) = txn {
+            if handle.instance_id != self.instance_id {
+                return Err(EngineError::InvalidArgument(
+                    "transaction handle belongs to a different Engine instance".to_string(),
+                ));
+            }
+        }
+        let started = Instant::now();
+        let stmt = match sql::parse(sql) {
+            Ok(statement) => statement,
+            Err(_) => Statement::Select {
+                columns: SelectCols::All,
+                table: String::new(),
+                filter: None,
+                order_by: None,
+                limit: None,
+                lock: None,
+            },
+        };
+        let result = crate::datafusion_provider::execute_datafusion(self, txn, sql).await;
+        if self.query_stats.capacity() > 0 {
+            let rows = match &result {
+                Ok(QueryResult::Rows { rows, .. }) => rows.len(),
+                Ok(QueryResult::Affected(n)) => *n,
+                _ => 0,
+            };
+            self.query_stats.record(QueryStatEntry {
+                query: sql.to_string(),
+                latency: started.elapsed(),
+                rows,
+                path: ExecutionPath::of(&stmt),
+                timestamp: SystemTime::now(),
+            });
+        }
+        result
+    }
+
+    /// DataFusion AP is opt-in. Without the feature the request is rejected.
+    #[cfg(not(feature = "datafusion"))]
+    pub fn exec_datafusion(
+        self: &Arc<Self>,
+        _txn: Option<&TxnHandle>,
+        _sql: &str,
+    ) -> Result<QueryResult> {
+        let _ = (self, _txn, _sql);
+        Err(EngineError::Unsupported(
+            "DataFusion AP path requires the 'datafusion' feature".to_string(),
+        ))
+    }
+
+    /// Execute a SQL statement with typed `$1..$n` bind parameters.
+    ///
+    /// Parameters replace [`Literal::Param`] nodes in the parsed AST; they are
+    /// never interpolated into SQL text. Int4, Int8, Float8, Text, Vector, and
+    /// NULL values are supported. Types must match the inferred column type
+    /// exactly, including a vector's dimension; in particular, Text is not
+    /// implicitly decoded as Vector. The parameter slice length must equal the
+    /// greatest referenced index (unused gaps remain valid, as in PostgreSQL).
+    /// Query statistics retain the original SQL text, including placeholders.
+    pub fn exec_with_params(
+        &self,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let mut session = SqlSession::new(NEXT_SQL_SESSION_ID.fetch_add(1, Ordering::Relaxed));
+        self.exec_with_params_in_session(&mut session, txn, sql, params)
+    }
+
+    /// Execute parameterized SQL with a persistent per-connection sequence context.
+    pub fn exec_with_params_in_session(
+        &self,
+        session: &mut SqlSession,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let started = Instant::now();
+        let stmt = sql::parse(sql)?;
+        self.exec_parsed(session, txn, sql, started, stmt, Some(params))
+    }
+
+    /// Infer the schema type of every parameter slot in `$1..$max` order.
+    ///
+    /// A gap or an otherwise uninferable position is returned as `None`.
+    /// Repeated parameters must have exactly compatible types; vector types
+    /// include their dimension. Statements without parameters return an empty
+    /// vector without requiring schema lookup.
+    pub fn parameter_types(&self, stmt: &Statement) -> Result<Vec<Option<ColumnType>>> {
+        let max_index = sql::max_parameter_index(stmt);
+        if max_index == 0 {
+            return Ok(Vec::new());
+        }
+        let mut inference = ParameterInference::new(max_index);
+        infer_statement_parameters(self, stmt, &mut inference)?;
+        Ok(inference.slots)
+    }
+
+    fn exec_parsed(
+        &self,
+        session: &mut SqlSession,
+        txn: Option<&TxnHandle>,
+        sql: &str,
+        started: Instant,
+        stmt: Statement,
+        params: Option<&[Value]>,
+    ) -> Result<QueryResult> {
+        let mut path = ExecutionPath::of(&stmt);
+        let result = match params {
+            Some(params) => self
+                .bind_parameters(stmt, params)
+                .and_then(|stmt| match txn {
+                    None => self.exec_auto(session, stmt, &mut path),
+                    Some(handle) => self.exec_txn(session, handle, stmt, &mut path),
+                }),
+            None => match txn {
+                None => self.exec_auto(session, stmt, &mut path),
+                Some(handle) => self.exec_txn(session, handle, stmt, &mut path),
+            },
         };
         // F2 (Stage E review): capacity 0 means "stats off" — skip the
         // per-statement String allocation entirely.
@@ -3651,7 +5448,52 @@ impl Engine {
         result
     }
 
-    fn exec_auto(&self, stmt: Statement) -> Result<QueryResult> {
+    fn bind_parameters(&self, mut stmt: Statement, params: &[Value]) -> Result<Statement> {
+        let inferred = self.parameter_types(&stmt)?;
+        if params.len() != inferred.len() {
+            let kind = if params.len() < inferred.len() {
+                "missing"
+            } else {
+                "extra"
+            };
+            return Err(EngineError::InvalidArgument(format!(
+                "{kind} parameter values: statement requires {} value(s), but {} were supplied",
+                inferred.len(),
+                params.len()
+            )));
+        }
+        let literals = params
+            .iter()
+            .zip(&inferred)
+            .enumerate()
+            .map(|(index, (value, expected))| parameter_to_literal(index + 1, *expected, value))
+            .collect::<Result<Vec<_>>>()?;
+        replace_parameters(&mut stmt, &literals)?;
+        Ok(stmt)
+    }
+
+    fn sequence_query(
+        &self,
+        session: &mut SqlSession,
+        function: SequenceFunction,
+        sequence: &str,
+    ) -> Result<QueryResult> {
+        let (name, value) = match function {
+            SequenceFunction::NextVal => ("nextval", self.nextval(session, sequence)?),
+            SequenceFunction::CurrVal => ("currval", self.currval(session, sequence)?),
+        };
+        Ok(QueryResult::Rows {
+            columns: vec![name.to_string()],
+            rows: vec![vec![Some(Datum::Int8(value))]],
+        })
+    }
+
+    fn exec_auto(
+        &self,
+        session: &mut SqlSession,
+        stmt: Statement,
+        path: &mut ExecutionPath,
+    ) -> Result<QueryResult> {
         match stmt {
             // Transaction control is programmatic only (Stage O review):
             // auto-commit mode has no transaction to begin or end, so these
@@ -3662,18 +5504,103 @@ impl Engine {
             Statement::Commit | Statement::Rollback => Err(EngineError::InvalidArgument(
                 "no transaction in progress".to_string(),
             )),
+            Statement::CreateSequence { name } => {
+                self.create_sequence(&name).map(|_| QueryResult::Ok)
+            }
+            Statement::SequenceQuery { function, sequence } => {
+                self.sequence_query(session, function, &sequence)
+            }
+            Statement::Explain(inner) => {
+                let Statement::Select {
+                    table,
+                    columns,
+                    filter,
+                    order_by,
+                    limit,
+                    ..
+                } = *inner
+                else {
+                    return Err(EngineError::Unsupported(
+                        "EXPLAIN currently supports SELECT only".to_string(),
+                    ));
+                };
+                // EXPLAIN plans and estimates only: no inner B+Tree/ANN
+                // execution and no FOR UPDATE row-lock stamping. The local
+                // guard covers the statistics scan.
+                let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
+                snap.advance_curcid();
+                let entry = self.table_entry(&table)?;
+                crate::executor::explain(
+                    self, &snap, &table, &entry, &columns, &filter, &order_by, &limit,
+                )
+            }
             Statement::CreateTable { name, columns } => {
-                let defs: Vec<ColumnDef> = columns
-                    .into_iter()
-                    .map(|c| ColumnDef {
-                        name: c.name,
-                        col_type: c.col_type,
-                    })
-                    .collect();
-                self.create_table(&name, &defs)?;
+                self.create_table_from_spec(&name, columns)?;
                 Ok(QueryResult::Ok)
             }
-            Statement::CreateIndex { table, column } => {
+            Statement::CreateIndex {
+                table,
+                column,
+                name,
+                method,
+                opclass,
+            } => {
+                if method == Some(sql::IndexMethod::Hnsw) {
+                    let opclass = opclass.ok_or_else(|| {
+                        EngineError::InvalidArgument(
+                            "USING hnsw requires an explicit vector opclass".to_string(),
+                        )
+                    })?;
+                    let metric = match opclass {
+                        sql::VectorOpclass::VectorL2Ops => pg_am_hnsw::Metric::L2,
+                        sql::VectorOpclass::VectorCosineOps => pg_am_hnsw::Metric::Cosine,
+                        sql::VectorOpclass::VectorIpOps => pg_am_hnsw::Metric::InnerProduct,
+                    };
+                    let entry = self.table_entry(&table)?;
+                    let column_def =
+                        entry
+                            .columns
+                            .iter()
+                            .find(|c| c.name == column)
+                            .ok_or_else(|| {
+                                EngineError::InvalidArgument(format!(
+                                    "table {table:?} has no column {column:?}"
+                                ))
+                            })?;
+                    let ColumnType::Vector(dim) = column_def.col_type else {
+                        return Err(EngineError::InvalidArgument(format!(
+                            "hnsw index requires a VECTOR column; {table}({column}) is {:?}",
+                            column_def.col_type
+                        )));
+                    };
+                    let dim = u16::try_from(dim).map_err(|_| {
+                        EngineError::InvalidArgument(format!(
+                            "VECTOR dim {dim} exceeds the HNSW u16 parameter range"
+                        ))
+                    })?;
+                    self.create_hnsw_index_on_named(
+                        &table,
+                        &column,
+                        name.as_deref(),
+                        pg_am_hnsw::HnswParams::default(),
+                        dim,
+                        metric,
+                        pg_am_hnsw::NeighborSelection::Heuristic,
+                        42,
+                    )?;
+                    return Ok(QueryResult::Ok);
+                }
+                if name.is_some() {
+                    return Err(EngineError::InvalidArgument(
+                        "named BTree index DDL is not yet supported in this execution path"
+                            .to_string(),
+                    ));
+                }
+                if opclass.is_some() {
+                    return Err(EngineError::InvalidArgument(
+                        "a vector opclass is only valid with USING hnsw".to_string(),
+                    ));
+                }
                 self.create_index(&table, &column)?;
                 Ok(QueryResult::Ok)
             }
@@ -3687,7 +5614,7 @@ impl Engine {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                     let mut count = 0;
                     for row in &rows {
-                        let values = build_insert_values(&entry, &columns, row)?;
+                        let values = self.build_insert_values(session, &entry, &columns, row)?;
                         self.insert_inner(snap, &entry, &values)?;
                         count += 1;
                     }
@@ -3716,7 +5643,7 @@ impl Engine {
                         let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
                         snap.advance_curcid();
                         self.exec_select(
-                            &snap, &columns, &table, &filter, &order_by, &limit, false, false,
+                            &snap, &columns, &table, &filter, &order_by, &limit, false, false, path,
                         )
                     }
                     // FOR UPDATE (M2c Stage P) needs a real transaction:
@@ -3728,7 +5655,7 @@ impl Engine {
                     Some(LockClause::ForUpdate) => self.auto_commit(|snap| {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                         self.exec_select(
-                            snap, &columns, &table, &filter, &order_by, &limit, true, false,
+                            snap, &columns, &table, &filter, &order_by, &limit, true, false, path,
                         )
                     }),
                     // FOR SHARE (Stage S multixact lite): stamps a shared
@@ -3737,7 +5664,7 @@ impl Engine {
                     Some(LockClause::ForShare) => self.auto_commit(|snap| {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                         self.exec_select(
-                            snap, &columns, &table, &filter, &order_by, &limit, true, true,
+                            snap, &columns, &table, &filter, &order_by, &limit, true, true, path,
                         )
                     }),
                 }
@@ -3786,7 +5713,13 @@ impl Engine {
         }
     }
 
-    fn exec_txn(&self, handle: &TxnHandle, stmt: Statement) -> Result<QueryResult> {
+    fn exec_txn(
+        &self,
+        session: &mut SqlSession,
+        handle: &TxnHandle,
+        stmt: Statement,
+        path: &mut ExecutionPath,
+    ) -> Result<QueryResult> {
         // A handle is bound to its creating engine (Stage O review): using
         // it against another instance would run statements against the wrong
         // registry while writing through the original engine's txn manager.
@@ -3807,7 +5740,31 @@ impl Engine {
             Statement::Rollback => Err(EngineError::InvalidArgument(
                 "ROLLBACK via exec is not supported; call TxnHandle::abort() instead".to_string(),
             )),
-            Statement::CreateTable { .. } | Statement::CreateIndex { .. } => {
+            Statement::SequenceQuery { function, sequence } => {
+                self.sequence_query(session, function, &sequence)
+            }
+            Statement::Explain(inner) => {
+                let Statement::Select {
+                    table,
+                    columns,
+                    filter,
+                    order_by,
+                    limit,
+                    ..
+                } = *inner
+                else {
+                    return Err(EngineError::Unsupported(
+                        "EXPLAIN currently supports SELECT only".to_string(),
+                    ));
+                };
+                let entry = self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
+                crate::executor::explain(
+                    self, &snap, &table, &entry, &columns, &filter, &order_by, &limit,
+                )
+            }
+            Statement::CreateTable { .. }
+            | Statement::CreateIndex { .. }
+            | Statement::CreateSequence { .. } => {
                 drop(snap);
                 Err(EngineError::InvalidArgument(
                     "DDL inside explicit transactions is not supported in M2b; run DDL in auto-commit mode (exec(None, ...))".to_string(),
@@ -3821,7 +5778,7 @@ impl Engine {
                 let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                 let mut count = 0;
                 for row in &rows {
-                    let values = build_insert_values(&entry, &columns, row)?;
+                    let values = self.build_insert_values(session, &entry, &columns, row)?;
                     self.insert_inner(&snap, &entry, &values)?;
                     count += 1;
                 }
@@ -3838,19 +5795,19 @@ impl Engine {
                 None => {
                     self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
                     self.exec_select(
-                        &snap, &columns, &table, &filter, &order_by, &limit, false, false,
+                        &snap, &columns, &table, &filter, &order_by, &limit, false, false, path,
                     )
                 }
                 Some(LockClause::ForUpdate) => {
                     self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                     self.exec_select(
-                        &snap, &columns, &table, &filter, &order_by, &limit, true, false,
+                        &snap, &columns, &table, &filter, &order_by, &limit, true, false, path,
                     )
                 }
                 Some(LockClause::ForShare) => {
                     self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                     self.exec_select(
-                        &snap, &columns, &table, &filter, &order_by, &limit, true, true,
+                        &snap, &columns, &table, &filter, &order_by, &limit, true, true, path,
                     )
                 }
             },
@@ -3890,6 +5847,52 @@ impl Engine {
         }
     }
 
+    /// Validate the Stage A/B SELECT shape without doing heap I/O. EXPLAIN and
+    /// normal execution share this gate so they cannot disagree on supported ANN
+    /// syntax, projection expressions, or ORDER BY columns.
+    pub(crate) fn validate_select_shape(
+        entry: &TableEntry,
+        columns: &SelectCols,
+        order_by: &Option<OrderByKind>,
+    ) -> Result<()> {
+        if let Some(OrderByKind::Column(ob)) = order_by {
+            let column = entry
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&ob.column))
+                .ok_or_else(|| {
+                    EngineError::InvalidPredicate(format!("no column {:?} in table", ob.column))
+                })?;
+            if matches!(column.col_type, ColumnType::Vector(_)) {
+                return Err(EngineError::InvalidArgument(format!(
+                    "ORDER BY VECTOR column {:?} is not supported; use a distance operator instead",
+                    ob.column
+                )));
+            }
+        }
+        if let SelectCols::Cols(items) = columns {
+            for item in items {
+                match item {
+                    SelectItem::Column(name) => {
+                        if !entry
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(name))
+                        {
+                            return Err(EngineError::InvalidPredicate(format!(
+                                "no column {name:?} in table"
+                            )));
+                        }
+                    }
+                    SelectItem::Distance(expr) => {
+                        crate::executor::prepare_distance(entry, expr)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Shared SELECT execution. `lock_rows` is the M2c `FOR UPDATE` mode
     /// (§9.1): after the scan/filter/sort/LIMIT, every surviving row is
     /// stamped with a lock-only `t_xmax` via [`HeapAM::lock_tuple`] BEFORE
@@ -3915,18 +5918,24 @@ impl Engine {
         columns: &SelectCols,
         table: &str,
         filter: &Option<Filter>,
-        order_by: &Option<OrderBy>,
+        order_by: &Option<OrderByKind>,
         limit: &Option<usize>,
         lock_rows: bool,
         shared: bool,
+        path: &mut ExecutionPath,
     ) -> Result<QueryResult> {
         let entry = self.table_entry(table)?;
-        let pred = filter
-            .as_ref()
-            .map(|f| filter_to_predicate(&entry, f))
-            .transpose()?;
-        let mut rows = self.scan_inner(snap, table, pred.as_ref())?;
-        if let Some(ob) = order_by {
+        Self::validate_select_shape(&entry, columns, order_by)?;
+        let output = crate::executor::execute(self, snap, table, &entry, filter, order_by, limit)?;
+        let is_hnsw = matches!(&output.plan.spec, crate::planner::ScanSpec::Hnsw(_));
+        let mut rows = output.rows;
+        *path = match &output.plan.spec {
+            crate::planner::ScanSpec::BTree(_) | crate::planner::ScanSpec::Hnsw(_) => {
+                ExecutionPath::IndexLookup
+            }
+            crate::planner::ScanSpec::Seq(_) => ExecutionPath::SeqScan,
+        };
+        if let Some(OrderByKind::Column(ob)) = order_by {
             let idx = entry
                 .columns
                 .iter()
@@ -3935,15 +5944,28 @@ impl Engine {
                     EngineError::InvalidPredicate(format!("no column {:?} in table", ob.column))
                 })?;
             rows.sort_by(|a, b| {
-                let av = a.1.get(idx);
-                let bv = b.1.get(idx);
-                let cmp = av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal);
+                let av = a.1.get(idx).and_then(|value| value.as_ref());
+                let bv = b.1.get(idx).and_then(|value| value.as_ref());
+                // PostgreSQL defaults: ASC NULLS LAST, DESC NULLS FIRST.
+                let cmp = match (av, bv) {
+                    (Some(a), Some(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                };
                 if ob.desc {
                     cmp.reverse()
                 } else {
                     cmp
                 }
             });
+        }
+        // hnsw_search_visible already returns the exact M6 order. Only an
+        // exact SeqScan fallback needs a SQL-distance sort here.
+        if !is_hnsw {
+            if let Some(OrderByKind::Expr(expr)) = order_by {
+                rows = crate::executor::sort_by_distance(&entry, rows, expr)?;
+            }
         }
         if let Some(n) = limit {
             rows.truncate(*n);
@@ -3964,26 +5986,53 @@ impl Engine {
                 let rows: Vec<Vec<Value>> = rows.into_iter().map(|(_, v)| v).collect();
                 (names, rows)
             }
-            SelectCols::Cols(cols) => {
-                let indices: Vec<usize> = cols
+            SelectCols::Cols(items) => {
+                enum Projection {
+                    Column(usize),
+                    Distance(crate::executor::DistanceEvaluator),
+                }
+                let names: Vec<String> = items
                     .iter()
-                    .map(|name| {
-                        entry
-                            .columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(name))
-                            .ok_or_else(|| {
-                                EngineError::InvalidPredicate(format!(
-                                    "no column {name:?} in table"
-                                ))
-                            })
+                    .map(|item| match item {
+                        SelectItem::Column(name) => name.clone(),
+                        SelectItem::Distance(_) => "?column?".to_string(),
+                    })
+                    .collect();
+                let projections = items
+                    .iter()
+                    .map(|item| match item {
+                        SelectItem::Column(name) => {
+                            let index = entry
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(name))
+                                .ok_or_else(|| {
+                                    EngineError::InvalidPredicate(format!(
+                                        "no column {name:?} in table"
+                                    ))
+                                })?;
+                            Ok(Projection::Column(index))
+                        }
+                        SelectItem::Distance(expr) => Ok(Projection::Distance(
+                            crate::executor::prepare_distance(&entry, expr)?,
+                        )),
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let rows: Vec<Vec<Value>> = rows
+                let projected = rows
                     .into_iter()
-                    .map(|(_, v)| indices.iter().map(|&i| v[i].clone()).collect())
-                    .collect();
-                (cols.clone(), rows)
+                    .map(|(_, values)| {
+                        projections
+                            .iter()
+                            .map(|projection| match projection {
+                                Projection::Column(index) => Ok(values[*index].clone()),
+                                Projection::Distance(evaluator) => evaluator
+                                    .evaluate(&values)
+                                    .map(|distance| distance.map(Datum::Float8)),
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (names, projected)
             }
         };
         Ok(QueryResult::Rows {
@@ -4010,7 +6059,27 @@ impl Engine {
     /// panic mid-transaction leaves in-memory state no one can vouch for,
     /// and the process-level failure policy (same as a WAL-fatal error)
     /// applies rather than a best-effort cleanup that might make it worse.
+    #[cfg(test)]
+    fn run_before_auto_commit_hook() {
+        BEFORE_AUTO_COMMIT_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook();
+            }
+        });
+    }
+
     fn auto_commit<T>(&self, op: impl FnOnce(&Snapshot) -> Result<T>) -> Result<T> {
+        self.auto_commit_with_hooks(op, || Ok(()), || {})
+    }
+
+    /// `on_success` runs after a durable commit but before table locks are
+    /// released; `on_error` runs before lock release on either failure path.
+    fn auto_commit_with_hooks<T>(
+        &self,
+        op: impl FnOnce(&Snapshot) -> Result<T>,
+        on_success: impl FnOnce() -> Result<()>,
+        on_error: impl FnOnce(),
+    ) -> Result<T> {
         let xid = self.txn.begin_txn();
         // The snapshot's registry entry is dropped when `op` returns — the
         // post-commit cleanup's watermark read (oldest_snapshot_xmin) must
@@ -4024,6 +6093,8 @@ impl Engine {
         };
         match op_result {
             Ok(v) => {
+                #[cfg(test)]
+                Self::run_before_auto_commit_hook();
                 let result = self.txn.commit_txn(xid);
                 if result.is_err() {
                     // Same fallback as TxnHandle::commit (F7): a failed
@@ -4044,7 +6115,7 @@ impl Engine {
                         tracing::warn!(error = %abort_err, xid = xid.0, "auto-commit commit-failure fallback abort failed");
                     }
                 }
-                if result.is_ok() {
+                let hook_result = if result.is_ok() {
                     // M6 Stage C: deferred post-commit graph actions run
                     // after the commit is durable AND before the table
                     // locks release (round-3 P3-1).
@@ -4057,10 +6128,14 @@ impl Engine {
                         self.txn.oldest_snapshot_xmin(),
                     );
                     self.index_undo.lock().remove(&xid);
+                    on_success()
                 } else {
                     self.pending_hnsw.lock().remove(&xid);
-                }
+                    on_error();
+                    Ok(())
+                };
                 self.lock_manager.release_all(xid);
+                hook_result?;
                 result?;
                 Ok(v)
             }
@@ -4075,6 +6150,10 @@ impl Engine {
                 if let Err(abort_err) = self.txn.abort_txn(xid) {
                     tracing::warn!(error = %abort_err, "auto-commit abort failed");
                 }
+                // Deferred graph actions belong to a now-aborted XID and
+                // must never accumulate across failed statements.
+                self.pending_hnsw.lock().remove(&xid);
+                on_error();
                 self.lock_manager.release_all(xid);
                 Err(e)
             }
@@ -4124,35 +6203,43 @@ impl Engine {
         Ok(())
     }
 
-    /// Locate the live (`relkind = 'r'`) `pg_class` row of `oid` by a raw
-    /// slot scan of the catalog's first page.
-    ///
-    /// Raw, not `HeapAM::scan`: catalog rows written by bootstrap carry the
-    /// synthetic bootstrap XID, which the CLOG has never heard of — a
-    /// visibility-filtered AM scan would see nothing. The registry only
-    /// tracks live tables, so a live row must exist.
-    fn find_live_pg_class_row(&self, oid: Oid) -> Result<Tid> {
-        let guard = self.storage.buffer_pool().pin(PG_CLASS.first_page)?;
-        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+    /// Locate the live (`relkind = 'r'`) `pg_class` version visible to the
+    /// current DDL transaction. TOAST migration and DROP both update this
+    /// catalog row, so a raw first-slot match can address an already-dead
+    /// version and spuriously fail with `TupleConcurrentlyUpdated`.
+    fn find_live_pg_class_row(&self, snap: &Snapshot, oid: Oid) -> Result<Tid> {
+        self.find_live_class_row(snap, oid, RELKIND_TABLE)
+    }
+
+    fn find_live_class_row(&self, snap: &Snapshot, oid: Oid, kind: &str) -> Result<Tid> {
         let columns = PG_CLASS.column_types();
-        for slot in 0..SlottedPage::slot_count(page) as u16 {
-            let Some(bytes) = SlottedPage::tuple(page, slot)? else {
-                continue;
-            };
-            let (_header, values) = decode_tuple(bytes, &columns)?;
+        let rows = self.heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_CLASS.oid.raw(),
+                first_page: PG_CLASS.first_page,
+                columns: &columns,
+            },
+            snapshot: snap,
+            clog: self.clog.as_ref(),
+        })?;
+        for (tid, values) in rows {
             let matches = matches!(&values[0], Some(Datum::Int8(v)) if *v == oid.0 as i64)
-                && matches!(&values[2], Some(Datum::Text(k)) if k == RELKIND_TABLE);
+                && matches!(&values[2], Some(Datum::Text(k)) if k == kind);
             if matches {
-                return Ok(Tid {
-                    page_id: PG_CLASS.first_page,
-                    slot_id: slot,
-                });
+                return Ok(tid);
             }
         }
-        Err(EngineError::Corrupted(format!(
-            "pg_class has no live row for table OID {}",
-            oid.0
-        )))
+        if kind == RELKIND_TABLE {
+            Err(EngineError::Corrupted(format!(
+                "pg_class has no live row for table OID {}",
+                oid.0
+            )))
+        } else {
+            Err(EngineError::Corrupted(format!(
+                "pg_class has no live {kind} row for relation OID {}",
+                oid.0
+            )))
+        }
     }
 
     /// Walk the on-disk page chain from `first_page` (same rules as the
@@ -4220,7 +6307,12 @@ impl Engine {
     /// we resolved was dropped while we waited — fail with
     /// [`EngineError::TableNotFound`]; the lock we took on the dead OID is
     /// released by the caller's normal commit/abort path.
-    fn lock_table_entry(&self, xid: TxnId, table: &str, mode: LockMode) -> Result<TableEntry> {
+    pub(crate) fn lock_table_entry(
+        &self,
+        xid: TxnId,
+        table: &str,
+        mode: LockMode,
+    ) -> Result<TableEntry> {
         let entry = self.table_entry(table)?;
         self.lock_table(xid, &entry, mode)?;
         let current = self
@@ -4233,6 +6325,15 @@ impl Engine {
             return Err(EngineError::TableNotFound(table.to_string()));
         }
         Ok(current)
+    }
+
+    /// All live table names and entries, used by the optional AP router.
+    pub fn table_entries(&self) -> Vec<(String, TableEntry)> {
+        self.registry
+            .read()
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect()
     }
 
     /// A cloned registry entry for `table` (testing / advanced use, e.g.
@@ -4334,10 +6435,10 @@ impl Engine {
     }
 
     /// The query statistics ring buffer (M3 Stage E, tech-selection §6.3):
-    /// one entry per [`Self::exec`] call, oldest dropped on overflow. The
-    /// typed API (`scan` / `insert` / `update` / `delete` /
-    /// `index_lookup`) does NOT produce entries — it never passes through
-    /// `exec`.
+    /// one entry per [`Self::exec`] or [`Self::exec_with_params`] call, oldest
+    /// dropped on overflow. The typed API (`scan` / `insert` / `update` /
+    /// `delete` / `index_lookup`) does NOT produce entries — it never passes
+    /// through either SQL execution entry point.
     pub fn query_stats(&self) -> &QueryStats {
         &self.query_stats
     }
@@ -4363,7 +6464,7 @@ fn tuple_header(curcid: u32) -> TupleHeader {
 }
 
 /// The codec column types of a registry entry, in schema order.
-fn column_types(entry: &TableEntry) -> Vec<ColumnType> {
+pub(crate) fn column_types(entry: &TableEntry) -> Vec<ColumnType> {
     entry.columns.iter().map(|c| c.col_type).collect()
 }
 
@@ -4374,23 +6475,6 @@ fn relation_desc<'a>(entry: &TableEntry, col_types: &'a [ColumnType]) -> Relatio
         first_page: entry.first_page,
         columns: col_types,
     }
-}
-
-/// Encode `values` as a heap tuple against the entry's schema.
-fn encode_row(
-    entry: &TableEntry,
-    col_types: &[ColumnType],
-    values: &[Value],
-    curcid: u32,
-) -> Result<Vec<u8>> {
-    if values.len() != entry.columns.len() {
-        return Err(EngineError::InvalidArgument(format!(
-            "table has {} columns but {} values given",
-            entry.columns.len(),
-            values.len()
-        )));
-    }
-    Ok(encode_tuple(tuple_header(curcid), col_types, values)?)
 }
 
 /// Check that a predicate's column index is in range for the table.
@@ -4419,6 +6503,21 @@ fn apply_predicate(rows: &mut Vec<(Tid, Vec<Value>)>, predicate: Option<&Predica
     }
 }
 
+/// Refuse to persist a FLOAT8 attribute into a legacy catalog that cannot
+/// describe OID 701. Computed distance results do not go through this gate.
+fn ensure_float8_storage_supported(has_float8_type: bool, schema: &[ColumnDef]) -> Result<()> {
+    if !has_float8_type
+        && schema
+            .iter()
+            .any(|column| column.col_type == ColumnType::Float8)
+    {
+        return Err(EngineError::Unsupported(
+            "legacy catalog has no FLOAT8 pg_type row; FLOAT8 column storage requires a catalog migration (distance results remain supported)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Map a codec column type to its built-in `pg_type` OID and `attlen`
 /// (§5.1; the built-in set has exactly one type per codec type).
 fn type_oid_of(col_type: ColumnType) -> Result<(TypeOid, i32)> {
@@ -4435,6 +6534,19 @@ fn type_oid_of(col_type: ColumnType) -> Result<(TypeOid, i32)> {
         .ok_or_else(|| EngineError::InvalidArgument(format!("no builtin type for {col_type:?}")))
 }
 
+fn ensure_finite_vector_components(vector: &[f32], description: &str) -> Result<()> {
+    if let Some((index, value)) = vector
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(EngineError::InvalidArgument(format!(
+            "{description} component {index} is not finite ({value})"
+        )));
+    }
+    Ok(())
+}
+
 /// Convert a SQL `Literal` to a heap `Value` (`Option<Datum>`) given the
 /// target column type.
 fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
@@ -4446,6 +6558,7 @@ fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
         }
         (Literal::Int(n), ColumnType::Int8) => Ok(Some(Datum::Int8(*n))),
         (Literal::Int(n), ColumnType::Timestamptz) => Ok(Some(Datum::Timestamptz(*n))),
+        (Literal::Float(f), ColumnType::Float8) => Ok(Some(Datum::Float8(*f))),
         (Literal::Str(s), ColumnType::Text) => Ok(Some(Datum::Text(s.clone()))),
         (Literal::Str(s), ColumnType::Bytea) => Ok(Some(Datum::Bytea(s.clone().into_bytes()))),
         // M6 Stage C: a vector literal must match the column's dim exactly
@@ -4458,6 +6571,7 @@ fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
                     v.len()
                 )));
             }
+            ensure_finite_vector_components(v, "vector literal")?;
             Ok(Some(Datum::Vector(v.clone())))
         }
         (Literal::Null, _) => Ok(None),
@@ -4467,54 +6581,108 @@ fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
     }
 }
 
-/// Build the full `values` vector for an INSERT, matching the table schema.
-fn build_insert_values(
-    entry: &TableEntry,
-    columns: &Option<Vec<String>>,
-    row: &[Literal],
-) -> Result<Vec<Value>> {
-    let n = entry.columns.len();
-    let values = match columns {
-        Some(cols) => {
-            if cols.len() != row.len() {
-                return Err(EngineError::InvalidArgument(format!(
-                    "column list has {} entries but {} values given",
-                    cols.len(),
-                    row.len()
-                )));
+impl Engine {
+    fn build_insert_values(
+        &self,
+        session: &mut SqlSession,
+        entry: &TableEntry,
+        columns: &Option<Vec<String>>,
+        row: &[Literal],
+    ) -> Result<Vec<Value>> {
+        let n = entry.columns.len();
+        let mut values = match columns {
+            Some(cols) => {
+                if cols.len() != row.len() {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "column list has {} entries but {} values given",
+                        cols.len(),
+                        row.len()
+                    )));
+                }
+                let mut v = vec![None; n];
+                for (col_name, lit) in cols.iter().zip(row.iter()) {
+                    let idx = entry
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                        .ok_or_else(|| {
+                            EngineError::InvalidArgument(format!("no column {col_name:?} in table"))
+                        })?;
+                    v[idx] = if matches!(lit, Literal::Default) {
+                        None
+                    } else {
+                        literal_to_value(lit, entry.columns[idx].col_type)?
+                    };
+                }
+                v
             }
-            let mut v = vec![None; n];
-            for (col_name, lit) in cols.iter().zip(row.iter()) {
-                let idx = entry
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                    .ok_or_else(|| {
-                        EngineError::InvalidArgument(format!("no column {col_name:?} in table"))
-                    })?;
-                v[idx] = literal_to_value(lit, entry.columns[idx].col_type)?;
+            None => {
+                if row.len() != n {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "table has {n} columns but {} values given",
+                        row.len()
+                    )));
+                }
+                row.iter()
+                    .zip(entry.columns.iter())
+                    .map(|(lit, col)| {
+                        if matches!(lit, Literal::Default) {
+                            Ok(None)
+                        } else {
+                            literal_to_value(lit, col.col_type)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?
             }
-            v
+        };
+
+        for (index, default) in entry.defaults.iter().enumerate() {
+            let is_default = match columns {
+                Some(cols) => {
+                    let provided = cols
+                        .iter()
+                        .position(|name| name.eq_ignore_ascii_case(&entry.columns[index].name));
+                    provided.is_none()
+                        || matches!(row.get(provided.unwrap()), Some(Literal::Default))
+                }
+                None => matches!(row.get(index), Some(Literal::Default)),
+            };
+            if !is_default {
+                continue;
+            }
+            let sequence_oid = default.ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "column {:?} has no DEFAULT",
+                    entry.columns[index].name
+                ))
+            })?;
+            let sequence = self.sequence_name(sequence_oid)?;
+            let next = self.nextval(session, &sequence)?;
+            let value = i32::try_from(next).map_err(|_| {
+                EngineError::InvalidArgument(format!(
+                    "sequence {sequence:?} value {next} is out of range for INT4"
+                ))
+            })?;
+            values[index] = Some(Datum::Int4(value));
         }
-        None => {
-            if row.len() != n {
-                return Err(EngineError::InvalidArgument(format!(
-                    "table has {n} columns but {} values given",
-                    row.len()
-                )));
-            }
-            row.iter()
-                .zip(entry.columns.iter())
-                .map(|(lit, col)| literal_to_value(lit, col.col_type))
-                .collect::<Result<Vec<_>>>()?
-        }
-    };
-    Ok(values)
+        Ok(values)
+    }
+
+    fn sequence_name(&self, oid: Oid) -> Result<String> {
+        self.sequences
+            .states
+            .lock()
+            .get(&oid)
+            .map(|state| state.name.clone())
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("sequence OID {oid} does not exist"))
+            })
+    }
 }
 
 /// Build a `Predicate` from a parsed `Filter`, resolving the column name
 /// to a 0-based index and converting the literal.
-fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate> {
+pub(crate) fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate> {
     let col_index = entry
         .columns
         .iter()
@@ -4545,6 +6713,15 @@ fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate>
                 )))
             }
         },
+        Literal::Float(f) => match col_type {
+            ColumnType::Float8 => Datum::Float8(*f),
+            _ => {
+                return Err(EngineError::InvalidPredicate(format!(
+                    "column {:?} is not FLOAT8",
+                    filter.column
+                )))
+            }
+        },
         Literal::Str(s) => match col_type {
             ColumnType::Text => Datum::Text(s.clone()),
             _ => {
@@ -4559,12 +6736,311 @@ fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate>
                 "NULL in WHERE is not supported".to_string(),
             ))
         }
+        Literal::Default => {
+            return Err(EngineError::InvalidPredicate(
+                "DEFAULT is only valid in INSERT VALUES".to_string(),
+            ))
+        }
+        Literal::Param(index) => {
+            return Err(EngineError::InvalidArgument(format!(
+                "unbound parameter ${index}; use Engine::exec_with_params"
+            )))
+        }
     };
     Ok(match filter.op {
         CmpOp::Eq => Predicate::Eq { col_index, value },
         CmpOp::Lt => Predicate::Lt { col_index, value },
         CmpOp::Gt => Predicate::Gt { col_index, value },
     })
+}
+
+struct ParameterInference {
+    slots: Vec<Option<ColumnType>>,
+}
+
+impl ParameterInference {
+    fn new(max_index: usize) -> Self {
+        Self {
+            slots: vec![None; max_index],
+        }
+    }
+
+    fn infer(&mut self, literal: &Literal, expected: ColumnType) -> Result<()> {
+        let Literal::Param(index) = literal else {
+            return Ok(());
+        };
+        let Some(slot) = index
+            .checked_sub(1)
+            .and_then(|index| self.slots.get_mut(index))
+        else {
+            return Err(EngineError::InvalidArgument(format!(
+                "invalid parameter index ${index}"
+            )));
+        };
+        match slot {
+            Some(existing) if *existing != expected => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "parameter ${index} has incompatible inferred types {existing:?} and {expected:?}"
+                )))
+            }
+            Some(_) => {}
+            None => *slot = Some(expected),
+        }
+        Ok(())
+    }
+}
+
+fn infer_statement_parameters(
+    engine: &Engine,
+    stmt: &Statement,
+    inference: &mut ParameterInference,
+) -> Result<()> {
+    match stmt {
+        Statement::Explain(inner) => infer_statement_parameters(engine, inner, inference)?,
+        Statement::Insert {
+            table,
+            columns,
+            rows,
+        } => {
+            let entry = engine.table_entry(table)?;
+            let targets = match columns {
+                Some(columns) => columns
+                    .iter()
+                    .map(|column| required_column_type(&entry, column, false))
+                    .collect::<Result<Vec<_>>>()?,
+                None => column_types(&entry),
+            };
+            for row in rows {
+                if row.len() != targets.len() {
+                    let message = if columns.is_some() {
+                        format!(
+                            "column list has {} entries but {} values given",
+                            targets.len(),
+                            row.len()
+                        )
+                    } else {
+                        format!(
+                            "table has {} columns but {} values given",
+                            targets.len(),
+                            row.len()
+                        )
+                    };
+                    return Err(EngineError::InvalidArgument(message));
+                }
+                for (literal, expected) in row.iter().zip(&targets) {
+                    inference.infer(literal, *expected)?;
+                }
+            }
+        }
+        Statement::Select {
+            columns,
+            table,
+            filter,
+            order_by,
+            ..
+        } => {
+            let entry = engine.table_entry(table)?;
+            if let SelectCols::Cols(items) = columns {
+                for item in items {
+                    if let SelectItem::Distance(expr) = item {
+                        infer_distance_parameter(&entry, expr, inference)?;
+                    }
+                }
+            }
+            infer_filter_parameter(&entry, filter, inference)?;
+            if let Some(OrderByKind::Expr(expr)) = order_by {
+                infer_distance_parameter(&entry, expr, inference)?;
+            }
+        }
+        Statement::Update {
+            table,
+            sets,
+            filter,
+        } => {
+            let entry = engine.table_entry(table)?;
+            for (column, literal) in sets {
+                let expected = required_column_type(&entry, column, false)?;
+                inference.infer(literal, expected)?;
+            }
+            infer_filter_parameter(&entry, filter, inference)?;
+        }
+        Statement::Delete { table, filter } => {
+            let entry = engine.table_entry(table)?;
+            infer_filter_parameter(&entry, filter, inference)?;
+        }
+        Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::SequenceQuery { .. } => {}
+    }
+    Ok(())
+}
+
+fn required_column_type(entry: &TableEntry, column: &str, predicate: bool) -> Result<ColumnType> {
+    entry
+        .columns
+        .iter()
+        .find(|candidate| candidate.name.eq_ignore_ascii_case(column))
+        .map(|column| column.col_type)
+        .ok_or_else(|| {
+            let message = format!("no column {column:?} in table");
+            if predicate {
+                EngineError::InvalidPredicate(message)
+            } else {
+                EngineError::InvalidArgument(message)
+            }
+        })
+}
+
+fn infer_filter_parameter(
+    entry: &TableEntry,
+    filter: &Option<Filter>,
+    inference: &mut ParameterInference,
+) -> Result<()> {
+    if let Some(filter) = filter {
+        let expected = required_column_type(entry, &filter.column, true)?;
+        inference.infer(&filter.value, expected)?;
+    }
+    Ok(())
+}
+
+fn infer_distance_parameter(
+    entry: &TableEntry,
+    expr: &OrderByExpr,
+    inference: &mut ParameterInference,
+) -> Result<()> {
+    if !matches!(expr.right, Expr::Literal(Literal::Param(_))) {
+        return Ok(());
+    }
+    let Expr::Column(column) = &expr.left else {
+        return Ok(());
+    };
+    let expected = required_column_type(entry, column, true)?;
+    let ColumnType::Vector(_) = expected else {
+        return Err(EngineError::InvalidArgument(format!(
+            "distance left operand {column:?} is not a VECTOR column"
+        )));
+    };
+    let Expr::Literal(literal) = &expr.right else {
+        unreachable!()
+    };
+    inference.infer(literal, expected)
+}
+
+fn parameter_to_literal(
+    index: usize,
+    expected: Option<ColumnType>,
+    value: &Value,
+) -> Result<Literal> {
+    let Some(datum) = value else {
+        return Ok(Literal::Null);
+    };
+    let (actual, literal) = match datum {
+        Datum::Int4(value) => (ColumnType::Int4, Literal::Int(i64::from(*value))),
+        Datum::Int8(value) => (ColumnType::Int8, Literal::Int(*value)),
+        Datum::Float8(value) => (ColumnType::Float8, Literal::Float(*value)),
+        Datum::Text(value) => (ColumnType::Text, Literal::Str(value.clone())),
+        Datum::Vector(value) => {
+            ensure_finite_vector_components(value, &format!("parameter ${index} vector"))?;
+            let dim = u32::try_from(value.len()).map_err(|_| {
+                EngineError::InvalidArgument(format!(
+                    "parameter ${index} vector dimension exceeds u32"
+                ))
+            })?;
+            (ColumnType::Vector(dim), Literal::Vector(value.clone()))
+        }
+        other => {
+            return Err(EngineError::InvalidArgument(format!(
+                "parameter ${index} uses unsupported datum type {other:?}"
+            )))
+        }
+    };
+    if let Some(expected) = expected {
+        if expected != actual {
+            return Err(EngineError::InvalidArgument(format!(
+                "parameter ${index} expects {expected:?}, got {actual:?}"
+            )));
+        }
+    }
+    Ok(literal)
+}
+
+fn replace_parameters(stmt: &mut Statement, literals: &[Literal]) -> Result<()> {
+    match stmt {
+        Statement::Explain(inner) => replace_parameters(inner, literals)?,
+        Statement::Insert { rows, .. } => {
+            for literal in rows.iter_mut().flatten() {
+                replace_parameter(literal, literals)?;
+            }
+        }
+        Statement::Select {
+            columns,
+            filter,
+            order_by,
+            ..
+        } => {
+            if let SelectCols::Cols(items) = columns {
+                for item in items {
+                    if let SelectItem::Distance(expr) = item {
+                        replace_expr_parameters(expr, literals)?;
+                    }
+                }
+            }
+            if let Some(filter) = filter {
+                replace_parameter(&mut filter.value, literals)?;
+            }
+            if let Some(OrderByKind::Expr(expr)) = order_by {
+                replace_expr_parameters(expr, literals)?;
+            }
+        }
+        Statement::Update { sets, filter, .. } => {
+            for (_, literal) in sets {
+                replace_parameter(literal, literals)?;
+            }
+            if let Some(filter) = filter {
+                replace_parameter(&mut filter.value, literals)?;
+            }
+        }
+        Statement::Delete { filter, .. } => {
+            if let Some(filter) = filter {
+                replace_parameter(&mut filter.value, literals)?;
+            }
+        }
+        Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::SequenceQuery { .. } => {}
+    }
+    Ok(())
+}
+
+fn replace_expr_parameters(expr: &mut OrderByExpr, literals: &[Literal]) -> Result<()> {
+    for operand in [&mut expr.left, &mut expr.right] {
+        if let Expr::Literal(literal) = operand {
+            replace_parameter(literal, literals)?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_parameter(literal: &mut Literal, literals: &[Literal]) -> Result<()> {
+    let index = match literal {
+        Literal::Param(index) => *index,
+        _ => return Ok(()),
+    };
+    let Some(replacement) = index.checked_sub(1).and_then(|index| literals.get(index)) else {
+        return Err(EngineError::InvalidArgument(format!(
+            "missing value for parameter ${index}"
+        )));
+    };
+    *literal = replacement.clone();
+    Ok(())
 }
 
 /// Apply UPDATE SET assignments to an existing row, producing the full new
@@ -4586,4 +7062,589 @@ fn apply_sets(
         new_values[idx] = literal_to_value(lit, entry.columns[idx].col_type)?;
     }
     Ok(new_values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_catalog_rejects_only_float8_column_storage() {
+        let float8 = [ColumnDef {
+            name: "distance".to_string(),
+            col_type: ColumnType::Float8,
+        }];
+        let err = ensure_float8_storage_supported(false, &float8).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)));
+        ensure_float8_storage_supported(true, &float8).unwrap();
+
+        let ordinary = [ColumnDef {
+            name: "id".to_string(),
+            col_type: ColumnType::Int4,
+        }];
+        ensure_float8_storage_supported(false, &ordinary).unwrap();
+    }
+
+    use tempfile::TempDir;
+
+    fn open(dir: &std::path::Path) -> Engine {
+        Engine::open(dir, EngineConfig::new(dir)).unwrap()
+    }
+
+    fn create_l2_table(engine: &Engine) {
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, v VECTOR(2))")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX ann_idx ON t USING hnsw (v vector_l2_ops)",
+            )
+            .unwrap();
+    }
+
+    fn raw_hnsw_map_page(engine: &Engine, index_oid: Oid) -> PageId {
+        let def = &PG_RELPAGES;
+        let columns = def.column_types();
+        let guard = engine.storage.buffer_pool().pin(def.first_page).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        for slot in 0..SlottedPage::slot_count(page) as u16 {
+            let Some(bytes) = SlottedPage::tuple(page, slot).unwrap() else {
+                continue;
+            };
+            let (_, values) = decode_tuple(bytes, &columns).unwrap();
+            if !matches!(values.first(), Some(Some(Datum::Int8(oid))) if *oid == index_oid.0 as i64)
+            {
+                continue;
+            }
+            return match values.get(2) {
+                Some(Some(Datum::Int8(page))) => PageId(*page as u64),
+                other => panic!("invalid relpages map page: {other:?}"),
+            };
+        }
+        panic!("no physical relpages row for failed index {index_oid:?}")
+    }
+
+    static COMMIT_FAIL_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static WRITER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static CREATE_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static ANN_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static ANN_RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static DROP_CLEANUP_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn wait_for_drop() {
+        ANN_STARTED.store(true, Ordering::SeqCst);
+        while !ANN_RELEASE.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    fn signal_drop_cleanup() {
+        DROP_CLEANUP_STARTED.store(true, Ordering::SeqCst);
+    }
+
+    fn wait_for_writer_ready() {
+        CREATE_LOCKED.store(true, Ordering::SeqCst);
+        while !WRITER_READY.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    #[expect(dead_code, reason = "the guard is held only for its Drop")]
+    struct CommitFailGuard(std::sync::MutexGuard<'static, ()>);
+
+    impl CommitFailGuard {
+        fn arm() -> Self {
+            let guard = COMMIT_FAIL_HOOK_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pg_txn::manager::test_hooks::set_commit_txn_force_fail(true);
+            Self(guard)
+        }
+    }
+
+    impl Drop for CommitFailGuard {
+        fn drop(&mut self) {
+            pg_txn::manager::test_hooks::set_commit_txn_force_fail(false);
+        }
+    }
+
+    #[test]
+    fn auto_commit_discards_pending_hnsw_after_a_later_error() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        create_l2_table(&engine);
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, [1,0])")
+            .unwrap();
+        let tid = engine.scan("t", None).unwrap()[0].0;
+
+        let result = engine.auto_commit(|snap| {
+            let _entry =
+                engine.lock_table_entry(snap.current_xid(), "t", LockMode::RowExclusive)?;
+            engine.delete_inner(snap, "t", tid)?;
+            Err::<(), _>(EngineError::InvalidArgument(
+                "injected failure after the first deferred HNSW action".to_string(),
+            ))
+        });
+        assert!(result.is_err());
+        assert!(
+            engine.pending_hnsw.lock().is_empty(),
+            "aborted XID left deferred HNSW actions behind"
+        );
+        assert_eq!(engine.scan("t", None).unwrap().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn hnsw_create_commit_failure_rolls_back_registry_and_handle() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, v VECTOR(2))")
+            .unwrap();
+        let hook = CommitFailGuard::arm();
+        let result = engine.create_hnsw_index_on(
+            "t",
+            "v",
+            pg_am_hnsw::HnswParams::default(),
+            2,
+            pg_am_hnsw::Metric::L2,
+            pg_am_hnsw::NeighborSelection::Heuristic,
+            42,
+        );
+        drop(hook);
+        assert!(result.is_err());
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+
+        engine
+            .create_hnsw_index_on(
+                "t",
+                "v",
+                pg_am_hnsw::HnswParams::default(),
+                2,
+                pg_am_hnsw::Metric::L2,
+                pg_am_hnsw::NeighborSelection::Heuristic,
+                42,
+            )
+            .unwrap();
+        assert_eq!(engine.indexes().len(), 1);
+        assert_eq!(engine.hnsw_handles.lock().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn btree_create_commit_failure_rolls_back_registry() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (id INT4)").unwrap();
+        let hook = CommitFailGuard::arm();
+        let result = engine.create_index("t", "id");
+        drop(hook);
+        assert!(result.is_err());
+        assert!(engine.indexes().is_empty());
+
+        engine.create_index("t", "id").unwrap();
+        assert_eq!(engine.indexes().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn seqscan_fallbacks_do_not_open_hnsw_handles() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(
+                None,
+                "CREATE TABLE t (id INT4, v VECTOR(2), other VECTOR(2))",
+            )
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX ann_idx ON t USING hnsw (v vector_l2_ops)",
+            )
+            .unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, [1,0], [0,1])")
+            .unwrap();
+
+        for query in [
+            "SELECT * FROM t ORDER BY v <-> '[1,0]' DESC LIMIT 1",
+            "SELECT * FROM t ORDER BY v <-> '[1,0]' ASC",
+            "SELECT * FROM t WHERE id > 0 ORDER BY v <-> '[1,0]' ASC LIMIT 1",
+            "SELECT * FROM t ORDER BY other <-> '[1,0]' ASC LIMIT 1",
+        ] {
+            engine.hnsw_handles.lock().clear();
+            engine.exec(None, query).unwrap();
+            assert!(
+                engine.hnsw_handles.lock().is_empty(),
+                "fallback opened an HNSW handle: {query}"
+            );
+        }
+
+        engine.hnsw_handles.lock().clear();
+        engine
+            .exec(None, "SELECT * FROM t ORDER BY v <-> '[1,0]' ASC LIMIT 1")
+            .unwrap();
+        assert_eq!(engine.hnsw_handles.lock().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn real_legacy_directory_rejects_float8_storage_before_heap_creation() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        let def = &pg_catalog::system_tables::PG_TYPE;
+        let columns = def.column_types();
+        let guard = engine.storage.buffer_pool().pin(def.first_page).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        let mut tid = None;
+        for slot in 0..SlottedPage::slot_count(page) as u16 {
+            let Some(bytes) = SlottedPage::tuple(page, slot).unwrap() else {
+                continue;
+            };
+            let (_, values) = decode_tuple(bytes, &columns).unwrap();
+            if matches!(values.first(), Some(Some(Datum::Int8(701)))) {
+                tid = Some(Tid {
+                    page_id: def.first_page,
+                    slot_id: slot,
+                });
+                break;
+            }
+        }
+        drop(guard);
+        let tid = tid.expect("fresh catalog contains FLOAT8");
+        let mut guard = engine.storage.buffer_pool().pin_mut(tid.page_id).unwrap();
+        let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+        SlottedPage::delete_tuple(page, tid.slot_id).unwrap();
+        drop(guard);
+        engine.checkpoint().unwrap();
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert!(
+            engine.catalog.type_by_oid(FLOAT8_OID).is_none(),
+            "legacy fixture still contains FLOAT8"
+        );
+        let before = engine.storage().page_allocator().lock().next_page_id();
+        let err = engine
+            .create_table(
+                "legacy_float8",
+                &[ColumnDef {
+                    name: "distance".to_string(),
+                    col_type: ColumnType::Float8,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
+        let after = engine.storage().page_allocator().lock().next_page_id();
+        assert_eq!(before, after);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn drop_cleanup_error_never_resurrects_a_live_table() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        create_l2_table(&engine);
+        let entry = engine.describe_table("t").unwrap();
+        // Force the post-commit page-free path to fail after the committed
+        // marker. In-memory cleanup must already have removed every entry.
+        engine
+            .storage
+            .page_allocator()
+            .lock()
+            .free_page(entry.first_page)
+            .unwrap();
+        let result = engine.drop_table("t");
+        assert!(result.is_ok(), "post-commit cleanup is only a warning");
+        assert!(matches!(
+            engine.scan("t", None),
+            Err(EngineError::TableNotFound(_))
+        ));
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert!(matches!(
+            engine.scan("t", None),
+            Err(EngineError::TableNotFound(_))
+        ));
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn drop_page_walk_error_after_commit_is_only_a_warning() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        create_l2_table(&engine);
+        let entry = engine.describe_table("t").unwrap();
+        // A self-link makes the post-commit chain walk fail before any page
+        // can be freed. The durable marker and in-memory cleanup still win.
+        let mut guard = engine
+            .storage
+            .buffer_pool()
+            .pin_mut(entry.first_page)
+            .unwrap();
+        let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+        SlottedPage::set_next_page(page, Some(entry.first_page)).unwrap();
+        drop(guard);
+
+        let result = engine.drop_table("t");
+        assert!(result.is_ok(), "post-commit page walk is only a warning");
+        assert!(matches!(
+            engine.scan("t", None),
+            Err(EngineError::TableNotFound(_))
+        ));
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert!(matches!(
+            engine.scan("t", None),
+            Err(EngineError::TableNotFound(_))
+        ));
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn drop_commit_failure_preserves_table_and_allows_retry() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        create_l2_table(&engine);
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, [1,0])")
+            .unwrap();
+        let hook = CommitFailGuard::arm();
+        let result = engine.drop_table("t");
+        drop(hook);
+        assert!(result.is_err());
+        assert_eq!(engine.scan("t", None).unwrap().len(), 1);
+        assert!(matches!(
+            engine.exec(None, "CREATE TABLE t (id INT4)"),
+            Err(EngineError::TableExists(_))
+        ));
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert_eq!(engine.scan("t", None).unwrap().len(), 1);
+        assert!(matches!(
+            engine.exec(None, "CREATE TABLE t (id INT4)"),
+            Err(EngineError::TableExists(_))
+        ));
+
+        engine.drop_table("t").unwrap();
+        assert!(matches!(
+            engine.scan("t", None),
+            Err(EngineError::TableNotFound(_))
+        ));
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        create_l2_table(&engine);
+        assert_eq!(engine.indexes().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn legacy_orphaned_serial_metadata_does_not_block_recreate() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (id SERIAL)").unwrap();
+        let entry = engine.describe_table("t").unwrap();
+        // Reproduce the pre-Stage-G DROP shape: only the table was marked and
+        // cleaned, leaving its SERIAL sequence/default metadata behind.
+        engine
+            .auto_commit_with_hooks(
+                |snap| {
+                    engine.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
+                    engine.drop_table_marker(snap, "t", &entry)
+                },
+                || engine.drop_table_storage("t", &entry),
+                || {},
+            )
+            .unwrap();
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (id SERIAL)").unwrap();
+        let mut session = SqlSession::new(1);
+        engine
+            .exec_in_session(&mut session, None, "INSERT INTO t VALUES (DEFAULT)")
+            .unwrap();
+        assert_eq!(
+            engine.scan("t", None).unwrap()[0].1[0],
+            Some(Datum::Int4(1))
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn create_index_commit_failure_rolls_back_before_waiters_run() {
+        let tmp = TempDir::new().unwrap();
+        let engine = Arc::new(open(tmp.path()));
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, v VECTOR(2))")
+            .unwrap();
+        let table_oid = engine.describe_table("t").unwrap().oid;
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                BEFORE_AUTO_COMMIT_HOOK.with(|hook| hook.set(None));
+                WRITER_READY.store(false, Ordering::SeqCst);
+                CREATE_LOCKED.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetHook;
+
+        let creator_engine = Arc::clone(&engine);
+        let creator = std::thread::spawn(move || {
+            let _hook = CommitFailGuard::arm();
+            BEFORE_AUTO_COMMIT_HOOK.with(|hook| hook.set(Some(wait_for_writer_ready)));
+            creator_engine.create_hnsw_index_on(
+                "t",
+                "v",
+                pg_am_hnsw::HnswParams::default(),
+                2,
+                pg_am_hnsw::Metric::L2,
+                pg_am_hnsw::NeighborSelection::Heuristic,
+                42,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !CREATE_LOCKED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "CREATE INDEX never reached its pre-commit hook"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let writer_engine = Arc::clone(&engine);
+        let writer =
+            std::thread::spawn(move || writer_engine.exec(None, "INSERT INTO t VALUES (1, [1,0])"));
+        let mut waiter_queued = false;
+        for _ in 0..10_000 {
+            if engine.table_lock_state(table_oid).is_some_and(|state| {
+                state
+                    .waiters
+                    .iter()
+                    .any(|(_, mode)| *mode == LockMode::RowExclusive)
+            }) {
+                waiter_queued = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(waiter_queued, "writer never queued behind Exclusive");
+        WRITER_READY.store(true, Ordering::SeqCst);
+        let create_result = creator.join().unwrap();
+        let write_result = writer.join().unwrap();
+
+        assert!(create_result.is_err());
+        assert!(write_result.is_ok(), "{write_result:?}");
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        // The failed index OID follows the table OID and its optional Stage D
+        // TOAST OID. Read the physical sidecar directly: MVCC would hide the
+        // aborted relpages row and produce a vacuous lookup result.
+        let has_toast = engine.describe_table("t").unwrap().toast.is_some();
+        let failed_index_oid = Oid(table_oid.0 + 1 + u64::from(has_toast));
+        let map_page = raw_hnsw_map_page(&engine, failed_index_oid);
+        let map = pg_am_btree::BTreeIndex::open(
+            Arc::clone(engine.storage.buffer_pool()),
+            Arc::clone(engine.storage.wal_writer()),
+            failed_index_oid,
+            map_page,
+            ColumnType::Int8,
+        )
+        .unwrap();
+        let key = encode_key(&Datum::Int8(0)).unwrap();
+        assert!(map.lookup(&key).unwrap().is_none());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn lazy_open_cannot_reinsert_a_handle_after_drop() {
+        let tmp = TempDir::new().unwrap();
+        let engine = Arc::new(open(tmp.path()));
+        create_l2_table(&engine);
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, [1,0])")
+            .unwrap();
+        engine.hnsw_handles.lock().clear();
+
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                BEFORE_HNSW_PUBLISH_HOOK.with(|hook| hook.set(None));
+                BEFORE_DROP_CLEANUP_HOOK.with(|hook| hook.set(None));
+                ANN_RELEASE.store(true, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetHook;
+        ANN_STARTED.store(false, Ordering::SeqCst);
+        ANN_RELEASE.store(false, Ordering::SeqCst);
+        DROP_CLEANUP_STARTED.store(false, Ordering::SeqCst);
+
+        let ann_engine = Arc::clone(&engine);
+        let ann = std::thread::spawn(move || {
+            BEFORE_HNSW_PUBLISH_HOOK.with(|hook| hook.set(Some(wait_for_drop)));
+            ann_engine.hnsw_search_visible("t", &[1.0, 0.0], 1, Some(64), &Snapshot::everything())
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ANN_STARTED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "ANN never reached its publish hook"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let drop_engine = Arc::clone(&engine);
+        let drop_thread = std::thread::spawn(move || {
+            BEFORE_DROP_CLEANUP_HOOK.with(|hook| hook.set(Some(signal_drop_cleanup)));
+            drop_engine.drop_table("t")
+        });
+        while !DROP_CLEANUP_STARTED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "DROP never reached post-commit cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // DROP is committed and inside cleanup while ANN is paused at publish.
+        // Prove the guards directly: an unsynchronized open/publish would let
+        // either try_write succeed here, regardless of thread scheduling.
+        assert!(
+            engine.registry.try_write().is_none(),
+            "table registry is not read-locked across HNSW publish"
+        );
+        assert!(
+            engine.indexes.try_write().is_none(),
+            "index registry is not read-locked across HNSW publish"
+        );
+        ANN_RELEASE.store(true, Ordering::SeqCst);
+        let ann_result = ann.join().unwrap();
+        let drop_result = drop_thread.join().unwrap();
+
+        assert!(ann_result.is_ok(), "{ann_result:?}");
+        assert!(drop_result.is_ok(), "{drop_result:?}");
+        assert!(engine.indexes().is_empty());
+        assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+    }
 }

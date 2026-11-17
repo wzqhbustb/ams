@@ -25,10 +25,16 @@
 #![warn(rust_2018_idioms)]
 
 pub mod clog_snapshot_migrate;
+#[cfg(feature = "datafusion")]
+pub mod datafusion_provider;
 pub mod diag;
 pub mod engine;
 pub mod error;
+pub(crate) mod executor;
+pub mod planner;
 pub mod query_stats;
+pub mod sequence;
+pub mod session;
 pub mod sql;
 
 pub use engine::{
@@ -48,3 +54,4 @@ pub use pg_am_heap::tuple::{ColumnType, Datum};
 // (M2c Stage P) without depending on pg-am-heap directly.
 pub use pg_am_heap::HeapError;
 pub use pg_storage::types::{Oid, PageId, Tid};
+pub use session::SqlSession;

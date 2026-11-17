@@ -1,14 +1,15 @@
 //! Minimal SQL parser: tokenizer + recursive descent (no external deps).
 //!
-//! Supports the M2b/M2c subset: BEGIN/COMMIT/ROLLBACK, CREATE TABLE,
-//! INSERT, SELECT (with WHERE/ORDER BY/LIMIT and the M2c `FOR UPDATE` /
-//! `FOR SHARE` lock clause), UPDATE, DELETE, CREATE INDEX. One statement
-//! per `parse` call; a single trailing `;` is allowed and stripped.
-//! Unquoted identifiers are lowercased (PostgreSQL fold-to-lower
-//! semantics); quoted identifiers do not exist in this subset, so table
-//! and column lookup is uniformly case-insensitive.
+//! Supports the M2b/M2c subset plus Phase 4a Stage 0 syntax: BEGIN/COMMIT/
+//! ROLLBACK, CREATE TABLE, INSERT, SELECT (with WHERE/ORDER BY/LIMIT and the
+//! M2c `FOR UPDATE` / `FOR SHARE` lock clause), UPDATE, DELETE, and CREATE
+//! INDEX with optional name/USING/opclass. ORDER BY also accepts the three
+//! vector distance operators. One statement per `parse` call; a single
+//! trailing `;` is allowed and stripped. Unquoted identifiers are lowercased
+//! (PostgreSQL fold-to-lower semantics); quoted identifiers do not exist in
+//! this subset, so table and column lookup is uniformly case-insensitive.
 //!
-//! # Not supported (by design, M2b/M2c)
+//! # Not supported (by design, M2b/M2c and Phase 4a Stage 0)
 //!
 //! - `--` / `/* */` comments: `-` is only ever a negative-number sign,
 //!   so `-- comment` fails with "invalid number: -" rather than being
@@ -17,8 +18,8 @@
 //!   keyword-colliding names.
 //! - Multi-statement input (only ONE optional trailing `;`).
 //! - RETURNING, JOIN, subqueries, aggregates, GROUP BY/HAVING, `<=`/`>=`/
-//!   `<>`/`!=` (only `=` / `<` / `>`), parenthesized expressions, and
-//!   arithmetic in statements.
+//!   `<>`/`!=` (only `=` / `<` / `>`), parenthesized expressions, and general
+//!   arithmetic outside the three ORDER BY distance operators.
 //! - `FOR NO KEY UPDATE` / `FOR KEY SHARE` (only the bare `FOR UPDATE` /
 //!   `FOR SHARE` forms). `FOR SHARE` is fully implemented since M2c
 //!   Stage S ("multixact lite"): it stamps a shared row lock
@@ -38,9 +39,18 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    /// EXPLAIN of one inner statement (Stage A supports SELECT).
+    Explain(Box<Statement>),
     CreateTable {
         name: String,
         columns: Vec<ColumnSpec>,
+    },
+    CreateSequence {
+        name: String,
+    },
+    SequenceQuery {
+        function: SequenceFunction,
+        sequence: String,
     },
     Insert {
         table: String,
@@ -51,7 +61,7 @@ pub enum Statement {
         columns: SelectCols,
         table: String,
         filter: Option<Filter>,
-        order_by: Option<OrderBy>,
+        order_by: Option<OrderByKind>,
         limit: Option<usize>,
         /// Row-lock clause (M2c Stage P): `FOR UPDATE` / `FOR SHARE`.
         lock: Option<LockClause>,
@@ -66,9 +76,80 @@ pub enum Statement {
         filter: Option<Filter>,
     },
     CreateIndex {
+        /// Optional index name (Phase 4a: `CREATE INDEX name ON ...`).
+        name: Option<String>,
         table: String,
         column: String,
+        /// `USING <method>` — defaults to `BTree` (PG's `USING btree/gin/gist`
+        /// family). `USING hnsw` requires an explicit opclass (§5.1).
+        method: Option<IndexMethod>,
+        /// The vector operator class (Phase 4a §5.1). Required for HNSW.
+        opclass: Option<VectorOpclass>,
     },
+}
+
+/// A sequence function evaluated as a single-row, no-FROM query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceFunction {
+    NextVal,
+    CurrVal,
+}
+
+/// The index method (PG's `USING <method>` family).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMethod {
+    BTree,
+    Hnsw,
+}
+
+/// The vector operator class (pgvector-compatible opclasses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorOpclass {
+    /// `vector_l2_ops` — L2 (Euclidean) distance.
+    VectorL2Ops,
+    /// `vector_cosine_ops` — cosine distance.
+    VectorCosineOps,
+    /// `vector_ip_ops` — inner product.
+    VectorIpOps,
+}
+
+/// A distance-operator expression in ORDER BY (Phase 4a §5.2):
+/// `ORDER BY <distance> ASC|DESC` where `<distance>` is one of the three
+/// ANN operator shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistanceOp {
+    /// `<->` — L2 (Euclidean) distance.
+    L2,
+    /// `<=>` — cosine distance.
+    Cosine,
+    /// `<#>` — inner product.
+    InnerProduct,
+}
+
+/// ORDER BY clause: either a plain column or a distance-operator expression
+/// (sum type — the two forms are mutually exclusive).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderByKind {
+    Column(OrderBy),
+    Expr(OrderByExpr),
+}
+
+/// A distance-operator ORDER BY expression (Phase 4a §5.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderByExpr {
+    pub op: DistanceOp,
+    pub left: Expr,
+    pub right: Expr,
+    /// `true` = DESC, `false` = ASC (default).
+    pub desc: bool,
+}
+
+/// An operand in an ORDER BY distance expression: a column reference or a
+/// literal (e.g. the query vector).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Column(String),
+    Literal(Literal),
 }
 
 /// A SELECT row-lock clause (M2c Stage P, tech-selection §9.1).
@@ -87,13 +168,23 @@ pub enum LockClause {
 pub struct ColumnSpec {
     pub name: String,
     pub col_type: ColumnType,
+    pub serial: bool,
 }
 
 /// Which columns a SELECT returns.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectCols {
     All,
-    Cols(Vec<String>),
+    Cols(Vec<SelectItem>),
+}
+
+/// One SELECT-list item: a plain column or a vector distance expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectItem {
+    Column(String),
+    /// Distance expression. `desc` is unused in a SELECT list and stays
+    /// false; ORDER BY owns the direction for its own expression.
+    Distance(OrderByExpr),
 }
 
 /// A WHERE clause filter.
@@ -123,10 +214,14 @@ pub struct OrderBy {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Int(i64),
+    Float(f64),
     Str(String),
     Null,
+    Default,
     /// M6 Stage C: a vector literal `[0.1, 2.5, ...]` (INSERT path).
     Vector(Vec<f32>),
+    /// A 1-based bind parameter (`$1`, `$2`, ...).
+    Param(usize),
 }
 
 // ─── Tokenizer ────────────────────────────────────────────────────────
@@ -138,6 +233,7 @@ enum Token {
     Commit,
     Rollback,
     Create,
+    Explain,
     Table,
     Insert,
     Into,
@@ -157,6 +253,9 @@ enum Token {
     Delete,
     Index,
     On,
+    Sequence,
+    Serial,
+    Default,
     Null,
     // Type names
     Type(ColumnType),
@@ -165,10 +264,19 @@ enum Token {
     /// M6 Stage C: floating-point literal (vector elements).
     Float(f64),
     Str(String),
+    Param(usize),
     // Operators
     Eq,
     Lt,
     Gt,
+    /// `USING` (index method clause, Phase 4a).
+    Using,
+    /// `<->` — L2 distance operator (ANN, Phase 4a §5.2).
+    L2Op,
+    /// `<=>` — cosine distance operator (ANN).
+    CosineOp,
+    /// `<#>` — inner product operator (ANN).
+    InnerProductOp,
     // Punctuation
     Comma,
     /// `[` — M6 Stage C vector literal open.
@@ -184,6 +292,8 @@ enum Token {
     // End of input
     Eof,
 }
+
+const MAX_PARAMETER_COUNT: usize = u16::MAX as usize;
 
 struct Tokenizer<'a> {
     chars: std::str::Chars<'a>,
@@ -225,14 +335,34 @@ impl<'a> Tokenizer<'a> {
                 Some(c) => {
                     if c == '\'' {
                         tokens.push(self.string_literal()?);
+                    } else if c == '$' {
+                        tokens.push(self.parameter_placeholder()?);
                     } else if c == '-' || c.is_ascii_digit() {
                         tokens.push(self.number_literal()?);
+                    } else if c == '<' {
+                        self.bump();
+                        // Longest match first: the three ANN distance
+                        // operators (`<->`, `<=>`, `<#>`) precede `<`.
+                        // Look ahead for the complete operator before
+                        // consuming its middle character. In particular,
+                        // `<-5` is a less-than followed by a negative number,
+                        // not a malformed `<->` operator.
+                        let operator = match (self.peek, self.chars.clone().next()) {
+                            (Some('-'), Some('>')) => Some(Token::L2Op),
+                            (Some('='), Some('>')) => Some(Token::CosineOp),
+                            (Some('#'), Some('>')) => Some(Token::InnerProductOp),
+                            _ => None,
+                        };
+                        if let Some(operator) = operator {
+                            self.bump();
+                            self.bump();
+                            tokens.push(operator);
+                        } else {
+                            tokens.push(Token::Lt);
+                        }
                     } else if c == '=' {
                         self.bump();
                         tokens.push(Token::Eq);
-                    } else if c == '<' {
-                        self.bump();
-                        tokens.push(Token::Lt);
                     } else if c == '>' {
                         self.bump();
                         tokens.push(Token::Gt);
@@ -295,6 +425,45 @@ impl<'a> Tokenizer<'a> {
         Ok(Token::Str(s))
     }
 
+    fn parameter_placeholder(&mut self) -> Result<Token> {
+        self.bump(); // $
+        let mut digits = String::new();
+        while self.peek.is_some_and(|c| c.is_ascii_digit()) {
+            digits.push(self.bump().unwrap());
+        }
+        if digits.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "malformed parameter placeholder: expected a decimal index after '$'".to_string(),
+            ));
+        }
+        let parameter_limit_error = || {
+            EngineError::InvalidArgument(format!(
+                "parameter placeholder ${digits} exceeds the PostgreSQL parameter limit of {MAX_PARAMETER_COUNT}"
+            ))
+        };
+        let index = digits
+            .parse::<usize>()
+            .map_err(|_| parameter_limit_error())?;
+        if index == 0 {
+            return Err(EngineError::InvalidArgument(
+                "parameter placeholder indices are 1-based; $0 is invalid".to_string(),
+            ));
+        }
+        if self
+            .peek
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$'))
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "malformed parameter placeholder ${digits}: non-decimal suffix {:?}",
+                self.peek.unwrap()
+            )));
+        }
+        if index > MAX_PARAMETER_COUNT {
+            return Err(parameter_limit_error());
+        }
+        Ok(Token::Param(index))
+    }
+
     fn number_literal(&mut self) -> Result<Token> {
         let mut s = String::new();
         if self.peek == Some('-') {
@@ -349,6 +518,7 @@ impl<'a> Tokenizer<'a> {
             "COMMIT" => Token::Commit,
             "ROLLBACK" => Token::Rollback,
             "CREATE" => Token::Create,
+            "EXPLAIN" => Token::Explain,
             "TABLE" => Token::Table,
             "INSERT" => Token::Insert,
             "INTO" => Token::Into,
@@ -368,9 +538,14 @@ impl<'a> Tokenizer<'a> {
             "DELETE" => Token::Delete,
             "INDEX" => Token::Index,
             "ON" => Token::On,
+            "USING" => Token::Using,
+            "SEQUENCE" => Token::Sequence,
+            "SERIAL" => Token::Serial,
+            "DEFAULT" => Token::Default,
             "NULL" => Token::Null,
             "INT" | "INT4" | "INTEGER" => Token::Type(ColumnType::Int4),
             "BIGINT" | "INT8" => Token::Type(ColumnType::Int8),
+            "FLOAT8" => Token::Type(ColumnType::Float8),
             "TEXT" | "VARCHAR" => Token::Type(ColumnType::Text),
             "BYTEA" => Token::Type(ColumnType::Bytea),
             "TIMESTAMPTZ" => Token::Type(ColumnType::Timestamptz),
@@ -482,6 +657,10 @@ impl Parser {
                 self.eat(&Token::Eof)?;
                 Ok(Statement::Rollback)
             }
+            Token::Explain => {
+                self.bump();
+                Ok(Statement::Explain(Box::new(self.parse_statement()?)))
+            }
             Token::Create => self.parse_create(),
             Token::Insert => self.parse_insert(),
             Token::Select => self.parse_select(),
@@ -498,10 +677,18 @@ impl Parser {
         match self.peek().clone() {
             Token::Table => self.parse_create_table(),
             Token::Index => self.parse_create_index(),
+            Token::Sequence => self.parse_create_sequence(),
             other => Err(EngineError::InvalidArgument(format!(
-                "expected TABLE or INDEX after CREATE, got {other:?}"
+                "expected TABLE, INDEX or SEQUENCE after CREATE, got {other:?}"
             ))),
         }
+    }
+
+    fn parse_create_sequence(&mut self) -> Result<Statement> {
+        self.bump(); // SEQUENCE
+        let name = self.eat_ident()?;
+        self.eat(&Token::Eof)?;
+        Ok(Statement::CreateSequence { name })
     }
 
     fn parse_create_table(&mut self) -> Result<Statement> {
@@ -511,8 +698,9 @@ impl Parser {
         let mut columns = Vec::new();
         loop {
             let col_name = self.eat_ident()?;
-            let col_type = match self.bump() {
-                Token::Type(t) => t,
+            let (col_type, serial) = match self.bump() {
+                Token::Type(t) => (t, false),
+                Token::Serial => (ColumnType::Int4, true),
                 other => {
                     return Err(EngineError::InvalidArgument(format!(
                         "expected column type, got {other:?}"
@@ -522,6 +710,7 @@ impl Parser {
             columns.push(ColumnSpec {
                 name: col_name,
                 col_type,
+                serial,
             });
             match self.peek() {
                 Token::Comma => {
@@ -544,13 +733,63 @@ impl Parser {
 
     fn parse_create_index(&mut self) -> Result<Statement> {
         self.bump(); // INDEX
+                     // Optional index name (Phase 4a: `CREATE INDEX name ON ...`).
+        let name = if matches!(self.peek(), Token::Ident(_)) {
+            Some(self.eat_ident()?)
+        } else {
+            None
+        };
         self.eat(&Token::On)?;
         let table = self.eat_ident()?;
+        // Optional `USING <method>` clause (defaults to BTree when absent).
+        let method = if matches!(self.peek(), Token::Using) {
+            self.bump(); // USING
+            match self.eat_ident()?.as_str() {
+                "btree" => Some(IndexMethod::BTree),
+                "hnsw" => Some(IndexMethod::Hnsw),
+                other => {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "unknown index method {other:?} (expected btree or hnsw)"
+                    )))
+                }
+            }
+        } else {
+            None
+        };
         self.eat(&Token::LParen)?;
         let column = self.eat_ident()?;
+        // Optional vector opclass (required for HNSW).
+        let opclass = if matches!(self.peek(), Token::Ident(_)) {
+            match self.eat_ident()?.as_str() {
+                "vector_l2_ops" => Some(VectorOpclass::VectorL2Ops),
+                "vector_cosine_ops" => Some(VectorOpclass::VectorCosineOps),
+                "vector_ip_ops" => Some(VectorOpclass::VectorIpOps),
+                other => {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "unknown vector opclass {other:?} (expected vector_l2_ops/vector_cosine_ops/vector_ip_ops)"
+                    )))
+                }
+            }
+        } else {
+            None
+        };
         self.eat(&Token::RParen)?;
+        // HNSW requires an explicit opclass (§5.1). Execution validates
+        // method/column compatibility and rejects unsupported DDL forms.
+        if method == Some(IndexMethod::Hnsw) && opclass.is_none() {
+            return Err(EngineError::InvalidArgument(
+                "HNSW index requires an opclass (vector_l2_ops/vector_cosine_ops/vector_ip_ops)"
+                    .to_string(),
+            ));
+        }
         self.eat(&Token::Eof)?;
-        Ok(Statement::CreateIndex { table, column })
+        Ok(Statement::CreateIndex {
+            name,
+            table,
+            column,
+            method,
+            opclass,
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -627,9 +866,11 @@ impl Parser {
     fn parse_literal(&mut self) -> Result<Literal> {
         match self.bump() {
             Token::Int(n) => Ok(Literal::Int(n)),
-            Token::Float(f) => Ok(Literal::Vector(vec![f as f32])),
+            Token::Float(f) => Ok(Literal::Float(f)),
             Token::Str(s) => Ok(Literal::Str(s)),
+            Token::Default => Ok(Literal::Default),
             Token::Null => Ok(Literal::Null),
+            Token::Param(index) => Ok(Literal::Param(index)),
             // M6 Stage C: `[1.0, 2.5, ...]` vector literal.
             Token::LBracket => {
                 let mut v = Vec::new();
@@ -667,6 +908,11 @@ impl Parser {
 
     fn parse_select(&mut self) -> Result<Statement> {
         self.bump(); // SELECT
+        if matches!(self.peek(), Token::Ident(name) if name == "nextval" || name == "currval")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            return self.parse_sequence_query();
+        }
         let columns = self.parse_select_cols()?;
         self.eat(&Token::From)?;
         let table = self.eat_ident()?;
@@ -683,6 +929,30 @@ impl Parser {
             limit,
             lock,
         })
+    }
+
+    fn parse_sequence_query(&mut self) -> Result<Statement> {
+        let function = match self.bump() {
+            Token::Ident(name) if name == "nextval" => SequenceFunction::NextVal,
+            Token::Ident(name) if name == "currval" => SequenceFunction::CurrVal,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "expected nextval or currval, got {other:?}"
+                )))
+            }
+        };
+        self.eat(&Token::LParen)?;
+        let sequence = match self.bump() {
+            Token::Str(name) => name,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "sequence name must be a string literal, got {other:?}"
+                )))
+            }
+        };
+        self.eat(&Token::RParen)?;
+        self.eat(&Token::Eof)?;
+        Ok(Statement::SequenceQuery { function, sequence })
     }
 
     /// The M2c row-lock clause (§9.1): `FOR UPDATE` / `FOR SHARE`, after
@@ -709,17 +979,51 @@ impl Parser {
                 Ok(SelectCols::All)
             }
             Token::Ident(_) => {
-                let mut cols = vec![self.eat_ident()?];
+                let mut items = vec![self.parse_select_item()?];
                 while matches!(self.peek(), Token::Comma) {
                     self.bump();
-                    cols.push(self.eat_ident()?);
+                    items.push(self.parse_select_item()?);
                 }
-                Ok(SelectCols::Cols(cols))
+                Ok(SelectCols::Cols(items))
             }
             other => Err(EngineError::InvalidArgument(format!(
                 "expected column list or '*', got {other:?}"
             ))),
         }
+    }
+
+    fn parse_select_item(&mut self) -> Result<SelectItem> {
+        let column = self.eat_ident()?;
+        if matches!(
+            self.peek(),
+            Token::L2Op | Token::CosineOp | Token::InnerProductOp
+        ) {
+            let (op, right) = self.parse_distance_tail()?;
+            Ok(SelectItem::Distance(OrderByExpr {
+                op,
+                left: Expr::Column(column),
+                right: Expr::Literal(right),
+                desc: false,
+            }))
+        } else {
+            Ok(SelectItem::Column(column))
+        }
+    }
+
+    /// Parse the operator and right operand shared by SELECT-list and ORDER
+    /// BY distance expressions. Direction belongs only to ORDER BY.
+    fn parse_distance_tail(&mut self) -> Result<(DistanceOp, Literal)> {
+        let op = match self.bump() {
+            Token::L2Op => DistanceOp::L2,
+            Token::CosineOp => DistanceOp::Cosine,
+            Token::InnerProductOp => DistanceOp::InnerProduct,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "expected vector distance operator, got {other:?}"
+                )))
+            }
+        };
+        Ok((op, self.parse_literal()?))
     }
 
     fn parse_optional_filter(&mut self) -> Result<Option<Filter>> {
@@ -742,13 +1046,21 @@ impl Parser {
         Ok(Some(Filter { column, op, value }))
     }
 
-    fn parse_optional_order_by(&mut self) -> Result<Option<OrderBy>> {
+    fn parse_optional_order_by(&mut self) -> Result<Option<OrderByKind>> {
         if !matches!(self.peek(), Token::Order) {
             return Ok(None);
         }
         self.bump(); // ORDER
         self.eat(&Token::By)?;
         let column = self.eat_ident()?;
+        let distance = if matches!(
+            self.peek(),
+            Token::L2Op | Token::CosineOp | Token::InnerProductOp
+        ) {
+            Some(self.parse_distance_tail()?)
+        } else {
+            None
+        };
         let desc = match self.peek() {
             Token::Asc => {
                 self.bump();
@@ -760,7 +1072,16 @@ impl Parser {
             }
             _ => false,
         };
-        Ok(Some(OrderBy { column, desc }))
+        if let Some((op, right)) = distance {
+            Ok(Some(OrderByKind::Expr(OrderByExpr {
+                op,
+                left: Expr::Column(column),
+                right: Expr::Literal(right),
+                desc,
+            })))
+        } else {
+            Ok(Some(OrderByKind::Column(OrderBy { column, desc })))
+        }
     }
 
     fn parse_optional_limit(&mut self) -> Result<Option<usize>> {
@@ -823,6 +1144,75 @@ pub fn parse(sql: &str) -> Result<Statement> {
     parser.parse_statement()
 }
 
+pub(crate) fn max_parameter_index(stmt: &Statement) -> usize {
+    fn literal_max(literal: &Literal) -> usize {
+        match literal {
+            Literal::Param(index) => *index,
+            _ => 0,
+        }
+    }
+
+    fn filter_max(filter: &Option<Filter>) -> usize {
+        filter
+            .as_ref()
+            .map_or(0, |filter| literal_max(&filter.value))
+    }
+
+    fn expr_max(expr: &OrderByExpr) -> usize {
+        let left = match &expr.left {
+            Expr::Literal(literal) => literal_max(literal),
+            Expr::Column(_) => 0,
+        };
+        let right = match &expr.right {
+            Expr::Literal(literal) => literal_max(literal),
+            Expr::Column(_) => 0,
+        };
+        left.max(right)
+    }
+
+    match stmt {
+        Statement::Explain(inner) => max_parameter_index(inner),
+        Statement::Insert { rows, .. } => rows.iter().flatten().map(literal_max).max().unwrap_or(0),
+        Statement::Select {
+            columns,
+            filter,
+            order_by,
+            ..
+        } => {
+            let columns_max = match columns {
+                SelectCols::All => 0,
+                SelectCols::Cols(items) => items
+                    .iter()
+                    .map(|item| match item {
+                        SelectItem::Column(_) => 0,
+                        SelectItem::Distance(expr) => expr_max(expr),
+                    })
+                    .max()
+                    .unwrap_or(0),
+            };
+            let order_max = match order_by {
+                Some(OrderByKind::Expr(expr)) => expr_max(expr),
+                _ => 0,
+            };
+            columns_max.max(filter_max(filter)).max(order_max)
+        }
+        Statement::Update { sets, filter, .. } => sets
+            .iter()
+            .map(|(_, literal)| literal_max(literal))
+            .max()
+            .unwrap_or(0)
+            .max(filter_max(filter)),
+        Statement::Delete { filter, .. } => filter_max(filter),
+        Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::SequenceQuery { .. } => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,6 +1270,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_explain_select() {
+        let stmt = parse("EXPLAIN SELECT * FROM users WHERE id = 1").unwrap();
+        match stmt {
+            Statement::Explain(inner) => {
+                assert!(matches!(*inner, Statement::Select { .. }));
+            }
+            other => panic!("expected Explain, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_select_all() {
         let stmt = parse("SELECT * FROM users").unwrap();
         match stmt {
@@ -917,14 +1318,19 @@ mod tests {
             } => {
                 assert_eq!(
                     columns,
-                    SelectCols::Cols(vec!["id".to_string(), "name".to_string()])
+                    SelectCols::Cols(vec![
+                        SelectItem::Column("id".to_string()),
+                        SelectItem::Column("name".to_string())
+                    ])
                 );
                 assert_eq!(table, "users");
                 let f = filter.unwrap();
                 assert_eq!(f.column, "id");
                 assert_eq!(f.op, CmpOp::Gt);
                 assert_eq!(f.value, Literal::Int(10));
-                let ob = order_by.unwrap();
+                let OrderByKind::Column(ob) = order_by.unwrap() else {
+                    panic!("expected column order by");
+                };
                 assert_eq!(ob.column, "name");
                 assert!(ob.desc);
                 assert_eq!(limit, Some(5));
@@ -1007,12 +1413,108 @@ mod tests {
     fn parse_create_index() {
         let stmt = parse("CREATE INDEX ON users (email)").unwrap();
         match stmt {
-            Statement::CreateIndex { table, column } => {
+            Statement::CreateIndex { table, column, .. } => {
                 assert_eq!(table, "users");
                 assert_eq!(column, "email");
             }
             other => panic!("expected CreateIndex, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_hnsw_create_index_with_all_opclasses() {
+        for (text, expected) in [
+            ("vector_l2_ops", VectorOpclass::VectorL2Ops),
+            ("vector_cosine_ops", VectorOpclass::VectorCosineOps),
+            ("vector_ip_ops", VectorOpclass::VectorIpOps),
+        ] {
+            let stmt = parse(&format!(
+                "CREATE INDEX idx ON items USING hnsw (embedding {text})"
+            ))
+            .unwrap();
+            match stmt {
+                Statement::CreateIndex {
+                    name,
+                    table,
+                    column,
+                    method,
+                    opclass,
+                } => {
+                    assert_eq!(name.as_deref(), Some("idx"));
+                    assert_eq!(table, "items");
+                    assert_eq!(column, "embedding");
+                    assert_eq!(method, Some(IndexMethod::Hnsw));
+                    assert_eq!(opclass, Some(expected));
+                }
+                other => panic!("expected CreateIndex, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_create_index_rejects_invalid_hnsw_options() {
+        assert!(parse("CREATE INDEX idx ON items USING hnsw (embedding)").is_err());
+        assert!(parse("CREATE INDEX idx ON items USING hnsw (embedding vector_bad_ops)").is_err());
+        assert!(parse("CREATE INDEX idx ON items USING gin (embedding)").is_err());
+    }
+
+    #[test]
+    fn parse_distance_order_by_all_operators_and_directions() {
+        for (text, expected) in [
+            ("<->", DistanceOp::L2),
+            ("<=>", DistanceOp::Cosine),
+            ("<#>", DistanceOp::InnerProduct),
+        ] {
+            for (direction, desc) in [("ASC", false), ("DESC", true)] {
+                let stmt = parse(&format!(
+                    "SELECT * FROM items ORDER BY embedding {text} '[1,2,3]' {direction} LIMIT 4"
+                ))
+                .unwrap();
+                match stmt {
+                    Statement::Select {
+                        order_by: Some(OrderByKind::Expr(expr)),
+                        limit: Some(4),
+                        ..
+                    } => {
+                        assert_eq!(expr.op, expected);
+                        assert_eq!(expr.desc, desc);
+                        assert_eq!(expr.left, Expr::Column("embedding".to_string()));
+                        assert_eq!(
+                            expr.right,
+                            Expr::Literal(Literal::Str("[1,2,3]".to_string()))
+                        );
+                    }
+                    other => panic!("expected distance SELECT, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_select_list_mixes_columns_and_distance_expressions() {
+        let stmt =
+            parse("SELECT id, embedding <-> '[1,2,3]', embedding <#> [4,5,6] FROM items").unwrap();
+        let Statement::Select { columns, .. } = stmt else {
+            panic!("expected SELECT")
+        };
+        let SelectCols::Cols(items) = columns else {
+            panic!("expected SELECT items")
+        };
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], SelectItem::Column("id".to_string()));
+        let SelectItem::Distance(l2) = &items[1] else {
+            panic!("expected L2 SELECT item")
+        };
+        assert_eq!(l2.op, DistanceOp::L2);
+        assert!(!l2.desc);
+        let SelectItem::Distance(ip) = &items[2] else {
+            panic!("expected inner-product SELECT item")
+        };
+        assert_eq!(ip.op, DistanceOp::InnerProduct);
+        assert_eq!(
+            ip.right,
+            Expr::Literal(Literal::Vector(vec![4.0, 5.0, 6.0]))
+        );
     }
 
     #[test]
@@ -1026,6 +1528,18 @@ mod tests {
             }
             _ => panic!("expected Select with filter"),
         }
+    }
+
+    #[test]
+    fn parse_negative_numbers_without_space_after_less_than() {
+        let stmt = parse("SELECT * FROM t WHERE v<-5").unwrap();
+        match stmt {
+            Statement::Select {
+                filter: Some(f), ..
+            } => assert_eq!(f.value, Literal::Int(-5)),
+            other => panic!("expected Select with filter, got {other:?}"),
+        }
+        assert!(parse("SELECT * FROM t WHERE v<-0.5").is_ok());
     }
 
     #[test]
@@ -1061,10 +1575,16 @@ mod tests {
                 order_by,
                 ..
             } => {
-                assert_eq!(columns, SelectCols::Cols(vec!["id".to_string()]));
+                assert_eq!(
+                    columns,
+                    SelectCols::Cols(vec![SelectItem::Column("id".to_string())])
+                );
                 assert_eq!(table, "users");
                 assert_eq!(filter.unwrap().column, "id");
-                assert_eq!(order_by.unwrap().column, "name");
+                let OrderByKind::Column(ob) = order_by.unwrap() else {
+                    panic!("expected column order by");
+                };
+                assert_eq!(ob.column, "name");
             }
             other => panic!("expected Select, got {other:?}"),
         }
