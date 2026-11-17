@@ -5,15 +5,17 @@ transactions, and concurrent B+Tree indexing — built toward a unified
 multi-modal engine for **AI-agent memory** (vector + full-text + graph +
 time-series, with structured metadata).
 
-> **Status (build in public):** Phase 1 is complete (tag `phase1-m3`) and
-> Phase 2 is essentially complete — the HNSW vector index now ships
-> page-resident storage, WAL-based crash recovery, concurrent DML, and
-> visibility-filtered ANN search (M4/M5/M6 all delivered and reviewed).
+> **Status (build in public):** Phase 1 is complete (tag `phase1-m3`),
+> Phase 2 is essentially complete, and **Phase 4a is complete** (latest
+> commit `d9996b9`). The HNSW vector index ships page-resident storage,
+> WAL-based crash recovery, concurrent DML, and visibility-filtered ANN
+> search. Phase 4a adds self-owned TP execution, HNSW SQL, Extended Query,
+> TOAST, optional DataFusion AP execution, and WAL-first sequences/SERIAL.
 > What exists today is a working, crash-safe storage/transaction **library**
-> plus a minimal PostgreSQL wire-protocol server — `psql` and standard PG
-> drivers can connect and run basic CRUD. Remaining Phase 2 closeout items:
-> the 24h stress rerun, the CI coverage report, and the `phase2-m6` tag.
-> See [Roadmap](#roadmap).
+> plus a PostgreSQL wire-protocol server — `psql` and standard PG drivers can
+> connect and run CRUD, transactions, parameterized queries, and ANN.
+> Remaining Phase 2 closeout items (parallel work): the 24h stress rerun, CI
+> coverage report, and `phase2-m6` tag. See [Roadmap](#roadmap).
 
 ---
 
@@ -51,6 +53,7 @@ proven.
 | Phase 2 M4 | In-memory HNSW foundations (`pg-am-hnsw`) | ✅ done |
 | Phase 2 M5 | HNSW WAL + page-resident persistence + crash recovery | ✅ done |
 | Phase 2 M6 | Concurrency control + Tier 1 transaction integration + vacuum extensions | 🚧 closing (24h stress rerun, CI coverage, `phase2-m6` tag pending) |
+| Phase 4a | SQL TP/ANN + Extended Query + TOAST + DataFusion AP + Sequence/SERIAL | ✅ done (`d9996b9`) |
 
 ## Architecture
 
@@ -62,11 +65,11 @@ insert/delete, and the audit/reachability tooling:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  pg-wire     PostgreSQL v3 wire protocol (Simple Query) │
-│              psql / PG drivers can connect (pg-server)  │
+│  pg-wire     PostgreSQL v3 Simple + Extended Query     │
+│              psql / PG drivers (pg-server)             │
 ├─────────────────────────────────────────────────────────┤
-│  pg-engine   top-level assembly: catalog + AMs + txn    │
-│              SQL-string execution, DDL/DML, checkpoint  │
+│  pg-engine   catalog + AMs + txn, SQL TP/ANN,          │
+│              optional DataFusion AP, TOAST, sequences  │
 ├─────────────────────────────────────────────────────────┤
 │  pg-am-heap  │  pg-am-btree          │  pg-catalog      │
 │  slotted     │  latch-coupled Blink   │  system tables, │
@@ -92,8 +95,9 @@ insert/delete, and the audit/reachability tooling:
 - **Locking**: row locks (via the tuple `t_xmax` protocol, `SELECT … FOR
   UPDATE` / `FOR SHARE`) and table locks, with a background deadlock detector
   (wait-for graph, youngest-victim selection).
-- **Heap**: variable-length tuples, HOT (heap-only tuple) updates, and MVCC
-  visibility.
+- **Heap**: variable-length tuples, HOT (heap-only tuple) updates, MVCC
+  visibility, and TOAST chunk I/O for oversized TEXT/BYTEA/VECTOR values,
+  with snapshot-aware detoasting and abort/vacuum reclamation.
 - **B+Tree**: latch-coupling (crabbing) reads, optimistic + pessimistic writes,
   Blink sibling links, a crash-safe three-step split protocol, and
   CLR-based undo for incomplete splits.
@@ -120,13 +124,21 @@ insert/delete, and the audit/reachability tooling:
 - **Engine API**: `CREATE TABLE` / `CREATE INDEX`, `INSERT` / `SELECT` /
   `UPDATE` / `DELETE` — both as typed methods and via a SQL-string `exec(...)`;
   `DROP TABLE` as a typed method only (not yet in the SQL subset).
+- **SQL TP and ANN (Phase 4a)**: a self-owned executor with B+Tree/SeqScan,
+  EXPLAIN, HNSW metric matching and exact SeqScan fallbacks, plus explicit
+  DataFusion AP execution (`datafusion` feature) for filters, aggregates,
+  computed columns, and JOINs under the same snapshot/lock lifetimes.
+- **Sequences and SERIAL**: WAL-first `nextval` that never reissues values
+  after rollback or crash, per-session `currval`, and SERIAL defaults with
+  transactional ownership and recreation after `DROP TABLE`.
 - **Observability (M3)**: the `QueryStats` ring buffer records only the SQL
   text path (`Engine::exec`); the typed API (`Engine::scan` / `insert` /
   `update` / `delete`, …) is deliberately NOT counted (tech-selection §6.3).
-- **PG Wire (M3)**: a minimal PostgreSQL v3 wire-protocol server (`pg-server`)
-  — Simple Query + text results, trust auth. `psql`, psycopg2, node-postgres
-  and rust-postgres can connect and run CRUD + transactions. Extended Query /
-  COPY / TLS land in Phase 4a/6.
+- **PG Wire (Phase 4a)**: Simple and Extended Query with typed parameters,
+  parameter/result format negotiation, portal lifecycle, failed-transaction
+  recovery, and pgvector-compatible VECTOR encodings. `psql`, psycopg2,
+  node-postgres, and rust-postgres can run CRUD, transactions, and ANN.
+  COPY and TLS remain Phase 6 work.
 - **Vacuum (M3)**: offline `Engine::vacuum(table)` — dead-tuple scan at a
   snapshot-registered horizon, index cleanup, in-page compaction and page
   freeing. Online/incremental vacuum is Phase 5b.
@@ -186,18 +198,19 @@ The full plan (with rationale, time estimates, and risk register) is in
 | **1 — Storage base + row store + tx + B+Tree** | Page / WAL / BufferPool (M1) · MVCC + crash recovery + locking (M2) · vacuum + observability + minimal PG Wire (M3) | ✅ done (tag `phase1-m3`) |
 | **2 — HNSW vector index** | in-memory graph (2a) → WAL + persistence (2b) → concurrency control (2c) | ✅ done (M4/M5/M6) |
 | **3 — Inverted index** | BM25 full-text, segment-based storage, merge | ⏳ next milestone (tech selection starting) |
-| **4 — SQL + multi-path fusion** | DataFusion + PG Wire extended (4a) → fusion planner (4b) | 📋 planned |
+| **4 — SQL + multi-path fusion** | SQL TP/ANN + Extended Query + TOAST + DataFusion AP + Sequence/SERIAL (4a) → fusion planner (4b) | ✅ 4a done (`d9996b9`); 4b planned |
 | **5a — Time-series + columnar** (parallel with 2/3/4a) | TTL partitions, columnar projection, distillation SDK stub | 📋 planned (can start anytime) |
 | **5b — Graph + GC + memory lifecycle** | lightweight graph AM, multi-AM GC, forgetting/layering SDK, fusion hooks | 📋 planned |
 | **6 — Protocol + multi-agent isolation** | full PG protocol, MCP server, row-level security | 📋 planned |
 | **7 — Production** | observability, compression, CBO, high availability | 📋 planned |
 
-The current work is **Phase 2 closeout (M6 Stage F)**: the 100-concurrent
-24h stress rerun (first run stalled at the watchdog, root cause under
-investigation), the CI coverage report (needs a PR), and the `phase2-m6`
-release tag (branch + PR after CI is green). The siftsmall/pgvector
-comparison is already landed in `docs/phase2-m6-benchmarks.md` (recall
-0.9990 vs 0.9940, with the insert-throughput gap recorded honestly).
+The latest closeout is **Phase 4a** (`d9996b9`): full workspace and
+DataFusion-feature debug/release tests, two adversarial reviews, MSRV 1.86,
+and siftsmall ANN acceptance are all green. In parallel, Phase 2 still has
+its previously documented closeout items: the 100-concurrent 24h stress
+rerun, CI coverage report, and `phase2-m6` tag. The siftsmall/pgvector
+comparison is in `docs/phase2-m6-benchmarks.md` (recall 0.9990 vs 0.9940,
+with the insert-throughput gap recorded honestly).
 
 Per-stage design decisions and deviations from PostgreSQL are documented in
 [docs/](docs/), particularly `docs/stage_spec.md` (what was actually built).
@@ -227,9 +240,13 @@ Correctness is the priority, so the test surface is heavy:
   redirect×insert).
 - **`proptest`**: property-based tests for the page allocator and WAL record
   round-trips.
+- **Phase 4a acceptance**: full workspace and DataFusion-feature debug/release
+  tests, MSRV 1.86 compilation, protocol golden bytes, TOAST crash recovery,
+  Sequence/SERIAL crash tests, and siftsmall ANN recall. DataFusion point
+  lookup is below 5ms, and every ANN benchmark query asserts the HNSW path.
 - **CI**: `rustfmt`, `clippy -D warnings`, MSRV check, per-crate test matrix,
   loom, and rustdoc-with-warnings-as-errors; plus a nightly criterion-bench
-  job and a coverage job (tarpaulin).
+  job and a pg-am-hnsw-only coverage job (tarpaulin).
 
 ## License
 
