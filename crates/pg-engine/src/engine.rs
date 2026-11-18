@@ -141,8 +141,8 @@ use pg_am_heap::{
 };
 use pg_catalog::builtin_types::{column_type_of_attr, BUILTIN_TYPES, FLOAT8_OID, VECTOR_OID};
 use pg_catalog::system_tables::{
-    SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, PG_ATTRIBUTE, PG_CLASS, PG_INDEX, PG_RELPAGES,
-    RELKIND_INDEX, RELKIND_TABLE,
+    SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, HNSW_AM_OID, INVERTED_AM_OID, PG_ATTRIBUTE,
+    PG_CLASS, PG_INDEX, PG_RELPAGES, RELKIND_INDEX, RELKIND_TABLE,
 };
 use pg_catalog::{Catalog, TableOid, TypeOid};
 use pg_storage::buffer_pool::BufferPool;
@@ -161,6 +161,7 @@ use pg_txn::{
 };
 
 use crate::error::{EngineError, Result};
+use crate::planner::{AmKind, InvertedIndexMetadata};
 use crate::query_stats::{ExecutionPath, QueryStatEntry, QueryStats, DEFAULT_QUERY_STATS_CAPACITY};
 use crate::sequence::{
     attrdefaults_table, sequence_class_row, sequences_table, SequenceManager,
@@ -169,8 +170,8 @@ use crate::sequence::{
 };
 use crate::session::SqlSession;
 use crate::sql::{
-    self, CmpOp, Expr, Filter, Literal, LockClause, OrderByExpr, OrderByKind, SelectCols,
-    SelectItem, SequenceFunction, Statement,
+    self, Bm25ScoreExpr, CmpOp, Expr, Filter, Literal, LockClause, OrderByExpr, OrderByKind,
+    SelectCols, SelectItem, SequenceFunction, Statement,
 };
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
@@ -261,6 +262,11 @@ pub struct EngineConfig {
     /// diagnostics. Default 1000 ([`DEFAULT_QUERY_STATS_CAPACITY`]);
     /// 0 disables recording. Overflow drops the oldest entry (§6.3 既定语义).
     pub query_stats_capacity: usize,
+    /// Whether an inverted query may read sealed segments when its WAL
+    /// freshness watermark lags behind the query snapshot. Default `false`
+    /// (`require_fresh`): stale reads fall back to SeqScan. This is an
+    /// engine-level switch only; no SQL syntax is added.
+    pub allow_stale_inverted: bool,
 }
 
 impl EngineConfig {
@@ -271,6 +277,7 @@ impl EngineConfig {
             clog_buffer_frames: DEFAULT_CLOG_BUFFER_FRAMES,
             deadlock_detector_interval: pg_txn::DEFAULT_DEADLOCK_INTERVAL,
             query_stats_capacity: DEFAULT_QUERY_STATS_CAPACITY,
+            allow_stale_inverted: false,
         }
     }
 }
@@ -392,6 +399,10 @@ pub struct TableEntry {
 /// append-only in M2b (no `DROP INDEX`).
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
+    /// The access method that owns this index.
+    pub kind: AmKind,
+    /// Inverted analyzer/watermark metadata; `Some` exactly for inverted AMs.
+    pub inverted: Option<InvertedIndexMetadata>,
     /// The index relation's OID (`pg_index.indexrelid`).
     pub index_oid: Oid,
     /// The indexed table's OID (`pg_index.indrelid`).
@@ -399,7 +410,8 @@ pub struct IndexEntry {
     /// The indexed column's name (from the index's `pg_attribute` row).
     pub column: String,
     /// The indexed column's codec type (the B+Tree key type). An HNSW index
-    /// is marked by `ColumnType::Vector(dim)` (M6 Stage C).
+    /// is marked by `ColumnType::Vector(dim)` (M6 Stage C); an inverted index
+    /// uses `ColumnType::Text` and never interprets it as a B+Tree key.
     pub key_type: ColumnType,
     /// The index's meta page (`pg_rust_relpages.first_page` of the index).
     pub meta_page: PageId,
@@ -561,6 +573,8 @@ pub struct Engine {
     /// [`Self::exec`] and [`Self::exec_with_params`] record one entry per
     /// statement — see [`Self::query_stats`].
     query_stats: QueryStats,
+    /// Phase 3 inverted-query freshness policy, retained for the planner.
+    allow_stale_inverted: bool,
     sequences: SequenceManager,
 }
 
@@ -1090,7 +1104,8 @@ impl Engine {
         // 7. Table registry from the catalog, index registry from the
         //    `pg_index` heap chain.
         let registry = Self::build_registry(&catalog, &heap, &txn, clog.as_ref(), &HashMap::new())?;
-        let indexes = Self::build_index_registry(&catalog, &heap, clog.as_ref(), &registry)?;
+        let indexes =
+            Self::build_index_registry(data_dir, &catalog, &heap, clog.as_ref(), &registry)?;
 
         // 8. Lock manager (sharing the victim registry) and the deadlock
         //    detector thread (M2c Stage R, §9.3). Started LAST, once both
@@ -1119,6 +1134,7 @@ impl Engine {
             instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             index_undo: Arc::new(Mutex::new(HashMap::new())),
             query_stats: QueryStats::new(config.query_stats_capacity),
+            allow_stale_inverted: config.allow_stale_inverted,
             sequences,
         };
         engine.initialize_sequences()?;
@@ -1380,6 +1396,7 @@ impl Engine {
     /// leaked pages, skipped with a warning (same policy as half-created
     /// tables).
     fn build_index_registry(
+        data_dir: &Path,
         catalog: &Catalog,
         heap: &HeapAM,
         clog: &dyn ClogAccessor,
@@ -1426,7 +1443,66 @@ impl Engine {
                     attr.type_oid, attr.len
                 ))
             })?;
+            let relation = catalog
+                .relation(pg_catalog::TableOid(index_oid))
+                .ok_or_else(|| {
+                    EngineError::Corrupted(format!("index {index_oid}: missing pg_class row"))
+                })?;
+            let (kind, expected_am_name) = match relation.am {
+                BTREE_AM_OID => (AmKind::BTree, "btree"),
+                HNSW_AM_OID => (AmKind::Hnsw, "hnsw"),
+                INVERTED_AM_OID => (AmKind::Inverted, "inverted"),
+                other => {
+                    return Err(EngineError::Corrupted(format!(
+                        "index {index_oid}: unknown access method {other}"
+                    )))
+                }
+            };
+            let am = catalog
+                .access_methods()
+                .iter()
+                .find(|am| am.oid == relation.am)
+                .ok_or_else(|| {
+                    EngineError::Corrupted(format!(
+                        "index {index_oid}: access method {} has no pg_am row",
+                        relation.am
+                    ))
+                })?;
+            if am.name != expected_am_name {
+                return Err(EngineError::Corrupted(format!(
+                    "index {index_oid}: access method {} has amname {:?}, expected {expected_am_name:?}",
+                    relation.am, am.name
+                )));
+            }
+            let inverted = if matches!(kind, AmKind::Inverted) {
+                if key_type != ColumnType::Text {
+                    return Err(EngineError::Corrupted(format!(
+                        "inverted index {index_oid} requires a TEXT column, got {key_type:?}"
+                    )));
+                }
+                let store = pg_am_inverted::SegmentStore::open(
+                    data_dir,
+                    index_oid,
+                    &pg_am_inverted::AnalyzerConfig::builtin(),
+                )
+                .map_err(|error| {
+                    EngineError::Corrupted(format!(
+                        "cannot recover inverted index {index_oid}: {error}"
+                    ))
+                })?;
+                let metadata = InvertedIndexMetadata::from_store(&store);
+                metadata.analyzer.validate().map_err(|error| {
+                    EngineError::Corrupted(format!(
+                        "inverted index {index_oid}: invalid analyzer metadata: {error}"
+                    ))
+                })?;
+                Some(metadata)
+            } else {
+                None
+            };
             indexes.push(IndexEntry {
+                kind,
+                inverted,
                 index_oid,
                 table_oid: Oid(*indrelid as u64),
                 column: attr.name.clone(),
@@ -2739,6 +2815,8 @@ impl Engine {
                 // index maintenance. The registry is in-memory (crash-rebuilt
                 // from the catalog), so the in-transaction push is safe.
                 self.indexes.write().push(IndexEntry {
+                    kind: AmKind::BTree,
+                    inverted: None,
                     index_oid,
                     table_oid: entry.oid,
                     column: column.to_string(),
@@ -2901,6 +2979,8 @@ impl Engine {
             let meta_page = index.meta_page_id();
             self.hnsw_handles.lock().insert(index_oid, Arc::new(index));
             self.indexes.write().push(IndexEntry {
+                kind: AmKind::Hnsw,
+            inverted: None,
                 index_oid,
                 table_oid: entry.oid,
                 column: column.to_string(),
@@ -3315,6 +3395,8 @@ impl Engine {
         let key = encode_key(&Datum::Int8(i64::from(node_id)))?;
         map.insert(&key, tid)?;
         let map_entry = IndexEntry {
+            kind: AmKind::Hnsw,
+            inverted: None,
             index_oid: idx.index_oid,
             table_oid: idx.table_oid,
             column: idx.column.clone(),
@@ -3984,7 +4066,11 @@ impl Engine {
             .indexes
             .read()
             .iter()
-            .find(|e| e.table_oid == entry.oid && e.column.eq_ignore_ascii_case(column))
+            .find(|e| {
+                matches!(e.kind, AmKind::BTree)
+                    && e.table_oid == entry.oid
+                    && e.column.eq_ignore_ascii_case(column)
+            })
             .cloned()
             .ok_or_else(|| EngineError::IndexNotFound(format!("{table}({column})")))?;
         let btree = BTreeAM::new(
@@ -3997,6 +4083,11 @@ impl Engine {
     /// The live index registry entries (testing / diagnostics).
     pub fn indexes(&self) -> Vec<IndexEntry> {
         self.indexes.read().clone()
+    }
+
+    /// Whether the inverted planner may intentionally use a stale index.
+    pub(crate) fn allow_stale_inverted(&self) -> bool {
+        self.allow_stale_inverted
     }
 
     /// Insert one row (single auto-commit transaction) and return its TID.
@@ -4250,9 +4341,12 @@ impl Engine {
             out_tid: Some(&mut out_tid),
         })?;
 
-        // B+Tree index maintenance (skip the HNSW index — it is not a
-        // B+Tree key type; its maintenance is the graph insert + map put).
+        // B+Tree index maintenance (skip HNSW and inverted: their graph /
+        // Tier 2 WAL consumer owns maintenance, never this B+Tree loop).
         for (idx, col_index) in &indexes {
+            if matches!(idx.kind, AmKind::Inverted) {
+                continue;
+            }
             if matches!(idx.key_type, ColumnType::Vector(_)) {
                 continue;
             }
@@ -4440,6 +4534,9 @@ impl Engine {
                 self.hot_chain_root(tid)?
             };
             for (idx, col_index) in &indexes {
+                if matches!(idx.kind, AmKind::Inverted) {
+                    continue;
+                }
                 if matches!(idx.key_type, ColumnType::Vector(_)) {
                     continue;
                 }
@@ -4546,6 +4643,9 @@ impl Engine {
             clog: self.clog.as_ref(),
         })?;
         for (idx, col_index) in &indexes {
+            if matches!(idx.kind, AmKind::Inverted) {
+                continue;
+            }
             if matches!(idx.key_type, ColumnType::Vector(_)) {
                 continue;
             }
@@ -4683,6 +4783,11 @@ impl Engine {
             // Phase 4: push-mode index cleanup, one descent per (key, tid)
             // per index (batch interfaces are Phase 5b, §4.3).
             for (idx, col_index) in &self.indexes_of(&entry) {
+                // Inverted indexes are reclaimed by segment merge, never by
+                // opening their metadata as a B+Tree.
+                if matches!(idx.kind, AmKind::Inverted) {
+                    continue;
+                }
                 // M6 Stage C (round-5 P1): an HNSW index is not a B+Tree —
                 // opening its meta page as one yields a fake "no root
                 // record" corruption. The graph's orphan-node reclamation
@@ -4810,6 +4915,12 @@ impl Engine {
 
     /// Open the B+Tree handle for a registry index entry.
     fn open_btree(&self, idx: &IndexEntry) -> Result<pg_am_btree::BTreeIndex> {
+        if !matches!(idx.kind, AmKind::BTree) {
+            return Err(EngineError::InvalidArgument(format!(
+                "index {:?} is {:?}, not a B+Tree",
+                idx.index_oid, idx.kind
+            )));
+        }
         let btree = BTreeAM::new(
             Arc::clone(self.storage.buffer_pool()),
             Arc::clone(self.storage.wal_writer()),
@@ -5144,10 +5255,11 @@ impl Engine {
             let old_values = self.read_row_by_tid_physical(entry, col_types, tid)?;
             let index_tid = self.hot_chain_root(tid)?;
             for (idx, col_index) in &indexes {
-                // M6 Stage C: an HNSW index is not a B+Tree key shape — its
-                // graph/sidecar compensation is the C-logic of its own
-                // (loser inserts are replayed by redo and hidden by the
-                // row filter; loser deletes never touched the graph). Skip.
+                // HNSW and inverted have their own recovery channels; never
+                // compensate them through this B+Tree-only loop.
+                if matches!(idx.kind, AmKind::Inverted) {
+                    continue;
+                }
                 if matches!(idx.key_type, ColumnType::Vector(_)) {
                     continue;
                 }
@@ -5323,6 +5435,7 @@ impl Engine {
                 columns: SelectCols::All,
                 table: String::new(),
                 filter: None,
+                extra_filter: None,
                 order_by: None,
                 limit: None,
                 lock: None,
@@ -5494,6 +5607,7 @@ impl Engine {
         stmt: Statement,
         path: &mut ExecutionPath,
     ) -> Result<QueryResult> {
+        reject_extra_where(&stmt)?;
         match stmt {
             // Transaction control is programmatic only (Stage O review):
             // auto-commit mode has no transaction to begin or end, so these
@@ -5544,7 +5658,18 @@ impl Engine {
                 name,
                 method,
                 opclass,
+                fulltext_index,
             } => {
+                if method == Some(sql::IndexMethod::Inverted) {
+                    if fulltext_index.as_deref().unwrap_or("bm25") != "bm25" {
+                        return Err(EngineError::Unsupported(
+                            "only fulltext_index='bm25' is supported".to_string(),
+                        ));
+                    }
+                    return Err(EngineError::Unsupported(
+                        "inverted index creation is not implemented in Stage 0".to_string(),
+                    ));
+                }
                 if method == Some(sql::IndexMethod::Hnsw) {
                     let opclass = opclass.ok_or_else(|| {
                         EngineError::InvalidArgument(
@@ -5626,6 +5751,7 @@ impl Engine {
                 columns,
                 table,
                 filter,
+                extra_filter: _,
                 order_by,
                 limit,
                 lock,
@@ -5728,6 +5854,7 @@ impl Engine {
                 "transaction handle belongs to a different Engine instance".to_string(),
             ));
         }
+        reject_extra_where(&stmt)?;
         handle.advance_curcid();
         let snap = handle.snapshot.borrow();
         match stmt {
@@ -5788,6 +5915,7 @@ impl Engine {
                 columns,
                 table,
                 filter,
+                extra_filter: _,
                 order_by,
                 limit,
                 lock,
@@ -5855,6 +5983,11 @@ impl Engine {
         columns: &SelectCols,
         order_by: &Option<OrderByKind>,
     ) -> Result<()> {
+        if matches!(order_by, Some(OrderByKind::Bm25Score(_))) {
+            return Err(EngineError::Unsupported(
+                "bm25_score ordering is not implemented in Stage 0".to_string(),
+            ));
+        }
         if let Some(OrderByKind::Column(ob)) = order_by {
             let column = entry
                 .columns
@@ -5886,6 +6019,11 @@ impl Engine {
                     }
                     SelectItem::Distance(expr) => {
                         crate::executor::prepare_distance(entry, expr)?;
+                    }
+                    SelectItem::Bm25Score(_) => {
+                        return Err(EngineError::Unsupported(
+                            "bm25_score projection is not implemented in Stage 0".to_string(),
+                        ));
                     }
                 }
             }
@@ -5932,6 +6070,11 @@ impl Engine {
         *path = match &output.plan.spec {
             crate::planner::ScanSpec::BTree(_) | crate::planner::ScanSpec::Hnsw(_) => {
                 ExecutionPath::IndexLookup
+            }
+            crate::planner::ScanSpec::Inverted(_) => {
+                return Err(EngineError::Unsupported(
+                    "inverted execution is not implemented in Stage 0".to_string(),
+                ))
             }
             crate::planner::ScanSpec::Seq(_) => ExecutionPath::SeqScan,
         };
@@ -5987,6 +6130,14 @@ impl Engine {
                 (names, rows)
             }
             SelectCols::Cols(items) => {
+                if items
+                    .iter()
+                    .any(|item| matches!(item, SelectItem::Bm25Score(_)))
+                {
+                    return Err(EngineError::Unsupported(
+                        "bm25_score projection is not implemented in Stage 0".to_string(),
+                    ));
+                }
                 enum Projection {
                     Column(usize),
                     Distance(crate::executor::DistanceEvaluator),
@@ -5996,6 +6147,9 @@ impl Engine {
                     .map(|item| match item {
                         SelectItem::Column(name) => name.clone(),
                         SelectItem::Distance(_) => "?column?".to_string(),
+                        SelectItem::Bm25Score(expr) => {
+                            expr.alias.clone().unwrap_or_else(|| "?column?".to_string())
+                        }
                     })
                     .collect();
                 let projections = items
@@ -6015,6 +6169,9 @@ impl Engine {
                         }
                         SelectItem::Distance(expr) => Ok(Projection::Distance(
                             crate::executor::prepare_distance(&entry, expr)?,
+                        )),
+                        SelectItem::Bm25Score(_) => Err(EngineError::Unsupported(
+                            "bm25_score projection is not implemented in Stage 0".to_string(),
                         )),
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -6680,6 +6837,29 @@ impl Engine {
     }
 }
 
+/// Stage 0 parses the full-text `ExtraWhere` shape for planner tests, but its
+/// exact executor arrives with the inverted implementation. Never drop the
+/// second predicate and accidentally run only the first one.
+fn reject_extra_where(stmt: &Statement) -> Result<()> {
+    let has_extra = match stmt {
+        Statement::Select { extra_filter, .. } => extra_filter.is_some(),
+        Statement::Explain(inner) => matches!(
+            inner.as_ref(),
+            Statement::Select {
+                extra_filter: Some(_),
+                ..
+            }
+        ),
+        _ => false,
+    };
+    if has_extra {
+        return Err(EngineError::Unsupported(
+            "additional WHERE predicates are not implemented in Stage 0".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Build a `Predicate` from a parsed `Filter`, resolving the column name
 /// to a 0-based index and converting the literal.
 pub(crate) fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate> {
@@ -6751,6 +6931,11 @@ pub(crate) fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result
         CmpOp::Eq => Predicate::Eq { col_index, value },
         CmpOp::Lt => Predicate::Lt { col_index, value },
         CmpOp::Gt => Predicate::Gt { col_index, value },
+        CmpOp::FullText => {
+            return Err(EngineError::Unsupported(
+                "full-text predicates are not implemented in Stage 0".to_string(),
+            ))
+        }
     })
 }
 
@@ -6836,6 +7021,7 @@ fn infer_statement_parameters(
             columns,
             table,
             filter,
+            extra_filter,
             order_by,
             ..
         } => {
@@ -6845,11 +7031,18 @@ fn infer_statement_parameters(
                     if let SelectItem::Distance(expr) = item {
                         infer_distance_parameter(&entry, expr, inference)?;
                     }
+                    if let SelectItem::Bm25Score(expr) = item {
+                        infer_bm25_parameter(&entry, expr, inference)?;
+                    }
                 }
             }
             infer_filter_parameter(&entry, filter, inference)?;
+            infer_filter_parameter(&entry, extra_filter, inference)?;
             if let Some(OrderByKind::Expr(expr)) = order_by {
                 infer_distance_parameter(&entry, expr, inference)?;
+            }
+            if let Some(OrderByKind::Bm25Score(expr)) = order_by {
+                infer_bm25_parameter(&entry, expr, inference)?;
             }
         }
         Statement::Update {
@@ -6901,7 +7094,18 @@ fn infer_filter_parameter(
     inference: &mut ParameterInference,
 ) -> Result<()> {
     if let Some(filter) = filter {
-        let expected = required_column_type(entry, &filter.column, true)?;
+        let column_type = required_column_type(entry, &filter.column, true)?;
+        let expected = if filter.op == CmpOp::FullText {
+            if column_type != ColumnType::Text {
+                return Err(EngineError::InvalidArgument(format!(
+                    "full-text left operand {:?} is not a TEXT column",
+                    filter.column
+                )));
+            }
+            ColumnType::Text
+        } else {
+            column_type
+        };
         inference.infer(&filter.value, expected)?;
     }
     Ok(())
@@ -6928,6 +7132,24 @@ fn infer_distance_parameter(
         unreachable!()
     };
     inference.infer(literal, expected)
+}
+
+fn infer_bm25_parameter(
+    entry: &TableEntry,
+    expr: &Bm25ScoreExpr,
+    inference: &mut ParameterInference,
+) -> Result<()> {
+    if !matches!(expr.query, Literal::Param(_)) {
+        return Ok(());
+    }
+    let expected = required_column_type(entry, &expr.column, true)?;
+    if expected != ColumnType::Text {
+        return Err(EngineError::InvalidArgument(format!(
+            "bm25_score left operand {:?} is not a TEXT column",
+            expr.column
+        )));
+    }
+    inference.infer(&expr.query, expected)
 }
 
 fn parameter_to_literal(
@@ -6979,6 +7201,7 @@ fn replace_parameters(stmt: &mut Statement, literals: &[Literal]) -> Result<()> 
         Statement::Select {
             columns,
             filter,
+            extra_filter,
             order_by,
             ..
         } => {
@@ -6987,13 +7210,22 @@ fn replace_parameters(stmt: &mut Statement, literals: &[Literal]) -> Result<()> 
                     if let SelectItem::Distance(expr) = item {
                         replace_expr_parameters(expr, literals)?;
                     }
+                    if let SelectItem::Bm25Score(expr) = item {
+                        replace_bm25_parameters(expr, literals)?;
+                    }
                 }
             }
             if let Some(filter) = filter {
                 replace_parameter(&mut filter.value, literals)?;
             }
+            if let Some(filter) = extra_filter {
+                replace_parameter(&mut filter.value, literals)?;
+            }
             if let Some(OrderByKind::Expr(expr)) = order_by {
                 replace_expr_parameters(expr, literals)?;
+            }
+            if let Some(OrderByKind::Bm25Score(expr)) = order_by {
+                replace_bm25_parameters(expr, literals)?;
             }
         }
         Statement::Update { sets, filter, .. } => {
@@ -7027,6 +7259,10 @@ fn replace_expr_parameters(expr: &mut OrderByExpr, literals: &[Literal]) -> Resu
         }
     }
     Ok(())
+}
+
+fn replace_bm25_parameters(expr: &mut Bm25ScoreExpr, literals: &[Literal]) -> Result<()> {
+    replace_parameter(&mut expr.query, literals)
 }
 
 fn replace_parameter(literal: &mut Literal, literals: &[Literal]) -> Result<()> {
@@ -7101,6 +7337,147 @@ mod tests {
                 "CREATE INDEX ann_idx ON t USING hnsw (v vector_l2_ops)",
             )
             .unwrap();
+    }
+
+    fn set_index_am_for_test(engine: &Engine, index_oid: Oid, am_oid: Oid) {
+        let columns = PG_CLASS.column_types();
+        debug_assert_eq!(PG_CLASS.columns.last().unwrap().name, "relam");
+        let mut guard = engine
+            .storage
+            .buffer_pool()
+            .pin_mut(PG_CLASS.first_page)
+            .unwrap();
+        let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+        let mut found = false;
+        for slot in 0..SlottedPage::slot_count(page) as u16 {
+            let (offset, len, is_target) = {
+                let Some(bytes) = SlottedPage::tuple(page, slot).unwrap() else {
+                    continue;
+                };
+                let (_, values) = decode_tuple(bytes, &columns).unwrap();
+                (
+                    SlottedPage::line_pointer(page, slot).unwrap().off() as usize,
+                    bytes.len(),
+                    matches!(values.first(), Some(Some(Datum::Int8(oid))) if *oid == index_oid.0 as i64),
+                )
+            };
+            if !is_target {
+                continue;
+            }
+            // `relam` is the final fixed-width attribute. Change the original
+            // physical row rather than adding an MVCC version because the
+            // legacy catalog snapshot reads that original row directly.
+            page[offset + len - 8..offset + len].copy_from_slice(&am_oid.0.to_le_bytes());
+            found = true;
+            break;
+        }
+        assert!(found, "test index {index_oid} has no pg_class row");
+        drop(guard);
+        engine.checkpoint().unwrap();
+    }
+
+    fn delete_am_row_for_test(engine: &Engine, am_oid: Oid) {
+        let def = &pg_catalog::system_tables::PG_AM;
+        let columns = def.column_types();
+        let guard = engine.storage.buffer_pool().pin(def.first_page).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        let mut tid = None;
+        for slot in 0..SlottedPage::slot_count(page) as u16 {
+            let Some(bytes) = SlottedPage::tuple(page, slot).unwrap() else {
+                continue;
+            };
+            let (_, values) = decode_tuple(bytes, &columns).unwrap();
+            if matches!(values.first(), Some(Some(Datum::Int8(oid))) if *oid == am_oid.0 as i64) {
+                tid = Some(Tid {
+                    page_id: def.first_page,
+                    slot_id: slot,
+                });
+                break;
+            }
+        }
+        drop(guard);
+        let tid = tid.expect("fresh catalog contains the AM row");
+        let mut guard = engine.storage.buffer_pool().pin_mut(tid.page_id).unwrap();
+        let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+        SlottedPage::delete_tuple(page, tid.slot_id).unwrap();
+        drop(guard);
+        engine.checkpoint().unwrap();
+    }
+
+    fn rename_am_for_test(engine: &Engine, am_oid: Oid, new_name: &str) {
+        let def = &pg_catalog::system_tables::PG_AM;
+        let columns = def.column_types();
+        let mut guard = engine
+            .storage
+            .buffer_pool()
+            .pin_mut(def.first_page)
+            .unwrap();
+        let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+        let mut found = false;
+        for slot in 0..SlottedPage::slot_count(page) as u16 {
+            let (offset, len, old_name_len, is_target) = {
+                let Some(bytes) = SlottedPage::tuple(page, slot).unwrap() else {
+                    continue;
+                };
+                let (_, values) = decode_tuple(bytes, &columns).unwrap();
+                let old_name_len = match values.get(1) {
+                    Some(Some(Datum::Text(name))) => name.len(),
+                    other => panic!("invalid pg_am name: {other:?}"),
+                };
+                (
+                    SlottedPage::line_pointer(page, slot).unwrap().off() as usize,
+                    bytes.len(),
+                    old_name_len,
+                    matches!(values.first(), Some(Some(Datum::Int8(oid))) if *oid == am_oid.0 as i64),
+                )
+            };
+            if !is_target {
+                continue;
+            }
+            assert_eq!(
+                old_name_len,
+                new_name.len(),
+                "test rename must not resize the tuple"
+            );
+            page[offset + len - old_name_len..offset + len].copy_from_slice(new_name.as_bytes());
+            found = true;
+            break;
+        }
+        assert!(found, "test AM {am_oid} has no pg_am row");
+        drop(guard);
+        engine.checkpoint().unwrap();
+    }
+
+    fn write_inverted_metadata_for_test(data_dir: &Path, index_oid: Oid, applied_lsn: Lsn) {
+        let segment_id = pg_storage::segment::SegmentId(7);
+        let manifest = pg_am_inverted::SegmentManifest {
+            generation: 1,
+            active_segment_ids: vec![segment_id],
+            applied_lsn,
+        };
+        let manifest_path = pg_am_inverted::SegmentStore::manifest_path(data_dir, index_oid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(manifest_path, manifest.encode().unwrap()).unwrap();
+
+        let metadata = pg_am_inverted::SegmentMeta {
+            format_version: pg_am_inverted::posting::SEGMENT_FORMAT_VERSION,
+            index_oid,
+            segment_id,
+            analyzer: pg_am_inverted::AnalyzerConfig::builtin(),
+            state: pg_storage::segment::SegmentState::Sealed,
+            doc_count: 0,
+            total_tokens: 0,
+            term_df: Default::default(),
+            created_from_lsn: Lsn::INVALID,
+            applied_lsn,
+            row_count: 0,
+            posting_count: 0,
+            byte_count: 0,
+        };
+        let metadata_path =
+            pg_am_inverted::SegmentStore::segment_metadata_path(data_dir, index_oid, segment_id);
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        std::fs::write(metadata_path, metadata.encode().unwrap()).unwrap();
     }
 
     fn raw_hnsw_map_page(engine: &Engine, index_oid: Oid) -> PageId {
@@ -7645,6 +8022,346 @@ mod tests {
         assert!(drop_result.is_ok(), "{drop_result:?}");
         assert!(engine.indexes().is_empty());
         assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn stage0_config_and_inverted_catalog_survive_reopen() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!EngineConfig::new(tmp.path()).allow_stale_inverted);
+        let engine = open(tmp.path());
+        assert!(!engine.allow_stale_inverted());
+        assert!(engine
+            .catalog
+            .access_methods()
+            .iter()
+            .any(|am| am.oid == INVERTED_AM_OID && am.name == "inverted"));
+        let error = engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON agent_memory USING inverted (content) WITH (fulltext_index='bm25')",
+            )
+            .unwrap_err();
+        assert!(matches!(error, EngineError::Unsupported(_)));
+        engine.shutdown();
+
+        let mut config = EngineConfig::new(tmp.path());
+        config.allow_stale_inverted = true;
+        let engine = Engine::open(tmp.path(), config).unwrap();
+        assert!(engine.allow_stale_inverted());
+        assert!(engine
+            .catalog
+            .access_methods()
+            .iter()
+            .any(|am| am.oid == INVERTED_AM_OID));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn legacy_directory_without_inverted_am_reopens() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        delete_am_row_for_test(&engine, INVERTED_AM_OID);
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert!(engine
+            .catalog
+            .access_methods()
+            .iter()
+            .all(|am| am.oid != INVERTED_AM_OID));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_registry_recovers_analyzer_and_watermark_contract() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (content TEXT)").unwrap();
+        engine.create_index("t", "content").unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        set_index_am_for_test(&engine, index_oid, INVERTED_AM_OID);
+        write_inverted_metadata_for_test(tmp.path(), index_oid, Lsn(128));
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        let entries = engine.indexes();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, AmKind::Inverted);
+        let metadata = entries[0].inverted.as_ref().unwrap();
+        metadata.analyzer.validate().unwrap();
+        assert_eq!(metadata.watermark.consumed_lsn, Lsn(128));
+        assert_eq!(metadata.watermark.durable_applied_lsn, Lsn(128));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_scan_request_preserves_index_oid_and_recovered_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (content TEXT)").unwrap();
+        engine.create_index("t", "content").unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        set_index_am_for_test(&engine, index_oid, INVERTED_AM_OID);
+        write_inverted_metadata_for_test(tmp.path(), index_oid, Lsn(128));
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        let entry = engine.table_entry("t").unwrap();
+        let filter = Some(Filter {
+            column: "content".to_string(),
+            op: CmpOp::FullText,
+            value: Literal::Str("contract".to_string()),
+        });
+        let request =
+            crate::executor::build_request(&engine, "t", &entry, &filter, &None, &Some(10))
+                .unwrap();
+        assert_eq!(request.indexes.len(), 1);
+        assert_eq!(request.indexes[0].index_oid, index_oid);
+        let metadata = request.indexes[0].inverted.as_ref().unwrap();
+        assert_eq!(metadata.analyzer, pg_am_inverted::AnalyzerConfig::builtin());
+        assert_eq!(metadata.watermark.consumed_lsn, Lsn(128));
+        assert_eq!(metadata.watermark.durable_applied_lsn, Lsn(128));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_registry_requires_real_segment_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (content TEXT)").unwrap();
+        engine.create_index("t", "content").unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        set_index_am_for_test(&engine, index_oid, INVERTED_AM_OID);
+        engine.shutdown();
+
+        let Err(error) = Engine::open(tmp.path(), EngineConfig::new(tmp.path())) else {
+            panic!("missing segment metadata must not be replaced with defaults")
+        };
+        assert!(
+            error.to_string().contains("cannot recover inverted index"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn inverted_registry_rejects_analyzer_hash_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (content TEXT)").unwrap();
+        engine.create_index("t", "content").unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        set_index_am_for_test(&engine, index_oid, INVERTED_AM_OID);
+        write_inverted_metadata_for_test(tmp.path(), index_oid, Lsn(128));
+        let segment_id = pg_storage::segment::SegmentId(7);
+        let path =
+            pg_am_inverted::SegmentStore::segment_metadata_path(tmp.path(), index_oid, segment_id);
+        let mut metadata =
+            pg_am_inverted::SegmentMeta::decode(&std::fs::read(&path).unwrap()).unwrap();
+        metadata.analyzer.config_hash = [1; 32];
+        std::fs::write(path, metadata.encode().unwrap()).unwrap();
+        engine.shutdown();
+
+        let Err(error) = Engine::open(tmp.path(), EngineConfig::new(tmp.path())) else {
+            panic!("a nonzero but wrong analyzer hash must be rejected")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("analyzer configuration mismatch"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn inverted_index_without_pg_am_row_is_not_treated_as_btree() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (id INT4)").unwrap();
+        engine.create_index("t", "id").unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        set_index_am_for_test(&engine, index_oid, INVERTED_AM_OID);
+        delete_am_row_for_test(&engine, INVERTED_AM_OID);
+        engine.shutdown();
+
+        let Err(error) = Engine::open(tmp.path(), EngineConfig::new(tmp.path())) else {
+            panic!("missing pg_am row must reject the inverted index")
+        };
+        assert!(error.to_string().contains("no pg_am row"), "{error}");
+    }
+
+    #[test]
+    fn inverted_registry_rejects_wrong_pg_am_name() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (content TEXT)").unwrap();
+        engine.create_index("t", "content").unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        set_index_am_for_test(&engine, index_oid, INVERTED_AM_OID);
+        write_inverted_metadata_for_test(tmp.path(), index_oid, Lsn(128));
+        rename_am_for_test(&engine, INVERTED_AM_OID, "btree___");
+        engine.shutdown();
+
+        let Err(error) = Engine::open(tmp.path(), EngineConfig::new(tmp.path())) else {
+            panic!("the inverted OID with a B+Tree name must be rejected")
+        };
+        assert!(error.to_string().contains("amname"), "{error}");
+    }
+
+    #[test]
+    fn inverted_registry_rejects_non_text_columns() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (id INT4)").unwrap();
+        engine.create_index("t", "id").unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        set_index_am_for_test(&engine, index_oid, INVERTED_AM_OID);
+        engine.shutdown();
+
+        let Err(error) = Engine::open(tmp.path(), EngineConfig::new(tmp.path())) else {
+            panic!("INT4 inverted index must fail during registry rebuild")
+        };
+        assert!(
+            error.to_string().contains("requires a TEXT column"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn inverted_dml_never_uses_btree_maintenance_or_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (content TEXT)").unwrap();
+        engine.create_index("t", "content").unwrap();
+        engine
+            .insert("t", &[Some(Datum::Text("before".to_string()))])
+            .unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        set_index_am_for_test(&engine, index_oid, INVERTED_AM_OID);
+        write_inverted_metadata_for_test(tmp.path(), index_oid, Lsn(128));
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        engine
+            .insert("t", &[Some(Datum::Text("contract".to_string()))])
+            .unwrap();
+        assert!(matches!(
+            engine.index_lookup("t", "content", &Datum::Text("contract".to_string())),
+            Err(EngineError::IndexNotFound(_))
+        ));
+        assert!(matches!(
+            engine.btree_index("t", "content"),
+            Err(EngineError::IndexNotFound(_))
+        ));
+        let result = engine
+            .exec(None, "UPDATE t SET content = 'updated'")
+            .unwrap();
+        assert!(matches!(result, QueryResult::Affected(2)));
+        let result = engine
+            .exec(None, "DELETE FROM t WHERE content = 'updated'")
+            .unwrap();
+        assert!(matches!(result, QueryResult::Affected(2)));
+        assert!(engine.scan("t", None).unwrap().is_empty());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn fulltext_parameters_are_typed_and_never_become_equality() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE agent_memory (id INT4, content TEXT)")
+            .unwrap();
+        let stmt = sql::parse("SELECT * FROM agent_memory WHERE content @@ $1").unwrap();
+        assert_eq!(
+            engine.parameter_types(&stmt).unwrap(),
+            vec![Some(ColumnType::Text)]
+        );
+        let non_text = sql::parse("SELECT * FROM agent_memory WHERE id @@ $1").unwrap();
+        assert!(matches!(
+            engine.parameter_types(&non_text),
+            Err(EngineError::InvalidArgument(_))
+        ));
+        assert!(engine
+            .exec(None, "SELECT * FROM agent_memory WHERE id @@ 'contract'")
+            .is_err());
+        let error = engine
+            .exec_with_params(
+                None,
+                "SELECT * FROM agent_memory WHERE content @@ $1",
+                &[Some(Datum::Text("contract".to_string()))],
+            )
+            .unwrap_err();
+        assert!(matches!(error, EngineError::Unsupported(_)));
+
+        let stmt =
+            sql::parse("SELECT * FROM agent_memory WHERE content @@ $1 AND id > $2").unwrap();
+        assert_eq!(
+            engine.parameter_types(&stmt).unwrap(),
+            vec![Some(ColumnType::Text), Some(ColumnType::Int4)]
+        );
+        let error = engine
+            .exec_with_params(
+                None,
+                "SELECT * FROM agent_memory WHERE content @@ $1 AND id > $2",
+                &[
+                    Some(Datum::Text("contract".to_string())),
+                    Some(Datum::Int4(5)),
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(error, EngineError::Unsupported(_)));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn plain_bm25_score_column_still_executes_normally() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (bm25_score FLOAT8)")
+            .unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (2.5), (1.5)")
+            .unwrap();
+        let result = engine
+            .exec(None, "SELECT bm25_score FROM t ORDER BY bm25_score")
+            .unwrap();
+        let QueryResult::Rows { columns, rows } = result else {
+            panic!("expected rows")
+        };
+        assert_eq!(columns, vec!["bm25_score"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Some(Datum::Float8(1.5)));
+        assert_eq!(rows[1][0], Some(Datum::Float8(2.5)));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn vacuum_skips_inverted_metadata_instead_of_opening_btree() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, 'contract')")
+            .unwrap();
+        engine.exec(None, "DELETE FROM t WHERE id = 1").unwrap();
+        let table_oid = engine.table_entry("t").unwrap().oid;
+        engine.indexes.write().push(IndexEntry {
+            kind: AmKind::Inverted,
+            inverted: Some(InvertedIndexMetadata::initial()),
+            index_oid: Oid(9879),
+            table_oid,
+            column: "content".to_string(),
+            key_type: ColumnType::Text,
+            // This is not a B+Tree page: any accidental B+Tree open fails.
+            meta_page: PageId(0),
+            map_page: None,
+        });
+        let stats = engine.vacuum("t").unwrap();
+        assert_eq!(stats.index_entries_removed, 0);
         engine.shutdown();
     }
 }

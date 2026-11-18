@@ -61,6 +61,8 @@ pub enum Statement {
         columns: SelectCols,
         table: String,
         filter: Option<Filter>,
+        /// Optional second predicate introduced by `AND` (Phase 3 Stage 0).
+        extra_filter: Option<Filter>,
         order_by: Option<OrderByKind>,
         limit: Option<usize>,
         /// Row-lock clause (M2c Stage P): `FOR UPDATE` / `FOR SHARE`.
@@ -85,6 +87,8 @@ pub enum Statement {
         method: Option<IndexMethod>,
         /// The vector operator class (Phase 4a §5.1). Required for HNSW.
         opclass: Option<VectorOpclass>,
+        /// Optional `WITH (fulltext_index = 'bm25')` declaration for inverted.
+        fulltext_index: Option<String>,
     },
 }
 
@@ -100,6 +104,8 @@ pub enum SequenceFunction {
 pub enum IndexMethod {
     BTree,
     Hnsw,
+    /// Inverted full-text index (Phase 3).
+    Inverted,
 }
 
 /// The vector operator class (pgvector-compatible opclasses).
@@ -132,6 +138,8 @@ pub enum DistanceOp {
 pub enum OrderByKind {
     Column(OrderBy),
     Expr(OrderByExpr),
+    /// BM25 full-text score expression (Phase 3).
+    Bm25Score(Bm25ScoreExpr),
 }
 
 /// A distance-operator ORDER BY expression (Phase 4a §5.2).
@@ -140,6 +148,19 @@ pub struct OrderByExpr {
     pub op: DistanceOp,
     pub left: Expr,
     pub right: Expr,
+    /// `true` = DESC, `false` = ASC (default).
+    pub desc: bool,
+}
+
+/// `bm25_score(column, query_text)` used by SELECT lists and ORDER BY.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bm25ScoreExpr {
+    /// Indexed text column to score.
+    pub column: String,
+    /// Full-text query text analyzed with the same analyzer as the index.
+    pub query: Literal,
+    /// Optional result-column label introduced by `AS`; not used for planning.
+    pub alias: Option<String>,
     /// `true` = DESC, `false` = ASC (default).
     pub desc: bool,
 }
@@ -185,6 +206,8 @@ pub enum SelectItem {
     /// Distance expression. `desc` is unused in a SELECT list and stays
     /// false; ORDER BY owns the direction for its own expression.
     Distance(OrderByExpr),
+    /// BM25 full-text score expression (Phase 3).
+    Bm25Score(Bm25ScoreExpr),
 }
 
 /// A WHERE clause filter.
@@ -201,6 +224,8 @@ pub enum CmpOp {
     Eq,
     Lt,
     Gt,
+    /// `@@` full-text match (Phase 3).
+    FullText,
 }
 
 /// ORDER BY clause.
@@ -277,6 +302,8 @@ enum Token {
     CosineOp,
     /// `<#>` — inner product operator (ANN).
     InnerProductOp,
+    /// `@@` full-text match operator (Phase 3).
+    FullTextOp,
     // Punctuation
     Comma,
     /// `[` — M6 Stage C vector literal open.
@@ -339,6 +366,16 @@ impl<'a> Tokenizer<'a> {
                         tokens.push(self.parameter_placeholder()?);
                     } else if c == '-' || c.is_ascii_digit() {
                         tokens.push(self.number_literal()?);
+                    } else if c == '@' {
+                        self.bump();
+                        if self.peek == Some('@') {
+                            self.bump();
+                            tokens.push(Token::FullTextOp);
+                        } else {
+                            return Err(EngineError::InvalidArgument(
+                                "expected second '@' in full-text operator".to_string(),
+                            ));
+                        }
                     } else if c == '<' {
                         self.bump();
                         // Longest match first: the three ANN distance
@@ -747,9 +784,10 @@ impl Parser {
             match self.eat_ident()?.as_str() {
                 "btree" => Some(IndexMethod::BTree),
                 "hnsw" => Some(IndexMethod::Hnsw),
+                "inverted" => Some(IndexMethod::Inverted),
                 other => {
                     return Err(EngineError::InvalidArgument(format!(
-                        "unknown index method {other:?} (expected btree or hnsw)"
+                        "unknown index method {other:?} (expected btree, hnsw, or inverted)"
                     )))
                 }
             }
@@ -774,6 +812,17 @@ impl Parser {
             None
         };
         self.eat(&Token::RParen)?;
+        let fulltext_index = self.parse_optional_fulltext_index()?;
+        if method != Some(IndexMethod::Inverted) && fulltext_index.is_some() {
+            return Err(EngineError::InvalidArgument(
+                "fulltext_index is only valid with USING inverted".to_string(),
+            ));
+        }
+        if method == Some(IndexMethod::Inverted) && opclass.is_some() {
+            return Err(EngineError::InvalidArgument(
+                "a vector opclass is not valid with USING inverted".to_string(),
+            ));
+        }
         // HNSW requires an explicit opclass (§5.1). Execution validates
         // method/column compatibility and rejects unsupported DDL forms.
         if method == Some(IndexMethod::Hnsw) && opclass.is_none() {
@@ -789,7 +838,38 @@ impl Parser {
             column,
             method,
             opclass,
+            fulltext_index,
         })
+    }
+
+    fn parse_optional_fulltext_index(&mut self) -> Result<Option<String>> {
+        if !matches!(self.peek(), Token::Ident(ref name) if name == "with") {
+            return Ok(None);
+        }
+        self.bump(); // WITH
+        self.eat(&Token::LParen)?;
+        let option = self.eat_ident()?;
+        if option != "fulltext_index" {
+            return Err(EngineError::InvalidArgument(format!(
+                "unknown index option {option:?}; expected fulltext_index"
+            )));
+        }
+        self.eat(&Token::Eq)?;
+        let value = match self.bump() {
+            Token::Str(value) => value,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "expected fulltext_index string value, got {other:?}"
+                )))
+            }
+        };
+        self.eat(&Token::RParen)?;
+        if value != "bm25" {
+            return Err(EngineError::Unsupported(format!(
+                "unsupported fulltext_index value {value:?}; only 'bm25' is supported"
+            )));
+        }
+        Ok(Some(value))
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -917,6 +997,7 @@ impl Parser {
         self.eat(&Token::From)?;
         let table = self.eat_ident()?;
         let filter = self.parse_optional_filter()?;
+        let extra_filter = self.parse_optional_extra_filter()?;
         let order_by = self.parse_optional_order_by()?;
         let limit = self.parse_optional_limit()?;
         let lock = self.parse_optional_lock_clause()?;
@@ -925,6 +1006,7 @@ impl Parser {
             columns,
             table,
             filter,
+            extra_filter,
             order_by,
             limit,
             lock,
@@ -994,6 +1076,25 @@ impl Parser {
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
         let column = self.eat_ident()?;
+        if column == "bm25_score" && matches!(self.peek(), Token::LParen) {
+            self.eat(&Token::LParen)?;
+            let column = self.eat_ident()?;
+            self.eat(&Token::Comma)?;
+            let query = self.parse_literal()?;
+            self.eat(&Token::RParen)?;
+            let alias = if matches!(self.peek(), Token::Ident(ref name) if name == "as") {
+                self.bump();
+                Some(self.eat_ident()?)
+            } else {
+                None
+            };
+            return Ok(SelectItem::Bm25Score(Bm25ScoreExpr {
+                column,
+                query,
+                alias,
+                desc: false,
+            }));
+        }
         if matches!(
             self.peek(),
             Token::L2Op | Token::CosineOp | Token::InnerProductOp
@@ -1031,11 +1132,24 @@ impl Parser {
             return Ok(None);
         }
         self.bump(); // WHERE
+        self.parse_filter().map(Some)
+    }
+
+    fn parse_optional_extra_filter(&mut self) -> Result<Option<Filter>> {
+        if !matches!(self.peek(), Token::Ident(ref name) if name == "and") {
+            return Ok(None);
+        }
+        self.bump(); // AND
+        self.parse_filter().map(Some)
+    }
+
+    fn parse_filter(&mut self) -> Result<Filter> {
         let column = self.eat_ident()?;
         let op = match self.bump() {
             Token::Eq => CmpOp::Eq,
             Token::Lt => CmpOp::Lt,
             Token::Gt => CmpOp::Gt,
+            Token::FullTextOp => CmpOp::FullText,
             other => {
                 return Err(EngineError::InvalidArgument(format!(
                     "expected comparison operator, got {other:?}"
@@ -1043,7 +1157,7 @@ impl Parser {
             }
         };
         let value = self.parse_literal()?;
-        Ok(Some(Filter { column, op, value }))
+        Ok(Filter { column, op, value })
     }
 
     fn parse_optional_order_by(&mut self) -> Result<Option<OrderByKind>> {
@@ -1053,10 +1167,21 @@ impl Parser {
         self.bump(); // ORDER
         self.eat(&Token::By)?;
         let column = self.eat_ident()?;
-        let distance = if matches!(
-            self.peek(),
-            Token::L2Op | Token::CosineOp | Token::InnerProductOp
-        ) {
+        let bm25_query = if column == "bm25_score" && matches!(self.peek(), Token::LParen) {
+            self.eat(&Token::LParen)?;
+            let score_column = self.eat_ident()?;
+            self.eat(&Token::Comma)?;
+            let query = self.parse_literal()?;
+            self.eat(&Token::RParen)?;
+            Some((score_column, query))
+        } else {
+            None
+        };
+        let distance = if bm25_query.is_none()
+            && matches!(
+                self.peek(),
+                Token::L2Op | Token::CosineOp | Token::InnerProductOp
+            ) {
             Some(self.parse_distance_tail()?)
         } else {
             None
@@ -1072,6 +1197,14 @@ impl Parser {
             }
             _ => false,
         };
+        if let Some((score_column, query)) = bm25_query {
+            return Ok(Some(OrderByKind::Bm25Score(Bm25ScoreExpr {
+                column: score_column,
+                query,
+                alias: None,
+                desc,
+            })));
+        }
         if let Some((op, right)) = distance {
             Ok(Some(OrderByKind::Expr(OrderByExpr {
                 op,
@@ -1170,12 +1303,17 @@ pub(crate) fn max_parameter_index(stmt: &Statement) -> usize {
         left.max(right)
     }
 
+    fn bm25_expr_max(expr: &Bm25ScoreExpr) -> usize {
+        literal_max(&expr.query)
+    }
+
     match stmt {
         Statement::Explain(inner) => max_parameter_index(inner),
         Statement::Insert { rows, .. } => rows.iter().flatten().map(literal_max).max().unwrap_or(0),
         Statement::Select {
             columns,
             filter,
+            extra_filter,
             order_by,
             ..
         } => {
@@ -1186,15 +1324,20 @@ pub(crate) fn max_parameter_index(stmt: &Statement) -> usize {
                     .map(|item| match item {
                         SelectItem::Column(_) => 0,
                         SelectItem::Distance(expr) => expr_max(expr),
+                        SelectItem::Bm25Score(expr) => bm25_expr_max(expr),
                     })
                     .max()
                     .unwrap_or(0),
             };
             let order_max = match order_by {
                 Some(OrderByKind::Expr(expr)) => expr_max(expr),
+                Some(OrderByKind::Bm25Score(expr)) => bm25_expr_max(expr),
                 _ => 0,
             };
-            columns_max.max(filter_max(filter)).max(order_max)
+            columns_max
+                .max(filter_max(filter))
+                .max(filter_max(extra_filter))
+                .max(order_max)
         }
         Statement::Update { sets, filter, .. } => sets
             .iter()
@@ -1288,6 +1431,7 @@ mod tests {
                 columns,
                 table,
                 filter,
+                extra_filter: None,
                 order_by,
                 limit,
                 lock,
@@ -1312,6 +1456,7 @@ mod tests {
                 columns,
                 table,
                 filter,
+                extra_filter: None,
                 order_by,
                 limit,
                 lock,
@@ -1439,6 +1584,7 @@ mod tests {
                     column,
                     method,
                     opclass,
+                    ..
                 } => {
                     assert_eq!(name.as_deref(), Some("idx"));
                     assert_eq!(table, "items");
@@ -1588,5 +1734,139 @@ mod tests {
             }
             other => panic!("expected Select, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_inverted_index_and_validate_fulltext_option() {
+        let stmt = parse(
+            "CREATE INDEX content_idx ON agent_memory USING inverted (content) WITH (fulltext_index='bm25')",
+        )
+        .unwrap();
+        assert_eq!(
+            stmt,
+            Statement::CreateIndex {
+                name: Some("content_idx".to_string()),
+                table: "agent_memory".to_string(),
+                column: "content".to_string(),
+                method: Some(IndexMethod::Inverted),
+                opclass: None,
+                fulltext_index: Some("bm25".to_string()),
+            }
+        );
+        assert!(parse(
+            "CREATE INDEX content_idx ON agent_memory USING inverted (content) WITH (fulltext_index='other')"
+        )
+        .is_err());
+        assert!(parse(
+            "CREATE INDEX content_idx ON agent_memory USING inverted (content) WITH (unknown='bm25')"
+        )
+        .is_err());
+        assert!(parse(
+            "CREATE INDEX content_idx ON agent_memory USING btree (content) WITH (fulltext_index='bm25')"
+        )
+        .is_err());
+        assert!(parse(
+            "CREATE INDEX content_idx ON agent_memory USING inverted (content vector_l2_ops)"
+        )
+        .is_err());
+        assert!(parse("CREATE INDEX idx ON agent_memory USING gin (content)").is_err());
+    }
+
+    #[test]
+    fn parse_fulltext_literal_parameter_and_extra_where() {
+        let stmt = parse("SELECT * FROM agent_memory WHERE content @@ 'contract'").unwrap();
+        let Statement::Select {
+            filter: Some(filter),
+            extra_filter: None,
+            ..
+        } = stmt
+        else {
+            panic!("expected full-text SELECT")
+        };
+        assert_eq!(filter.column, "content");
+        assert_eq!(filter.op, CmpOp::FullText);
+        assert_eq!(filter.value, Literal::Str("contract".to_string()));
+
+        let stmt = parse("SELECT * FROM agent_memory WHERE content @@ $1").unwrap();
+        assert_eq!(max_parameter_index(&stmt), 1);
+        let Statement::Select {
+            filter: Some(filter),
+            ..
+        } = stmt
+        else {
+            panic!("expected parameterized full-text SELECT")
+        };
+        assert_eq!(filter.op, CmpOp::FullText);
+        assert_eq!(filter.value, Literal::Param(1));
+
+        let stmt = parse("SELECT * FROM agent_memory WHERE content @@ 'x' AND id > 5").unwrap();
+        let Statement::Select {
+            filter: Some(filter),
+            extra_filter: Some(extra),
+            ..
+        } = stmt
+        else {
+            panic!("expected ExtraWhere SELECT")
+        };
+        assert_eq!(filter.op, CmpOp::FullText);
+        assert_eq!(extra.column, "id");
+        assert_eq!(extra.op, CmpOp::Gt);
+        assert_eq!(extra.value, Literal::Int(5));
+    }
+
+    #[test]
+    fn bm25_score_identifier_remains_a_plain_column() {
+        let stmt = parse("SELECT bm25_score FROM t").unwrap();
+        let Statement::Select { columns, .. } = stmt else {
+            panic!("expected SELECT")
+        };
+        assert_eq!(
+            columns,
+            SelectCols::Cols(vec![SelectItem::Column("bm25_score".to_string())])
+        );
+
+        let stmt = parse("SELECT * FROM t ORDER BY bm25_score").unwrap();
+        let Statement::Select { order_by, .. } = stmt else {
+            panic!("expected ORDER BY SELECT")
+        };
+        assert!(matches!(
+            order_by,
+            Some(OrderByKind::Column(OrderBy {
+                column,
+                desc: false,
+            })) if column == "bm25_score"
+        ));
+    }
+
+    #[test]
+    fn parse_bm25_projection_order_and_alias() {
+        let stmt = parse(
+            "SELECT id, bm25_score(content, 'contract') AS score FROM agent_memory WHERE content @@ 'contract' ORDER BY bm25_score(content, 'contract') DESC LIMIT 10",
+        )
+        .unwrap();
+        let Statement::Select {
+            columns,
+            order_by: Some(OrderByKind::Bm25Score(order)),
+            limit: Some(10),
+            ..
+        } = stmt
+        else {
+            panic!("expected BM25 SELECT")
+        };
+        let SelectCols::Cols(items) = columns else {
+            panic!("expected explicit projection")
+        };
+        assert_eq!(items.len(), 2);
+        let SelectItem::Bm25Score(projection) = &items[1] else {
+            panic!("expected BM25 projection")
+        };
+        assert_eq!(projection.column, "content");
+        assert_eq!(projection.query, Literal::Str("contract".to_string()));
+        assert_eq!(projection.alias.as_deref(), Some("score"));
+        assert!(!projection.desc);
+        assert_eq!(order.column, "content");
+        assert_eq!(order.query, projection.query);
+        assert!(order.desc);
+        assert!(order.alias.is_none());
     }
 }

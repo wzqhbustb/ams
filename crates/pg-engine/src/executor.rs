@@ -82,10 +82,16 @@ pub(crate) fn execute(
         }
         ScanSpec::Seq(spec) => execute_seq(engine, snap, table, entry, &spec.predicate)?,
         ScanSpec::Hnsw(spec) => execute_hnsw(engine, snap, table, entry, spec)?,
+        ScanSpec::Inverted(_) => {
+            return Err(EngineError::Unsupported(
+                "inverted execution is not implemented in Stage 0".to_string(),
+            ))
+        }
     };
     if let Some(reason) = fallback_reason {
         plan.spec = ScanSpec::Seq(crate::planner::SeqScanSpec {
             predicate: filter.clone(),
+            extra_predicate: None,
             order_by: order_by.clone(),
             limit: *limit,
             est_rows: 0,
@@ -321,7 +327,7 @@ pub(crate) fn sort_by_distance(
         .collect())
 }
 
-fn build_request(
+pub(crate) fn build_request(
     engine: &Engine,
     table: &str,
     entry: &TableEntry,
@@ -344,7 +350,7 @@ fn build_request(
         .indexes_of(entry)
         .into_iter()
         .map(|(idx, _)| {
-            let is_hnsw = matches!(idx.key_type, ColumnType::Vector(_));
+            let is_hnsw = matches!(idx.kind, AmKind::Hnsw);
             let (opclass, ef_search_default) = if is_hnsw
                 && ann_column.is_some_and(|column| idx.column.eq_ignore_ascii_case(column))
             {
@@ -361,7 +367,9 @@ fn build_request(
                 (None, None)
             };
             Ok(IndexMetadata {
-                kind: if is_hnsw { AmKind::Hnsw } else { AmKind::BTree },
+                kind: idx.kind,
+                index_oid: idx.index_oid,
+                inverted: idx.inverted,
                 column: idx.column,
                 opclass,
                 ef_search_default,
@@ -371,8 +379,10 @@ fn build_request(
     Ok(ScanRequest {
         table: table.to_string(),
         predicate: filter.clone(),
+        extra_predicate: None,
         order_by: order_by.clone(),
         limit: *limit,
+        allow_stale_inverted: engine.allow_stale_inverted(),
         indexes,
     })
 }
@@ -435,6 +445,7 @@ pub(crate) fn explain(
     if matches!(&plan.spec, ScanSpec::BTree(_)) && !snapshot_allows_btree(engine, snap) {
         plan.spec = ScanSpec::Seq(crate::planner::SeqScanSpec {
             predicate: filter.clone(),
+            extra_predicate: None,
             order_by: order_by.clone(),
             limit: *limit,
             est_rows: 0,
@@ -444,6 +455,7 @@ pub(crate) fn explain(
     } else if key_too_large && matches!(&plan.spec, ScanSpec::BTree(_)) {
         plan.spec = ScanSpec::Seq(crate::planner::SeqScanSpec {
             predicate: filter.clone(),
+            extra_predicate: None,
             order_by: order_by.clone(),
             limit: *limit,
             est_rows: 0,
@@ -469,7 +481,7 @@ pub(crate) fn explain(
             spec.est_rows = est_rows;
             spec.est_pages = est_pages;
         }
-        ScanSpec::Hnsw(_) => {}
+        ScanSpec::Hnsw(_) | ScanSpec::Inverted(_) => {}
     }
     Ok(crate::QueryResult::Rows {
         columns: vec!["plan".to_string()],
@@ -508,6 +520,11 @@ fn execute_btree(
             .into_iter()
             .map(|(_, tid)| tid)
             .collect(),
+        CmpOp::FullText => {
+            return Err(EngineError::Unsupported(
+                "full-text execution is not implemented in Stage 0".to_string(),
+            ))
+        }
     };
     let col_types = column_types(entry);
     let mut rows = Vec::new();

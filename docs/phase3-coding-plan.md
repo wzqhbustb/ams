@@ -1,0 +1,223 @@
+# Phase 3 Coding Plan：全文倒排索引（BM25 / Segment / Tier 2）
+
+版本：v1.2（2026-11-17）
+依据：`docs/phase3-tech-selection.md` v1.2（含 TOAST 消费、SegmentManifest、`ExtraWhere`、参数化查询与偏离登记）
+前置：Phase 1/2 已交付；Phase 4a 已完成并合入。Phase 2 的 24h 压测、CI coverage、`phase2-m6` tag 并行推进，不阻塞本计划。
+
+---
+
+## 硬约束（贯穿所有 Stage，违反即返工）
+
+1. **heap + WAL 是唯一事实源**：segment 是可重建的二级结构，不得成为独立写入真相；查询候选最终必须经 heap MVCC 可见性复核。
+2. **AM 注册表可插拔**：新增 `AmKind::Inverted`、注册项、AST 与 `InvertedScanSpec` 即可，禁止修改 selector/executor 的核心分派结构。
+3. **Commit 才能进入倒排**：WAL consumer 按 XID 暂存变更，Commit 按原顺序应用，Abort 丢弃；绝不允许 in-flight 版本进入 write buffer。`HeapUpdate` 必须**先删除 old_tid 的 posting，再插入 new_tid/new_tuple 的 posting**，不得只按新行追加；TOAST 复用旧 group 时删除旧 posting 不需要 detoast。
+4. **快照与 Guard 不可分割**：所有读路径使用真实 `(Snapshot, SnapshotGuard)`，禁止 `Snapshot::everything()`；Guard 覆盖 WAND、merge stream、TOAST 组包、派生任务与 heap 回表。
+5. **TOAST 语义唯一**：20B pointer、2000B chunk 上限、同 XID 且 chunk 先于主行写，全部复用 Stage D 的组包/校验 helper；新 group 缺块或共享旧 group 损坏均为 `Corrupted` 并停水位，不得跳过。
+6. **backfill 使用 `AccessExclusive`**：锁覆盖快照、初始 segment、初始 manifest 和 consumer 起点，禁止 `AccessShare` 或按 entry 去重掩盖并发重复基线。
+7. **merge 以 `SegmentManifest` 原子切换读集合**：target 与 inputs 不得同时可见；只允许完整旧 generation 或完整新 generation。
+8. **回退必须精确**：`ExtraWhere` 一律 SeqScan + 普通过滤 + BM25 精确评分/排序，禁止倒排候选后 post-filter；无 LIMIT 时不静默截断，超时只报错、不采样。
+9. **统计按 segment 保存并汇总**：checkpoint 只作优化，不作为全局统计事实源；merge 间历史统计窗口必须显式记录，不能宣称始终精确。
+10. **WAL 与 SegmentId 契约冻结**：只复用 `SegmentSeal=110`、`SegmentMerge=111`；`LogicalInverted=101` 保留，SegmentId 在索引实例内不复用。
+11. **参数化必须走类型化绑定**：`content @@ $1` 接受 `Literal::Param`，推断为 TEXT，经 `exec_with_params`/pg-wire Bind 后使用同一 Analyzer；禁止 SQL 文本替换。
+12. **Tantivy 只作对照**：生产路径不嵌入 Tantivy，也不新增异步 runtime；基准版本与 lockfile 固定，不得无约束升级。
+13. **WAND 不得牺牲正确性**：任何 upper-bound 剪枝必须与 DAAT 全量结果、分数及 tie-break 完全一致；同分不得跳过。
+14. **测试先行**：Analyzer、posting、segment、WAL/Tier 2、`Bm25Score` AST、参数化与 `ExtraWhere` 的 golden tests 必须先于对应实现。
+
+### 对 ROADMAP 原文的有意修订（偏离登记）
+
+1. **全局统计持久化**：ROADMAP 原文要求 `doc_count/avgdl/term_df` 在 checkpoint metadata file 中维护；本计划改为**按 segment 保存并汇总**，checkpoint 只作恢复优化。理由是避免“统计已更新、行未提交”的分布式事务窗口，segment 统计与对应版本同生同灭，崩溃和 merge 均可重算验证。
+2. **大表回退限制**：ROADMAP 原文为 `timeout/sampling limits`；本计划只保留 timeout，**拒绝 sampling**。采样会静默改变结果集与 BM25 排名，破坏与索引路径的语义一致性；超时后以结构化错误返回，不得用近似结果冒充精确回退。
+
+---
+
+## Stage 0：格式冻结、crate 骨架、AST 与 CI（1–2 天）
+
+| 任务 | 交付物 |
+|---|---|
+| crate 与依赖注册 | 新建 `crates/pg-am-inverted`，加入 workspace members；模块骨架 `error.rs`、`analyzer.rs`、`posting.rs`、`segment.rs`、`bm25.rs`、`wand.rs`、`tier2.rs`、`index.rs`、`recovery.rs`。不依赖 `pg-engine` 或 DataFusion |
+| 依赖锁定 | `jieba-rs = { version = "=0.10.1", default-features = false }`；build dependency `jieba-macros = "=0.10.1"`；`rust-stemmers = "1.2.0"`。Tantivy 仅 benchmark：`0.25.0`，并锁定 `time=0.3.45`、`uuid=1.24.0`、`bon=3.3.1`、`darling=0.20.11` |
+| SQL AST | 新增 inverted `CreateIndex` 方法与可选 `fulltext_index='bm25'`；新增 `SelectItem::Bm25Score`、`OrderByKind::Bm25Score`、`InvertedScanSpec`、`ExtraWhere`；`Literal::Param` 对 `@@` 推断为 TEXT。`AS score` 只作输出标签，ORDER BY 直接重复评分表达式，不引入 alias 解析 |
+| stale 配置 | 在 `EngineConfig` 增加 `allow_stale_inverted: bool`，默认 `false`（即 `require_fresh`）。只允许 engine 配置级开关，不引入 SQL 语法；`allow_stale` 时计划必须标注 `StaleIndex` |
+| pg-wire 投影 | `SelectItem::Bm25Score` 的 statement/portal `RowDescription` 静态返回 FLOAT8（OID 701，与距离列同型）；Stage 0 以静态字段描述和手工结果形状覆盖 Simple/Extended 编码的空/非空形态，真实查询端到端空结果与非空结果验收归 Stage B（此时执行尚未实现） |
+| catalog/AM 注册 | 固定 `INVERTED_AM_OID = 9879`（紧随 HNSW 的 9878）并注册 `pg_class.relam`；`build_index_registry` 支持 inverted 的 analyzer 配置、watermark 与 orphan 过滤，DROP TABLE 不重建。`Engine::vacuum` 对 inverted 只走 segment merge GC，禁止按 B+Tree 清理 posting；旧目录无该 OID 时按未知 AM 处理而非误认 B+Tree |
+| 格式冻结 | `Token { text: String, position: u32 }`、posting、doc-length、`SegmentMeta`、`SegmentManifest { generation, active_segment_ids, applied_lsn }`、SegmentId 与 110/111 payload 契约；二进制 magic/version/CRC 与长度上限 |
+| AM 方法契约 | `build` 初始化 SegmentStore；独立 `search` 查询；`insert/delete/scan` 显式返回 `Unsupported`，禁止空 Vec/空 Ok/伪造 heap tuple |
+| 参数与回退 | `content @@ $1`、`content @@ 'x' AND id > 5` 的解析和 planner 负例；`ExtraWhere` 固定为 SeqScan，未知 AM/fulltext_index 响亮拒绝 |
+| CI 注册 | 新 crate 加入 clippy/test/doc crate matrix、fmt、MSRV workspace check；`pg-am-inverted` 无 loom feature，归入 **all-features test 分支**，不使用 pg-storage/pg-am-btree/pg-am-hnsw 的 default-feature 例外；覆盖率若需要必须另建 pg-am-inverted 专用 job，不能沿用 pg-am-hnsw 数字 |
+| Golden tests | Analyzer token、posting/segment bytes、SegmentManifest、AST、参数类型、ExtraWhere、未知 AM、非法版本/长度/CRC |
+
+**验收**：
+- `cargo test -p pg-am-inverted --lib`
+- `cargo test -p pg-engine --lib`
+- `cargo +1.86.0 check --workspace --all-features`
+
+本阶段只冻结格式与 AST，不得提前实现倒排查询或让 `@@` 静默等价于字符串相等。
+
+---
+
+## Stage A：Analyzer、posting、BM25 与 DAAT（2–3 天）
+
+| 任务 | 交付物 |
+|---|---|
+| 分析器 | `Analyzer` trait 与 `Token { text, position }`；英文 Snowball/stop-word、中文 jieba、混合文本处理；建索引与查询使用同一实例、词典和配置 hash |
+| 中文词典 | `Jieba::empty()` + `load_dict(BufRead)`；词典作为带版本/SHA256 的 vendored 数据资产，禁止运行时下载 |
+| Posting/统计 | 有序 `(term, tid, position)` posting、doc-length、segment-local `doc_count/total_tokens/term_df`；有界编码与损坏检测 |
+| BM25 | `k1=1.2`、`b=0.75`、标准 idf；f64 计算，零文档/零 df/零 avgdl 安全处理；同分 `(score DESC, tid ASC)` |
+| DAAT | 单 term scan、多 term AND 交集、OR 全量基线；top-k 有界堆，超大 k 不按输入直接预分配 |
+| 测试 | 中英文/混合 token、position、词典 hash、BM25 对 Tantivy `bm25.rs` 已知答案、重复 term、长短文档、零文档/零 df、损坏 posting/segment、LIMIT 0/1/k/超大 k |
+
+**验收**：内存模型的 Analyzer、posting、BM25 与 DAAT 结果正确；Tantivy 已知答案逐项一致；所有损坏输入结构化报错，无 panic。
+
+**实现补充**：全局统计只在 segment 内维护，后续查询从 active manifest 的 segment 汇总；不创建全局计数文件。首版不实现 phrase、prefix、fuzzy、括号优先级或完整 query parser。
+
+---
+
+## Stage B：单 segment 持久化、backfill、查询与 EXPLAIN（2–3 天）
+
+| 任务 | 交付物 |
+|---|---|
+| SegmentStore | write buffer → Frozen → Sealed 的单 segment 写路径；版本化二进制、metadata、doc-length、posting blocks、CRC；临时文件 fsync → rename → 父目录 fsync。`seal()` 同时发射 `SegmentSeal=110` 并注册幂等 redo handler，不能只做文件状态迁移 |
+| 初始 manifest | `generation=1`、active IDs、初始 `durable_applied_lsn`；查询固定 generation，不遍历磁盘所有 sealed 文件 |
+| backfill | **全程 `AccessExclusive`**：取锁后重新取快照与 `base_lsn=synced_lsn()`，扫描并构建初始 segment，发布初始 manifest 和 consumer 起点，再从 `successor(base_lsn)` 消费；大表增量 backfill 不在本阶段实现。**空 WAL 时从第一条 WAL 记录开始**，successor 必须按 LSN 对齐规则计算，不能产生非法 LSN |
+| registry/回滚 | 镜像 Phase 4a `create_hnsw_index` 的审查结论：registry/handle 在 `auto_commit_with_hooks` 成功钩子里、commit 后且锁释放前发布；op Err 或 commit Err 在锁释放前回滚，禁止幽灵 registry/consumer。backfill 的 `AccessExclusive` 与 registry 回滚必须覆盖并发 waiter，commit failure 后可重试 |
+| AM 与查询 | `build/search/freshness`；`insert/delete/scan` 显式 `Unsupported`；单 segment DAAT + BM25 + heap 回表，LIMIT/top-k 与无索引回退 |
+| TOAST helper | 将 Stage D 的组包与校验提炼为 pg-am-heap 可复用 helper；backfill 以真实快照 detoast，不使用 physical detoast 或 `Snapshot::everything()` |
+| EXPLAIN | `InvertedScan` 输出 index/analyzer/limit/consumed_lsn/snapshot_frontier/plan；回退输出 `NoIndex`、`ExtraWhere`、`UnsupportedQuery` 等 |
+| 测试 | 空表/非空表 backfill、空表+空 WAL、首次 DML 与 reopen、并发 DML 锁互斥、结果不重复、单 segment 查询、TOAST 多 chunk、旧目录无索引、文件损坏/rename 窗口、重复 seal、参数化 `@@ $1`、额外谓词回退、backfill commit failure 后并发 waiter 无幽灵 registry/consumer 且可重试 |
+
+**验收**：单 segment 可持久化并 reopen；backfill 与并发 DML 不产生重复行或重复文档统计；`ExtraWhere` 结果与精确 SeqScan 一致；坏 magic/version/长度/CRC 均为 `Corrupted`。
+
+**实现补充**：初始 backfill 的写停止窗口是首版明确接受的限制，必须记录到基准；不得用 per-entry 去重掩盖 backfill 与 WAL 的竞态。
+
+---
+
+## Stage C：Tier 2 consumer、TOAST 消费与 watermark（3–4 天）
+
+| 任务 | 交付物 |
+|---|---|
+| WAL consumer | 实现 `WalTailReader`：只读已 flush 记录、拉取式背压、跨段续传；per-XID pending 有界，Commit 按序应用，Abort 丢弃。**HeapUpdate 必须先删 old_tid posting 再插入 new_tid/new_tuple posting**，TOAST 复用旧 group 删除旧 posting 不需要 detoast |
+| 水位 | 区分 `consumed_lsn`（进程内查询新鲜度）与 `durable_applied_lsn`（durable seal 后恢复起点）；`WatermarkRegistry` 单调更新，stale worker 不得回写 |
+| TOAST 新 group | pending 中同 XID chunk 按 seq 组包，校验 relation/rawsize/extsize/连续 seq/≤2000B/总大小/UTF-8；任何损坏都 `Corrupted` 停水位 |
+| TOAST 共享旧 group | pending 无该 valueid 时，用 commit 后新 snapshot + Guard 读取 committed chunk 并复用同一 helper；禁止 physical detoast 或 `Snapshot::everything()` |
+| 新鲜度与回退 | `snapshot_frontier = wal_writer.synced_lsn()`；不足时默认 `require_fresh` 回退，允许显式 `allow_stale` 只读 sealed 并标注 `StaleIndex` |
+| lag 与观测 | 暴露 `wal_lag_records/bytes`、`applied_lsn`、`synced_lsn`、`last_progress_at`、`watermark_lag_seconds=max(0, now-last_progress_at)`；落后时缩短退避，不 busy-loop |
+| p95 观测 | 新增 doc-hidden `commit_finished_at` 测试 hook 记录 XID commit 完成时间；consumer 侧记录 `visible_at`，用二者差值衡量真实提交可见延迟 |
+| 测试 | Commit/Abort/in-flight、跨 WAL 段、checkpoint 前后、pending 溢出、TOAST 新/共享 group、缺/重/乱序/尺寸错误/非法 UTF-8、stale worker、旧快照回退、Guard × vacuum；UPDATE 后仅一行、旧 term 消失、新 term 可检索且统计不重复；DELETE 后候选被剔除、tombstone 与统计窗口明确 |
+
+**验收**：
+- Abort 不入库、in-flight 不入库；重复消费不重复，崩溃恢复不丢失。
+- TOAST 损坏均不推进水位；普通字段与 >8KiB 多 chunk 文本均可检索。
+- 固定负载下已提交行 **p95 < 1s 可搜索**，使用 `commit_finished_at → visible_at` 样本，而不是 consumer 首次看到 WAL 的时间。
+
+**实现补充**：大事务 pending 优先使用有界临时存储；未实现前必须暂停并响亮报错，不能把未提交版本提前发布。`allow_stale` 只能由调用方显式选择，默认始终是 `require_fresh`。
+
+---
+
+## Stage D：k-way merge、物理删除与 manifest 原子替换（2–3 天）
+
+| 任务 | 交付物 |
+|---|---|
+| k-way merge | 按 `(term, tid, position)` 流式合并，不全量载入内存；重复 redo entry 按完整键去重，正常 UPDATE 保留不同 TID |
+| 物理删除 | tombstone 从 merge 输出中丢弃；统计汇总与重算交叉校验；merge 间历史统计窗口在 EXPLAIN/文档中可观察 |
+| SegmentManifest | target durable 后先不发布；以 `merged_applied_lsn = max(inputs.applied_lsn)` 计算水位，空 inputs 保持原值，禁止用 merge 完成时的 `synced_lsn()` 跳过新 DML。manifest 使用 `manifest.tmp → fsync → 原子 rename → 父目录 fsync`：一次替换安装 target、移除 inputs、`generation + 1`，替换前读者只见旧 generation，替换后只见新 generation；替换失败旧 manifest 继续有效 |
+| 生命周期与 redo | `Active → Frozen → Sealed → Merging → Retired`；`SegmentSeal=110` 在 seal 时发射且幂等，`SegmentMerge=111` 携带有序 inputs + target，重复安装/退休幂等；失败时 inputs 保持 Sealed |
+| 并发与清理 | 单 consumer 与 merge worker 协调 manifest；禁止并发 seal 同 ID 或并发覆盖 generation/applied_lsn；未发布目标按临时文件清理 |
+| 测试 | merge 前后结果和 tie-break 一致、并发 reader×merge×DML、统计一致、target durable 但 manifest 未替换、替换完成、manifest 撕裂/替换失败、重复 seal/merge、SegmentId 不复用；DELETE tombstone 在 merge 输出中物理清除且统计重算正确 |
+
+**验收**：merge 不丢行、不重复、不混代；任何崩溃窗口只见完整旧或新 generation；失败 merge 不产生可见半成品。
+
+**实现补充**：manifest 替换是唯一读集合切换点，redo 也必须遵守；不允许先改 manifest 再写 target，也不允许先 retire inputs 再 durable target。
+
+---
+
+## Stage E：WAND、全 crash matrix 与检索基准（3–4 天）
+
+| 任务 | 交付物 |
+|---|---|
+| WAND | term upper-bound、pivot、候选维护与 top-k；上界只能使用安全 BM25 max_score；`score_upper_bound < 当前第 k 名` 才允许跳过，等于时保留并执行 tie-break |
+| 正确性对拍 | WAND 与 DAAT 在单 term/AND/OR、空结果、重复 term、并列分数、LIMIT 0/1/k/超大 k 下逐项相同；无 LIMIT 时全量精确评估 |
+| 全 crash matrix | WAL commit 前后、消费前后、seal rename 前后、manifest 替换前后、pending 溢出、TOAST 缺块、重复 open/reopen、DROP 后重建 |
+| 并发验收 | reader×merge×DML、旧快照 vacuum、TOAST 共享旧 group、consumer 与 stale worker、merge 与查询 Guard 生命周期 |
+| BEIR/中文质量 | BEIR SciFact + 冻结中文/混合文本集，同一 Analyzer 和固定 flush+merge 统计截面；NDCG@10 与 Tantivy 差异目标 **±0.005** |
+| 性能基准 | 相对 Tantivy 延迟 **不超过 3×** 并记录绝对延迟；WAND/DAAT 结果一致后才比较性能；记录硬件、OS、Rust、数据/查询 hash、缓存口径 |
+| Tier 2 负载 | release、10k docs、16 clients、100 commits/s、60s/≥1000 commit 样本、100 个高中低频/空结果查询；普通 1KiB 档与 TOAST 档（每批至少一个 >8KiB 样本）均覆盖 merge 开/关 |
+
+**验收**：
+- 全 crash matrix 无重复、无丢失、无半成品；WAND 与 DAAT 结果完全一致。
+- NDCG@10 达目标，Tier 2 p95 < 1s，Tantivy 对比延迟 ≤3×；所有原始结果和命令写入 `docs/phase3-benchmarks.md`。
+
+---
+
+## Stage F：全量门禁、两轮对抗审查与归档（1–2 天）
+
+| 任务 | 交付物 |
+|---|---|
+| 全量回归 | workspace 默认 feature debug + release；新 crate debug + release；保留既有 TP/ANN/Wire/TOAST/DataFusion 全部回归，不发明不受支持的 workspace all-features test 口径 |
+| 静态门禁 | `cargo check --workspace --all-features`、MSRV 1.86 实编译、逐 crate Clippy/rustdoc、fmt、`git diff --check` |
+| 对抗审查 ×2 | 第一轮实现审查 → 修复 → 第二轮复核；重点为 backfill、pending、TOAST、watermark、manifest、旧快照、WAND upper-bound 与 crash |
+| 覆盖率 | 若新增覆盖率，必须另注册 pg-am-inverted 专用 job；不得沿用 pg-am-hnsw 的 90% 结果冒充本 crate 覆盖率 |
+| 归档 | `docs/stage_spec.md` 增加 Phase 3 各节（交付内容/关键约束/审查回流/验证数字）+ `docs/phase3-benchmarks.md` + 本计划的最终实现补充 |
+
+**验收命令（全阶段收口）**：
+
+```bash
+cargo test --workspace
+cargo test --workspace --release
+cargo test -p pg-am-inverted
+cargo test -p pg-am-inverted --release
+cargo test -p pg-engine --features datafusion
+cargo test -p pg-engine --features datafusion --release
+cargo check --workspace --all-features
+for crate in pg-storage pg-txn pg-catalog pg-am-heap pg-am-btree pg-am-hnsw pg-am-inverted pg-engine pg-wire; do
+  cargo clippy -p "$crate" --all-targets --all-features -- -D warnings || exit 1
+done
+cargo fmt --all -- --check
+for crate in pg-storage pg-txn pg-catalog pg-am-heap pg-am-btree pg-am-hnsw pg-am-inverted pg-engine pg-wire; do
+  RUSTDOCFLAGS="-D warnings" cargo doc -p "$crate" --all-features --no-deps || exit 1
+done
+CARGO_TARGET_DIR=target/msrv-phase3 cargo +1.86.0 check --workspace --all-features
+```
+
+---
+
+## CI 注册清单
+
+| # | 内容 | workflow/job | 运行条件 |
+|---|------|-------------|---------|
+| 1 | crate 骨架、AST、格式 golden tests（Stage 0） | ci.yml 新增 pg-am-inverted matrix + pg-engine 既有 matrix | 每 push |
+| 2 | Analyzer/posting/BM25/DAAT（Stage A） | pg-am-inverted test matrix | 每 push |
+| 3 | 单 segment、backfill、查询与 EXPLAIN（Stage B） | 同上 | 每 push |
+| 4 | Tier 2/TOAST consumer、watermark、crash（Stage C） | 单元每 push + crash rounds 手动/nightly | 每 push + 手动 |
+| 5 | k-way merge、manifest、物理删除（Stage D） | 单元每 push + 并发回归 | 每 push |
+| 6 | WAND、全 crash matrix、BEIR/性能基准（Stage E） | 单元每 push + 手动 release benchmark/nightly | 每 push + 手动 |
+| 7 | 全量回归与两轮对抗审查（Stage F） | 全 workspace debug/release + MSRV + 静态门禁 | Stage F 收口时 |
+| 8 | 覆盖率 | 独立 pg-am-inverted coverage job（若注册） | 每 push；不得复用 pg-am-hnsw 结果 |
+
+---
+
+## 风险与开放问题（登记，不阻塞）
+
+- **大事务 pending**：有界临时存储未落地前必须暂停消费并响亮报错，不能提前发布未提交版本。
+- **backfill 写停止**：首版用 `AccessExclusive` 换取简单且可证明的基线一致性；后续在线 backfill 优先评估 per-TID upsert，而不是按 entry 去重。
+- **统计截面**：merge 间历史统计会影响排序，必须可观察；若业务要求更强一致性，后续引入按 LSN 的统计增量。
+- **旧快照**：首版只允许当前快照走倒排，历史 posting 版本化是独立工作。
+- **WAND upper-bound**：错误上界会直接漏行，必须 DAAT 全量对拍，尤其同分与非有限值。
+- **词典/分析器升级**：配置 hash 变化必须显式重建，不能在线混用。
+- **Tantivy 版本漂移**：基准版本和 lockfile 一并归档，禁止无约束升级造成 MSRV 或质量数字失真。
+- **merge 与读者延迟**：大 segment 流式 merge 仍需测量 I/O 与页缓存污染；优化只能发生在正确性证据之后。
+- **stale 读配置**：`allow_stale` 是有意放宽，默认 `require_fresh` 不得被配置静默覆盖。
+- **TOAST 组包与复用 group**：新 group 缺块与共享旧 group 损坏只能 `Corrupted` 停水位，不得通过忽略 chunk 提高新鲜度。
+- **M6 收口项并行**：24h 复跑/CI 报告/tag 与本计划无依赖，不阻塞各 Stage。
+
+---
+
+## 修订记录
+
+| 版本 | 日期 | 内容 |
+|---|---|---|
+| v1.0 | 2026-11-17 | 初稿：依据技术选型 v1.2，拆出 Stage 0–F 的交付物、验收、CI、依赖锁定和两轮审查；覆盖 backfill、manifest、TOAST、Tier 2、参数化、WAND、merge/crash 与性能基准。 |
+| v1.1 | 2026-11-17 | 审查修复：`HeapUpdate` 明确先删旧 posting 再插新 posting；补 `INVERTED_AM_OID`、catalog/reopen/vacuum 路径；merge 水位改为 `max(inputs.applied_lsn)`，manifest 增加 tmp+fsync+rename 持久化；补 `SegmentSeal=110` 发射/redo、空 WAL 起点和 DataFusion debug/release 验收命令。 |
+| v1.2 | 2026-11-17 | 二审修复：`EngineConfig.allow_stale_inverted` 默认 false 且只作 engine 配置；补 pg-wire `Bm25Score` FLOAT8(701) RowDescription；backfill registry/rollback 镜像 create_hnsw_index 锁内发布与失败清理；补 DELETE tombstone 统计窗口与 merge 物理清除测试；`INVERTED_AM_OID=9879`；pg-am-inverted 归 all-features test 分支。 |
+| v1.3 | 2026-11-17 | Stage 0 审查回流：`@@` 非 TEXT 列在参数推断期拒绝且 RHS 固定 TEXT；stale 配置传入 planner；registry/planner 共享 analyzer/watermark 并校验 pg_am；补 doc-length、Posting/SegmentMeta/SegmentManifest 精确字节 golden；Wire 验收明确 Stage 0 静态编码与 Stage B 真实端到端结果的分工。 |
+| v1.4 | 2026-11-18 | 二审深度修复：DML/loser compensation/typed lookup 全面禁止把 inverted 当 B+Tree；reopen 改为读取真实 manifest 和 active segment metadata，校验 analyzer hash，禁止伪造零水位；planner 补 `index_oid`，pg_am 同时校验 OID 与 `amname`。 |
+| v1.5 | 2026-11-18 | 三审修复：bincode 解码增加嵌套读取/分配上限；manifest 水位必须等于 active 最大覆盖且允许零水位空集合；freshness 返回 consumed；`SegmentMeta` 补 `row_count`，Posting 校验频次和 position 严格递增；修复 BM25 alias 类型优先级及普通 `bm25_score` 列名兼容。 |

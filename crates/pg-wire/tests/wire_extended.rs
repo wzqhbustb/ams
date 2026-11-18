@@ -659,7 +659,7 @@ fn execute_suspends_and_resumes_without_row_description() {
     assert_eq!(tags(&out), [b'D', b'D', b's']);
     assert_eq!(row_values(&messages[0].body), [Some(b"1".to_vec())]);
     assert_eq!(row_values(&messages[1].body), [Some(b"2".to_vec())]);
-    assert_eq!(messages[2].body, []);
+    assert!(messages[2].body.is_empty());
 
     let out = send(&mut session, execute("p", 2));
     let messages = scan_messages(&out);
@@ -1101,4 +1101,73 @@ fn simple_multi_statement_is_atomic_and_fully_parsed_first() {
         command_tags(&simple(&mut session, "SELECT * FROM t")),
         ["SELECT 0"]
     );
+}
+
+#[test]
+fn bm25_statement_and_portal_descriptions_are_float8() {
+    let (_tmp, _engine, mut session) = open_session();
+    simple(
+        &mut session,
+        "CREATE TABLE agent_memory (id INT4, content TEXT)",
+    );
+    assert_eq!(
+        send(
+            &mut session,
+            parse(
+                "s",
+                "SELECT id, bm25_score(content, $1) AS score FROM agent_memory WHERE content @@ $1",
+                vec![0],
+            ),
+        ),
+        [b'1', 0, 0, 0, 4]
+    );
+    let out = send(&mut session, describe(ObjectKind::Statement, "s"));
+    let messages = scan_messages(&out);
+    assert_eq!(tags(&out), [b't', b'T']);
+    assert_eq!(parameter_oids(&messages[0].body), [25]);
+    let fields = row_description(&messages[1].body);
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].type_oid, 23);
+    assert_eq!(fields[1].name, "score");
+    assert_eq!(fields[1].type_oid, 701);
+    assert_eq!(fields[1].table_oid, 0);
+    assert_eq!(fields[1].attnum, 0);
+
+    assert_eq!(
+        send(
+            &mut session,
+            bind(
+                "p",
+                "s",
+                vec![FORMAT_TEXT],
+                vec![Some(b"contract".to_vec())],
+                vec![FORMAT_BINARY],
+            ),
+        ),
+        [b'2', 0, 0, 0, 4]
+    );
+    let out = send(&mut session, describe(ObjectKind::Portal, "p"));
+    let messages = scan_messages(&out);
+    assert_eq!(tags(&out), [b'T']);
+    let fields = row_description(&messages[0].body);
+    assert_eq!(fields[1].type_oid, 701);
+    assert_eq!(fields[1].format, FORMAT_BINARY);
+}
+
+#[test]
+fn fulltext_parameter_rejects_non_text_column_before_describe() {
+    let (_tmp, _engine, mut session) = open_session();
+    simple(
+        &mut session,
+        "CREATE TABLE agent_memory (id INT4, content TEXT)",
+    );
+    let out = send(
+        &mut session,
+        parse("bad", "SELECT * FROM agent_memory WHERE id @@ $1", vec![0]),
+    );
+    let messages = scan_messages(&out);
+    assert_eq!(tags(&out), [b'E']);
+    assert_eq!(error_field(&messages[0].body, b'C'), "42601");
+    assert!(error_field(&messages[0].body, b'M').contains("not a TEXT column"));
+    sync(&mut session, STATUS_IDLE);
 }

@@ -1265,6 +1265,12 @@ impl Session {
                     SelectItem::Distance(_) => {
                         Ok(make_field("?column?".to_string(), 0, 0, ColumnType::Float8))
                     }
+                    SelectItem::Bm25Score(expr) => Ok(make_field(
+                        expr.alias.clone().unwrap_or_else(|| "?column?".to_string()),
+                        0,
+                        0,
+                        ColumnType::Float8,
+                    )),
                 })
                 .collect(),
         }
@@ -1294,14 +1300,24 @@ impl Session {
             .iter()
             .enumerate()
             .map(|(i, name)| {
-                let resolved = schema.as_ref().and_then(|entry| {
-                    entry
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .find(|(_, c)| &c.name == name)
-                        .map(|(attnum, c)| (entry.oid.0 as u32, attnum as i16 + 1, c.col_type))
-                });
+                let computed = matches!(
+                    select_items.and_then(|items| items.get(i)),
+                    Some(SelectItem::Distance(_) | SelectItem::Bm25Score(_))
+                );
+                // A computed expression's alias must never be resolved as a
+                // same-named base column.
+                let resolved = if computed {
+                    None
+                } else {
+                    schema.as_ref().and_then(|entry| {
+                        entry
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .find(|(_, c)| &c.name == name)
+                            .map(|(attnum, c)| (entry.oid.0 as u32, attnum as i16 + 1, c.col_type))
+                    })
+                };
                 let (table_oid, attnum, ty) = match resolved {
                     Some((oid, attnum, ty)) => (oid, attnum, ty),
                     None if matches!(stmt, Statement::SequenceQuery { .. }) => {
@@ -1309,11 +1325,11 @@ impl Session {
                     }
                     None if matches!(
                         select_items.and_then(|items| items.get(i)),
-                        Some(SelectItem::Distance(_))
+                        Some(SelectItem::Distance(_) | SelectItem::Bm25Score(_))
                     ) =>
                     {
-                        // Computed distance columns have a static type even
-                        // when the result is empty and no datum can infer it.
+                        // Computed distance/BM25 columns have a static type
+                        // even when the result is empty and no datum can infer it.
                         (0, 0, pg_engine::ColumnType::Float8)
                     }
                     None => {
@@ -1356,5 +1372,84 @@ fn ok_tag(stmt: &Statement) -> &'static str {
         Statement::CreateIndex { .. } => "CREATE INDEX",
         Statement::CreateSequence { .. } => "CREATE SEQUENCE",
         _ => "OK",
+    }
+}
+
+#[cfg(test)]
+mod stage0_bm25_tests {
+    use super::*;
+    use pg_engine::{Datum, EngineConfig};
+
+    #[test]
+    fn empty_and_nonempty_bm25_results_keep_float8_wire_shape() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap());
+        engine
+            .exec(None, "CREATE TABLE agent_memory (id INT4, content TEXT)")
+            .unwrap();
+        let session = Session::new(engine);
+        let stmt = pg_engine::sql::parse(
+            "SELECT id, bm25_score(content, 'contract') AS score FROM agent_memory WHERE content @@ 'contract'",
+        )
+        .unwrap();
+        let columns = vec!["id".to_string(), "score".to_string()];
+
+        // Stage 0 does not execute BM25. Supplying the result shape directly
+        // tests the same schema-driven Simple/Extended encoder without
+        // pretending that query execution already exists.
+        let empty = session.field_descs(&stmt, &columns, &[]);
+        assert_eq!(empty[0].type_oid, 23);
+        assert_eq!(empty[1].name, "score");
+        assert_eq!(empty[1].type_oid, 701);
+        assert_eq!(empty[1].type_len, 8);
+
+        let rows = vec![vec![Some(Datum::Int4(1)), Some(Datum::Float8(1.25))]];
+        let nonempty = session.field_descs(&stmt, &columns, &rows);
+        assert_eq!(nonempty[1].type_oid, 701);
+        let encoded: Vec<Option<Vec<u8>>> = rows[0]
+            .iter()
+            .map(|value| {
+                value
+                    .as_ref()
+                    .map(|datum| encode_value(datum, FORMAT_TEXT).unwrap())
+            })
+            .collect();
+        let encoded_refs: Vec<Option<&[u8]>> =
+            encoded.iter().map(|value| value.as_deref()).collect();
+        let mut bytes = Vec::new();
+        codec::data_row(&mut bytes, &encoded_refs);
+        assert_eq!(
+            bytes,
+            [b'D', 0, 0, 0, 19, 0, 2, 0, 0, 0, 1, b'1', 0, 0, 0, 4, b'1', b'.', b'2', b'5',]
+        );
+        session.engine.shutdown();
+    }
+
+    #[test]
+    fn bm25_alias_cannot_inherit_base_column_type() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap());
+        engine
+            .exec(None, "CREATE TABLE t (content TEXT, score INT4)")
+            .unwrap();
+        let session = Session::new(engine);
+        let stmt = pg_engine::sql::parse(
+            "SELECT bm25_score(content, 'x') AS score FROM t WHERE content @@ 'x'",
+        )
+        .unwrap();
+        let prepared = PreparedStatementKind::Sql(Box::new(stmt.clone()));
+        let extended = match session.statement_field_descs(&prepared, FORMAT_TEXT) {
+            Ok(fields) => fields,
+            Err(_) => panic!("BM25 statement description failed"),
+        };
+        assert_eq!(extended[0].name, "score");
+        assert_eq!(extended[0].type_oid, 701);
+
+        let simple = session.field_descs(&stmt, &["score".to_string()], &[]);
+        assert_eq!(simple[0].name, "score");
+        assert_eq!(simple[0].type_oid, 701);
+        assert_eq!(simple[0].table_oid, 0);
+        assert_eq!(simple[0].attnum, 0);
+        session.engine.shutdown();
     }
 }
