@@ -267,6 +267,10 @@ pub struct EngineConfig {
     /// (`require_fresh`): stale reads fall back to SeqScan. This is an
     /// engine-level switch only; no SQL syntax is added.
     pub allow_stale_inverted: bool,
+    /// Analyzer identity expected when recovering inverted segment metadata.
+    /// Defaults to the built-in mixed analyzer; custom configurations are
+    /// accepted only when the persisted identity matches exactly.
+    pub inverted_analyzer: pg_am_inverted::AnalyzerConfig,
 }
 
 impl EngineConfig {
@@ -278,6 +282,7 @@ impl EngineConfig {
             deadlock_detector_interval: pg_txn::DEFAULT_DEADLOCK_INTERVAL,
             query_stats_capacity: DEFAULT_QUERY_STATS_CAPACITY,
             allow_stale_inverted: false,
+            inverted_analyzer: pg_am_inverted::AnalyzerConfig::builtin(),
         }
     }
 }
@@ -1104,8 +1109,14 @@ impl Engine {
         // 7. Table registry from the catalog, index registry from the
         //    `pg_index` heap chain.
         let registry = Self::build_registry(&catalog, &heap, &txn, clog.as_ref(), &HashMap::new())?;
-        let indexes =
-            Self::build_index_registry(data_dir, &catalog, &heap, clog.as_ref(), &registry)?;
+        let indexes = Self::build_index_registry(
+            data_dir,
+            &catalog,
+            &heap,
+            clog.as_ref(),
+            &registry,
+            &config.inverted_analyzer,
+        )?;
 
         // 8. Lock manager (sharing the victim registry) and the deadlock
         //    detector thread (M2c Stage R, §9.3). Started LAST, once both
@@ -1401,6 +1412,7 @@ impl Engine {
         heap: &HeapAM,
         clog: &dyn ClogAccessor,
         tables: &HashMap<String, TableEntry>,
+        expected_analyzer: &pg_am_inverted::AnalyzerConfig,
     ) -> Result<Vec<IndexEntry>> {
         let columns = PG_INDEX.column_types();
         let rows = heap.scan(ScanContext {
@@ -1480,16 +1492,13 @@ impl Engine {
                         "inverted index {index_oid} requires a TEXT column, got {key_type:?}"
                     )));
                 }
-                let store = pg_am_inverted::SegmentStore::open(
-                    data_dir,
-                    index_oid,
-                    &pg_am_inverted::AnalyzerConfig::builtin(),
-                )
-                .map_err(|error| {
-                    EngineError::Corrupted(format!(
-                        "cannot recover inverted index {index_oid}: {error}"
-                    ))
-                })?;
+                let store =
+                    pg_am_inverted::SegmentStore::open(data_dir, index_oid, expected_analyzer)
+                        .map_err(|error| {
+                            EngineError::Corrupted(format!(
+                                "cannot recover inverted index {index_oid}: {error}"
+                            ))
+                        })?;
                 let metadata = InvertedIndexMetadata::from_store(&store);
                 metadata.analyzer.validate().map_err(|error| {
                     EngineError::Corrupted(format!(
@@ -7449,6 +7458,20 @@ mod tests {
     }
 
     fn write_inverted_metadata_for_test(data_dir: &Path, index_oid: Oid, applied_lsn: Lsn) {
+        write_inverted_metadata_with_analyzer_for_test(
+            data_dir,
+            index_oid,
+            applied_lsn,
+            pg_am_inverted::AnalyzerConfig::builtin(),
+        );
+    }
+
+    fn write_inverted_metadata_with_analyzer_for_test(
+        data_dir: &Path,
+        index_oid: Oid,
+        applied_lsn: Lsn,
+        analyzer: pg_am_inverted::AnalyzerConfig,
+    ) {
         let segment_id = pg_storage::segment::SegmentId(7);
         let manifest = pg_am_inverted::SegmentManifest {
             generation: 1,
@@ -7463,7 +7486,7 @@ mod tests {
             format_version: pg_am_inverted::posting::SEGMENT_FORMAT_VERSION,
             index_oid,
             segment_id,
-            analyzer: pg_am_inverted::AnalyzerConfig::builtin(),
+            analyzer,
             state: pg_storage::segment::SegmentState::Sealed,
             doc_count: 0,
             total_tokens: 0,
@@ -8055,6 +8078,38 @@ mod tests {
             .iter()
             .any(|am| am.oid == INVERTED_AM_OID));
         engine.shutdown();
+    }
+
+    #[test]
+    fn english_and_chinese_analyzers_reopen_with_matching_config() {
+        for analyzer in [
+            pg_am_inverted::AnalyzerConfig::english(),
+            pg_am_inverted::AnalyzerConfig::chinese(),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut config = EngineConfig::new(tmp.path());
+            config.inverted_analyzer = analyzer.clone();
+            let engine = Engine::open(tmp.path(), config.clone()).unwrap();
+            engine.exec(None, "CREATE TABLE t (content TEXT)").unwrap();
+            engine.create_index("t", "content").unwrap();
+            let index_oid = engine.indexes()[0].index_oid;
+            set_index_am_for_test(&engine, index_oid, INVERTED_AM_OID);
+            write_inverted_metadata_with_analyzer_for_test(
+                tmp.path(),
+                index_oid,
+                Lsn(128),
+                analyzer.clone(),
+            );
+            engine.shutdown();
+
+            let engine = Engine::open(tmp.path(), config).unwrap();
+            let entries = engine.indexes();
+            assert_eq!(entries.len(), 1);
+            let metadata = entries[0].inverted.as_ref().unwrap();
+            assert_eq!(metadata.analyzer, analyzer);
+            assert_eq!(metadata.watermark.consumed_lsn, Lsn(128));
+            engine.shutdown();
+        }
     }
 
     #[test]

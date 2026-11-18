@@ -8,6 +8,7 @@
 
 pub mod analyzer;
 pub mod bm25;
+pub mod daat;
 pub mod error;
 pub mod index;
 pub mod posting;
@@ -16,7 +17,8 @@ pub mod segment;
 pub mod tier2;
 pub mod wand;
 
-pub use analyzer::AnalyzerConfig;
+pub use analyzer::{Analyzer, AnalyzerConfig, DefaultAnalyzer, Token};
+pub use daat::{parse_query, InMemoryIndex, InMemoryStats, Query, ScoredTid};
 pub use error::{InvertedError, Result};
 pub use index::InvertedIndex;
 pub use posting::{DocLength, Posting, SegmentMeta};
@@ -29,32 +31,88 @@ mod tests {
     use pg_storage::types::Lsn;
 
     fn write_active_store(data_dir: &std::path::Path, manifest_lsn: Lsn, segment_lsn: Lsn) {
-        let index_oid = pg_storage::types::Oid(9879);
-        let segment_id = pg_storage::segment::SegmentId(7);
-        let manifest = SegmentManifest {
-            generation: 1,
-            active_segment_ids: vec![segment_id],
-            applied_lsn: manifest_lsn,
-        };
-        let manifest_path = SegmentStore::manifest_path(data_dir, index_oid);
-        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
-        std::fs::write(manifest_path, manifest.encode().unwrap()).unwrap();
-        let metadata = SegmentMeta {
+        write_active_store_with_state(
+            data_dir,
+            manifest_lsn,
+            segment_lsn,
+            pg_storage::segment::SegmentState::Sealed,
+        );
+    }
+
+    fn segment_meta_fixture() -> SegmentMeta {
+        SegmentMeta {
             format_version: posting::SEGMENT_FORMAT_VERSION,
-            index_oid,
-            segment_id,
+            index_oid: pg_storage::types::Oid(9879),
+            segment_id: pg_storage::segment::SegmentId(7),
             analyzer: AnalyzerConfig::builtin(),
             state: pg_storage::segment::SegmentState::Sealed,
             doc_count: 0,
             total_tokens: 0,
             term_df: Default::default(),
             created_from_lsn: Lsn::INVALID,
-            applied_lsn: segment_lsn,
+            applied_lsn: Lsn(128),
             row_count: 0,
             posting_count: 0,
             byte_count: 0,
+        }
+    }
+
+    fn segment_meta_golden_shape() -> SegmentMeta {
+        SegmentMeta {
+            doc_count: 2,
+            total_tokens: 18,
+            term_df: std::collections::BTreeMap::from([
+                ("contract".to_string(), 2),
+                ("rust".to_string(), 1),
+            ]),
+            row_count: 2,
+            posting_count: 3,
+            ..segment_meta_fixture()
+        }
+    }
+
+    #[test]
+    fn golden_shaped_segment_opens() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_active_store_with_meta(tmp.path(), Lsn(128), segment_meta_golden_shape());
+        let store = SegmentStore::open(
+            tmp.path(),
+            pg_storage::types::Oid(9879),
+            &AnalyzerConfig::builtin(),
+        )
+        .unwrap();
+        assert_eq!(store.manifest().applied_lsn, Lsn(128));
+    }
+
+    fn write_active_store_with_state(
+        data_dir: &std::path::Path,
+        manifest_lsn: Lsn,
+        segment_lsn: Lsn,
+        state: pg_storage::segment::SegmentState,
+    ) {
+        let metadata = SegmentMeta {
+            state,
+            applied_lsn: segment_lsn,
+            ..segment_meta_fixture()
         };
-        let metadata_path = SegmentStore::segment_metadata_path(data_dir, index_oid, segment_id);
+        write_active_store_with_meta(data_dir, manifest_lsn, metadata);
+    }
+
+    fn write_active_store_with_meta(
+        data_dir: &std::path::Path,
+        manifest_lsn: Lsn,
+        metadata: SegmentMeta,
+    ) {
+        let manifest = SegmentManifest {
+            generation: 1,
+            active_segment_ids: vec![metadata.segment_id],
+            applied_lsn: manifest_lsn,
+        };
+        let manifest_path = SegmentStore::manifest_path(data_dir, metadata.index_oid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(manifest_path, manifest.encode().unwrap()).unwrap();
+        let metadata_path =
+            SegmentStore::segment_metadata_path(data_dir, metadata.index_oid, metadata.segment_id);
         std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
         std::fs::write(metadata_path, metadata.encode().unwrap()).unwrap();
     }
@@ -101,10 +159,10 @@ mod tests {
 
     #[test]
     fn bm25_matches_tantivy_formula() {
-        assert!((bm25::idf(1, 2) - std::f64::consts::LN_2).abs() < 1e-12);
-        assert_eq!(bm25::idf(0, 2), 0.0);
-        assert_eq!(bm25::score(0, 10, 20.0, 1, 2), 0.0);
-        let score = bm25::score(2, 10, 20.0, 1, 2);
+        assert!((bm25::idf(1, 2).unwrap() - std::f64::consts::LN_2).abs() < 1e-12);
+        assert_eq!(bm25::idf(0, 2).unwrap(), 0.0);
+        assert_eq!(bm25::score(0, 10, 20.0, 1, 2).unwrap(), 0.0);
+        let score = bm25::score(2, 10, 20.0, 1, 2).unwrap();
         assert!(score.is_finite() && score > 0.0);
     }
 
@@ -162,7 +220,7 @@ mod tests {
         let meta_bytes = meta.encode().unwrap();
         assert_eq!(
             hex(&meta_bytes),
-            "5047495601004600000001fb972607056d69786564ce169a2a3b6211695a404942e83925d5af65b713c53fefa1c7ebe342a60992680202120208636f6e74726163740204727573740178800203fb00012531398b"
+            "5047495601004600000001fb972607056d6978656484d0b3945ec7c3cb3aea7b017027f704cf1af4be25243aa52586cebf9f5557e30202120208636f6e74726163740204727573740178800203fb000171953cd0"
         );
         assert_eq!(posting::SegmentMeta::decode(&meta_bytes).unwrap(), meta);
         let mut bad_version = meta.clone();
@@ -268,6 +326,99 @@ mod tests {
             Posting::decode(&unordered.encode().unwrap()),
             Err(InvertedError::Corrupted(_))
         ));
+    }
+
+    #[test]
+    fn active_manifest_rejects_merging_and_retired_segments() {
+        for state in [
+            pg_storage::segment::SegmentState::Active,
+            pg_storage::segment::SegmentState::Frozen,
+            pg_storage::segment::SegmentState::Sealed,
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_active_store_with_state(tmp.path(), Lsn(128), Lsn(128), state);
+            assert!(SegmentStore::open(
+                tmp.path(),
+                pg_storage::types::Oid(9879),
+                &AnalyzerConfig::builtin()
+            )
+            .is_ok());
+        }
+        for state in [
+            pg_storage::segment::SegmentState::Merging,
+            pg_storage::segment::SegmentState::Retired,
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_active_store_with_state(tmp.path(), Lsn(128), Lsn(128), state);
+            let error = SegmentStore::open(
+                tmp.path(),
+                pg_storage::types::Oid(9879),
+                &AnalyzerConfig::builtin(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("not readable"));
+        }
+    }
+
+    #[test]
+    fn segment_stats_are_validated_at_open() {
+        let reject = |metadata: SegmentMeta| {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_active_store_with_meta(tmp.path(), Lsn(128), metadata);
+            assert!(SegmentStore::open(
+                tmp.path(),
+                pg_storage::types::Oid(9879),
+                &AnalyzerConfig::builtin(),
+            )
+            .is_err());
+        };
+        let mut invalid = segment_meta_fixture();
+        invalid.doc_count = 1;
+        invalid.row_count = 0;
+        reject(invalid);
+
+        let mut invalid = segment_meta_fixture();
+        invalid.total_tokens = 1;
+        invalid.posting_count = 1;
+        invalid.term_df.insert("contract".to_string(), 1);
+        reject(invalid);
+
+        let mut invalid = segment_meta_fixture();
+        invalid.doc_count = 1;
+        invalid.term_df.insert("contract".to_string(), 1);
+        reject(invalid);
+
+        let mut invalid = segment_meta_fixture();
+        invalid.doc_count = 1;
+        invalid.posting_count = 1;
+        reject(invalid);
+
+        let mut invalid = segment_meta_fixture();
+        invalid.doc_count = 1;
+        invalid.total_tokens = 1;
+        invalid.posting_count = 1;
+        invalid.term_df.insert("contract".to_string(), 2);
+        reject(invalid);
+
+        let mut invalid = segment_meta_fixture();
+        invalid.doc_count = 2;
+        invalid.total_tokens = 18;
+        invalid.posting_count = 1;
+        invalid.term_df.insert("contract".to_string(), 2);
+        invalid.term_df.insert("rust".to_string(), 1);
+        reject(invalid);
+
+        let mut valid = segment_meta_fixture();
+        valid.doc_count = 2;
+        valid.row_count = 2;
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_active_store_with_meta(tmp.path(), Lsn(128), valid);
+        assert!(SegmentStore::open(
+            tmp.path(),
+            pg_storage::types::Oid(9879),
+            &AnalyzerConfig::builtin()
+        )
+        .is_ok());
     }
 
     #[test]

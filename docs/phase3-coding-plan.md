@@ -203,6 +203,12 @@ CARGO_TARGET_DIR=target/msrv-phase3 cargo +1.86.0 check --workspace --all-featur
 - **旧快照**：首版只允许当前快照走倒排，历史 posting 版本化是独立工作。
 - **WAND upper-bound**：错误上界会直接漏行，必须 DAAT 全量对拍，尤其同分与非有限值。
 - **词典/分析器升级**：配置 hash 变化必须显式重建，不能在线混用。
+- **英文 CJK 与日韩/西里尔文本**：`english` 将连续 CJK 段视为不透明 token；Kana/Hangul/西里尔进入 Latin 分支且 stemming 近似空转，日韩及混合语种召回属于当前非目标，不能按英文检索质量验收。
+- **小词典与 OOV 回退**：`custom.dict` 当前仅覆盖 5 个词，词典外中文可能退回单字切分并放大 df；已补回退行为测试，Stage E 前必须替换为真实、带版本的词典资产并重跑中文质量基准。
+- **position 语义**：Latin stop-word 留位置空洞，CJK 空 token 不占位；未来 phrase 查询必须显式登记并测试该差异。
+- **Analyzer 失配 fail-stop**：任一索引的 analyzer hash 失配会阻止整个 Engine 打开，当前选择是显式重建；若未来需要可用性隔离，应另评估“隔离该索引 + require_fresh 回退”，不得静默换分析器。
+- **DAAT 性能债**：当前实现包含 per-term `BTreeSet` 分配和候选×term map 查找，Stage E 需要真流式 DAAT 基线与 WAND 对照；性能优化只能在正确性证据之后进行。
+- **Posting 写入校验**：`Posting::validate` 已抽出为公共函数，Stage B 持久化前必须调用，不能只依赖 decode 时发现损坏。
 - **Tantivy 版本漂移**：基准版本和 lockfile 一并归档，禁止无约束升级造成 MSRV 或质量数字失真。
 - **merge 与读者延迟**：大 segment 流式 merge 仍需测量 I/O 与页缓存污染；优化只能发生在正确性证据之后。
 - **stale 读配置**：`allow_stale` 是有意放宽，默认 `require_fresh` 不得被配置静默覆盖。
@@ -221,3 +227,8 @@ CARGO_TARGET_DIR=target/msrv-phase3 cargo +1.86.0 check --workspace --all-featur
 | v1.3 | 2026-11-17 | Stage 0 审查回流：`@@` 非 TEXT 列在参数推断期拒绝且 RHS 固定 TEXT；stale 配置传入 planner；registry/planner 共享 analyzer/watermark 并校验 pg_am；补 doc-length、Posting/SegmentMeta/SegmentManifest 精确字节 golden；Wire 验收明确 Stage 0 静态编码与 Stage B 真实端到端结果的分工。 |
 | v1.4 | 2026-11-18 | 二审深度修复：DML/loser compensation/typed lookup 全面禁止把 inverted 当 B+Tree；reopen 改为读取真实 manifest 和 active segment metadata，校验 analyzer hash，禁止伪造零水位；planner 补 `index_oid`，pg_am 同时校验 OID 与 `amname`。 |
 | v1.5 | 2026-11-18 | 三审修复：bincode 解码增加嵌套读取/分配上限；manifest 水位必须等于 active 最大覆盖且允许零水位空集合；freshness 返回 consumed；`SegmentMeta` 补 `row_count`，Posting 校验频次和 position 严格递增；修复 BM25 alias 类型优先级及普通 `bm25_score` 列名兼容。 |
+| v1.6 | 2026-11-18 | Stage A 实现：`DefaultAnalyzer` 英文 Snowball、jieba 中文与混合分析链，vendored `custom.dict` 与真实 SHA256 配置身份；新增 `InMemoryIndex`、精确 DAAT AND/OR、BM25 和有界 top-k；使用 Tantivy `Bm25Weight` 对拍并覆盖零文档、重复 term、并列分数及超大 LIMIT。 |
+| v1.7 | 2026-11-18 | Stage A 审查回流：`InMemoryIndex<A: Analyzer>` 暴露索引持有的 Analyzer，查询必须复用该实例；`EngineConfig.inverted_analyzer` 支持 english/chinese/mixed 精确匹配 reopen；hash 纳入 `ANALYZER_FORMAT_VERSION`；补 `term_df`，不可能的 BM25 统计与缺失 doc-length 改为 `Corrupted`。 |
+| v1.8 | 2026-11-18 | 深度审查修复：active manifest 拒绝 `Merging`/`Retired`；`insert_document` 拒绝无效 TID、空 token 和非递增 position；reopen 校验 `row_count/doc_count/posting_count/total_tokens/term_df` 一致性，避免生命周期与统计损坏进入查询。 |
+| v1.9 | 2026-11-18 | 审查修复：`posting_count` 统一为 `(term,doc)` 记录数，reopen 改为 `term_df.len() <= posting_count <= total_tokens` 并补 golden 形状正例；OR 全查询去重保证幂等；存储 I/O 错误保留 Storage 变体；AnalyzerConfig 校验真实 hash，english hash 不再耦合中文词典；`or` 支持大小写；补全所有 reopen 分支测试并登记 CJK、词典、position、fail-stop 和 DAAT 性能风险。 |
+| v1.10 | 2026-11-18 | 二轮审查修复：`insert_document` 增加 token 数量上限、u32 转换检查及先算后写，杜绝截断和失败残留；Stage 0 scratch probe 转为具体 AST/错误变体回归；精确钉死 jieba OOV 单字回退，并修正去重测试命名。 |

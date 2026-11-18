@@ -2816,6 +2816,7 @@ dependencies = [
  "pg-txn",
  "rust-stemmers",
  "serde",
+ "sha2 0.11.0",
  "tantivy",
  "tempfile",
  "thiserror",

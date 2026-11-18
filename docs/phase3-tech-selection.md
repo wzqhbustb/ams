@@ -237,7 +237,7 @@ b  = 0.75
 首版 `@@` 右侧复用同一分析器，支持：
 
 - 空白分隔的多 term **AND**；
-- 大写 `OR` 分隔的 **OR**；
+- 大小写不敏感的 `or` 分隔的 **OR**；
 - 不包含引号短语、括号优先级、否定、prefix/fuzzy。
 
 多 term AND 使用 DAAT 交集，OR 使用 WAND 剪枝；单 term 直接 posting scan。候选进入 BM25 前先做必要的文档存在性与统计检查，避免无意义打分。
@@ -645,3 +645,8 @@ cargo +1.86.0 check
 | v1.0 | 2026-11-17 | 初稿：冻结倒排数据模型、segment/Tier 2、MVCC/回退、merge/recovery、SQL/planner、依赖与验收口径；明确 jieba/macros 0.10.1 与 Tantivy 0.25.0 的 MSRV 兼容选择。 |
 | v1.1 | 2026-11-17 | 审查修复：backfill 改为 `AccessExclusive` 全锁协议，防止重复基线；新增 `SegmentManifest` 保证 merge 原子可见性；明确 `AccessMethod` 必要方法返回 `Unsupported` 的契约；`Bm25Score` 直接用于 ORDER BY 以避免 alias 依赖；补齐 lag 秒数定义、commit→visible 测量和固定性能负载。 |
 | v1.2 | 2026-11-17 | 二审修复：新增 TOAST Tier 2 消费协议（同 XID 新 group 组包、共享旧 group 的 MVCC detoast、Corrupted 停水位）；`ExtraWhere` 统一走 SeqScan 精确过滤与评分；显式登记 per-segment 统计与拒绝 sampling 两项 ROADMAP 偏离；`content @@ $1` 参数化纳入 Stage 0；`commit_finished_at` 测试 hook 纳入 Stage C；基准增加 >8KiB TOAST 样本。 |
+| v1.3 | 2026-11-18 | Stage A 实现：冻结 `DefaultAnalyzer` 与 vendored `custom.dict`，配置 hash 同时绑定 analyzer 名称、stop-word 和词典；补内存 DAAT 精确基线、并列 `(score DESC, tid ASC)` 和有界 top-k，Tantivy `Bm25Weight` 数值对拍通过。 |
+| v1.4 | 2026-11-18 | Stage A 审查回流：查询复用索引持有的 Analyzer；`EngineConfig.inverted_analyzer` 支持 english/chinese/mixed reopen；配置 hash 纳入 `ANALYZER_FORMAT_VERSION`；补 `term_df`，不可能的 BM25 统计与缺失 doc-length 明确返回 `Corrupted`。 |
+| v1.5 | 2026-11-18 | 深度审查修复：active manifest 仅接受 Active/Frozen/Sealed；无效 TID、空 token 和非递增 position 在写入前拒绝；reopen 增加 segment 统计一致性校验，防止生命周期和统计损坏进入查询。 |
+| v1.6 | 2026-11-18 | 审查修复：`posting_count` 统一为 `(term,doc)` 记录数并允许合法非零范围；OR 全查询去重保证幂等；存储错误保留 Storage 变体；AnalyzerConfig 校验真实 hash 且 english 排除中文词典；`or` 支持大小写；补 golden 形状 reopen 正例与所有统计/生命周期分支测试。 |
+| v1.7 | 2026-11-18 | 二轮审查修复：文档写入改为先计算全部 term_freq 再统一落盘，token 数量与 u32 转换在变异前校验，避免截断和 poisoned posting；scratch probe 转为具体 AST/错误断言；精确固定 jieba OOV 单字回退。 |

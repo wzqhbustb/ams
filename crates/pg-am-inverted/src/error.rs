@@ -30,7 +30,23 @@ impl InvertedError {
             }
             Self::Corrupted(message) => pg_am_heap::HeapError::Corrupted(message),
             Self::InvalidArgument(message) => pg_am_heap::HeapError::InvalidArgument(message),
-            Self::Storage(message) => pg_am_heap::HeapError::InvalidArgument(message),
+            Self::Storage(message) => pg_am_heap::HeapError::Storage(
+                pg_storage::error::StorageError::MetadataCorrupted(message),
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_failures_are_not_reported_as_caller_arguments() {
+        let error = InvertedError::Storage("disk offline".to_string()).into_heap();
+        assert!(matches!(
+            error,
+            pg_am_heap::HeapError::Storage(pg_storage::error::StorageError::MetadataCorrupted(_))
+        ));
     }
 }

@@ -139,6 +139,17 @@ impl SegmentStore {
                     meta.segment_id.0, segment_id.0
                 )));
             }
+            if matches!(
+                meta.state,
+                pg_storage::segment::SegmentState::Merging
+                    | pg_storage::segment::SegmentState::Retired
+            ) {
+                return Err(InvertedError::Corrupted(format!(
+                    "segment {} is not readable in the active manifest",
+                    segment_id.0
+                )));
+            }
+            validate_segment_stats(&meta)?;
             if meta.created_from_lsn.0 > meta.applied_lsn.0 {
                 return Err(InvertedError::Corrupted(format!(
                     "segment {} has created_from_lsn after applied_lsn",
@@ -237,4 +248,38 @@ impl SegmentStore {
 fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path)
         .map_err(|error| InvertedError::Storage(format!("cannot read {}: {error}", path.display())))
+}
+
+fn validate_segment_stats(meta: &SegmentMeta) -> Result<()> {
+    if meta.row_count < meta.doc_count {
+        return Err(InvertedError::Corrupted(
+            "segment row_count is smaller than doc_count".to_string(),
+        ));
+    }
+    if meta.posting_count < meta.term_df.len() as u64 || meta.posting_count > meta.total_tokens {
+        return Err(InvertedError::Corrupted(format!(
+            "segment posting_count {} is outside term_df.len()..=total_tokens ({}..={})",
+            meta.posting_count,
+            meta.term_df.len(),
+            meta.total_tokens
+        )));
+    }
+    if meta.doc_count == 0
+        && (meta.total_tokens != 0 || meta.posting_count != 0 || !meta.term_df.is_empty())
+    {
+        return Err(InvertedError::Corrupted(
+            "empty segment has postings or document frequencies".to_string(),
+        ));
+    }
+    if meta.total_tokens == 0 && !meta.term_df.is_empty() {
+        return Err(InvertedError::Corrupted(
+            "segment has term frequencies but no tokens".to_string(),
+        ));
+    }
+    if meta.term_df.values().any(|df| *df > meta.doc_count) {
+        return Err(InvertedError::Corrupted(
+            "segment term_df exceeds doc_count".to_string(),
+        ));
+    }
+    Ok(())
 }

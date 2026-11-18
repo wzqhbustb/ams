@@ -25,22 +25,29 @@ impl Posting {
         crate::recovery::encode(self)
     }
 
-    /// Decode a posting and validate its frame, internal frequency, and
-    /// strictly increasing position sequence.
-    pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
-        let posting: Self = crate::recovery::decode(bytes)?;
-        if posting.term_freq as usize != posting.positions.len() {
+    /// Validate internal frequency and strictly increasing positions. Stage B
+    /// must call this before persisting a posting.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.term_freq as usize != self.positions.len() {
             return Err(crate::InvertedError::Corrupted(format!(
                 "term_freq {} does not match position count {}",
-                posting.term_freq,
-                posting.positions.len()
+                self.term_freq,
+                self.positions.len()
             )));
         }
-        if posting.positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+        if self.positions.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(crate::InvertedError::Corrupted(
                 "posting positions are not strictly increasing".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    /// Decode a posting and validate its frame, internal frequency, and
+    /// strictly increasing position sequence.
+    pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
+        let posting: Self = crate::recovery::decode(bytes)?;
+        posting.validate()?;
         Ok(posting)
     }
 }
