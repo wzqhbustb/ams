@@ -158,6 +158,11 @@ impl DefaultAnalyzer {
         Self::new(AnalyzerConfig::builtin())
     }
 
+    /// Construct the built-in analyzer matching a persisted configuration.
+    pub fn from_config(config: AnalyzerConfig) -> Self {
+        Self::new(config)
+    }
+
     fn new(config: AnalyzerConfig) -> Self {
         let mut jieba = Jieba::empty();
         jieba

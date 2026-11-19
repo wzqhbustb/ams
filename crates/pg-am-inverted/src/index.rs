@@ -7,11 +7,12 @@ use pg_am_heap::tuple::Datum;
 use pg_storage::recovery::RedoHandler;
 use pg_storage::types::{Lsn, Oid, Tid};
 
+use crate::daat::{Query, ScoredTid};
 use crate::error::{InvertedError, Result};
 use crate::segment::SegmentStore;
 
-/// Inverted access method. Stage 0 deliberately keeps DML out of this AM:
-/// writes arrive through heap WAL and Tier 2 instead of direct API calls.
+/// Inverted access method. Direct DML stays out of this AM: writes arrive
+/// through heap WAL and Tier 2 instead of direct API calls.
 #[derive(Debug)]
 pub struct InvertedIndex {
     store: SegmentStore,
@@ -30,9 +31,39 @@ impl InvertedIndex {
         Self { store }
     }
 
-    /// Stage 0 has no query implementation; this fails loudly.
-    pub fn search(&self) -> Result<()> {
-        self.store.search()
+    /// Execute exact DAAT and BM25 over the recovered segment.
+    pub fn search(&self, query: &Query, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
+        self.store.search(query, limit)
+    }
+
+    /// Analyze query text with the index analyzer and execute exact DAAT.
+    pub fn search_text(&self, text: &str, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
+        self.store.search_text(text, limit)
+    }
+
+    /// Insert one committed heap document into the in-process write view.
+    pub fn insert_document(&mut self, tid: Tid, text: &str) -> Result<()> {
+        self.store.insert_document(tid, text)
+    }
+
+    /// Delete one committed heap document from the in-process write view.
+    pub fn delete_document(&mut self, tid: Tid) -> Result<bool> {
+        self.store.delete_document(tid)
+    }
+
+    /// Advance the query-visible consumed WAL frontier monotonically.
+    pub fn advance_consumed(&mut self, lsn: Lsn) {
+        self.store.advance_consumed(lsn);
+    }
+
+    /// Return the analyzer identity shared by postings and query parsing.
+    pub fn analyzer_config(&self) -> &crate::AnalyzerConfig {
+        self.store.analyzer_config()
+    }
+
+    /// Return the current consumed and durable watermarks.
+    pub fn watermark(&self) -> crate::Watermark {
+        self.store.watermark()
     }
 }
 

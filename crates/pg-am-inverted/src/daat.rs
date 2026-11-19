@@ -147,6 +147,34 @@ impl<A: Analyzer> InMemoryIndex<A> {
         }
     }
 
+    /// Rebuild an index from persisted postings and document lengths. No heap
+    /// scan or analyzer reprocessing is performed during recovery.
+    pub fn from_parts(
+        analyzer: A,
+        postings: BTreeMap<String, BTreeMap<Tid, Posting>>,
+        doc_lengths: BTreeMap<Tid, u64>,
+        stats: InMemoryStats,
+    ) -> Self {
+        Self {
+            analyzer,
+            postings,
+            doc_lengths,
+            total_tokens: stats.total_tokens,
+            row_count: stats.row_count,
+            posting_count: stats.posting_count,
+        }
+    }
+
+    /// Read the persisted `(term, document)` posting map.
+    pub fn postings(&self) -> &BTreeMap<String, BTreeMap<Tid, Posting>> {
+        &self.postings
+    }
+
+    /// Read the persisted per-document token lengths.
+    pub fn doc_lengths(&self) -> &BTreeMap<Tid, u64> {
+        &self.doc_lengths
+    }
+
     /// Borrow the exact analyzer instance used for document analysis. Query
     /// parsing must use this reference rather than constructing another one.
     pub fn analyzer(&self) -> &A {
@@ -223,6 +251,39 @@ impl<A: Analyzer> InMemoryIndex<A> {
         self.total_tokens += doc_len;
         self.row_count += 1;
         Ok(())
+    }
+
+    /// Remove one document and all of its posting entries. Returns `false`
+    /// when the TID was absent, making committed WAL replay idempotent.
+    pub fn delete_document(&mut self, tid: Tid) -> Result<bool> {
+        let Some(doc_len) = self.doc_lengths.get(&tid).copied() else {
+            return Ok(false);
+        };
+        let removed_postings = self
+            .postings
+            .values()
+            .filter(|documents| documents.contains_key(&tid))
+            .count() as u64;
+        let total_tokens = self.total_tokens.checked_sub(doc_len).ok_or_else(|| {
+            InvertedError::Corrupted("document length exceeds index total_tokens".to_string())
+        })?;
+        let row_count = self
+            .row_count
+            .checked_sub(1)
+            .ok_or_else(|| InvertedError::Corrupted("index row_count underflow".to_string()))?;
+        let posting_count = self
+            .posting_count
+            .checked_sub(removed_postings)
+            .ok_or_else(|| InvertedError::Corrupted("index posting_count underflow".to_string()))?;
+        self.doc_lengths.remove(&tid);
+        self.total_tokens = total_tokens;
+        self.row_count = row_count;
+        self.posting_count = posting_count;
+        self.postings.retain(|_, documents| {
+            documents.remove(&tid);
+            !documents.is_empty()
+        });
+        Ok(true)
     }
 
     /// Current segment-local statistics.

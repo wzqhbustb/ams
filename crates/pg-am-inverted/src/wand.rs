@@ -2,9 +2,9 @@
 
 use crate::error::{InvertedError, Result};
 
-/// Stage 0 has no WAND implementation; this entry point fails loudly.
+/// WAND is deferred to the optimization stage; this entry point fails loudly.
 pub fn search() -> Result<()> {
     Err(InvertedError::Unsupported(
-        "WAND execution is not implemented in Stage 0",
+        "WAND execution is not implemented",
     ))
 }

@@ -3,7 +3,7 @@
 /// Errors produced by inverted indexing, decoding, and lifecycle operations.
 #[derive(Debug, thiserror::Error)]
 pub enum InvertedError {
-    /// The requested operation is outside the Stage 0 contract.
+    /// The requested operation is outside the current access-method contract.
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
     /// On-disk bytes, manifest state, or TOAST data are malformed.

@@ -90,6 +90,8 @@ pub struct ScanRequest {
     pub limit: Option<usize>,
     /// Whether an inverted plan may intentionally use stale segments.
     pub allow_stale_inverted: bool,
+    /// Durable WAL frontier required by this query's snapshot.
+    pub snapshot_frontier: pg_storage::types::Lsn,
     /// Metadata for indexes available on this table.
     pub indexes: Vec<IndexMetadata>,
 }
@@ -106,8 +108,7 @@ pub enum ScanSpec {
     BTree(BTreeScanSpec),
     /// An HNSW approximate nearest-neighbor scan.
     Hnsw(HnswScanSpec),
-    /// An inverted full-text scan. Stage 0 freezes the shape but never
-    /// constructs it; execution remains explicitly unsupported.
+    /// An inverted full-text scan with exact DAAT/BM25 and heap recheck.
     Inverted(InvertedScanSpec),
     /// A sequential heap scan.
     Seq(SeqScanSpec),
@@ -313,21 +314,20 @@ fn inverted_matches(req: &ScanRequest) -> bool {
         || matches!(req.order_by, Some(OrderByKind::Bm25Score(_)))
 }
 
-/// Plan only Stage 0's safe full-text fallbacks. A usable inverted index is
-/// deliberately not executed until Stage B; returning an empty or approximate
-/// result here would hide an unimplemented access path.
+/// Plan an exact inverted scan, or an exact heap fallback when the index
+/// cannot satisfy this query's freshness and predicate shape.
 fn plan_inverted(req: &ScanRequest) -> Result<ScanPlan> {
     if req.extra_predicate.is_some() {
         return Ok(seq_plan(req, SeqScanReason::ExtraWhere));
     }
     let Some(predicate) = &req.predicate else {
         return Err(EngineError::Unsupported(
-            "bm25_score without a full-text predicate is not implemented in Stage 0".to_string(),
+            "bm25_score requires a full-text predicate".to_string(),
         ));
     };
     if predicate.op != crate::sql::CmpOp::FullText {
         return Err(EngineError::Unsupported(
-            "inverted query planning is not implemented in Stage 0".to_string(),
+            "bm25_score ordering requires a full-text predicate".to_string(),
         ));
     }
     if !matches!(predicate.value, Literal::Str(_) | Literal::Param(_)) {
@@ -347,19 +347,28 @@ fn plan_inverted(req: &ScanRequest) -> Result<ScanPlan> {
     metadata.analyzer.validate().map_err(|error| {
         EngineError::Corrupted(format!("invalid inverted analyzer metadata: {error}"))
     })?;
-    if metadata.watermark.durable_applied_lsn.0 > metadata.watermark.consumed_lsn.0 {
+    if metadata.watermark.durable_applied_lsn > metadata.watermark.consumed_lsn {
         return Err(EngineError::Corrupted(
             "inverted durable watermark exceeds consumed watermark".to_string(),
         ));
     }
-    let policy = if req.allow_stale_inverted {
-        "allow_stale"
-    } else {
-        "require_fresh"
-    };
-    Err(EngineError::Unsupported(format!(
-        "inverted query planning is not implemented in Stage 0 ({policy})"
-    )))
+    let stale = metadata.watermark.consumed_lsn < req.snapshot_frontier;
+    if stale && !req.allow_stale_inverted {
+        return Ok(seq_plan(req, SeqScanReason::SnapshotFallback));
+    }
+    Ok(ScanPlan {
+        spec: ScanSpec::Inverted(InvertedScanSpec {
+            index_oid: index.index_oid,
+            column: predicate.column.clone(),
+            query: predicate.value.clone(),
+            analyzer_config: metadata.analyzer.clone(),
+            limit: req.limit,
+            consumed_lsn: metadata.watermark.consumed_lsn,
+            snapshot_frontier: req.snapshot_frontier,
+            stale_index: stale,
+            candidate_count: 0,
+        }),
+    })
 }
 
 fn btree_matches(req: &ScanRequest) -> bool {
@@ -438,6 +447,9 @@ fn plan_hnsw(req: &ScanRequest) -> Result<ScanPlan> {
 
 /// Plan an ordinary predicate through B+Tree, or a plain sequential scan.
 fn plan_btree(req: &ScanRequest) -> Result<ScanPlan> {
+    if req.extra_predicate.is_some() {
+        return Ok(seq_plan(req, SeqScanReason::ExtraWhere));
+    }
     let Some(predicate) = &req.predicate else {
         return Ok(seq_plan(req, SeqScanReason::Plain));
     };
@@ -505,6 +517,7 @@ mod tests {
             })),
             limit,
             allow_stale_inverted: false,
+            snapshot_frontier: pg_storage::types::Lsn::INVALID,
             indexes,
         }
     }
@@ -525,6 +538,7 @@ mod tests {
             order_by: None,
             limit: None,
             allow_stale_inverted: false,
+            snapshot_frontier: pg_storage::types::Lsn::INVALID,
             indexes,
         }
     }
@@ -563,6 +577,7 @@ mod tests {
             order_by: None,
             limit: None,
             allow_stale_inverted: false,
+            snapshot_frontier: pg_storage::types::Lsn::INVALID,
             indexes: vec![],
         };
         let registration = AmRegistration {
@@ -826,6 +841,7 @@ mod tests {
             order_by: None,
             limit: Some(10),
             allow_stale_inverted: false,
+            snapshot_frontier: pg_storage::types::Lsn::INVALID,
             indexes,
         }
     }
@@ -864,22 +880,30 @@ mod tests {
     }
 
     #[test]
-    fn stage0_never_constructs_a_fake_inverted_scan() {
-        let Err(error) = plan_for_predicate(&fulltext_request(vec![inverted_metadata()])) else {
-            panic!("Stage 0 must reject an inverted execution plan")
+    fn fresh_inverted_metadata_constructs_a_real_scan() {
+        let plan = plan_for_predicate(&fulltext_request(vec![inverted_metadata()])).unwrap();
+        let ScanSpec::Inverted(spec) = &plan.spec else {
+            panic!("expected InvertedScan")
         };
-        assert!(matches!(error, EngineError::Unsupported(_)));
-        assert!(error.to_string().contains("require_fresh"));
+        assert_eq!(spec.index_oid, pg_storage::types::Oid(9879));
+        assert!(!spec.stale_index);
+        assert!(plan.explain().contains("InvertedScan"));
     }
 
     #[test]
     fn stale_policy_reaches_inverted_planning() {
         let mut req = fulltext_request(vec![inverted_metadata()]);
+        req.snapshot_frontier = pg_storage::types::Lsn(128);
+        let plan = plan_for_predicate(&req).unwrap();
+        assert!(matches!(plan.spec, ScanSpec::Seq(_)));
+
         req.allow_stale_inverted = true;
-        let Err(error) = plan_for_predicate(&req) else {
-            panic!("Stage 0 must reject an inverted execution plan")
+        let plan = plan_for_predicate(&req).unwrap();
+        let ScanSpec::Inverted(spec) = &plan.spec else {
+            panic!("allow_stale must retain InvertedScan")
         };
-        assert!(error.to_string().contains("allow_stale"));
+        assert!(spec.stale_index);
+        assert!(plan.explain().contains("stale_index=true"));
     }
 
     #[test]
@@ -891,6 +915,7 @@ mod tests {
             order_by: None,
             limit: None,
             allow_stale_inverted: false,
+            snapshot_frontier: pg_storage::types::Lsn::INVALID,
             indexes: vec![],
         };
         let plan = plan_for_predicate(&req).unwrap();

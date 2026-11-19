@@ -29,6 +29,7 @@ pub use tier2::Watermark;
 mod tests {
     use super::*;
     use pg_storage::types::Lsn;
+    use std::collections::BTreeMap;
 
     fn write_active_store(data_dir: &std::path::Path, manifest_lsn: Lsn, segment_lsn: Lsn) {
         write_active_store_with_state(
@@ -115,6 +116,94 @@ mod tests {
             SegmentStore::segment_metadata_path(data_dir, metadata.index_oid, metadata.segment_id);
         std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
         std::fs::write(metadata_path, metadata.encode().unwrap()).unwrap();
+        let (postings, doc_lengths) = if metadata.total_tokens == 0 {
+            let doc_lengths = (0..metadata.doc_count)
+                .map(|index| DocLength {
+                    tid: pg_storage::types::Tid {
+                        page_id: pg_storage::types::PageId(42),
+                        slot_id: index as u16 + 1,
+                    },
+                    token_count: 0,
+                })
+                .collect();
+            (BTreeMap::new(), doc_lengths)
+        } else {
+            golden_payload()
+        };
+        let postings_path =
+            SegmentStore::postings_path(data_dir, metadata.index_oid, metadata.segment_id);
+        std::fs::create_dir_all(postings_path.parent().unwrap()).unwrap();
+        std::fs::write(postings_path, crate::recovery::encode(&postings).unwrap()).unwrap();
+        let doc_lengths_path =
+            SegmentStore::doc_lengths_path(data_dir, metadata.index_oid, metadata.segment_id);
+        std::fs::create_dir_all(doc_lengths_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            doc_lengths_path,
+            crate::recovery::encode(&doc_lengths).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn golden_payload() -> (
+        std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<pg_storage::types::Tid, Posting>,
+        >,
+        Vec<DocLength>,
+    ) {
+        let first = pg_storage::types::Tid {
+            page_id: pg_storage::types::PageId(42),
+            slot_id: 1,
+        };
+        let second = pg_storage::types::Tid {
+            page_id: pg_storage::types::PageId(42),
+            slot_id: 2,
+        };
+        let postings = std::collections::BTreeMap::from([
+            (
+                "contract".to_string(),
+                std::collections::BTreeMap::from([
+                    (
+                        first,
+                        Posting {
+                            tid: first,
+                            term_freq: 1,
+                            positions: vec![0],
+                        },
+                    ),
+                    (
+                        second,
+                        Posting {
+                            tid: second,
+                            term_freq: 1,
+                            positions: vec![0],
+                        },
+                    ),
+                ]),
+            ),
+            (
+                "rust".to_string(),
+                std::collections::BTreeMap::from([(
+                    first,
+                    Posting {
+                        tid: first,
+                        term_freq: 1,
+                        positions: vec![0],
+                    },
+                )]),
+            ),
+        ]);
+        let doc_lengths = vec![
+            DocLength {
+                tid: first,
+                token_count: 10,
+            },
+            DocLength {
+                tid: second,
+                token_count: 8,
+            },
+        ];
+        (postings, doc_lengths)
     }
 
     #[test]
@@ -253,25 +342,24 @@ mod tests {
     }
 
     #[test]
-    fn initial_empty_manifest_reopens_but_nonzero_watermark_is_rejected() {
+    fn empty_manifest_reopens_at_its_backfill_watermark() {
         let tmp = tempfile::TempDir::new().unwrap();
         let index_oid = pg_storage::types::Oid(9879);
-        let manifest = SegmentStore::new(index_oid).manifest().clone();
         let path = SegmentStore::manifest_path(tmp.path(), index_oid);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, manifest.encode().unwrap()).unwrap();
-        let store = SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
-        assert!(store.manifest().active_segment_ids.is_empty());
-        assert_eq!(store.watermark().consumed_lsn, Lsn::INVALID);
-        assert_eq!(store.watermark().durable_applied_lsn, Lsn::INVALID);
-
-        let manifest = SegmentManifest {
-            generation: 1,
-            active_segment_ids: Vec::new(),
-            applied_lsn: Lsn(128),
-        };
-        std::fs::write(&path, manifest.encode().unwrap()).unwrap();
-        assert!(SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).is_err());
+        for applied_lsn in [Lsn::INVALID, Lsn(128)] {
+            let manifest = SegmentManifest {
+                generation: 1,
+                active_segment_ids: Vec::new(),
+                applied_lsn,
+            };
+            std::fs::write(&path, manifest.encode().unwrap()).unwrap();
+            let store =
+                SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+            assert!(store.manifest().active_segment_ids.is_empty());
+            assert_eq!(store.watermark().consumed_lsn, applied_lsn);
+            assert_eq!(store.watermark().durable_applied_lsn, applied_lsn);
+        }
     }
 
     #[test]
@@ -436,6 +524,74 @@ mod tests {
     }
 
     #[test]
+    fn segment_create_seal_reopen_and_delete_are_consistent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_oid = pg_storage::types::Oid(9879);
+        let tid = pg_storage::types::Tid {
+            page_id: pg_storage::types::PageId(1),
+            slot_id: 0,
+        };
+        let mut store = SegmentStore::create(
+            tmp.path(),
+            index_oid,
+            AnalyzerConfig::builtin(),
+            vec![(tid, "rust contract".to_string())],
+            Lsn::FIRST,
+        )
+        .unwrap();
+        let config = pg_storage::config::StorageConfig::new(tmp.path());
+        let wal = pg_storage::wal::WalWriter::open(tmp.path(), &config).unwrap();
+        store.seal(&wal, pg_storage::types::TxnId(1)).unwrap();
+        store.seal(&wal, pg_storage::types::TxnId(1)).unwrap();
+        let empty_oid = pg_storage::types::Oid(9880);
+        let mut empty = SegmentStore::create(
+            tmp.path(),
+            empty_oid,
+            AnalyzerConfig::builtin(),
+            Vec::new(),
+            Lsn(128),
+        )
+        .unwrap();
+        empty.seal(&wal, pg_storage::types::TxnId(2)).unwrap();
+        wal.flush().unwrap();
+        drop(wal);
+
+        let mut reader = pg_storage::wal::reader::WalReader::open(
+            tmp.path().join("wal"),
+            config.wal_segment_size,
+        )
+        .unwrap();
+        let mut seal_count = 0;
+        while let Some(record) = reader.next_record().unwrap() {
+            if record.record_type == pg_storage::wal::record::WalRecordType::SegmentSeal {
+                seal_count += 1;
+            }
+        }
+        assert_eq!(seal_count, 1);
+        drop(reader);
+        let storage = pg_storage::engine::StorageEngine::open_with_redo_handlers(
+            tmp.path(),
+            &config,
+            vec![Box::new(segment::SegmentSealRedoHandler)],
+            Vec::new(),
+        )
+        .unwrap();
+        storage.shutdown();
+
+        let mut recovered =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert_eq!(recovered.search_text("contract", None).unwrap().len(), 1);
+        assert!(recovered.delete_document(tid).unwrap());
+        assert!(!recovered.delete_document(tid).unwrap());
+        assert!(recovered.search_text("contract", None).unwrap().is_empty());
+        recovered.insert_document(tid, "replacement").unwrap();
+        assert_eq!(recovered.search_text("replacement", None).unwrap().len(), 1);
+        let empty = SegmentStore::open(tmp.path(), empty_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert!(empty.manifest().active_segment_ids.is_empty());
+        assert_eq!(empty.watermark().consumed_lsn, Lsn(128));
+    }
+
+    #[test]
     fn inverted_methods_are_explicitly_unsupported() {
         use pg_am_heap::access_method::{
             AccessMethod, DeleteContext, InsertContext, RelationDesc, ScanContext,
@@ -444,7 +600,10 @@ mod tests {
         use pg_txn::Snapshot;
 
         let index = InvertedIndex::new(pg_storage::types::Oid(9879));
-        assert!(matches!(index.search(), Err(InvertedError::Unsupported(_))));
+        assert!(index
+            .search(&Query::And(Vec::new()), None)
+            .unwrap()
+            .is_empty());
         let rel = RelationDesc {
             rel_oid: pg_storage::types::Oid(1),
             first_page: pg_storage::types::PageId(1),

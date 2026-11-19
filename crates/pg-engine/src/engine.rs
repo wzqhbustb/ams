@@ -139,6 +139,7 @@ use pg_am_heap::tuple::{decode_tuple, encode_tuple, ColumnType, Datum, TupleHead
 use pg_am_heap::{
     heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM,
 };
+use pg_am_inverted::Analyzer as _;
 use pg_catalog::builtin_types::{column_type_of_attr, BUILTIN_TYPES, FLOAT8_OID, VECTOR_OID};
 use pg_catalog::system_tables::{
     SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, HNSW_AM_OID, INVERTED_AM_OID, PG_ATTRIBUTE,
@@ -344,6 +345,15 @@ pub enum Predicate {
         /// The value to compare against (type must match the column).
         value: Datum,
     },
+    /// Keep rows whose TEXT column matches the analyzed full-text query.
+    FullText {
+        /// 0-based column position in the table's schema.
+        col_index: usize,
+        /// Query text stored as `Datum::Text` for the common predicate API.
+        value: Datum,
+        /// Analyzer used for both the query and the candidate document.
+        analyzer: pg_am_inverted::AnalyzerConfig,
+    },
 }
 
 impl Predicate {
@@ -352,7 +362,8 @@ impl Predicate {
         match self {
             Predicate::Eq { col_index, .. }
             | Predicate::Lt { col_index, .. }
-            | Predicate::Gt { col_index, .. } => *col_index,
+            | Predicate::Gt { col_index, .. }
+            | Predicate::FullText { col_index, .. } => *col_index,
         }
     }
 
@@ -361,7 +372,8 @@ impl Predicate {
         match self {
             Predicate::Eq { value, .. }
             | Predicate::Lt { value, .. }
-            | Predicate::Gt { value, .. } => value,
+            | Predicate::Gt { value, .. }
+            | Predicate::FullText { value, .. } => value,
         }
     }
 
@@ -374,7 +386,40 @@ impl Predicate {
             Predicate::Eq { value, .. } => d == value,
             Predicate::Lt { value, .. } => d < value,
             Predicate::Gt { value, .. } => d > value,
+            Predicate::FullText {
+                value: Datum::Text(query),
+                analyzer,
+                ..
+            } => {
+                let Datum::Text(document) = d else {
+                    return false;
+                };
+                fulltext_matches(analyzer, query, document)
+            }
+            Predicate::FullText { .. } => false,
         }
+    }
+}
+
+fn fulltext_matches(
+    analyzer_config: &pg_am_inverted::AnalyzerConfig,
+    query: &str,
+    document: &str,
+) -> bool {
+    let analyzer = pg_am_inverted::DefaultAnalyzer::from_config(analyzer_config.clone());
+    let query = pg_am_inverted::parse_query(&analyzer, query);
+    let document_terms = analyzer
+        .analyze(document)
+        .into_iter()
+        .map(|token| token.text)
+        .collect::<std::collections::BTreeSet<_>>();
+    match query {
+        pg_am_inverted::Query::And(query_terms) => {
+            !query_terms.is_empty() && query_terms.iter().all(|term| document_terms.contains(term))
+        }
+        pg_am_inverted::Query::Or(groups) => groups.iter().any(|group| {
+            !group.is_empty() && group.iter().all(|term| document_terms.contains(term))
+        }),
     }
 }
 
@@ -506,6 +551,17 @@ pub struct HnswVacuumStats {
     pub leak_after: HnswLeakReport,
 }
 
+/// One committed inverted-index change awaiting its transaction's WAL commit.
+#[derive(Debug, Clone)]
+enum InvertedWalAction {
+    /// Replace a document idempotently, then insert non-NULL text.
+    Upsert { tid: Tid, text: Option<String> },
+    /// Remove the document owned by a HOT chain root.
+    Delete { tid: Tid },
+}
+
+type PendingInvertedLog = HashMap<Oid, HashMap<TxnId, Vec<InvertedWalAction>>>;
+
 /// The assembled engine: storage + catalog + heap AM + txn manager + disk
 /// CLOG + in-memory table registry. Assembly order is documented at the
 /// module level.
@@ -560,6 +616,12 @@ pub struct Engine {
     /// run only after the commit record lands). Discarded untouched on
     /// abort; replayed idempotently on the commit success path.
     pending_hnsw: Arc<Mutex<PendingHnswLog>>,
+    /// Inverted segment stores, keyed by index OID. Each handle owns the
+    /// recovered manifest, analyzer, and WAL watermark for one full-text index.
+    inverted_handles:
+        Arc<Mutex<std::collections::HashMap<Oid, Arc<Mutex<pg_am_inverted::InvertedIndex>>>>>,
+    /// Uncommitted WAL actions retained across synchronous catch-up calls.
+    pending_inverted: Arc<Mutex<PendingInvertedLog>>,
     /// Serializes `create_table` / `drop_table` (see the module docs for the
     /// DDL-vs-DML concurrency scope).
     ddl_lock: Mutex<()>,
@@ -580,6 +642,8 @@ pub struct Engine {
     query_stats: QueryStats,
     /// Phase 3 inverted-query freshness policy, retained for the planner.
     allow_stale_inverted: bool,
+    /// Analyzer identity used when creating new inverted segments.
+    inverted_analyzer: pg_am_inverted::AnalyzerConfig,
     sequences: SequenceManager,
 }
 
@@ -1026,6 +1090,7 @@ impl Engine {
         redo_handlers.extend(txn_redo_handlers());
         redo_handlers.extend(btree_redo_handlers());
         redo_handlers.extend(pg_am_hnsw::redo::hnsw_redo_handlers());
+        redo_handlers.push(Box::new(pg_am_inverted::segment::SegmentSealRedoHandler));
         redo_handlers.push(Box::new(sequences.redo_handler()));
         let undo_handlers: Vec<Box<dyn UndoHandler>> =
             vec![Box::new(HeapUndoHandler), Box::new(BTreeUndoHandler)];
@@ -1140,12 +1205,15 @@ impl Engine {
             registry: RwLock::new(registry),
             indexes: RwLock::new(indexes),
             hnsw_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            inverted_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending_inverted: Arc::new(Mutex::new(HashMap::new())),
             pending_hnsw: Arc::new(Mutex::new(HashMap::new())),
             ddl_lock: Mutex::new(()),
             instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             index_undo: Arc::new(Mutex::new(HashMap::new())),
             query_stats: QueryStats::new(config.query_stats_capacity),
             allow_stale_inverted: config.allow_stale_inverted,
+            inverted_analyzer: config.inverted_analyzer,
             sequences,
         };
         engine.initialize_sequences()?;
@@ -2670,6 +2738,12 @@ impl Engine {
         self.hnsw_handles
             .lock()
             .retain(|index_oid, _| !index_oids.contains(index_oid));
+        self.inverted_handles
+            .lock()
+            .retain(|index_oid, _| !index_oids.contains(index_oid));
+        self.pending_inverted
+            .lock()
+            .retain(|index_oid, _| !index_oids.contains(index_oid));
         let mut pages = match self.walk_chain(entry.first_page) {
             Ok(pages) => pages,
             Err(error) => {
@@ -2758,7 +2832,7 @@ impl Engine {
         // early if they cannot. The rows are encoded exactly as
         // `create_index_catalog_rows` will encode them.
         let index_oid = self.catalog.oid_allocator().alloc();
-        self.ensure_index_catalog_room(&entry, column, index_oid)?;
+        self.ensure_index_catalog_room(&entry, column, index_oid, BTREE_AM_OID)?;
 
         // The scan + bulk load + catalog write run as ONE auto-commit
         // transaction holding the table's Exclusive lock (M2c Stage P,
@@ -2817,7 +2891,14 @@ impl Engine {
                 let index = btree.build_index(index_oid, key_type, entries)?;
                 let meta_page = index.meta_page();
 
-                self.create_index_catalog_rows(&snap, &entry, column, index_oid, meta_page)?;
+                self.create_index_catalog_rows(
+                    &snap,
+                    &entry,
+                    column,
+                    index_oid,
+                    meta_page,
+                    BTREE_AM_OID,
+                )?;
                 // Registry push INSIDE the lock-holding transaction (round-4
                 // P3-C): pushing after the lock released left a residual window
                 // where a concurrent INSERT saw no index and wrote rows without
@@ -2839,6 +2920,134 @@ impl Engine {
             || {
                 // Registry publication is in-memory and OID-scoped: a failed
                 // commit must not leave a usable ghost index behind.
+                self.indexes
+                    .write()
+                    .retain(|index| index.index_oid != index_oid);
+            },
+        );
+        result?;
+        Ok(index_oid)
+    }
+
+    /// Create an inverted full-text index with a full backfill under
+    /// `AccessExclusive`. Catalog rows and the in-memory registry are written
+    /// inside the same transaction; failure cleans them before lock release.
+    fn create_inverted_index_on_named(
+        &self,
+        table: &str,
+        column: &str,
+        index_name: Option<&str>,
+    ) -> Result<Oid> {
+        let _ddl = self.ddl_lock.lock();
+        let entry = self.table_entry(table)?;
+        let col_index = entry
+            .columns
+            .iter()
+            .position(|c| c.name == column)
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("table {table:?} has no column {column:?}"))
+            })?;
+        if entry.columns[col_index].col_type != ColumnType::Text {
+            return Err(EngineError::InvalidArgument(format!(
+                "inverted index requires a TEXT column; {table}({column}) is {:?}",
+                entry.columns[col_index].col_type
+            )));
+        }
+        if self
+            .indexes
+            .read()
+            .iter()
+            .any(|index| index.table_oid == entry.oid && index.column == column)
+        {
+            return Err(EngineError::IndexExists(format!("{table}({column})")));
+        }
+        let index_name = index_name
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}_{column}_inverted_idx", entry.oid.0));
+        if self.relation_name_exists(&index_name)? {
+            return Err(EngineError::IndexExists(index_name));
+        }
+        let index_oid = self.catalog.oid_allocator().alloc();
+        self.ensure_index_catalog_room(&entry, column, index_oid, INVERTED_AM_OID)?;
+        let pending_store = Mutex::new(None);
+        let result = self.auto_commit_with_hooks(
+            |snap| {
+                let _locked =
+                    self.lock_table_entry(snap.current_xid(), table, LockMode::AccessExclusive)?;
+                let (mut snap, _re_guard) = self.txn.snapshot(snap.current_xid());
+                snap.advance_curcid();
+                let col_types = column_types(&entry);
+                let rows = self.heap.scan(ScanContext {
+                    rel: relation_desc(&entry, &col_types),
+                    snapshot: &snap,
+                    clog: self.clog.as_ref(),
+                })?;
+                let mut documents = Vec::with_capacity(rows.len());
+                for (tid, values) in rows {
+                    let values = self.heap.detoast_values(
+                        &relation_desc(&entry, &col_types),
+                        &snap,
+                        self.clog.as_ref(),
+                        &values,
+                    )?;
+                    let Some(Datum::Text(text)) = &values[col_index] else {
+                        continue;
+                    };
+                    let index_tid = self.hot_chain_root(tid)?;
+                    documents.push((index_tid, text.clone()));
+                }
+                let mut store = pg_am_inverted::SegmentStore::create(
+                    self.storage.data_dir(),
+                    index_oid,
+                    self.inverted_analyzer.clone(),
+                    documents,
+                    self.storage.wal_writer().synced_lsn(),
+                )
+                .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+                store
+                    .seal(self.storage.wal_writer(), snap.current_xid())
+                    .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+                self.create_index_catalog_rows(
+                    &snap,
+                    &entry,
+                    column,
+                    index_oid,
+                    PageId::INVALID,
+                    INVERTED_AM_OID,
+                )?;
+                *pending_store.lock() = Some(store);
+                Ok(())
+            },
+            || {
+                // Publish only after the catalog commit is durable, while the
+                // AccessExclusive lock still excludes every concurrent writer.
+                let mut store = pending_store.lock().take().ok_or_else(|| {
+                    EngineError::Corrupted("missing inverted backfill store".to_string())
+                })?;
+                // No table DML can belong to (base_lsn, current frontier]:
+                // AccessExclusive is still held. Advancing past our own
+                // catalog commit cannot skip a document change.
+                store.advance_consumed(self.storage.wal_writer().synced_lsn());
+                let metadata = InvertedIndexMetadata::from_store(&store);
+                self.inverted_handles.lock().insert(
+                    index_oid,
+                    Arc::new(Mutex::new(pg_am_inverted::InvertedIndex::from_store(store))),
+                );
+                self.indexes.write().push(IndexEntry {
+                    kind: AmKind::Inverted,
+                    inverted: Some(metadata),
+                    index_oid,
+                    table_oid: entry.oid,
+                    column: column.to_string(),
+                    key_type: ColumnType::Text,
+                    meta_page: PageId::INVALID,
+                    map_page: None,
+                });
+                Ok(())
+            },
+            || {
+                pending_store.lock().take();
+                self.inverted_handles.lock().remove(&index_oid);
                 self.indexes
                     .write()
                     .retain(|index| index.index_oid != index_oid);
@@ -3839,6 +4048,7 @@ impl Engine {
         column: &str,
         index_oid: Oid,
         meta_page: PageId,
+        access_method_oid: Oid,
     ) -> Result<()> {
         let col_index = entry
             .columns
@@ -3853,7 +4063,7 @@ impl Engine {
             Some(Datum::Text(RELKIND_INDEX.to_string())),
             Some(Datum::Int4(1)),
             Some(Datum::Int8(0)),
-            Some(Datum::Int8(BTREE_AM_OID.0 as i64)),
+            Some(Datum::Int8(access_method_oid.0 as i64)),
         ];
         self.insert_catalog_row(snap, &PG_CLASS, &class_row)?;
 
@@ -3899,6 +4109,7 @@ impl Engine {
         entry: &TableEntry,
         column: &str,
         index_oid: Oid,
+        access_method_oid: Oid,
     ) -> Result<()> {
         let col_index = entry
             .columns
@@ -3915,7 +4126,7 @@ impl Engine {
                     Some(Datum::Text(RELKIND_INDEX.to_string())),
                     Some(Datum::Int4(1)),
                     Some(Datum::Int8(0)),
-                    Some(Datum::Int8(BTREE_AM_OID.0 as i64)),
+                    Some(Datum::Int8(access_method_oid.0 as i64)),
                 ],
             ),
             (
@@ -4061,7 +4272,7 @@ impl Engine {
     /// to the first version that is not `HEAP_ONLY_TUPLE`. Every version in
     /// a HOT chain shares the same indexed columns, so the root's entry
     /// carries exactly the key the caller read back from `tid`.
-    fn hot_chain_root(&self, tid: Tid) -> Result<Tid> {
+    pub(crate) fn hot_chain_root(&self, tid: Tid) -> Result<Tid> {
         let guard = self.storage.buffer_pool().pin(tid.page_id)?;
         let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
         Ok(pg_am_heap::hot_chain_root(page, tid.page_id, tid)?)
@@ -4097,6 +4308,267 @@ impl Engine {
     /// Whether the inverted planner may intentionally use a stale index.
     pub(crate) fn allow_stale_inverted(&self) -> bool {
         self.allow_stale_inverted
+    }
+
+    /// Open an inverted handle lazily. DDL serialization prevents a concurrent
+    /// DROP from cleaning the registry before an old handle is republished.
+    pub(crate) fn inverted_handle(
+        &self,
+        index_oid: Oid,
+    ) -> Result<Arc<Mutex<pg_am_inverted::InvertedIndex>>> {
+        let _ddl = self.ddl_lock.lock();
+        if let Some(handle) = self.inverted_handles.lock().get(&index_oid) {
+            return Ok(Arc::clone(handle));
+        }
+        let live = self
+            .indexes
+            .read()
+            .iter()
+            .any(|index| index.index_oid == index_oid && index.kind == AmKind::Inverted);
+        if !live {
+            return Err(EngineError::IndexNotFound(format!(
+                "inverted index {index_oid}"
+            )));
+        }
+        let store = pg_am_inverted::SegmentStore::open(
+            self.storage.data_dir(),
+            index_oid,
+            &self.inverted_analyzer,
+        )
+        .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+        let handle = Arc::new(Mutex::new(pg_am_inverted::InvertedIndex::from_store(store)));
+        self.inverted_handles
+            .lock()
+            .insert(index_oid, Arc::clone(&handle));
+        Ok(handle)
+    }
+
+    /// Select the indexed analyzer for an exact heap fallback, or the default
+    /// analyzer when no inverted index exists on this table column.
+    pub(crate) fn inverted_analyzer_for(
+        &self,
+        table_oid: Oid,
+        column: &str,
+    ) -> pg_am_inverted::AnalyzerConfig {
+        self.indexes
+            .read()
+            .iter()
+            .find(|index| {
+                index.kind == AmKind::Inverted
+                    && index.table_oid == table_oid
+                    && index.column.eq_ignore_ascii_case(column)
+            })
+            .and_then(|index| index.inverted.as_ref())
+            .map_or_else(
+                || self.inverted_analyzer.clone(),
+                |metadata| metadata.analyzer.clone(),
+            )
+    }
+
+    /// Whether an inverted scan is complete for this snapshot. Read-only
+    /// implicit transactions may use the index; any older snapshot, other
+    /// in-flight writer, or write by the snapshot's own XID forces the heap.
+    pub(crate) fn inverted_snapshot_allows(&self, index_oid: Oid, snap: &Snapshot) -> bool {
+        if snap.xmax() != self.txn.current_xid()
+            || snap.xip().iter().any(|xid| *xid != snap.current_xid())
+        {
+            return false;
+        }
+        !self
+            .pending_inverted
+            .lock()
+            .get(&index_oid)
+            .is_some_and(|pending| pending.contains_key(&snap.current_xid()))
+    }
+
+    /// Catch one inverted index up to the durable WAL frontier. Heap changes
+    /// remain private per XID until Commit; Abort discards them. The consumed
+    /// frontier is an end-LSN prefix, so replay starts at it directly (or at
+    /// `Lsn::FIRST` for an empty WAL), never one record beyond it.
+    pub(crate) fn refresh_inverted(
+        &self,
+        index_entry: &IndexEntry,
+        entry: &TableEntry,
+    ) -> Result<InvertedIndexMetadata> {
+        let handle = self.inverted_handle(index_entry.index_oid)?;
+        let mut index = handle.lock();
+        // Include a caller's own unflushed writes in pending, so the snapshot
+        // check above cannot accidentally treat its read-write transaction
+        // as read-only.
+        self.storage.wal_writer().flush()?;
+        let start = index.watermark().consumed_lsn;
+        let frontier = self.storage.wal_writer().synced_lsn();
+        if start > frontier {
+            return Err(EngineError::Corrupted(format!(
+                "inverted consumed LSN {start} exceeds synced frontier {frontier}"
+            )));
+        }
+        if start == frontier {
+            let metadata = InvertedIndexMetadata {
+                analyzer: index.analyzer_config().clone(),
+                watermark: index.watermark(),
+            };
+            drop(index);
+            self.publish_inverted_watermark(index_entry.index_oid, &metadata);
+            return Ok(metadata);
+        }
+
+        let col_index = entry
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(&index_entry.column))
+            .ok_or_else(|| {
+                EngineError::Corrupted(format!(
+                    "inverted index column {:?} is missing from table {}",
+                    index_entry.column, entry.oid.0
+                ))
+            })?;
+        let col_types = column_types(entry);
+        let rel = relation_desc(entry, &col_types);
+        let pages = self
+            .heap
+            .relation_pages(&rel)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let (mut snap, _snap_guard) = self.txn.snapshot(TxnId::INVALID);
+        snap.advance_curcid();
+        let replay_start = if start.is_valid() { start } else { Lsn::FIRST };
+        let mut reader = WalReader::open_at(
+            self.storage.data_dir().join("wal"),
+            self.storage.config().wal_segment_size,
+            replay_start,
+        )?;
+        let mut all_pending = self.pending_inverted.lock();
+        let pending = all_pending.entry(index_entry.index_oid).or_default();
+        while let Some(record) = reader.next_record()? {
+            let record_end = reader.current_lsn();
+            if record_end > frontier {
+                break;
+            }
+            match record.record_type {
+                WalRecordType::HeapInsert => {
+                    let decoded =
+                        pg_storage::wal::record::HeapInsertRecord::decode(&record.payload)?;
+                    if pages.contains(&decoded.page_id) {
+                        let tid = Tid {
+                            page_id: decoded.page_id,
+                            slot_id: decoded.slot_id,
+                        };
+                        let text = self.decode_inverted_text(
+                            &snap,
+                            &rel,
+                            &col_types,
+                            col_index,
+                            &decoded.tuple_bytes,
+                        )?;
+                        pending
+                            .entry(record.txn_id)
+                            .or_default()
+                            .push(InvertedWalAction::Upsert { tid, text });
+                    }
+                }
+                WalRecordType::HeapUpdate => {
+                    let decoded = HeapUpdateRecord::decode(&record.payload)?;
+                    if pages.contains(&decoded.new_tid.page_id) {
+                        let old_tid = self.hot_chain_root(decoded.old_tid)?;
+                        let text = self.decode_inverted_text(
+                            &snap,
+                            &rel,
+                            &col_types,
+                            col_index,
+                            &decoded.new_tuple_bytes,
+                        )?;
+                        let actions = pending.entry(record.txn_id).or_default();
+                        // Update order is part of the correctness contract:
+                        // old postings disappear before the new version is added.
+                        actions.push(InvertedWalAction::Delete { tid: old_tid });
+                        actions.push(InvertedWalAction::Upsert {
+                            tid: decoded.new_tid,
+                            text,
+                        });
+                    }
+                }
+                WalRecordType::HeapDelete => {
+                    let decoded = HeapDeleteRecord::decode(&record.payload)?;
+                    if pages.contains(&decoded.tid.page_id) {
+                        let tid = self.hot_chain_root(decoded.tid)?;
+                        pending
+                            .entry(record.txn_id)
+                            .or_default()
+                            .push(InvertedWalAction::Delete { tid });
+                    }
+                }
+                WalRecordType::TxnCommit => {
+                    for action in pending.remove(&record.txn_id).unwrap_or_default() {
+                        match action {
+                            InvertedWalAction::Upsert { tid, text } => {
+                                index
+                                    .delete_document(tid)
+                                    .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+                                if let Some(text) = text {
+                                    index.insert_document(tid, &text).map_err(|error| {
+                                        EngineError::Corrupted(error.to_string())
+                                    })?;
+                                }
+                            }
+                            InvertedWalAction::Delete { tid } => {
+                                index
+                                    .delete_document(tid)
+                                    .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+                            }
+                        }
+                    }
+                }
+                WalRecordType::TxnAbort => {
+                    pending.remove(&record.txn_id);
+                }
+                // HOT preserves every indexed key and the chain-root TID, so
+                // its new tuple needs no inverted maintenance.
+                WalRecordType::HeapHotUpdate => {}
+                _ => {}
+            }
+            index.advance_consumed(record_end);
+        }
+        let metadata = InvertedIndexMetadata {
+            analyzer: index.analyzer_config().clone(),
+            watermark: index.watermark(),
+        };
+        drop(all_pending);
+        drop(index);
+        self.publish_inverted_watermark(index_entry.index_oid, &metadata);
+        Ok(metadata)
+    }
+
+    fn decode_inverted_text(
+        &self,
+        snap: &Snapshot,
+        rel: &RelationDesc<'_>,
+        col_types: &[ColumnType],
+        col_index: usize,
+        tuple_bytes: &[u8],
+    ) -> Result<Option<String>> {
+        let (_, values) = decode_tuple(tuple_bytes, col_types)?;
+        let values = self
+            .heap
+            .detoast_values(rel, snap, self.clog.as_ref(), &values)?;
+        match &values[col_index] {
+            Some(Datum::Text(text)) => Ok(Some(text.clone())),
+            None => Ok(None),
+            other => Err(EngineError::Corrupted(format!(
+                "inverted TEXT column decoded as {other:?}"
+            ))),
+        }
+    }
+
+    fn publish_inverted_watermark(&self, index_oid: Oid, metadata: &InvertedIndexMetadata) {
+        if let Some(entry) = self
+            .indexes
+            .write()
+            .iter_mut()
+            .find(|entry| entry.index_oid == index_oid)
+        {
+            entry.inverted = Some(metadata.clone());
+        }
     }
 
     /// Insert one row (single auto-commit transaction) and return its TID.
@@ -5616,7 +6088,6 @@ impl Engine {
         stmt: Statement,
         path: &mut ExecutionPath,
     ) -> Result<QueryResult> {
-        reject_extra_where(&stmt)?;
         match stmt {
             // Transaction control is programmatic only (Stage O review):
             // auto-commit mode has no transaction to begin or end, so these
@@ -5638,6 +6109,7 @@ impl Engine {
                     table,
                     columns,
                     filter,
+                    extra_filter,
                     order_by,
                     limit,
                     ..
@@ -5654,7 +6126,15 @@ impl Engine {
                 snap.advance_curcid();
                 let entry = self.table_entry(&table)?;
                 crate::executor::explain(
-                    self, &snap, &table, &entry, &columns, &filter, &order_by, &limit,
+                    self,
+                    &snap,
+                    &table,
+                    &entry,
+                    &columns,
+                    &filter,
+                    &extra_filter,
+                    &order_by,
+                    &limit,
                 )
             }
             Statement::CreateTable { name, columns } => {
@@ -5675,9 +6155,8 @@ impl Engine {
                             "only fulltext_index='bm25' is supported".to_string(),
                         ));
                     }
-                    return Err(EngineError::Unsupported(
-                        "inverted index creation is not implemented in Stage 0".to_string(),
-                    ));
+                    self.create_inverted_index_on_named(&table, &column, name.as_deref())?;
+                    return Ok(QueryResult::Ok);
                 }
                 if method == Some(sql::IndexMethod::Hnsw) {
                     let opclass = opclass.ok_or_else(|| {
@@ -5760,7 +6239,7 @@ impl Engine {
                 columns,
                 table,
                 filter,
-                extra_filter: _,
+                extra_filter,
                 order_by,
                 limit,
                 lock,
@@ -5778,7 +6257,16 @@ impl Engine {
                         let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
                         snap.advance_curcid();
                         self.exec_select(
-                            &snap, &columns, &table, &filter, &order_by, &limit, false, false, path,
+                            &snap,
+                            &columns,
+                            &table,
+                            &filter,
+                            &extra_filter,
+                            &order_by,
+                            &limit,
+                            false,
+                            false,
+                            path,
                         )
                     }
                     // FOR UPDATE (M2c Stage P) needs a real transaction:
@@ -5790,7 +6278,16 @@ impl Engine {
                     Some(LockClause::ForUpdate) => self.auto_commit(|snap| {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                         self.exec_select(
-                            snap, &columns, &table, &filter, &order_by, &limit, true, false, path,
+                            snap,
+                            &columns,
+                            &table,
+                            &filter,
+                            &extra_filter,
+                            &order_by,
+                            &limit,
+                            true,
+                            false,
+                            path,
                         )
                     }),
                     // FOR SHARE (Stage S multixact lite): stamps a shared
@@ -5799,7 +6296,16 @@ impl Engine {
                     Some(LockClause::ForShare) => self.auto_commit(|snap| {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                         self.exec_select(
-                            snap, &columns, &table, &filter, &order_by, &limit, true, true, path,
+                            snap,
+                            &columns,
+                            &table,
+                            &filter,
+                            &extra_filter,
+                            &order_by,
+                            &limit,
+                            true,
+                            true,
+                            path,
                         )
                     }),
                 }
@@ -5814,7 +6320,13 @@ impl Engine {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                     let pred = filter
                         .as_ref()
-                        .map(|f| filter_to_predicate(&entry, f))
+                        .map(|f| {
+                            filter_to_predicate_with_analyzer(
+                                &entry,
+                                f,
+                                &self.inverted_analyzer_for(entry.oid, &f.column),
+                            )
+                        })
                         .transpose()?;
                     let rows = self.scan_inner(snap, &table, pred.as_ref())?;
                     let mut count = 0;
@@ -5833,7 +6345,13 @@ impl Engine {
                         self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                     let pred = filter
                         .as_ref()
-                        .map(|f| filter_to_predicate(&entry, f))
+                        .map(|f| {
+                            filter_to_predicate_with_analyzer(
+                                &entry,
+                                f,
+                                &self.inverted_analyzer_for(entry.oid, &f.column),
+                            )
+                        })
                         .transpose()?;
                     let rows = self.scan_inner(snap, &table, pred.as_ref())?;
                     let mut count = 0;
@@ -5863,7 +6381,6 @@ impl Engine {
                 "transaction handle belongs to a different Engine instance".to_string(),
             ));
         }
-        reject_extra_where(&stmt)?;
         handle.advance_curcid();
         let snap = handle.snapshot.borrow();
         match stmt {
@@ -5884,6 +6401,7 @@ impl Engine {
                     table,
                     columns,
                     filter,
+                    extra_filter,
                     order_by,
                     limit,
                     ..
@@ -5895,7 +6413,15 @@ impl Engine {
                 };
                 let entry = self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
                 crate::executor::explain(
-                    self, &snap, &table, &entry, &columns, &filter, &order_by, &limit,
+                    self,
+                    &snap,
+                    &table,
+                    &entry,
+                    &columns,
+                    &filter,
+                    &extra_filter,
+                    &order_by,
+                    &limit,
                 )
             }
             Statement::CreateTable { .. }
@@ -5924,7 +6450,7 @@ impl Engine {
                 columns,
                 table,
                 filter,
-                extra_filter: _,
+                extra_filter,
                 order_by,
                 limit,
                 lock,
@@ -5932,19 +6458,46 @@ impl Engine {
                 None => {
                     self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
                     self.exec_select(
-                        &snap, &columns, &table, &filter, &order_by, &limit, false, false, path,
+                        &snap,
+                        &columns,
+                        &table,
+                        &filter,
+                        &extra_filter,
+                        &order_by,
+                        &limit,
+                        false,
+                        false,
+                        path,
                     )
                 }
                 Some(LockClause::ForUpdate) => {
                     self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                     self.exec_select(
-                        &snap, &columns, &table, &filter, &order_by, &limit, true, false, path,
+                        &snap,
+                        &columns,
+                        &table,
+                        &filter,
+                        &extra_filter,
+                        &order_by,
+                        &limit,
+                        true,
+                        false,
+                        path,
                     )
                 }
                 Some(LockClause::ForShare) => {
                     self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                     self.exec_select(
-                        &snap, &columns, &table, &filter, &order_by, &limit, true, true, path,
+                        &snap,
+                        &columns,
+                        &table,
+                        &filter,
+                        &extra_filter,
+                        &order_by,
+                        &limit,
+                        true,
+                        true,
+                        path,
                     )
                 }
             },
@@ -5956,7 +6509,13 @@ impl Engine {
                 let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                 let pred = filter
                     .as_ref()
-                    .map(|f| filter_to_predicate(&entry, f))
+                    .map(|f| {
+                        filter_to_predicate_with_analyzer(
+                            &entry,
+                            f,
+                            &self.inverted_analyzer_for(entry.oid, &f.column),
+                        )
+                    })
                     .transpose()?;
                 let rows = self.scan_inner(&snap, &table, pred.as_ref())?;
                 let mut count = 0;
@@ -5971,7 +6530,13 @@ impl Engine {
                 let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                 let pred = filter
                     .as_ref()
-                    .map(|f| filter_to_predicate(&entry, f))
+                    .map(|f| {
+                        filter_to_predicate_with_analyzer(
+                            &entry,
+                            f,
+                            &self.inverted_analyzer_for(entry.oid, &f.column),
+                        )
+                    })
                     .transpose()?;
                 let rows = self.scan_inner(&snap, &table, pred.as_ref())?;
                 let mut count = 0;
@@ -5992,10 +6557,8 @@ impl Engine {
         columns: &SelectCols,
         order_by: &Option<OrderByKind>,
     ) -> Result<()> {
-        if matches!(order_by, Some(OrderByKind::Bm25Score(_))) {
-            return Err(EngineError::Unsupported(
-                "bm25_score ordering is not implemented in Stage 0".to_string(),
-            ));
+        if let Some(OrderByKind::Bm25Score(expr)) = order_by {
+            crate::executor::validate_bm25(entry, expr)?;
         }
         if let Some(OrderByKind::Column(ob)) = order_by {
             let column = entry
@@ -6029,10 +6592,8 @@ impl Engine {
                     SelectItem::Distance(expr) => {
                         crate::executor::prepare_distance(entry, expr)?;
                     }
-                    SelectItem::Bm25Score(_) => {
-                        return Err(EngineError::Unsupported(
-                            "bm25_score projection is not implemented in Stage 0".to_string(),
-                        ));
+                    SelectItem::Bm25Score(expr) => {
+                        crate::executor::validate_bm25(entry, expr)?;
                     }
                 }
             }
@@ -6065,6 +6626,7 @@ impl Engine {
         columns: &SelectCols,
         table: &str,
         filter: &Option<Filter>,
+        extra_filter: &Option<Filter>,
         order_by: &Option<OrderByKind>,
         limit: &Option<usize>,
         lock_rows: bool,
@@ -6073,18 +6635,23 @@ impl Engine {
     ) -> Result<QueryResult> {
         let entry = self.table_entry(table)?;
         Self::validate_select_shape(&entry, columns, order_by)?;
-        let output = crate::executor::execute(self, snap, table, &entry, filter, order_by, limit)?;
+        let output = crate::executor::execute(
+            self,
+            snap,
+            table,
+            &entry,
+            filter,
+            extra_filter,
+            order_by,
+            limit,
+        )?;
         let is_hnsw = matches!(&output.plan.spec, crate::planner::ScanSpec::Hnsw(_));
+        let use_inverted = matches!(&output.plan.spec, crate::planner::ScanSpec::Inverted(_));
         let mut rows = output.rows;
         *path = match &output.plan.spec {
-            crate::planner::ScanSpec::BTree(_) | crate::planner::ScanSpec::Hnsw(_) => {
-                ExecutionPath::IndexLookup
-            }
-            crate::planner::ScanSpec::Inverted(_) => {
-                return Err(EngineError::Unsupported(
-                    "inverted execution is not implemented in Stage 0".to_string(),
-                ))
-            }
+            crate::planner::ScanSpec::BTree(_)
+            | crate::planner::ScanSpec::Hnsw(_)
+            | crate::planner::ScanSpec::Inverted(_) => ExecutionPath::IndexLookup,
             crate::planner::ScanSpec::Seq(_) => ExecutionPath::SeqScan,
         };
         if let Some(OrderByKind::Column(ob)) = order_by {
@@ -6119,6 +6686,21 @@ impl Engine {
                 rows = crate::executor::sort_by_distance(&entry, rows, expr)?;
             }
         }
+        if let Some(OrderByKind::Bm25Score(expr)) = order_by {
+            let scores =
+                crate::executor::bm25_scores(self, snap, table, &entry, expr, use_inverted)?;
+            rows.sort_by(|a, b| {
+                let a_score = scores.get(&a.0).copied().unwrap_or(0.0);
+                let b_score = scores.get(&b.0).copied().unwrap_or(0.0);
+                let ordering = a_score.total_cmp(&b_score);
+                let ordering = if expr.desc {
+                    ordering.reverse()
+                } else {
+                    ordering
+                };
+                ordering.then_with(|| a.0.cmp(&b.0))
+            });
+        }
         if let Some(n) = limit {
             rows.truncate(*n);
         }
@@ -6139,17 +6721,10 @@ impl Engine {
                 (names, rows)
             }
             SelectCols::Cols(items) => {
-                if items
-                    .iter()
-                    .any(|item| matches!(item, SelectItem::Bm25Score(_)))
-                {
-                    return Err(EngineError::Unsupported(
-                        "bm25_score projection is not implemented in Stage 0".to_string(),
-                    ));
-                }
                 enum Projection {
                     Column(usize),
                     Distance(crate::executor::DistanceEvaluator),
+                    Bm25Score(std::collections::HashMap<Tid, f64>),
                 }
                 let names: Vec<String> = items
                     .iter()
@@ -6179,14 +6754,21 @@ impl Engine {
                         SelectItem::Distance(expr) => Ok(Projection::Distance(
                             crate::executor::prepare_distance(&entry, expr)?,
                         )),
-                        SelectItem::Bm25Score(_) => Err(EngineError::Unsupported(
-                            "bm25_score projection is not implemented in Stage 0".to_string(),
-                        )),
+                        SelectItem::Bm25Score(expr) => {
+                            Ok(Projection::Bm25Score(crate::executor::bm25_scores(
+                                self,
+                                snap,
+                                table,
+                                &entry,
+                                expr,
+                                use_inverted,
+                            )?))
+                        }
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let projected = rows
                     .into_iter()
-                    .map(|(_, values)| {
+                    .map(|(tid, values)| {
                         projections
                             .iter()
                             .map(|projection| match projection {
@@ -6194,6 +6776,9 @@ impl Engine {
                                 Projection::Distance(evaluator) => evaluator
                                     .evaluate(&values)
                                     .map(|distance| distance.map(Datum::Float8)),
+                                Projection::Bm25Score(scores) => Ok(Some(Datum::Float8(
+                                    scores.get(&tid).copied().unwrap_or(0.0),
+                                ))),
                             })
                             .collect::<Result<Vec<_>>>()
                     })
@@ -6846,32 +7431,18 @@ impl Engine {
     }
 }
 
-/// Stage 0 parses the full-text `ExtraWhere` shape for planner tests, but its
-/// exact executor arrives with the inverted implementation. Never drop the
-/// second predicate and accidentally run only the first one.
-fn reject_extra_where(stmt: &Statement) -> Result<()> {
-    let has_extra = match stmt {
-        Statement::Select { extra_filter, .. } => extra_filter.is_some(),
-        Statement::Explain(inner) => matches!(
-            inner.as_ref(),
-            Statement::Select {
-                extra_filter: Some(_),
-                ..
-            }
-        ),
-        _ => false,
-    };
-    if has_extra {
-        return Err(EngineError::Unsupported(
-            "additional WHERE predicates are not implemented in Stage 0".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// Build a `Predicate` from a parsed `Filter`, resolving the column name
 /// to a 0-based index and converting the literal.
 pub(crate) fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate> {
+    filter_to_predicate_with_analyzer(entry, filter, &pg_am_inverted::AnalyzerConfig::builtin())
+}
+
+/// Build a predicate with the analyzer belonging to a particular inverted index.
+pub(crate) fn filter_to_predicate_with_analyzer(
+    entry: &TableEntry,
+    filter: &Filter,
+    analyzer: &pg_am_inverted::AnalyzerConfig,
+) -> Result<Predicate> {
     let col_index = entry
         .columns
         .iter()
@@ -6936,15 +7507,21 @@ pub(crate) fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result
             )))
         }
     };
+    if filter.op == CmpOp::FullText && col_type != ColumnType::Text {
+        return Err(EngineError::InvalidPredicate(format!(
+            "full-text left operand {:?} is not a TEXT column",
+            filter.column
+        )));
+    }
     Ok(match filter.op {
         CmpOp::Eq => Predicate::Eq { col_index, value },
         CmpOp::Lt => Predicate::Lt { col_index, value },
         CmpOp::Gt => Predicate::Gt { col_index, value },
-        CmpOp::FullText => {
-            return Err(EngineError::Unsupported(
-                "full-text predicates are not implemented in Stage 0".to_string(),
-            ))
-        }
+        CmpOp::FullText => Predicate::FullText {
+            col_index,
+            value,
+            analyzer: analyzer.clone(),
+        },
     })
 }
 
@@ -7501,6 +8078,27 @@ mod tests {
             pg_am_inverted::SegmentStore::segment_metadata_path(data_dir, index_oid, segment_id);
         std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
         std::fs::write(metadata_path, metadata.encode().unwrap()).unwrap();
+        let postings: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<pg_storage::types::Tid, pg_am_inverted::posting::Posting>,
+        > = Default::default();
+        let postings_path =
+            pg_am_inverted::SegmentStore::postings_path(data_dir, index_oid, segment_id);
+        std::fs::create_dir_all(postings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            postings_path,
+            pg_am_inverted::recovery::encode(&postings).unwrap(),
+        )
+        .unwrap();
+        let doc_lengths: Vec<pg_am_inverted::DocLength> = Vec::new();
+        let doc_lengths_path =
+            pg_am_inverted::SegmentStore::doc_lengths_path(data_dir, index_oid, segment_id);
+        std::fs::create_dir_all(doc_lengths_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            doc_lengths_path,
+            pg_am_inverted::recovery::encode(&doc_lengths).unwrap(),
+        )
+        .unwrap();
     }
 
     fn raw_hnsw_map_page(engine: &Engine, index_oid: Oid) -> PageId {
@@ -7937,7 +8535,15 @@ mod tests {
         let writer =
             std::thread::spawn(move || writer_engine.exec(None, "INSERT INTO t VALUES (1, [1,0])"));
         let mut waiter_queued = false;
-        for _ in 0..10_000 {
+        while !waiter_queued {
+            assert!(
+                Instant::now() < deadline,
+                "writer never queued behind the index build lock"
+            );
+            if writer.is_finished() {
+                let result = writer.join().unwrap();
+                panic!("writer finished before queuing behind the index build lock: {result:?}");
+            }
             if engine.table_lock_state(table_oid).is_some_and(|state| {
                 state
                     .waiters
@@ -7945,9 +8551,8 @@ mod tests {
                     .any(|(_, mode)| *mode == LockMode::RowExclusive)
             }) {
                 waiter_queued = true;
-                break;
             }
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
         assert!(waiter_queued, "writer never queued behind Exclusive");
         WRITER_READY.store(true, Ordering::SeqCst);
@@ -7974,6 +8579,98 @@ mod tests {
         .unwrap();
         let key = encode_key(&Datum::Int8(0)).unwrap();
         assert!(map.lookup(&key).unwrap().is_none());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_create_commit_failure_rolls_back_before_waiters_run() {
+        let tmp = TempDir::new().unwrap();
+        let engine = Arc::new(open(tmp.path()));
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (0, 'before')")
+            .unwrap();
+        let table_oid = engine.describe_table("t").unwrap().oid;
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                BEFORE_AUTO_COMMIT_HOOK.with(|hook| hook.set(None));
+                WRITER_READY.store(false, Ordering::SeqCst);
+                CREATE_LOCKED.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetHook;
+
+        let creator_engine = Arc::clone(&engine);
+        let creator = std::thread::spawn(move || {
+            let _hook = CommitFailGuard::arm();
+            BEFORE_AUTO_COMMIT_HOOK.with(|hook| hook.set(Some(wait_for_writer_ready)));
+            creator_engine.exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !CREATE_LOCKED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "inverted CREATE INDEX never reached its pre-commit hook"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let writer_engine = Arc::clone(&engine);
+        let writer = std::thread::spawn(move || {
+            writer_engine.exec(None, "INSERT INTO t VALUES (1, 'after')")
+        });
+        let mut waiter_queued = false;
+        while !waiter_queued {
+            assert!(
+                Instant::now() < deadline,
+                "writer never queued behind the index build lock"
+            );
+            if writer.is_finished() {
+                let result = writer.join().unwrap();
+                panic!("writer finished before queuing behind the index build lock: {result:?}");
+            }
+            if engine.table_lock_state(table_oid).is_some_and(|state| {
+                state
+                    .waiters
+                    .iter()
+                    .any(|(_, mode)| *mode == LockMode::RowExclusive)
+            }) {
+                waiter_queued = true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(waiter_queued, "writer never queued behind AccessExclusive");
+        WRITER_READY.store(true, Ordering::SeqCst);
+        let create_result = creator.join().unwrap();
+        let write_result = writer.join().unwrap();
+        assert!(create_result.is_err());
+        assert!(write_result.is_ok(), "{write_result:?}");
+        assert!(engine.indexes().is_empty());
+        assert!(engine.inverted_handles.lock().is_empty());
+        assert!(engine.pending_inverted.lock().is_empty());
+
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let result = engine
+            .exec(
+                None,
+                "SELECT id FROM t WHERE content @@ 'after' ORDER BY id",
+            )
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.len() == 1));
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::IndexLookup
+        );
         engine.shutdown();
     }
 
@@ -8049,7 +8746,7 @@ mod tests {
     }
 
     #[test]
-    fn stage0_config_and_inverted_catalog_survive_reopen() {
+    fn inverted_backfill_and_catalog_survive_reopen() {
         let tmp = TempDir::new().unwrap();
         assert!(!EngineConfig::new(tmp.path()).allow_stale_inverted);
         let engine = open(tmp.path());
@@ -8059,24 +8756,243 @@ mod tests {
             .access_methods()
             .iter()
             .any(|am| am.oid == INVERTED_AM_OID && am.name == "inverted"));
-        let error = engine
+        engine
+            .exec(None, "CREATE TABLE agent_memory (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "INSERT INTO agent_memory VALUES (1, 'rust contract'), (2, 'other document')",
+            )
+            .unwrap();
+        engine
+            .insert(
+                "agent_memory",
+                &[
+                    Some(Datum::Int4(9)),
+                    Some(Datum::Text(format!("{} toasted", "x".repeat(9000)))),
+                ],
+            )
+            .unwrap();
+        engine
             .exec(
                 None,
                 "CREATE INDEX content_idx ON agent_memory USING inverted (content) WITH (fulltext_index='bm25')",
             )
-            .unwrap_err();
-        assert!(matches!(error, EngineError::Unsupported(_)));
+            .unwrap();
+        let result = engine
+            .exec(
+                None,
+                "SELECT id FROM agent_memory WHERE content @@ 'contract'",
+            )
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected full-text rows")
+        };
+        assert_eq!(rows, vec![vec![Some(Datum::Int4(1))]]);
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::IndexLookup
+        );
+        let result = engine
+            .exec(
+                None,
+                "SELECT id, bm25_score(content, 'contract') AS score FROM agent_memory WHERE content @@ 'contract' ORDER BY bm25_score(content, 'contract') DESC",
+            )
+            .unwrap();
+        let QueryResult::Rows { columns, rows } = result else {
+            panic!("expected BM25 projection")
+        };
+        assert_eq!(columns, vec!["id", "score"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Some(Datum::Int4(1)));
+        assert!(matches!(rows[0][1], Some(Datum::Float8(score)) if score > 0.0));
+
+        let result = engine
+            .exec(
+                None,
+                "SELECT id, bm25_score(content, 'contract') AS score FROM agent_memory WHERE content @@ 'contract' AND id > 0 ORDER BY bm25_score(content, 'contract') DESC",
+            )
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected exact ExtraWhere BM25 projection")
+        };
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0][1], Some(Datum::Float8(score)) if score > 0.0));
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::SeqScan
+        );
+        let explain = engine
+            .exec(
+                None,
+                "EXPLAIN SELECT id FROM agent_memory WHERE content @@ 'contract'",
+            )
+            .unwrap();
+        assert!(matches!(
+            explain,
+            QueryResult::Rows { rows, .. }
+                if matches!(&rows[0][0], Some(Datum::Text(plan)) if plan.contains("InvertedScan"))
+        ));
+        let query_ids = |engine: &Engine, sql: &str| {
+            let result = engine.exec(None, sql).unwrap();
+            let QueryResult::Rows { rows, .. } = result else {
+                panic!("expected ID rows")
+            };
+            rows.into_iter()
+                .map(|row| match &row[0] {
+                    Some(Datum::Int4(id)) => i64::from(*id),
+                    other => panic!("unexpected ID value {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            query_ids(
+                &engine,
+                "SELECT id FROM agent_memory WHERE content @@ 'toasted'"
+            ),
+            vec![9]
+        );
+        engine
+            .insert(
+                "agent_memory",
+                &[
+                    Some(Datum::Int4(10)),
+                    Some(Datum::Text(format!("{} aftertoast", "y".repeat(9000)))),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            query_ids(
+                &engine,
+                "SELECT id FROM agent_memory WHERE content @@ 'aftertoast'"
+            ),
+            vec![10]
+        );
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::IndexLookup
+        );
+        engine
+            .exec(
+                None,
+                "INSERT INTO agent_memory VALUES (3, 'fresh contract')",
+            )
+            .unwrap();
+        assert_eq!(
+            query_ids(
+                &engine,
+                "SELECT id FROM agent_memory WHERE content @@ 'contract' ORDER BY id"
+            ),
+            vec![1, 3]
+        );
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::IndexLookup
+        );
+        engine
+            .exec(
+                None,
+                "UPDATE agent_memory SET content = 'changed text' WHERE id = 3",
+            )
+            .unwrap();
+        assert_eq!(
+            query_ids(
+                &engine,
+                "SELECT id FROM agent_memory WHERE content @@ 'contract'"
+            ),
+            vec![1]
+        );
+        assert_eq!(
+            query_ids(
+                &engine,
+                "SELECT id FROM agent_memory WHERE content @@ 'changed'"
+            ),
+            vec![3]
+        );
+        engine
+            .exec(None, "DELETE FROM agent_memory WHERE id = 3")
+            .unwrap();
+        assert_eq!(
+            query_ids(
+                &engine,
+                "SELECT id FROM agent_memory WHERE content @@ 'changed'"
+            ),
+            Vec::<i64>::new()
+        );
+        let txn = engine.begin_txn().unwrap();
+        engine
+            .exec(
+                Some(&txn),
+                "INSERT INTO agent_memory VALUES (11, 'own contract')",
+            )
+            .unwrap();
+        let own = engine
+            .exec(
+                Some(&txn),
+                "SELECT id FROM agent_memory WHERE content @@ 'own'",
+            )
+            .unwrap();
+        assert!(matches!(own, QueryResult::Rows { rows, .. } if rows.len() == 1));
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::SeqScan
+        );
+        txn.commit().unwrap();
+        assert_eq!(
+            query_ids(
+                &engine,
+                "SELECT id FROM agent_memory WHERE content @@ 'own'"
+            ),
+            vec![11]
+        );
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::IndexLookup
+        );
+        engine
+            .exec(None, "DELETE FROM agent_memory WHERE id = 11")
+            .unwrap();
+
+        let txn = engine.begin_txn().unwrap();
+        engine
+            .exec(
+                Some(&txn),
+                "INSERT INTO agent_memory VALUES (4, 'aborted contract')",
+            )
+            .unwrap();
+        txn.abort().unwrap();
+        assert_eq!(
+            query_ids(
+                &engine,
+                "SELECT id FROM agent_memory WHERE content @@ 'aborted'"
+            ),
+            Vec::<i64>::new()
+        );
         engine.shutdown();
 
         let mut config = EngineConfig::new(tmp.path());
         config.allow_stale_inverted = true;
         let engine = Engine::open(tmp.path(), config).unwrap();
         assert!(engine.allow_stale_inverted());
-        assert!(engine
-            .catalog
-            .access_methods()
-            .iter()
-            .any(|am| am.oid == INVERTED_AM_OID));
+        let indexes = engine.indexes();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].kind, AmKind::Inverted);
+        assert_eq!(
+            indexes[0].inverted.as_ref().unwrap().analyzer,
+            pg_am_inverted::AnalyzerConfig::builtin()
+        );
+        assert_eq!(
+            query_ids(
+                &engine,
+                "SELECT id FROM agent_memory WHERE content @@ 'contract'"
+            ),
+            vec![1]
+        );
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::IndexLookup
+        );
         engine.shutdown();
     }
 
@@ -8175,7 +9091,8 @@ mod tests {
         assert_eq!(request.indexes[0].index_oid, index_oid);
         let metadata = request.indexes[0].inverted.as_ref().unwrap();
         assert_eq!(metadata.analyzer, pg_am_inverted::AnalyzerConfig::builtin());
-        assert_eq!(metadata.watermark.consumed_lsn, Lsn(128));
+        assert_eq!(metadata.watermark.consumed_lsn, request.snapshot_frontier);
+        assert!(metadata.watermark.consumed_lsn >= Lsn(128));
         assert_eq!(metadata.watermark.durable_applied_lsn, Lsn(128));
         engine.shutdown();
     }
@@ -8340,14 +9257,20 @@ mod tests {
         assert!(engine
             .exec(None, "SELECT * FROM agent_memory WHERE id @@ 'contract'")
             .is_err());
-        let error = engine
+        engine
+            .exec(
+                None,
+                "INSERT INTO agent_memory VALUES (1, 'rust contract'), (2, 'other document')",
+            )
+            .unwrap();
+        let result = engine
             .exec_with_params(
                 None,
                 "SELECT * FROM agent_memory WHERE content @@ $1",
                 &[Some(Datum::Text("contract".to_string()))],
             )
-            .unwrap_err();
-        assert!(matches!(error, EngineError::Unsupported(_)));
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.len() == 1));
 
         let stmt =
             sql::parse("SELECT * FROM agent_memory WHERE content @@ $1 AND id > $2").unwrap();
@@ -8355,17 +9278,21 @@ mod tests {
             engine.parameter_types(&stmt).unwrap(),
             vec![Some(ColumnType::Text), Some(ColumnType::Int4)]
         );
-        let error = engine
+        let result = engine
             .exec_with_params(
                 None,
                 "SELECT * FROM agent_memory WHERE content @@ $1 AND id > $2",
                 &[
                     Some(Datum::Text("contract".to_string())),
-                    Some(Datum::Int4(5)),
+                    Some(Datum::Int4(0)),
                 ],
             )
-            .unwrap_err();
-        assert!(matches!(error, EngineError::Unsupported(_)));
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.len() == 1));
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::SeqScan
+        );
         engine.shutdown();
     }
 

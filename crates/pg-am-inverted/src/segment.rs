@@ -1,15 +1,16 @@
 //! Segment manifest and store contracts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use pg_storage::segment::SegmentId;
-use pg_storage::types::{Lsn, Oid};
+use pg_storage::segment::{SegmentId, SegmentState};
+use pg_storage::types::{Lsn, Oid, Tid};
 use serde::{Deserialize, Serialize};
 
-use crate::analyzer::AnalyzerConfig;
+use crate::analyzer::{AnalyzerConfig, DefaultAnalyzer};
+use crate::daat::{InMemoryIndex, InMemoryStats, Query, ScoredTid};
 use crate::error::{InvertedError, Result};
-use crate::posting::SegmentMeta;
+use crate::posting::{DocLength, Posting, SegmentMeta};
 use crate::tier2::Watermark;
 
 /// The only legal read set for a generation of an inverted index.
@@ -35,30 +36,144 @@ impl SegmentManifest {
     }
 }
 
-/// Segment storage contract. Stage 0 freezes the format and recovery path;
-/// query execution remains unimplemented.
-#[derive(Debug)]
+/// Segment storage with durable metadata, postings, and an in-memory DAAT view.
 pub struct SegmentStore {
     manifest: SegmentManifest,
+    index_oid: Oid,
     analyzer: AnalyzerConfig,
     watermark: Watermark,
+    index: InMemoryIndex<DefaultAnalyzer>,
+    /// Whether every active segment already has its idempotent seal record.
+    wal_sealed: bool,
+}
+
+impl std::fmt::Debug for SegmentStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SegmentStore")
+            .field("manifest", &self.manifest)
+            .field("index_oid", &self.index_oid)
+            .field("analyzer", &self.analyzer)
+            .field("watermark", &self.watermark)
+            .finish()
+    }
 }
 
 impl SegmentStore {
     /// Create an empty in-memory store and its initial manifest.
-    pub fn new(_index_oid: Oid) -> Self {
+    pub fn new(index_oid: Oid) -> Self {
+        Self::empty_with_analyzer(index_oid, AnalyzerConfig::builtin())
+    }
+
+    fn empty_with_analyzer(index_oid: Oid, analyzer: AnalyzerConfig) -> Self {
         Self {
             manifest: SegmentManifest {
                 generation: 1,
                 active_segment_ids: Vec::new(),
                 applied_lsn: Lsn::INVALID,
             },
-            analyzer: AnalyzerConfig::builtin(),
+            index_oid,
+            analyzer: analyzer.clone(),
             watermark: Watermark {
                 consumed_lsn: Lsn::INVALID,
                 durable_applied_lsn: Lsn::INVALID,
             },
+            index: InMemoryIndex::new(DefaultAnalyzer::from_config(analyzer)),
+            wal_sealed: true,
         }
+    }
+
+    /// Build and durably publish an initial segment. Empty input publishes an
+    /// empty manifest without inventing an empty on-disk segment.
+    pub fn create(
+        data_dir: &Path,
+        index_oid: Oid,
+        analyzer: AnalyzerConfig,
+        documents: Vec<(Tid, String)>,
+        base_lsn: Lsn,
+    ) -> Result<Self> {
+        analyzer.validate()?;
+        let mut index = InMemoryIndex::new(DefaultAnalyzer::from_config(analyzer.clone()));
+        for (tid, text) in documents {
+            index.insert_document(tid, &text)?;
+        }
+        let stats = index.stats();
+        let active_segment_ids = if stats.doc_count == 0 {
+            Vec::new()
+        } else {
+            vec![SegmentId(1)]
+        };
+        let store = Self {
+            manifest: SegmentManifest {
+                generation: 1,
+                active_segment_ids,
+                applied_lsn: base_lsn,
+            },
+            index_oid,
+            analyzer: analyzer.clone(),
+            watermark: Watermark {
+                consumed_lsn: base_lsn,
+                durable_applied_lsn: base_lsn,
+            },
+            index,
+            wal_sealed: false,
+        };
+        store.persist(data_dir, base_lsn)?;
+        Ok(store)
+    }
+
+    fn persist(&self, data_dir: &Path, base_lsn: Lsn) -> Result<()> {
+        let stats = self.index.stats();
+        if stats.doc_count > 0 {
+            let segment_id = SegmentId(1);
+            let postings_bytes = crate::recovery::encode(self.index.postings())?;
+            let doc_lengths = self
+                .index
+                .doc_lengths()
+                .iter()
+                .map(|(tid, token_count)| DocLength {
+                    tid: *tid,
+                    token_count: *token_count,
+                })
+                .collect::<Vec<_>>();
+            let doc_length_bytes = crate::recovery::encode(&doc_lengths)?;
+            write_atomic(
+                &Self::postings_path(data_dir, self.index_oid, segment_id),
+                &postings_bytes,
+            )?;
+            write_atomic(
+                &Self::doc_lengths_path(data_dir, self.index_oid, segment_id),
+                &doc_length_bytes,
+            )?;
+            let metadata = SegmentMeta {
+                format_version: crate::posting::SEGMENT_FORMAT_VERSION,
+                index_oid: self.index_oid,
+                segment_id,
+                analyzer: self.analyzer.clone(),
+                state: SegmentState::Sealed,
+                doc_count: stats.doc_count,
+                total_tokens: stats.total_tokens,
+                term_df: self
+                    .index
+                    .postings()
+                    .iter()
+                    .map(|(term, docs)| (term.clone(), docs.len() as u64))
+                    .collect(),
+                created_from_lsn: base_lsn,
+                applied_lsn: base_lsn,
+                row_count: stats.row_count,
+                posting_count: stats.posting_count,
+                byte_count: (postings_bytes.len() + doc_length_bytes.len()) as u64,
+            };
+            write_atomic(
+                &Self::segment_metadata_path(data_dir, self.index_oid, segment_id),
+                &metadata.encode()?,
+            )?;
+        }
+        write_atomic(
+            &Self::manifest_path(data_dir, self.index_oid),
+            &self.manifest.encode()?,
+        )
     }
 
     /// Location of the generation manifest for one inverted index.
@@ -82,11 +197,27 @@ impl SegmentStore {
             .join(format!("{}.meta", segment_id.0))
     }
 
-    /// Recover the manifest and every active segment's metadata. An empty
-    /// manifest is valid only at `Lsn::INVALID`. Otherwise the manifest
-    /// watermark must equal the maximum active segment coverage. The analyzer
-    /// must match the caller's configured instance exactly; watermark replay
-    /// starts at the durable manifest position, not a fabricated zero value.
+    /// Location of the `(term, document)` posting map for one segment.
+    pub fn postings_path(data_dir: &Path, index_oid: Oid, segment_id: SegmentId) -> PathBuf {
+        data_dir
+            .join("inverted")
+            .join(index_oid.0.to_string())
+            .join("segments")
+            .join(format!("{}.postings", segment_id.0))
+    }
+
+    /// Location of the per-document token-length table for one segment.
+    pub fn doc_lengths_path(data_dir: &Path, index_oid: Oid, segment_id: SegmentId) -> PathBuf {
+        data_dir
+            .join("inverted")
+            .join(index_oid.0.to_string())
+            .join("segments")
+            .join(format!("{}.doc_lengths", segment_id.0))
+    }
+
+    /// Recover the manifest and every active segment's metadata and payload.
+    /// An empty manifest is valid only at `Lsn::INVALID`. Otherwise the
+    /// manifest watermark must equal the maximum active segment coverage.
     pub fn open(
         data_dir: &Path,
         index_oid: Oid,
@@ -101,19 +232,15 @@ impl SegmentStore {
             ));
         }
         if manifest.active_segment_ids.is_empty() {
-            if manifest.applied_lsn != Lsn::INVALID {
-                return Err(InvertedError::Corrupted(
-                    "empty manifest carries a nonzero watermark".to_string(),
-                ));
-            }
-            return Ok(Self {
-                manifest,
-                analyzer: expected_analyzer.clone(),
-                watermark: Watermark {
-                    consumed_lsn: Lsn::INVALID,
-                    durable_applied_lsn: Lsn::INVALID,
-                },
-            });
+            // An empty backfill still has a real WAL base frontier. Preserve
+            // it so the first post-create DML is consumed rather than skipped.
+            let mut store = Self::empty_with_analyzer(index_oid, expected_analyzer.clone());
+            store.watermark = Watermark {
+                consumed_lsn: manifest.applied_lsn,
+                durable_applied_lsn: manifest.applied_lsn,
+            };
+            store.manifest = manifest;
+            return Ok(store);
         }
         let unique_ids = manifest.active_segment_ids.iter().collect::<BTreeSet<_>>();
         if unique_ids.len() != manifest.active_segment_ids.len() {
@@ -124,6 +251,8 @@ impl SegmentStore {
 
         let mut analyzer: Option<AnalyzerConfig> = None;
         let mut max_applied_lsn = Lsn::INVALID;
+        let mut postings = BTreeMap::new();
+        let mut doc_lengths = BTreeMap::new();
         for segment_id in &manifest.active_segment_ids {
             let path = Self::segment_metadata_path(data_dir, index_oid, *segment_id);
             let meta = SegmentMeta::decode(&read_bytes(&path)?)?;
@@ -139,11 +268,7 @@ impl SegmentStore {
                     meta.segment_id.0, segment_id.0
                 )));
             }
-            if matches!(
-                meta.state,
-                pg_storage::segment::SegmentState::Merging
-                    | pg_storage::segment::SegmentState::Retired
-            ) {
+            if matches!(meta.state, SegmentState::Merging | SegmentState::Retired) {
                 return Err(InvertedError::Corrupted(format!(
                     "segment {} is not readable in the active manifest",
                     segment_id.0
@@ -172,6 +297,20 @@ impl SegmentStore {
             } else {
                 analyzer = Some(meta.analyzer.clone());
             }
+
+            let segment_postings: BTreeMap<_, _> = crate::recovery::decode(&read_bytes(
+                &Self::postings_path(data_dir, index_oid, *segment_id),
+            )?)?;
+            let segment_doc_lengths: Vec<DocLength> = crate::recovery::decode(&read_bytes(
+                &Self::doc_lengths_path(data_dir, index_oid, *segment_id),
+            )?)?;
+            let segment_doc_lengths = segment_doc_lengths
+                .into_iter()
+                .map(|doc| (doc.tid, doc.token_count))
+                .collect::<BTreeMap<_, _>>();
+            validate_segment_payload(&meta, &segment_postings, &segment_doc_lengths)?;
+            postings.extend(segment_postings);
+            doc_lengths.extend(segment_doc_lengths);
             max_applied_lsn = max_applied_lsn.max(meta.applied_lsn);
         }
         if max_applied_lsn != manifest.applied_lsn {
@@ -192,14 +331,32 @@ impl SegmentStore {
                 analyzer.config_hash
             )));
         }
+        let stats = InMemoryStats {
+            doc_count: doc_lengths.len() as u64,
+            total_tokens: doc_lengths.values().sum(),
+            row_count: doc_lengths.len() as u64,
+            posting_count: postings
+                .values()
+                .map(|documents| documents.len() as u64)
+                .sum(),
+        };
+        let index = InMemoryIndex::from_parts(
+            DefaultAnalyzer::from_config(analyzer.clone()),
+            postings,
+            doc_lengths,
+            stats,
+        );
         let watermark = Watermark {
             consumed_lsn: manifest.applied_lsn,
             durable_applied_lsn: manifest.applied_lsn,
         };
         Ok(Self {
             manifest,
+            index_oid,
             analyzer,
             watermark,
+            index,
+            wal_sealed: true,
         })
     }
 
@@ -230,24 +387,130 @@ impl SegmentStore {
         Ok(())
     }
 
-    /// Stage 0 does not execute a query yet.
-    pub fn search(&self) -> Result<()> {
-        Err(InvertedError::Unsupported(
-            "inverted search is not implemented in Stage 0",
-        ))
+    /// Execute the recovered in-memory DAAT index with exact BM25.
+    pub fn search(&self, query: &Query, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
+        self.index.search(query, limit)
     }
 
-    /// Sealing is defined by the next stage, not simulated by Stage 0.
-    pub fn seal(&self) -> Result<()> {
-        Err(InvertedError::Unsupported(
-            "segment sealing is not implemented in Stage 0",
-        ))
+    /// Analyze query text with the segment's own analyzer and execute DAAT.
+    pub fn search_text(&self, text: &str, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
+        let query = crate::daat::parse_query(self.index.analyzer(), text);
+        self.search(&query, limit)
+    }
+
+    /// Insert one committed document into the in-process write view.
+    pub fn insert_document(&mut self, tid: Tid, text: &str) -> Result<()> {
+        self.index.insert_document(tid, text)
+    }
+
+    /// Delete one committed document from the in-process write view.
+    pub fn delete_document(&mut self, tid: Tid) -> Result<bool> {
+        self.index.delete_document(tid)
+    }
+
+    /// Advance the in-process consumed frontier monotonically. Durable segment
+    /// metadata is deliberately unchanged until a later sealing stage.
+    pub fn advance_consumed(&mut self, lsn: Lsn) {
+        self.watermark.consumed_lsn = self.watermark.consumed_lsn.max(lsn);
+    }
+
+    /// Emit `SegmentSeal=110` for every active segment, at most once for this
+    /// store instance. The durable segment files and manifest already describe
+    /// a sealed initial backfill, so redo only validates this marker.
+    pub fn seal(
+        &mut self,
+        wal: &pg_storage::wal::WalWriter,
+        xid: pg_storage::types::TxnId,
+    ) -> Result<()> {
+        if self.wal_sealed {
+            return Ok(());
+        }
+        for segment_id in self.manifest.active_segment_ids.iter().copied() {
+            let payload = bincode::serde::encode_to_vec(
+                segment_id,
+                pg_storage::wal::record::bincode_config(),
+            )
+            .map_err(|error| InvertedError::Storage(error.to_string()))?;
+            wal.append(pg_storage::wal::record::WalRecord {
+                lsn: Lsn::INVALID,
+                prev_lsn: Lsn::INVALID,
+                txn_id: xid,
+                record_type: pg_storage::wal::record::WalRecordType::SegmentSeal,
+                flags: 0,
+                payload,
+            })
+            .map_err(|error| InvertedError::Storage(error.to_string()))?;
+        }
+        self.wal_sealed = true;
+        Ok(())
+    }
+}
+
+/// Redo handler for the initial-segment seal marker. File publication happens
+/// before this record is appended, so applying it again is intentionally a
+/// no-op after strict payload validation.
+#[derive(Debug)]
+pub struct SegmentSealRedoHandler;
+
+impl pg_storage::recovery::RedoHandler for SegmentSealRedoHandler {
+    fn kind(&self) -> pg_storage::wal::record::WalRecordType {
+        pg_storage::wal::record::WalRecordType::SegmentSeal
+    }
+
+    fn apply(
+        &self,
+        record: &pg_storage::wal::record::WalRecord,
+        _ctx: &mut pg_storage::recovery::RedoContext<'_>,
+    ) -> pg_storage::error::Result<()> {
+        let (segment_id, consumed) = bincode::serde::decode_from_slice::<SegmentId, _>(
+            &record.payload,
+            pg_storage::wal::record::bincode_config(),
+        )
+        .map_err(|error| pg_storage::error::StorageError::Serialize(error.to_string()))?;
+        if consumed != record.payload.len() || segment_id.0 == 0 {
+            return Err(pg_storage::error::StorageError::MetadataCorrupted(
+                "malformed SegmentSeal payload".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
 fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path)
         .map_err(|error| InvertedError::Storage(format!("cannot read {}: {error}", path.display())))
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        InvertedError::InvalidArgument(format!("{} has no parent directory", path.display()))
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        InvertedError::Storage(format!("cannot create {}: {error}", parent.display()))
+    })?;
+    let temporary = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&temporary).map_err(|error| {
+        InvertedError::Storage(format!("cannot create {}: {error}", temporary.display()))
+    })?;
+    std::io::Write::write_all(&mut file, bytes).map_err(|error| {
+        InvertedError::Storage(format!("cannot write {}: {error}", temporary.display()))
+    })?;
+    file.sync_all().map_err(|error| {
+        InvertedError::Storage(format!("cannot fsync {}: {error}", temporary.display()))
+    })?;
+    std::fs::rename(&temporary, path).map_err(|error| {
+        InvertedError::Storage(format!(
+            "cannot rename {} to {}: {error}",
+            temporary.display(),
+            path.display()
+        ))
+    })?;
+    let directory = std::fs::File::open(parent).map_err(|error| {
+        InvertedError::Storage(format!("cannot open {}: {error}", parent.display()))
+    })?;
+    directory.sync_all().map_err(|error| {
+        InvertedError::Storage(format!("cannot fsync {}: {error}", parent.display()))
+    })
 }
 
 fn validate_segment_stats(meta: &SegmentMeta) -> Result<()> {
@@ -280,6 +543,54 @@ fn validate_segment_stats(meta: &SegmentMeta) -> Result<()> {
         return Err(InvertedError::Corrupted(
             "segment term_df exceeds doc_count".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_segment_payload(
+    meta: &SegmentMeta,
+    postings: &BTreeMap<String, BTreeMap<Tid, Posting>>,
+    doc_lengths: &BTreeMap<Tid, u64>,
+) -> Result<()> {
+    if doc_lengths.len() as u64 != meta.doc_count {
+        return Err(InvertedError::Corrupted(
+            "segment doc_count does not match doc-length rows".to_string(),
+        ));
+    }
+    let total_tokens = doc_lengths.values().sum::<u64>();
+    if total_tokens != meta.total_tokens {
+        return Err(InvertedError::Corrupted(
+            "segment total_tokens does not match doc lengths".to_string(),
+        ));
+    }
+    let posting_count = postings
+        .values()
+        .map(|documents| documents.len() as u64)
+        .sum::<u64>();
+    if posting_count != meta.posting_count {
+        return Err(InvertedError::Corrupted(
+            "segment posting_count does not match posting rows".to_string(),
+        ));
+    }
+    let term_df = postings
+        .iter()
+        .map(|(term, documents)| (term.clone(), documents.len() as u64))
+        .collect::<BTreeMap<_, _>>();
+    if term_df != meta.term_df {
+        return Err(InvertedError::Corrupted(
+            "segment term_df does not match postings".to_string(),
+        ));
+    }
+    for documents in postings.values() {
+        for posting in documents.values() {
+            if !doc_lengths.contains_key(&posting.tid) {
+                return Err(InvertedError::Corrupted(format!(
+                    "posting for {:?} has no document length",
+                    posting.tid
+                )));
+            }
+            posting.validate()?;
+        }
     }
     Ok(())
 }

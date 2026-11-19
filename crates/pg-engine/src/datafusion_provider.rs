@@ -379,10 +379,11 @@ impl PgExecutionPlan {
             ..
         } = self;
         let first = filters.first().cloned();
-        let mut rows =
-            crate::executor::execute(&engine, &snapshot, &table, &entry, &first, &None, &None)
-                .map_err(df_error)?
-                .rows;
+        let mut rows = crate::executor::execute(
+            &engine, &snapshot, &table, &entry, &first, &None, &None, &None,
+        )
+        .map_err(df_error)?
+        .rows;
         for filter in filters.iter().skip(1) {
             let predicate = filter_to_predicate(&entry, filter).map_err(df_error)?;
             let index = predicate.col_index();

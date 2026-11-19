@@ -9,10 +9,13 @@ use pg_am_heap::tuple::{ColumnType, Datum};
 use pg_storage::types::Tid;
 use pg_txn::Snapshot;
 
-use crate::engine::{column_types, filter_to_predicate, Engine, TableEntry, Value};
+use crate::engine::{
+    column_types, filter_to_predicate, filter_to_predicate_with_analyzer, Engine, TableEntry, Value,
+};
 use crate::error::{EngineError, Result};
 use crate::planner::{
-    plan_for_predicate, AmKind, HnswScanSpec, IndexMetadata, ScanPlan, ScanRequest, ScanSpec,
+    plan_for_predicate, AmKind, HnswScanSpec, IndexMetadata, InvertedScanSpec, ScanPlan,
+    ScanRequest, ScanSpec,
 };
 use crate::sql::{CmpOp, DistanceOp, Expr, Filter, Literal, OrderByExpr, OrderByKind};
 
@@ -35,12 +38,14 @@ pub(crate) struct ScanOutput {
 }
 
 /// Plan and execute one ordinary SELECT scan against the caller's snapshot.
+#[allow(clippy::too_many_arguments)] // mirrors the parsed Select AST fields
 pub(crate) fn execute(
     engine: &Engine,
     snap: &Snapshot,
     table: &str,
     entry: &TableEntry,
     filter: &Option<Filter>,
+    extra_filter: &Option<Filter>,
     order_by: &Option<OrderByKind>,
     limit: &Option<usize>,
 ) -> Result<ScanOutput> {
@@ -49,10 +54,11 @@ pub(crate) fn execute(
         // scan, regardless of whether the planner selects ANN or a fallback.
         prepare_distance(entry, expr)?;
     }
-    let request = build_request(engine, table, entry, filter, order_by, limit)?;
+    let request =
+        build_request_with_extra(engine, table, entry, filter, extra_filter, order_by, limit)?;
     let mut plan = plan_for_predicate(&request)?;
     let mut fallback_reason = None;
-    let rows = match &plan.spec {
+    let rows = match &mut plan.spec {
         ScanSpec::BTree(spec) if snapshot_allows_btree(engine, snap) => {
             let btree_filter = spec
                 .predicate
@@ -72,26 +78,37 @@ pub(crate) fn execute(
                 // second, unrelated snapshot recheck or a different reason.
                 None => {
                     fallback_reason = Some(crate::planner::SeqScanReason::KeyTooLarge);
-                    execute_seq(engine, snap, table, entry, filter)?
+                    execute_seq_with_extra(engine, snap, table, entry, filter, extra_filter)?
                 }
             }
         }
         ScanSpec::BTree(_) => {
             fallback_reason = Some(crate::planner::SeqScanReason::SnapshotFallback);
-            execute_seq(engine, snap, table, entry, filter)?
+            execute_seq_with_extra(engine, snap, table, entry, filter, extra_filter)?
         }
-        ScanSpec::Seq(spec) => execute_seq(engine, snap, table, entry, &spec.predicate)?,
+        ScanSpec::Seq(spec) => execute_seq_with_extra(
+            engine,
+            snap,
+            table,
+            entry,
+            &spec.predicate,
+            &spec.extra_predicate,
+        )?,
         ScanSpec::Hnsw(spec) => execute_hnsw(engine, snap, table, entry, spec)?,
-        ScanSpec::Inverted(_) => {
-            return Err(EngineError::Unsupported(
-                "inverted execution is not implemented in Stage 0".to_string(),
-            ))
+        ScanSpec::Inverted(spec) if !engine.inverted_snapshot_allows(spec.index_oid, snap) => {
+            fallback_reason = Some(crate::planner::SeqScanReason::SnapshotFallback);
+            execute_seq_with_extra(engine, snap, table, entry, filter, extra_filter)?
+        }
+        ScanSpec::Inverted(spec) => {
+            let (rows, candidate_count) = execute_inverted(engine, snap, entry, spec)?;
+            spec.candidate_count = candidate_count;
+            rows
         }
     };
     if let Some(reason) = fallback_reason {
         plan.spec = ScanSpec::Seq(crate::planner::SeqScanSpec {
             predicate: filter.clone(),
-            extra_predicate: None,
+            extra_predicate: extra_filter.clone(),
             order_by: order_by.clone(),
             limit: *limit,
             est_rows: 0,
@@ -100,6 +117,145 @@ pub(crate) fn execute(
         });
     }
     Ok(ScanOutput { rows, plan })
+}
+
+fn execute_inverted(
+    engine: &Engine,
+    snap: &Snapshot,
+    entry: &TableEntry,
+    spec: &InvertedScanSpec,
+) -> Result<(ScanRows, u64)> {
+    let Literal::Str(query) = &spec.query else {
+        return Err(EngineError::InvalidArgument(
+            "full-text query must be a bound text literal".to_string(),
+        ));
+    };
+    let filter = Filter {
+        column: spec.column.clone(),
+        op: CmpOp::FullText,
+        value: spec.query.clone(),
+    };
+    let predicate = filter_to_predicate_with_analyzer(entry, &filter, &spec.analyzer_config)?;
+    let handle = engine.inverted_handle(spec.index_oid)?;
+    let hits = handle
+        .lock()
+        .search_text(query, None)
+        .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+    let candidate_count = hits.len() as u64;
+    let col_types = column_types(entry);
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    for hit in hits {
+        let Some(visible_tid) = engine.heap_tuple_visible(snap, hit.tid)? else {
+            continue;
+        };
+        if !seen.insert(visible_tid) {
+            continue;
+        }
+        let values = engine.read_row_by_tid(snap, entry, &col_types, visible_tid)?;
+        // Visibility alone is insufficient for stale candidates and recycled
+        // slots: the visible document must still satisfy the analyzed query.
+        if predicate.matches(&values[predicate.col_index()]) {
+            rows.push((visible_tid, values));
+        }
+    }
+    Ok((rows, candidate_count))
+}
+
+/// Validate a BM25 expression before any index or heap work.
+pub(crate) fn validate_bm25(entry: &TableEntry, expr: &crate::sql::Bm25ScoreExpr) -> Result<()> {
+    bm25_query(entry, expr).map(|_| ())
+}
+
+fn bm25_query(entry: &TableEntry, expr: &crate::sql::Bm25ScoreExpr) -> Result<String> {
+    let column = entry
+        .columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(&expr.column))
+        .ok_or_else(|| {
+            EngineError::InvalidPredicate(format!("no column {:?} in table", expr.column))
+        })?;
+    if column.col_type != ColumnType::Text {
+        return Err(EngineError::InvalidArgument(format!(
+            "bm25_score left operand {:?} is not a TEXT column",
+            expr.column
+        )));
+    }
+    match &expr.query {
+        Literal::Str(query) => Ok(query.clone()),
+        Literal::Param(index) => Err(EngineError::InvalidArgument(format!(
+            "unbound parameter ${index}; use Engine::exec_with_params"
+        ))),
+        _ => Err(EngineError::InvalidArgument(
+            "bm25_score query must be text or a typed text parameter".to_string(),
+        )),
+    }
+}
+
+/// Compute exact scores keyed by visible heap TID. A sequential fallback
+/// builds its statistics from the visible heap, never from inverted candidates.
+pub(crate) fn bm25_scores(
+    engine: &Engine,
+    snap: &Snapshot,
+    table: &str,
+    entry: &TableEntry,
+    expr: &crate::sql::Bm25ScoreExpr,
+    use_inverted: bool,
+) -> Result<std::collections::HashMap<Tid, f64>> {
+    let query = bm25_query(entry, expr)?;
+    let column = entry
+        .columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case(&expr.column))
+        .expect("validated BM25 column");
+    let mut scores = std::collections::HashMap::new();
+    if use_inverted {
+        let (index_entry, _) = engine
+            .indexes_of(entry)
+            .into_iter()
+            .find(|(index, _)| {
+                index.kind == AmKind::Inverted && index.column.eq_ignore_ascii_case(&expr.column)
+            })
+            .ok_or_else(|| {
+                EngineError::IndexNotFound(format!("inverted index on {:?}", expr.column))
+            })?;
+        let hits = engine
+            .inverted_handle(index_entry.index_oid)?
+            .lock()
+            .search_text(&query, None)
+            .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+        for hit in hits {
+            if let Some(visible_tid) = engine.heap_tuple_visible(snap, hit.tid)? {
+                scores.insert(visible_tid, hit.score);
+            }
+        }
+        return Ok(scores);
+    }
+
+    let analyzer = engine.inverted_analyzer_for(entry.oid, &expr.column);
+    let mut index =
+        pg_am_inverted::InMemoryIndex::new(pg_am_inverted::DefaultAnalyzer::from_config(analyzer));
+    let rows = engine.scan_inner(snap, table, None)?;
+    let mut visible_tids = std::collections::HashMap::new();
+    for (visible_tid, values) in rows {
+        let index_tid = engine.hot_chain_root(visible_tid)?;
+        visible_tids.insert(index_tid, visible_tid);
+        if let Some(Datum::Text(text)) = &values[column] {
+            index
+                .insert_document(index_tid, text)
+                .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+        }
+    }
+    let query = pg_am_inverted::parse_query(index.analyzer(), &query);
+    for hit in index
+        .search(&query, None)
+        .map_err(|error| EngineError::Corrupted(error.to_string()))?
+    {
+        if let Some(visible_tid) = visible_tids.get(&hit.tid) {
+            scores.insert(*visible_tid, hit.score);
+        }
+    }
+    Ok(scores)
 }
 
 fn execute_hnsw(
@@ -327,11 +483,24 @@ pub(crate) fn sort_by_distance(
         .collect())
 }
 
+#[cfg(test)]
 pub(crate) fn build_request(
     engine: &Engine,
     table: &str,
     entry: &TableEntry,
     filter: &Option<Filter>,
+    order_by: &Option<OrderByKind>,
+    limit: &Option<usize>,
+) -> Result<ScanRequest> {
+    build_request_with_extra(engine, table, entry, filter, &None, order_by, limit)
+}
+
+pub(crate) fn build_request_with_extra(
+    engine: &Engine,
+    table: &str,
+    entry: &TableEntry,
+    filter: &Option<Filter>,
+    extra_filter: &Option<Filter>,
     order_by: &Option<OrderByKind>,
     limit: &Option<usize>,
 ) -> Result<ScanRequest> {
@@ -346,6 +515,14 @@ pub(crate) fn build_request(
         }
         _ => None,
     };
+    let inverted_column = filter
+        .as_ref()
+        .filter(|filter| filter.op == CmpOp::FullText)
+        .map(|filter| filter.column.as_str())
+        .or(match order_by {
+            Some(OrderByKind::Bm25Score(expr)) => Some(expr.column.as_str()),
+            _ => None,
+        });
     let indexes = engine
         .indexes_of(entry)
         .into_iter()
@@ -366,10 +543,17 @@ pub(crate) fn build_request(
             } else {
                 (None, None)
             };
+            let inverted = if idx.kind == AmKind::Inverted
+                && inverted_column.is_some_and(|column| idx.column.eq_ignore_ascii_case(column))
+            {
+                Some(engine.refresh_inverted(&idx, entry)?)
+            } else {
+                idx.inverted
+            };
             Ok(IndexMetadata {
                 kind: idx.kind,
                 index_oid: idx.index_oid,
-                inverted: idx.inverted,
+                inverted,
                 column: idx.column,
                 opclass,
                 ef_search_default,
@@ -379,10 +563,11 @@ pub(crate) fn build_request(
     Ok(ScanRequest {
         table: table.to_string(),
         predicate: filter.clone(),
-        extra_predicate: None,
+        extra_predicate: extra_filter.clone(),
         order_by: order_by.clone(),
         limit: *limit,
         allow_stale_inverted: engine.allow_stale_inverted(),
+        snapshot_frontier: engine.storage().wal_writer().synced_lsn(),
         indexes,
     })
 }
@@ -403,11 +588,31 @@ fn execute_seq(
     entry: &TableEntry,
     filter: &Option<Filter>,
 ) -> Result<Vec<(Tid, Vec<Value>)>> {
+    execute_seq_with_extra(engine, snap, table, entry, filter, &None)
+}
+
+fn execute_seq_with_extra(
+    engine: &Engine,
+    snap: &Snapshot,
+    table: &str,
+    entry: &TableEntry,
+    filter: &Option<Filter>,
+    extra_filter: &Option<Filter>,
+) -> Result<Vec<(Tid, Vec<Value>)>> {
     let predicate = filter
         .as_ref()
-        .map(|filter| filter_to_predicate(entry, filter))
+        .map(|filter| {
+            let analyzer = engine.inverted_analyzer_for(entry.oid, &filter.column);
+            filter_to_predicate_with_analyzer(entry, filter, &analyzer)
+        })
         .transpose()?;
-    engine.scan_inner(snap, table, predicate.as_ref())
+    let mut rows = engine.scan_inner(snap, table, predicate.as_ref())?;
+    if let Some(filter) = extra_filter {
+        let analyzer = engine.inverted_analyzer_for(entry.oid, &filter.column);
+        let predicate = filter_to_predicate_with_analyzer(entry, filter, &analyzer)?;
+        rows.retain(|(_, values)| predicate.matches(&values[predicate.col_index()]));
+    }
+    Ok(rows)
 }
 
 /// Produce EXPLAIN output without executing the inner B+Tree/ANN plan.
@@ -421,6 +626,7 @@ pub(crate) fn explain(
     entry: &TableEntry,
     columns: &crate::sql::SelectCols,
     filter: &Option<Filter>,
+    extra_filter: &Option<Filter>,
     order_by: &Option<OrderByKind>,
     limit: &Option<usize>,
 ) -> Result<crate::QueryResult> {
@@ -434,7 +640,8 @@ pub(crate) fn explain(
         .as_ref()
         .map(|filter| filter_to_predicate(entry, filter))
         .transpose()?;
-    let request = build_request(engine, table, entry, filter, order_by, limit)?;
+    let request =
+        build_request_with_extra(engine, table, entry, filter, extra_filter, order_by, limit)?;
     let mut plan = plan_for_predicate(&request)?;
     let key_too_large = predicate.as_ref().is_some_and(|predicate| {
         matches!(
@@ -442,10 +649,13 @@ pub(crate) fn explain(
             Err(pg_am_btree::BTreeError::KeyTooLarge(_))
         )
     });
-    if matches!(&plan.spec, ScanSpec::BTree(_)) && !snapshot_allows_btree(engine, snap) {
+    if (matches!(&plan.spec, ScanSpec::BTree(_)) && !snapshot_allows_btree(engine, snap))
+        || matches!(&plan.spec, ScanSpec::Inverted(spec)
+            if !engine.inverted_snapshot_allows(spec.index_oid, snap))
+    {
         plan.spec = ScanSpec::Seq(crate::planner::SeqScanSpec {
             predicate: filter.clone(),
-            extra_predicate: None,
+            extra_predicate: extra_filter.clone(),
             order_by: order_by.clone(),
             limit: *limit,
             est_rows: 0,
@@ -455,7 +665,7 @@ pub(crate) fn explain(
     } else if key_too_large && matches!(&plan.spec, ScanSpec::BTree(_)) {
         plan.spec = ScanSpec::Seq(crate::planner::SeqScanSpec {
             predicate: filter.clone(),
-            extra_predicate: None,
+            extra_predicate: extra_filter.clone(),
             order_by: order_by.clone(),
             limit: *limit,
             est_rows: 0,
@@ -470,7 +680,8 @@ pub(crate) fn explain(
         first_page: entry.first_page,
         columns: &col_types,
     };
-    let est_rows = engine.scan_inner(snap, table, predicate.as_ref())?.len() as u64;
+    let est_rows =
+        execute_seq_with_extra(engine, snap, table, entry, filter, extra_filter)?.len() as u64;
     let est_pages = engine.heap().relation_pages(&rel)?.len() as u64;
     match &mut plan.spec {
         ScanSpec::BTree(spec) => {
@@ -522,7 +733,7 @@ fn execute_btree(
             .collect(),
         CmpOp::FullText => {
             return Err(EngineError::Unsupported(
-                "full-text execution is not implemented in Stage 0".to_string(),
+                "a full-text predicate cannot execute through a B+Tree".to_string(),
             ))
         }
     };
@@ -611,7 +822,7 @@ mod tests {
         let (snap, _guard) = engine
             .txn_manager()
             .snapshot(pg_storage::types::TxnId::INVALID);
-        execute(engine, &snap, "t", &entry, &filter, &None, &None).unwrap()
+        execute(engine, &snap, "t", &entry, &filter, &None, &None, &None).unwrap()
     }
 
     #[test]
@@ -666,7 +877,7 @@ mod tests {
 
     fn execute_snapshot(engine: &Engine, snap: &Snapshot, filter: Option<Filter>) -> ScanOutput {
         let entry = engine.describe_table("t").unwrap();
-        execute(engine, snap, "t", &entry, &filter, &None, &None).unwrap()
+        execute(engine, snap, "t", &entry, &filter, &None, &None, &None).unwrap()
     }
 
     #[test]
@@ -1074,7 +1285,17 @@ mod tests {
         }
         let _reset = ResetHook;
         POST_BTREE_SCAN_HOOK.with(|hook| hook.set(Some(delete_id_one)));
-        let output = execute(&engine, &snap, "hook_t", &entry, &id_eq(1), &None, &None).unwrap();
+        let output = execute(
+            &engine,
+            &snap,
+            "hook_t",
+            &entry,
+            &id_eq(1),
+            &None,
+            &None,
+            &None,
+        )
+        .unwrap();
         match output.plan.spec {
             ScanSpec::Seq(spec) => assert_eq!(spec.reason, SeqScanReason::SnapshotFallback),
             _ => panic!("post-scan XID change must use the heap fallback"),
