@@ -545,7 +545,10 @@ pub(crate) fn build_request_with_extra(
             };
             let inverted = if idx.kind == AmKind::Inverted
                 && inverted_column.is_some_and(|column| idx.column.eq_ignore_ascii_case(column))
+                && !engine.allow_stale_inverted()
             {
+                // require_fresh catches up before planning. allow_stale uses
+                // the current sealed generation and preserves the stale marker.
                 Some(engine.refresh_inverted(&idx, entry)?)
             } else {
                 idx.inverted

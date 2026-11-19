@@ -551,16 +551,61 @@ pub struct HnswVacuumStats {
     pub leak_after: HnswLeakReport,
 }
 
-/// One committed inverted-index change awaiting its transaction's WAL commit.
+/// One inverted-index change awaiting its transaction's WAL commit.
 #[derive(Debug, Clone)]
 enum InvertedWalAction {
-    /// Replace a document idempotently, then insert non-NULL text.
-    Upsert { tid: Tid, text: Option<String> },
+    /// Replace a document idempotently using its WAL-encoded tuple bytes.
+    Upsert { tid: Tid, tuple_bytes: Vec<u8> },
     /// Remove the document owned by a HOT chain root.
     Delete { tid: Tid },
+    /// A TOAST group to validate at commit; `None` requires full validation
+    /// because the deleted chunk's identity could not be recovered safely.
+    ToastChanged { valueid: Option<u32> },
+}
+
+impl InvertedWalAction {
+    fn approximate_bytes(&self) -> usize {
+        match self {
+            Self::Upsert { tuple_bytes, .. } => std::mem::size_of::<Self>() + tuple_bytes.len(),
+            Self::Delete { .. } | Self::ToastChanged { .. } => std::mem::size_of::<Self>(),
+        }
+    }
 }
 
 type PendingInvertedLog = HashMap<Oid, HashMap<TxnId, Vec<InvertedWalAction>>>;
+
+const INVERTED_PENDING_LIMIT: usize = 1024;
+const INVERTED_PENDING_BYTES_LIMIT: usize = 16 * 1024 * 1024;
+const INVERTED_PENDING_XID_LIMIT: usize = 64;
+
+fn push_inverted_pending(
+    pending: &mut HashMap<TxnId, Vec<InvertedWalAction>>,
+    xid: TxnId,
+    action: InvertedWalAction,
+    limit: usize,
+    byte_limit: usize,
+) -> Result<()> {
+    let current_bytes = pending.get(&xid).map_or(0usize, |actions| {
+        actions
+            .iter()
+            .map(InvertedWalAction::approximate_bytes)
+            .sum()
+    });
+    let action_bytes = action.approximate_bytes();
+    if pending.len() >= INVERTED_PENDING_XID_LIMIT && !pending.contains_key(&xid) {
+        return Err(EngineError::Unsupported(format!(
+            "inverted pending exceeds {INVERTED_PENDING_XID_LIMIT} transactions"
+        )));
+    }
+    let actions = pending.entry(xid).or_default();
+    if actions.len() >= limit || current_bytes.saturating_add(action_bytes) > byte_limit {
+        return Err(EngineError::Unsupported(format!(
+            "inverted pending transaction exceeds {limit} actions or {byte_limit} bytes; commit or split the transaction"
+        )));
+    }
+    actions.push(action);
+    Ok(())
+}
 
 /// The assembled engine: storage + catalog + heap AM + txn manager + disk
 /// CLOG + in-memory table registry. Assembly order is documented at the
@@ -622,6 +667,14 @@ pub struct Engine {
         Arc<Mutex<std::collections::HashMap<Oid, Arc<Mutex<pg_am_inverted::InvertedIndex>>>>>,
     /// Uncommitted WAL actions retained across synchronous catch-up calls.
     pending_inverted: Arc<Mutex<PendingInvertedLog>>,
+    /// Per-index consumer lag and last-progress observations.
+    inverted_lag: Arc<Mutex<HashMap<Oid, pg_am_inverted::tier2::LagMetrics>>>,
+    /// Commit completion times used by the test-only visibility-latency hook.
+    #[cfg(test)]
+    inverted_commit_finished: Arc<Mutex<HashMap<TxnId, Instant>>>,
+    /// Commit-to-visible latency samples used by the test-only hook.
+    #[cfg(test)]
+    inverted_visibility_samples: Arc<Mutex<HashMap<Oid, Vec<Duration>>>>,
     /// Serializes `create_table` / `drop_table` (see the module docs for the
     /// DDL-vs-DML concurrency scope).
     ddl_lock: Mutex<()>,
@@ -698,6 +751,9 @@ pub struct TxnHandle {
     /// commit and DISCARDED on abort (the graph is never touched by an
     /// uncommitted delete, §6.2/§8.1).
     pending_hnsw: Arc<Mutex<PendingHnswLog>>,
+    /// Shared commit completion times for the test-only visibility hook.
+    #[cfg(test)]
+    inverted_commit_finished: Arc<Mutex<HashMap<TxnId, Instant>>>,
 }
 
 impl TxnHandle {
@@ -755,6 +811,10 @@ impl TxnHandle {
         // bit flips, so a woken row-lock waiter that then needs this
         // transaction's table locks never observes the reverse order.
         if result.is_ok() {
+            #[cfg(test)]
+            self.inverted_commit_finished
+                .lock()
+                .insert(xid, Instant::now());
             // Drop OUR snapshot registration BEFORE the watermark read —
             // the cleanup's `oldest_snapshot_xmin()` must not count this
             // transaction's own snapshot (otherwise it concludes "someone
@@ -1056,12 +1116,17 @@ fn pending_map_remove(
 }
 
 #[cfg(test)]
+type CommitFinishedHook = fn(&Engine, TxnId);
+
+#[cfg(test)]
 thread_local! {
     static BEFORE_AUTO_COMMIT_HOOK: std::cell::Cell<Option<fn()>> =
         std::cell::Cell::new(None);
     static BEFORE_HNSW_PUBLISH_HOOK: std::cell::Cell<Option<fn()>> =
         std::cell::Cell::new(None);
     static BEFORE_DROP_CLEANUP_HOOK: std::cell::Cell<Option<fn()>> =
+        std::cell::Cell::new(None);
+    static COMMIT_FINISHED_HOOK: std::cell::Cell<Option<CommitFinishedHook>> =
         std::cell::Cell::new(None);
 }
 
@@ -1207,6 +1272,11 @@ impl Engine {
             hnsw_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             inverted_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_inverted: Arc::new(Mutex::new(HashMap::new())),
+            inverted_lag: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            inverted_commit_finished: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            inverted_visibility_samples: Arc::new(Mutex::new(HashMap::new())),
             pending_hnsw: Arc::new(Mutex::new(HashMap::new())),
             ddl_lock: Mutex::new(()),
             instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
@@ -2744,6 +2814,9 @@ impl Engine {
         self.pending_inverted
             .lock()
             .retain(|index_oid, _| !index_oids.contains(index_oid));
+        self.inverted_lag
+            .lock()
+            .retain(|index_oid, _| !index_oids.contains(index_oid));
         let mut pages = match self.walk_chain(entry.first_page) {
             Ok(pages) => pages,
             Err(error) => {
@@ -3005,7 +3078,11 @@ impl Engine {
                 )
                 .map_err(|error| EngineError::Corrupted(error.to_string()))?;
                 store
-                    .seal(self.storage.wal_writer(), snap.current_xid())
+                    .seal(
+                        self.storage.data_dir(),
+                        self.storage.wal_writer(),
+                        snap.current_xid(),
+                    )
                     .map_err(|error| EngineError::Corrupted(error.to_string()))?;
                 self.create_index_catalog_rows(
                     &snap,
@@ -4404,6 +4481,23 @@ impl Engine {
             )));
         }
         if start == frontier {
+            let seal_end = index
+                .seal(
+                    self.storage.data_dir(),
+                    self.storage.wal_writer(),
+                    TxnId::INVALID,
+                )
+                .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+            if let Some(seal_end) = seal_end {
+                index.advance_consumed(seal_end);
+            }
+            let frontier = seal_end.map_or(frontier, |end| frontier.max(end));
+            self.record_inverted_lag(
+                index_entry.index_oid,
+                start,
+                index.watermark().consumed_lsn,
+                frontier,
+            );
             let metadata = InvertedIndexMetadata {
                 analyzer: index.analyzer_config().clone(),
                 watermark: index.watermark(),
@@ -4430,18 +4524,30 @@ impl Engine {
             .relation_pages(&rel)?
             .into_iter()
             .collect::<HashSet<_>>();
-        let (mut snap, _snap_guard) = self.txn.snapshot(TxnId::INVALID);
-        snap.advance_curcid();
+        let toast_pages = if let Some(toast) = entry.toast {
+            self.heap
+                .relation_pages(&RelationDesc {
+                    rel_oid: toast.rel_oid,
+                    first_page: toast.first_page,
+                    columns: &[ColumnType::Int8, ColumnType::Int4, ColumnType::Bytea],
+                })?
+                .into_iter()
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
         let replay_start = if start.is_valid() { start } else { Lsn::FIRST };
-        let mut reader = WalReader::open_at(
+        let tail = pg_am_inverted::tier2::FlushedWalTail::new(
             self.storage.data_dir().join("wal"),
             self.storage.config().wal_segment_size,
-            replay_start,
-        )?;
+            Arc::clone(self.storage.wal_writer()),
+        );
+        let records = pg_storage::tier2::WalTailReader::tail_from(&tail, replay_start);
         let mut all_pending = self.pending_inverted.lock();
         let pending = all_pending.entry(index_entry.index_oid).or_default();
-        while let Some(record) = reader.next_record()? {
-            let record_end = reader.current_lsn();
+        for record in records {
+            let record = record?;
+            let record_end = record.lsn.advance(record.record_size() as u64);
             if record_end > frontier {
                 break;
             }
@@ -4449,59 +4555,142 @@ impl Engine {
                 WalRecordType::HeapInsert => {
                     let decoded =
                         pg_storage::wal::record::HeapInsertRecord::decode(&record.payload)?;
+                    if toast_pages.contains(&decoded.page_id) {
+                        push_inverted_pending(
+                            pending,
+                            record.txn_id,
+                            InvertedWalAction::ToastChanged {
+                                valueid: Some(self.toast_valueid_from_tuple(&decoded.tuple_bytes)?),
+                            },
+                            INVERTED_PENDING_LIMIT,
+                            INVERTED_PENDING_BYTES_LIMIT,
+                        )?;
+                    }
                     if pages.contains(&decoded.page_id) {
                         let tid = Tid {
                             page_id: decoded.page_id,
                             slot_id: decoded.slot_id,
                         };
-                        let text = self.decode_inverted_text(
-                            &snap,
-                            &rel,
-                            &col_types,
-                            col_index,
-                            &decoded.tuple_bytes,
+                        push_inverted_pending(
+                            pending,
+                            record.txn_id,
+                            InvertedWalAction::Upsert {
+                                tid,
+                                tuple_bytes: decoded.tuple_bytes,
+                            },
+                            INVERTED_PENDING_LIMIT,
+                            INVERTED_PENDING_BYTES_LIMIT,
                         )?;
-                        pending
-                            .entry(record.txn_id)
-                            .or_default()
-                            .push(InvertedWalAction::Upsert { tid, text });
                     }
                 }
                 WalRecordType::HeapUpdate => {
                     let decoded = HeapUpdateRecord::decode(&record.payload)?;
+                    if toast_pages.contains(&decoded.old_tid.page_id)
+                        || toast_pages.contains(&decoded.new_tid.page_id)
+                    {
+                        push_inverted_pending(
+                            pending,
+                            record.txn_id,
+                            InvertedWalAction::ToastChanged {
+                                valueid: Some(
+                                    self.toast_valueid_from_tuple(&decoded.new_tuple_bytes)?,
+                                ),
+                            },
+                            INVERTED_PENDING_LIMIT,
+                            INVERTED_PENDING_BYTES_LIMIT,
+                        )?;
+                    }
                     if pages.contains(&decoded.new_tid.page_id) {
                         let old_tid = self.hot_chain_root(decoded.old_tid)?;
-                        let text = self.decode_inverted_text(
-                            &snap,
-                            &rel,
-                            &col_types,
-                            col_index,
-                            &decoded.new_tuple_bytes,
-                        )?;
-                        let actions = pending.entry(record.txn_id).or_default();
                         // Update order is part of the correctness contract:
                         // old postings disappear before the new version is added.
-                        actions.push(InvertedWalAction::Delete { tid: old_tid });
-                        actions.push(InvertedWalAction::Upsert {
-                            tid: decoded.new_tid,
-                            text,
-                        });
+                        push_inverted_pending(
+                            pending,
+                            record.txn_id,
+                            InvertedWalAction::Delete { tid: old_tid },
+                            INVERTED_PENDING_LIMIT,
+                            INVERTED_PENDING_BYTES_LIMIT,
+                        )?;
+                        push_inverted_pending(
+                            pending,
+                            record.txn_id,
+                            InvertedWalAction::Upsert {
+                                tid: decoded.new_tid,
+                                tuple_bytes: decoded.new_tuple_bytes,
+                            },
+                            INVERTED_PENDING_LIMIT,
+                            INVERTED_PENDING_BYTES_LIMIT,
+                        )?;
                     }
                 }
                 WalRecordType::HeapDelete => {
                     let decoded = HeapDeleteRecord::decode(&record.payload)?;
+                    if toast_pages.contains(&decoded.tid.page_id) {
+                        push_inverted_pending(
+                            pending,
+                            record.txn_id,
+                            InvertedWalAction::ToastChanged {
+                                valueid: self.toast_valueid_at(decoded.tid, decoded.xmax)?,
+                            },
+                            INVERTED_PENDING_LIMIT,
+                            INVERTED_PENDING_BYTES_LIMIT,
+                        )?;
+                    }
                     if pages.contains(&decoded.tid.page_id) {
                         let tid = self.hot_chain_root(decoded.tid)?;
-                        pending
-                            .entry(record.txn_id)
-                            .or_default()
-                            .push(InvertedWalAction::Delete { tid });
+                        push_inverted_pending(
+                            pending,
+                            record.txn_id,
+                            InvertedWalAction::Delete { tid },
+                            INVERTED_PENDING_LIMIT,
+                            INVERTED_PENDING_BYTES_LIMIT,
+                        )?;
                     }
                 }
                 WalRecordType::TxnCommit => {
-                    for action in pending.remove(&record.txn_id).unwrap_or_default() {
+                    let actions = pending.get(&record.txn_id).cloned().unwrap_or_default();
+                    if actions.is_empty() {
+                        pending.remove(&record.txn_id);
+                        #[cfg(test)]
+                        self.record_inverted_visible(index_entry.index_oid, record.txn_id);
+                        index.advance_consumed(record_end);
+                        continue;
+                    }
+                    let valueids = actions
+                        .iter()
+                        .filter_map(|action| match action {
+                            InvertedWalAction::ToastChanged {
+                                valueid: Some(valueid),
+                            } => Some(*valueid),
+                            _ => None,
+                        })
+                        .collect::<HashSet<_>>();
+                    let validate_all = actions.iter().any(|action| {
+                        matches!(action, InvertedWalAction::ToastChanged { valueid: None })
+                    });
+                    let (commit_snap, _commit_guard) =
+                        self.inverted_commit_snapshot(record.txn_id)?;
+                    self.validate_toast_groups(&commit_snap, &rel, &valueids, validate_all)?;
+                    for action in actions {
                         match action {
-                            InvertedWalAction::Upsert { tid, text } => {
+                            InvertedWalAction::ToastChanged { .. } => {}
+                            InvertedWalAction::Upsert { tid, tuple_bytes } => {
+                                let text = if self.inverted_version_is_current(
+                                    &commit_snap,
+                                    &col_types,
+                                    tid,
+                                    record.txn_id,
+                                )? {
+                                    self.decode_inverted_text(
+                                        &commit_snap,
+                                        &rel,
+                                        &col_types,
+                                        col_index,
+                                        &tuple_bytes,
+                                    )?
+                                } else {
+                                    None
+                                };
                                 index
                                     .delete_document(tid)
                                     .map_err(|error| EngineError::Corrupted(error.to_string()))?;
@@ -4518,17 +4707,34 @@ impl Engine {
                             }
                         }
                     }
+                    pending.remove(&record.txn_id);
+                    #[cfg(test)]
+                    self.record_inverted_visible(index_entry.index_oid, record.txn_id);
                 }
                 WalRecordType::TxnAbort => {
                     pending.remove(&record.txn_id);
                 }
-                // HOT preserves every indexed key and the chain-root TID, so
-                // its new tuple needs no inverted maintenance.
-                WalRecordType::HeapHotUpdate => {}
                 _ => {}
             }
             index.advance_consumed(record_end);
         }
+        let seal_end = index
+            .seal(
+                self.storage.data_dir(),
+                self.storage.wal_writer(),
+                TxnId::INVALID,
+            )
+            .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+        if let Some(seal_end) = seal_end {
+            index.advance_consumed(seal_end);
+        }
+        let frontier = seal_end.map_or(frontier, |end| frontier.max(end));
+        self.record_inverted_lag(
+            index_entry.index_oid,
+            start,
+            index.watermark().consumed_lsn,
+            frontier,
+        );
         let metadata = InvertedIndexMetadata {
             analyzer: index.analyzer_config().clone(),
             watermark: index.watermark(),
@@ -4537,6 +4743,28 @@ impl Engine {
         drop(index);
         self.publish_inverted_watermark(index_entry.index_oid, &metadata);
         Ok(metadata)
+    }
+
+    /// Return whether `tid` is still the visible version written by `xid`.
+    /// Superseded versions must not be detoasted: their chunks may have been
+    /// legally reclaimed, and later WAL records will converge to the new row.
+    fn inverted_version_is_current(
+        &self,
+        snap: &Snapshot,
+        col_types: &[ColumnType],
+        tid: Tid,
+        xid: TxnId,
+    ) -> Result<bool> {
+        if self.heap_tuple_visible(snap, tid)? != Some(tid) {
+            return Ok(false);
+        }
+        let guard = self.storage.buffer_pool().pin(tid.page_id)?;
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        let Some(bytes) = SlottedPage::tuple(page, tid.slot_id)? else {
+            return Ok(false);
+        };
+        let (header, _) = decode_tuple(bytes, col_types)?;
+        Ok(header.t_xmin == xid)
     }
 
     fn decode_inverted_text(
@@ -4558,6 +4786,92 @@ impl Engine {
                 "inverted TEXT column decoded as {other:?}"
             ))),
         }
+    }
+
+    fn inverted_commit_snapshot(&self, xid: TxnId) -> Result<(Snapshot, SnapshotGuard)> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let (mut snap, guard) = self.txn.snapshot(TxnId::INVALID);
+            // CLOG may flip before the XID leaves the active set. Only a
+            // snapshot that excludes this XID can see its newly written chunks.
+            if !snap.xip().contains(&xid) {
+                snap.advance_curcid();
+                return Ok((snap, guard));
+            }
+            if Instant::now() >= deadline {
+                return Err(EngineError::Corrupted(format!(
+                    "commit record for XID {} is visible while it remains in the active set",
+                    xid.0
+                )));
+            }
+            drop(guard);
+            std::thread::yield_now();
+        }
+    }
+
+    fn validate_toast_groups(
+        &self,
+        snap: &Snapshot,
+        rel: &RelationDesc<'_>,
+        valueids: &HashSet<u32>,
+        validate_all: bool,
+    ) -> Result<()> {
+        if valueids.is_empty() && !validate_all {
+            return Ok(());
+        }
+        // One main-relation scan per commit, and detoast only rows that point
+        // to a changed group. This avoids a full detoast pass per chunk record.
+        let rows = self.heap.scan(ScanContext {
+            rel: *rel,
+            snapshot: snap,
+            clog: self.clog.as_ref(),
+        })?;
+        for (_, values) in rows {
+            let changed = validate_all
+                || values.iter().any(|value| match value {
+                    Some(Datum::External(pointer)) => valueids.contains(&pointer.va_valueid),
+                    _ => false,
+                });
+            if changed {
+                self.heap
+                    .detoast_values(rel, snap, self.clog.as_ref(), &values)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn toast_valueid_from_tuple(&self, tuple_bytes: &[u8]) -> Result<u32> {
+        let (_, values) = decode_tuple(
+            tuple_bytes,
+            &[ColumnType::Int8, ColumnType::Int4, ColumnType::Bytea],
+        )?;
+        match values.first() {
+            Some(Some(Datum::Int8(valueid))) => u32::try_from(*valueid)
+                .map_err(|_| EngineError::Corrupted(format!("invalid TOAST valueid {valueid}"))),
+            other => Err(EngineError::Corrupted(format!(
+                "malformed TOAST chunk identity: {other:?}"
+            ))),
+        }
+    }
+
+    fn toast_valueid_at(&self, tid: Tid, xmax: TxnId) -> Result<Option<u32>> {
+        let guard = self.storage.buffer_pool().pin(tid.page_id)?;
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        let Some(bytes) = SlottedPage::tuple(page, tid.slot_id)? else {
+            // Vacuum may have reclaimed the physical tuple. Validate all
+            // referenced groups at commit instead of trusting a missing slot.
+            return Ok(None);
+        };
+        let (header, _) = decode_tuple(
+            bytes,
+            &[ColumnType::Int8, ColumnType::Int4, ColumnType::Bytea],
+        )?;
+        if header.t_xmax != xmax {
+            // A reused slot belongs to a different valueid. Full validation is
+            // safer than validating the wrong group.
+            return Ok(None);
+        }
+        Ok(Some(self.toast_valueid_from_tuple(bytes)?))
     }
 
     fn publish_inverted_watermark(&self, index_oid: Oid, metadata: &InvertedIndexMetadata) {
@@ -5794,6 +6108,8 @@ impl Engine {
             wal_writer: Arc::clone(self.storage.wal_writer()),
             hnsw_handles: Arc::clone(&self.hnsw_handles),
             pending_hnsw: Arc::clone(&self.pending_hnsw),
+            #[cfg(test)]
+            inverted_commit_finished: Arc::clone(&self.inverted_commit_finished),
         })
     }
 
@@ -6819,6 +7135,92 @@ impl Engine {
         });
     }
 
+    #[cfg(test)]
+    fn run_commit_finished_hook(&self, xid: TxnId) {
+        COMMIT_FINISHED_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook(self, xid);
+            }
+        });
+    }
+
+    #[cfg(test)]
+    fn record_inverted_visible(&self, index_oid: Oid, xid: TxnId) {
+        if let Some(finished_at) = self.inverted_commit_finished.lock().get(&xid).copied() {
+            self.inverted_visibility_samples
+                .lock()
+                .entry(index_oid)
+                .or_default()
+                .push(finished_at.elapsed());
+        }
+    }
+
+    fn record_inverted_lag(&self, index_oid: Oid, previous: Lsn, applied: Lsn, synced: Lsn) {
+        let now = Instant::now();
+        let last_progress_at = if applied > previous {
+            now
+        } else {
+            self.inverted_lag
+                .lock()
+                .get(&index_oid)
+                .map_or(now, |metrics| metrics.last_progress_at)
+        };
+        self.inverted_lag.lock().insert(
+            index_oid,
+            pg_am_inverted::tier2::LagMetrics {
+                wal_lag_records: 0,
+                wal_lag_bytes: synced.0.saturating_sub(applied.0),
+                applied_lsn: applied,
+                synced_lsn: synced,
+                last_progress_at,
+                watermark_lag_seconds: 0.0,
+            },
+        );
+    }
+
+    /// Read a point-in-time lag snapshot for one inverted index.
+    pub fn inverted_lag_metrics(
+        &self,
+        index_oid: Oid,
+    ) -> Result<Option<pg_am_inverted::tier2::LagMetrics>> {
+        let Some(mut metrics) = self.inverted_lag.lock().get(&index_oid).cloned() else {
+            return Ok(None);
+        };
+        let synced = metrics
+            .synced_lsn
+            .max(self.storage.wal_writer().synced_lsn());
+        metrics.synced_lsn = synced;
+        metrics.wal_lag_bytes = synced.0.saturating_sub(metrics.applied_lsn.0);
+        metrics.wal_lag_records = if synced > metrics.applied_lsn {
+            let tail = pg_am_inverted::tier2::FlushedWalTail::new(
+                self.storage.data_dir().join("wal"),
+                self.storage.config().wal_segment_size,
+                Arc::clone(self.storage.wal_writer()),
+            );
+            let records = pg_storage::tier2::WalTailReader::tail_from(&tail, metrics.applied_lsn);
+            let mut count = 0;
+            for record in records {
+                let _ = record?;
+                count += 1;
+            }
+            count
+        } else {
+            0
+        };
+        metrics.watermark_lag_seconds = metrics.last_progress_at.elapsed().as_secs_f64();
+        Ok(Some(metrics))
+    }
+
+    /// Commit-to-visible samples collected by the test-only commit hook.
+    #[cfg(test)]
+    pub fn inverted_visibility_samples(&self, index_oid: Oid) -> Vec<Duration> {
+        self.inverted_visibility_samples
+            .lock()
+            .get(&index_oid)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn auto_commit<T>(&self, op: impl FnOnce(&Snapshot) -> Result<T>) -> Result<T> {
         self.auto_commit_with_hooks(op, || Ok(()), || {})
     }
@@ -6867,6 +7269,8 @@ impl Engine {
                     }
                 }
                 let hook_result = if result.is_ok() {
+                    #[cfg(test)]
+                    self.run_commit_finished_hook(xid);
                     // M6 Stage C: deferred post-commit graph actions run
                     // after the commit is durable AND before the table
                     // locks release (round-3 P3-1).
@@ -8149,6 +8553,18 @@ mod tests {
         }
     }
 
+    static INVERTED_WRITER_READY: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static INVERTED_CREATE_LOCKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn wait_for_inverted_writer_ready() {
+        INVERTED_CREATE_LOCKED.store(true, Ordering::SeqCst);
+        while !INVERTED_WRITER_READY.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
     #[expect(dead_code, reason = "the guard is held only for its Drop")]
     struct CommitFailGuard(std::sync::MutexGuard<'static, ()>);
 
@@ -8507,6 +8923,8 @@ mod tests {
             }
         }
         let _reset = ResetHook;
+        WRITER_READY.store(false, Ordering::SeqCst);
+        CREATE_LOCKED.store(false, Ordering::SeqCst);
 
         let creator_engine = Arc::clone(&engine);
         let creator = std::thread::spawn(move || {
@@ -8597,23 +9015,25 @@ mod tests {
         impl Drop for ResetHook {
             fn drop(&mut self) {
                 BEFORE_AUTO_COMMIT_HOOK.with(|hook| hook.set(None));
-                WRITER_READY.store(false, Ordering::SeqCst);
-                CREATE_LOCKED.store(false, Ordering::SeqCst);
+                INVERTED_WRITER_READY.store(false, Ordering::SeqCst);
+                INVERTED_CREATE_LOCKED.store(false, Ordering::SeqCst);
             }
         }
         let _reset = ResetHook;
+        INVERTED_WRITER_READY.store(false, Ordering::SeqCst);
+        INVERTED_CREATE_LOCKED.store(false, Ordering::SeqCst);
 
         let creator_engine = Arc::clone(&engine);
         let creator = std::thread::spawn(move || {
             let _hook = CommitFailGuard::arm();
-            BEFORE_AUTO_COMMIT_HOOK.with(|hook| hook.set(Some(wait_for_writer_ready)));
+            BEFORE_AUTO_COMMIT_HOOK.with(|hook| hook.set(Some(wait_for_inverted_writer_ready)));
             creator_engine.exec(
                 None,
                 "CREATE INDEX content_idx ON t USING inverted (content)",
             )
         });
         let deadline = Instant::now() + Duration::from_secs(30);
-        while !CREATE_LOCKED.load(Ordering::SeqCst) {
+        while !INVERTED_CREATE_LOCKED.load(Ordering::SeqCst) {
             assert!(
                 Instant::now() < deadline,
                 "inverted CREATE INDEX never reached its pre-commit hook"
@@ -8645,7 +9065,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(waiter_queued, "writer never queued behind AccessExclusive");
-        WRITER_READY.store(true, Ordering::SeqCst);
+        INVERTED_WRITER_READY.store(true, Ordering::SeqCst);
         let create_result = creator.join().unwrap();
         let write_result = writer.join().unwrap();
         assert!(create_result.is_err());
@@ -8742,6 +9162,255 @@ mod tests {
         assert!(drop_result.is_ok(), "{drop_result:?}");
         assert!(engine.indexes().is_empty());
         assert!(engine.hnsw_handles.lock().is_empty());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_pending_limit_is_loud_and_bounded() {
+        let mut pending = HashMap::new();
+        let xid = TxnId(7);
+        let action = InvertedWalAction::Delete {
+            tid: Tid {
+                page_id: PageId(1),
+                slot_id: 0,
+            },
+        };
+        push_inverted_pending(&mut pending, xid, action.clone(), 2, usize::MAX).unwrap();
+        push_inverted_pending(&mut pending, xid, action.clone(), 2, usize::MAX).unwrap();
+        let error = push_inverted_pending(&mut pending, xid, action, 2, usize::MAX).unwrap_err();
+        assert!(matches!(error, EngineError::Unsupported(_)));
+        assert_eq!(pending.get(&xid).unwrap().len(), 2);
+
+        let mut pending = HashMap::new();
+        let action = InvertedWalAction::Upsert {
+            tid: Tid {
+                page_id: PageId(1),
+                slot_id: 0,
+            },
+            tuple_bytes: vec![0; 128],
+        };
+        push_inverted_pending(&mut pending, xid, action.clone(), 2, 256).unwrap();
+        let error = push_inverted_pending(&mut pending, xid, action, 2, 256).unwrap_err();
+        assert!(matches!(error, EngineError::Unsupported(_)));
+
+        let mut pending = HashMap::new();
+        let action = InvertedWalAction::Delete {
+            tid: Tid {
+                page_id: PageId(1),
+                slot_id: 0,
+            },
+        };
+        for xid in 0..INVERTED_PENDING_XID_LIMIT as u64 {
+            push_inverted_pending(&mut pending, TxnId(xid + 1), action.clone(), 1, usize::MAX)
+                .unwrap();
+        }
+        let error = push_inverted_pending(
+            &mut pending,
+            TxnId(INVERTED_PENDING_XID_LIMIT as u64 + 1),
+            action,
+            1,
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert!(matches!(error, EngineError::Unsupported(_)));
+    }
+
+    #[test]
+    fn inverted_lag_and_commit_visibility_latency_are_observed() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        fn record_commit(engine: &Engine, xid: TxnId) {
+            engine
+                .inverted_commit_finished
+                .lock()
+                .insert(xid, Instant::now());
+        }
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                COMMIT_FINISHED_HOOK.with(|hook| hook.set(None));
+            }
+        }
+        let _reset = ResetHook;
+        COMMIT_FINISHED_HOOK.with(|hook| hook.set(Some(record_commit)));
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        engine
+            .exec(None, "CREATE TABLE other (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX other_idx ON other USING inverted (content)",
+            )
+            .unwrap();
+        engine.inverted_visibility_samples.lock().clear();
+        engine.inverted_commit_finished.lock().clear();
+        for id in 0..8 {
+            engine
+                .exec(
+                    None,
+                    &format!(
+                        "INSERT INTO t VALUES ({id}, '{} contract')",
+                        "x".repeat(9_000)
+                    ),
+                )
+                .unwrap();
+        }
+        engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'contract'")
+            .unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        let mut samples = engine.inverted_visibility_samples(index_oid);
+        assert_eq!(samples.len(), 8);
+        samples.sort();
+        let p95 = samples[samples.len() * 95 / 100];
+        assert!(p95 < Duration::from_secs(1), "p95 was {p95:?}");
+        let metrics = engine.inverted_lag_metrics(index_oid).unwrap().unwrap();
+        assert_eq!(metrics.wal_lag_records, 0);
+        assert_eq!(metrics.wal_lag_bytes, 0);
+        assert_eq!(
+            metrics.applied_lsn,
+            engine.indexes()[0]
+                .inverted
+                .as_ref()
+                .unwrap()
+                .watermark
+                .consumed_lsn
+        );
+        assert!(metrics.synced_lsn >= metrics.applied_lsn);
+        assert!(metrics.watermark_lag_seconds >= 0.0);
+
+        engine
+            .exec(None, "SELECT id FROM other WHERE content @@ 'contract'")
+            .unwrap();
+        let other_oid = engine.indexes()[1].index_oid;
+        assert_eq!(engine.inverted_visibility_samples(other_oid).len(), 8);
+
+        engine
+            .exec(None, "INSERT INTO t VALUES (8, 'contract')")
+            .unwrap();
+        let lagging = engine.inverted_lag_metrics(index_oid).unwrap().unwrap();
+        assert!(lagging.wal_lag_records > 0);
+        assert!(lagging.wal_lag_bytes > 0);
+        engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'contract'")
+            .unwrap();
+        let caught_up = engine.inverted_lag_metrics(index_oid).unwrap().unwrap();
+        assert_eq!(caught_up.wal_lag_records, 0);
+        assert_eq!(caught_up.wal_lag_bytes, 0);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_allow_stale_reads_sealed_generation() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = EngineConfig::new(tmp.path());
+        config.allow_stale_inverted = true;
+        let engine = Engine::open(tmp.path(), config).unwrap();
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, 'contract')")
+            .unwrap();
+        let result = engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'contract'")
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.is_empty()));
+        let explain = engine
+            .exec(None, "EXPLAIN SELECT id FROM t WHERE content @@ 'contract'")
+            .unwrap();
+        assert!(matches!(
+            explain,
+            QueryResult::Rows { rows, .. }
+                if matches!(&rows[0][0], Some(Datum::Text(plan)) if plan.contains("stale_index=true"))
+        ));
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        let result = engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'contract'")
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.len() == 1));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_cross_segment_checkpoint_and_reopen_preserve_documents() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = EngineConfig::new(tmp.path());
+        config.storage.wal_segment_size = 16384;
+        let engine = Engine::open(tmp.path(), config.clone()).unwrap();
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let query_count = |engine: &Engine| {
+            let result = engine
+                .exec(None, "SELECT id FROM t WHERE content @@ 'contract'")
+                .unwrap();
+            let QueryResult::Rows { rows, .. } = result else {
+                panic!("expected full-text rows")
+            };
+            rows.len()
+        };
+        for id in 0..12 {
+            engine
+                .exec(
+                    None,
+                    &format!(
+                        "INSERT INTO t VALUES ({id}, '{} contract')",
+                        "x".repeat(300)
+                    ),
+                )
+                .unwrap();
+        }
+        assert_eq!(query_count(&engine), 12);
+        engine.checkpoint().unwrap();
+        for id in 12..24 {
+            engine
+                .exec(
+                    None,
+                    &format!(
+                        "INSERT INTO t VALUES ({id}, '{} contract')",
+                        "x".repeat(300)
+                    ),
+                )
+                .unwrap();
+        }
+        assert_eq!(query_count(&engine), 24);
+        let before = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+        assert!(before.consumed_lsn >= before.durable_applied_lsn);
+        engine.shutdown();
+
+        let engine = Engine::open(tmp.path(), config).unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (24, 'reopened contract')")
+            .unwrap();
+        assert_eq!(query_count(&engine), 25);
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::IndexLookup
+        );
         engine.shutdown();
     }
 
@@ -8994,6 +9663,28 @@ mod tests {
             ExecutionPath::IndexLookup
         );
         engine.shutdown();
+    }
+
+    #[test]
+    fn empty_inverted_index_rejects_analyzer_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = EngineConfig::new(tmp.path());
+        config.inverted_analyzer = pg_am_inverted::AnalyzerConfig::english();
+        let engine = Engine::open(tmp.path(), config.clone()).unwrap();
+        engine.exec(None, "CREATE TABLE t (content TEXT)").unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        engine.shutdown();
+
+        config.inverted_analyzer = pg_am_inverted::AnalyzerConfig::chinese();
+        let Err(error) = Engine::open(tmp.path(), config) else {
+            panic!("empty index accepted a different analyzer")
+        };
+        assert!(error.to_string().contains("analyzer"), "{error}");
     }
 
     #[test]

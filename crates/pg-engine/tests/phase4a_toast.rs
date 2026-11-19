@@ -874,6 +874,381 @@ fn toast_registration_failure_aborts_table_and_allows_retry() {
 }
 
 #[test]
+fn inverted_superseded_toast_version_is_skipped_on_replay() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table(
+            "t",
+            &[
+                column("id", ColumnType::Int8),
+                column("content", ColumnType::Text),
+            ],
+        )
+        .unwrap();
+    engine
+        .exec(
+            None,
+            "CREATE INDEX content_idx ON t USING inverted (content)",
+        )
+        .unwrap();
+    engine
+        .insert(
+            "t",
+            &[
+                Some(Datum::Int8(1)),
+                Some(Datum::Text(format!("{} needle", "x".repeat(4_500)))),
+            ],
+        )
+        .unwrap();
+    engine
+        .exec(None, "UPDATE t SET content = 'newterm' WHERE id = 1")
+        .unwrap();
+    engine.vacuum("t").unwrap();
+    engine.shutdown();
+
+    let engine = open(tmp.path());
+    let result = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'newterm'")
+        .unwrap();
+    assert_eq!(rows(result).len(), 1);
+    let result = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap();
+    assert!(rows(result).is_empty());
+}
+
+#[test]
+fn inverted_inflight_toast_insert_and_abort_recover_cleanly() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table(
+            "t",
+            &[
+                column("id", ColumnType::Int8),
+                column("content", ColumnType::Text),
+            ],
+        )
+        .unwrap();
+    engine
+        .exec(
+            None,
+            "CREATE INDEX content_idx ON t USING inverted (content)",
+        )
+        .unwrap();
+    let txn = engine.begin_txn().unwrap();
+    engine
+        .exec(
+            Some(&txn),
+            &format!("INSERT INTO t VALUES (1, '{} needle')", "x".repeat(4_500)),
+        )
+        .unwrap();
+
+    let result = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap();
+    assert!(rows(result).is_empty());
+    txn.abort().unwrap();
+    let result = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap();
+    assert!(rows(result).is_empty());
+
+    engine
+        .insert(
+            "t",
+            &[
+                Some(Datum::Int8(1)),
+                Some(Datum::Text(format!("{} needle", "x".repeat(4_500)))),
+            ],
+        )
+        .unwrap();
+    let result = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap();
+    assert_eq!(rows(result).len(), 1);
+}
+
+#[test]
+fn inverted_shared_toast_group_survives_non_hot_update() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table(
+            "t",
+            &[
+                column("id", ColumnType::Int8),
+                column("content", ColumnType::Text),
+            ],
+        )
+        .unwrap();
+    engine
+        .insert(
+            "t",
+            &[
+                Some(Datum::Int8(1)),
+                Some(Datum::Text(format!("{} needle", "x".repeat(4_500)))),
+            ],
+        )
+        .unwrap();
+    engine.create_index("t", "id").unwrap();
+    engine
+        .exec(
+            None,
+            "CREATE INDEX content_idx ON t USING inverted (content)",
+        )
+        .unwrap();
+    let entry = engine.describe_table("t").unwrap();
+    let old_pointer = raw_external_pointer(&engine, &entry, engine.scan("t", None).unwrap()[0].0);
+
+    engine
+        .exec(None, "UPDATE t SET id = 2 WHERE id = 1")
+        .unwrap();
+    let new_pointer = raw_external_pointer(&engine, &entry, engine.scan("t", None).unwrap()[0].0);
+    assert_eq!(old_pointer.va_valueid, new_pointer.va_valueid);
+    let result = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap();
+    let result = rows(result);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0][0], Some(Datum::Int8(2)));
+    assert_eq!(
+        engine.query_stats().entries().last().unwrap().path,
+        pg_engine::ExecutionPath::IndexLookup
+    );
+}
+
+#[test]
+fn inverted_toast_corruption_stops_the_watermark() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table(
+            "t",
+            &[
+                column("id", ColumnType::Int8),
+                column("content", ColumnType::Text),
+            ],
+        )
+        .unwrap();
+    engine
+        .insert(
+            "t",
+            &[
+                Some(Datum::Int8(1)),
+                Some(Datum::Text(format!("{} needle", "x".repeat(4_500)))),
+            ],
+        )
+        .unwrap();
+    engine
+        .exec(
+            None,
+            "CREATE INDEX content_idx ON t USING inverted (content)",
+        )
+        .unwrap();
+    engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap();
+    let before = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+    let entry = engine.describe_table("t").unwrap();
+    let pointer = raw_external_pointer(&engine, &entry, engine.scan("t", None).unwrap()[0].0);
+    let tid = chunk_tid(&engine, &entry, pointer.va_valueid, 1);
+    let (xid, snapshot) = writer_snapshot(&engine);
+    engine
+        .heap()
+        .delete(DeleteContext {
+            rel: toast_relation(&entry),
+            snapshot: &snapshot,
+            tid,
+            clog: engine.clog().as_ref(),
+        })
+        .unwrap();
+    engine.txn_manager().commit_txn(xid).unwrap();
+
+    let error = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap_err();
+    assert!(error.to_string().contains("TOAST"), "{error}");
+    let after = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+    assert_eq!(after, before);
+}
+
+#[test]
+fn inverted_toast_delete_then_vacuum_still_stops_watermark() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table(
+            "t",
+            &[
+                column("id", ColumnType::Int8),
+                column("content", ColumnType::Text),
+            ],
+        )
+        .unwrap();
+    engine
+        .insert(
+            "t",
+            &[
+                Some(Datum::Int8(1)),
+                Some(Datum::Text(format!("{} needle", "x".repeat(4_500)))),
+            ],
+        )
+        .unwrap();
+    engine
+        .exec(
+            None,
+            "CREATE INDEX content_idx ON t USING inverted (content)",
+        )
+        .unwrap();
+    engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap();
+    let before = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+    let entry = engine.describe_table("t").unwrap();
+    let pointer = raw_external_pointer(&engine, &entry, engine.scan("t", None).unwrap()[0].0);
+    let tid = chunk_tid(&engine, &entry, pointer.va_valueid, 1);
+    let (xid, snapshot) = writer_snapshot(&engine);
+    engine
+        .heap()
+        .delete(DeleteContext {
+            rel: toast_relation(&entry),
+            snapshot: &snapshot,
+            tid,
+            clog: engine.clog().as_ref(),
+        })
+        .unwrap();
+    engine.txn_manager().commit_txn(xid).unwrap();
+    engine.vacuum("t").unwrap();
+
+    let error = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap_err();
+    assert!(error.to_string().contains("TOAST"), "{error}");
+    let after = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+    assert_eq!(after, before);
+}
+
+#[test]
+fn inverted_duplicate_ordering_and_oversized_chunks_stop_watermark() {
+    for (seq, payload) in [
+        (0, vec![b'x'; 2_000]),
+        (7, vec![b'x'; 1]),
+        (0, vec![b'x'; 2_001]),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .create_table(
+                "t",
+                &[
+                    column("id", ColumnType::Int8),
+                    column("content", ColumnType::Text),
+                ],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "t",
+                &[
+                    Some(Datum::Int8(1)),
+                    Some(Datum::Text(format!("{} needle", "x".repeat(4_500)))),
+                ],
+            )
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+            .unwrap();
+        let before = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+        let entry = engine.describe_table("t").unwrap();
+        let pointer = raw_external_pointer(&engine, &entry, engine.scan("t", None).unwrap()[0].0);
+        let (xid, snapshot) = writer_snapshot(&engine);
+        insert_chunk(&engine, &entry, &snapshot, pointer.va_valueid, seq, payload);
+        engine.txn_manager().commit_txn(xid).unwrap();
+
+        assert!(engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+            .is_err());
+        let after = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+        assert_eq!(after, before);
+    }
+}
+
+#[test]
+fn inverted_invalid_utf8_stops_watermark_before_publication() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table(
+            "t",
+            &[
+                column("id", ColumnType::Int8),
+                column("content", ColumnType::Text),
+            ],
+        )
+        .unwrap();
+    engine
+        .exec(
+            None,
+            "CREATE INDEX content_idx ON t USING inverted (content)",
+        )
+        .unwrap();
+    let before = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+    let entry = engine.describe_table("t").unwrap();
+    let columns = [ColumnType::Int8, ColumnType::Text];
+    let (xid, snapshot) = writer_snapshot(&engine);
+    let external = engine
+        .heap()
+        .externalize_value(
+            &main_relation(&entry, &columns),
+            &snapshot,
+            ColumnType::Bytea,
+            &Datum::Bytea(vec![0xff]),
+        )
+        .unwrap();
+    let tuple = encode_tuple(
+        TupleHeader::new(
+            TxnId::INVALID,
+            TxnId::INVALID,
+            0,
+            [0; 16],
+            Tid {
+                page_id: PageId::INVALID,
+                slot_id: 0,
+            },
+            0,
+        ),
+        &columns,
+        &[Some(Datum::Int8(1)), Some(external)],
+    )
+    .unwrap();
+    engine
+        .heap()
+        .insert(InsertContext {
+            rel: main_relation(&entry, &columns),
+            snapshot: &snapshot,
+            tuple: &tuple,
+            out_tid: None,
+        })
+        .unwrap();
+    engine.txn_manager().commit_txn(xid).unwrap();
+
+    let error = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap_err();
+    assert!(error.to_string().contains("UTF-8"), "{error}");
+    let after = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+    assert_eq!(after, before);
+}
+
+#[test]
 fn zero_length_values_still_require_their_empty_chunk() {
     for (column_type, datum) in [
         (ColumnType::Text, Datum::Text(String::new())),

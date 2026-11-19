@@ -65,6 +65,16 @@ impl InvertedIndex {
     pub fn watermark(&self) -> crate::Watermark {
         self.store.watermark()
     }
+
+    /// Persist the current write view and return the last seal marker's end LSN.
+    pub fn seal(
+        &mut self,
+        data_dir: &std::path::Path,
+        wal: &pg_storage::wal::WalWriter,
+        xid: pg_storage::types::TxnId,
+    ) -> Result<Option<Lsn>> {
+        self.store.seal(data_dir, wal, xid)
+    }
 }
 
 impl AccessMethod for InvertedIndex {

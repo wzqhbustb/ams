@@ -347,6 +347,11 @@ mod tests {
         let index_oid = pg_storage::types::Oid(9879);
         let path = SegmentStore::manifest_path(tmp.path(), index_oid);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            SegmentStore::analyzer_path(tmp.path(), index_oid),
+            crate::recovery::encode(&AnalyzerConfig::builtin()).unwrap(),
+        )
+        .unwrap();
         for applied_lsn in [Lsn::INVALID, Lsn(128)] {
             let manifest = SegmentManifest {
                 generation: 1,
@@ -541,8 +546,12 @@ mod tests {
         .unwrap();
         let config = pg_storage::config::StorageConfig::new(tmp.path());
         let wal = pg_storage::wal::WalWriter::open(tmp.path(), &config).unwrap();
-        store.seal(&wal, pg_storage::types::TxnId(1)).unwrap();
-        store.seal(&wal, pg_storage::types::TxnId(1)).unwrap();
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
         let empty_oid = pg_storage::types::Oid(9880);
         let mut empty = SegmentStore::create(
             tmp.path(),
@@ -552,7 +561,9 @@ mod tests {
             Lsn(128),
         )
         .unwrap();
-        empty.seal(&wal, pg_storage::types::TxnId(2)).unwrap();
+        empty
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(2))
+            .unwrap();
         wal.flush().unwrap();
         drop(wal);
 
@@ -589,6 +600,266 @@ mod tests {
         let empty = SegmentStore::open(tmp.path(), empty_oid, &AnalyzerConfig::builtin()).unwrap();
         assert!(empty.manifest().active_segment_ids.is_empty());
         assert_eq!(empty.watermark().consumed_lsn, Lsn(128));
+    }
+
+    #[test]
+    fn seal_generations_are_crash_safe_and_never_reuse_ids() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_oid = pg_storage::types::Oid(9879);
+        let tid = |slot| pg_storage::types::Tid {
+            page_id: pg_storage::types::PageId(1),
+            slot_id: slot,
+        };
+        let config = pg_storage::config::StorageConfig::new(tmp.path());
+        let wal = pg_storage::wal::WalWriter::open(tmp.path(), &config).unwrap();
+        let mut store = SegmentStore::create(
+            tmp.path(),
+            index_oid,
+            AnalyzerConfig::builtin(),
+            vec![(tid(1), "rust".to_string())],
+            Lsn::FIRST,
+        )
+        .unwrap();
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        let old_manifest =
+            std::fs::read(SegmentStore::manifest_path(tmp.path(), index_oid)).unwrap();
+
+        store.insert_document(tid(2), "contract").unwrap();
+        store.advance_consumed(Lsn(128));
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert_eq!(store.manifest().generation, 2);
+        assert_eq!(
+            store.manifest().active_segment_ids,
+            vec![pg_storage::segment::SegmentId(2)]
+        );
+        assert_eq!(store.watermark().durable_applied_lsn, Lsn(128));
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert_eq!(store.manifest().generation, 2);
+        store.advance_consumed(Lsn(256));
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert_eq!(store.manifest().generation, 2);
+        assert_eq!(store.watermark().durable_applied_lsn, Lsn(128));
+        let recovered =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert_eq!(recovered.search_text("rust", None).unwrap().len(), 1);
+        assert_eq!(recovered.search_text("contract", None).unwrap().len(), 1);
+
+        // Simulate a crash before the generation-2 manifest rename. The old
+        // segment is untouched, so replaying the same commit cannot double it.
+        std::fs::write(
+            SegmentStore::manifest_path(tmp.path(), index_oid),
+            old_manifest,
+        )
+        .unwrap();
+        let mut crashed =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert!(crashed.search_text("contract", None).unwrap().is_empty());
+        crashed.insert_document(tid(2), "contract").unwrap();
+        crashed.advance_consumed(Lsn(128));
+        crashed
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert_eq!(
+            crashed.manifest().active_segment_ids,
+            vec![pg_storage::segment::SegmentId(3)]
+        );
+        assert_eq!(crashed.search_text("rust", None).unwrap().len(), 1);
+        assert_eq!(crashed.search_text("contract", None).unwrap().len(), 1);
+
+        assert!(crashed.delete_document(tid(1)).unwrap());
+        assert!(crashed.delete_document(tid(2)).unwrap());
+        crashed.advance_consumed(Lsn(256));
+        crashed
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert!(crashed.manifest().active_segment_ids.is_empty());
+        crashed.insert_document(tid(3), "fresh").unwrap();
+        crashed.advance_consumed(Lsn(512));
+        crashed
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert_eq!(
+            crashed.manifest().active_segment_ids,
+            vec![pg_storage::segment::SegmentId(4)]
+        );
+        let reopened =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert_eq!(reopened.search_text("fresh", None).unwrap().len(), 1);
+        assert_eq!(reopened.search_text("rust", None).unwrap().len(), 0);
+        wal.flush().unwrap();
+    }
+
+    #[test]
+    fn active_segments_merge_terms_and_reject_duplicate_documents() {
+        fn write_segment(
+            data_dir: &std::path::Path,
+            index_oid: pg_storage::types::Oid,
+            segment_id: pg_storage::segment::SegmentId,
+            tid: pg_storage::types::Tid,
+        ) {
+            let postings = BTreeMap::from([(
+                "contract".to_string(),
+                BTreeMap::from([(
+                    tid,
+                    Posting {
+                        tid,
+                        term_freq: 1,
+                        positions: vec![0],
+                    },
+                )]),
+            )]);
+            let doc_lengths = vec![DocLength {
+                tid,
+                token_count: 1,
+            }];
+            let metadata = SegmentMeta {
+                format_version: posting::SEGMENT_FORMAT_VERSION,
+                index_oid,
+                segment_id,
+                analyzer: AnalyzerConfig::builtin(),
+                state: pg_storage::segment::SegmentState::Sealed,
+                doc_count: 1,
+                total_tokens: 1,
+                term_df: BTreeMap::from([("contract".to_string(), 1)]),
+                created_from_lsn: Lsn::INVALID,
+                applied_lsn: Lsn(128),
+                row_count: 1,
+                posting_count: 1,
+                byte_count: 0,
+            };
+            for (path, bytes) in [
+                (
+                    SegmentStore::segment_metadata_path(data_dir, index_oid, segment_id),
+                    metadata.encode().unwrap(),
+                ),
+                (
+                    SegmentStore::postings_path(data_dir, index_oid, segment_id),
+                    crate::recovery::encode(&postings).unwrap(),
+                ),
+                (
+                    SegmentStore::doc_lengths_path(data_dir, index_oid, segment_id),
+                    crate::recovery::encode(&doc_lengths).unwrap(),
+                ),
+            ] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_oid = pg_storage::types::Oid(9879);
+        let tid = |slot| pg_storage::types::Tid {
+            page_id: pg_storage::types::PageId(1),
+            slot_id: slot,
+        };
+        write_segment(
+            tmp.path(),
+            index_oid,
+            pg_storage::segment::SegmentId(1),
+            tid(1),
+        );
+        write_segment(
+            tmp.path(),
+            index_oid,
+            pg_storage::segment::SegmentId(2),
+            tid(2),
+        );
+        let manifest = SegmentManifest {
+            generation: 2,
+            active_segment_ids: vec![
+                pg_storage::segment::SegmentId(1),
+                pg_storage::segment::SegmentId(2),
+            ],
+            applied_lsn: Lsn(128),
+        };
+        let manifest_path = SegmentStore::manifest_path(tmp.path(), index_oid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, manifest.encode().unwrap()).unwrap();
+        let store = SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert_eq!(store.search_text("contract", None).unwrap().len(), 2);
+
+        write_segment(
+            tmp.path(),
+            index_oid,
+            pg_storage::segment::SegmentId(2),
+            tid(1),
+        );
+        let error =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap_err();
+        assert!(error.to_string().contains("duplicate"), "{error}");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_segment(
+            tmp.path(),
+            index_oid,
+            pg_storage::segment::SegmentId(1),
+            tid(1),
+        );
+        let manifest = SegmentManifest {
+            generation: 1,
+            active_segment_ids: vec![pg_storage::segment::SegmentId(1)],
+            applied_lsn: Lsn(128),
+        };
+        let manifest_path = SegmentStore::manifest_path(tmp.path(), index_oid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, manifest.encode().unwrap()).unwrap();
+        let path = SegmentStore::doc_lengths_path(
+            tmp.path(),
+            index_oid,
+            pg_storage::segment::SegmentId(1),
+        );
+        let mut lengths: Vec<DocLength> =
+            crate::recovery::decode(&std::fs::read(&path).unwrap()).unwrap();
+        lengths.push(lengths[0].clone());
+        std::fs::write(&path, crate::recovery::encode(&lengths).unwrap()).unwrap();
+        let error =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate document length"),
+            "{error}"
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_segment(
+            tmp.path(),
+            index_oid,
+            pg_storage::segment::SegmentId(1),
+            tid(1),
+        );
+        let manifest = SegmentManifest {
+            generation: 1,
+            active_segment_ids: vec![pg_storage::segment::SegmentId(1)],
+            applied_lsn: Lsn(128),
+        };
+        let manifest_path = SegmentStore::manifest_path(tmp.path(), index_oid);
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, manifest.encode().unwrap()).unwrap();
+        let path =
+            SegmentStore::postings_path(tmp.path(), index_oid, pg_storage::segment::SegmentId(1));
+        let mut postings: BTreeMap<String, BTreeMap<pg_storage::types::Tid, Posting>> =
+            crate::recovery::decode(&std::fs::read(&path).unwrap()).unwrap();
+        let mut posting = postings
+            .get_mut("contract")
+            .unwrap()
+            .remove(&tid(1))
+            .unwrap();
+        posting.tid = tid(2);
+        postings
+            .get_mut("contract")
+            .unwrap()
+            .insert(tid(1), posting);
+        std::fs::write(&path, crate::recovery::encode(&postings).unwrap()).unwrap();
+        let error =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap_err();
+        assert!(error.to_string().contains("disagrees"), "{error}");
     }
 
     #[test]
