@@ -16,6 +16,12 @@ use crate::segment::SegmentStore;
 #[derive(Debug)]
 pub struct InvertedIndex {
     store: SegmentStore,
+    merge_capacity_blocked: bool,
+    seal_capacity_blocked: bool,
+    fail_merge_with_capacity: bool,
+    fail_seal_with_capacity: bool,
+    merge_attempts: usize,
+    seal_attempts: usize,
 }
 
 impl InvertedIndex {
@@ -23,12 +29,26 @@ impl InvertedIndex {
     pub fn new(index_oid: Oid) -> Self {
         Self {
             store: SegmentStore::new(index_oid),
+            merge_capacity_blocked: false,
+            seal_capacity_blocked: false,
+            fail_merge_with_capacity: false,
+            fail_seal_with_capacity: false,
+            merge_attempts: 0,
+            seal_attempts: 0,
         }
     }
 
     /// Wrap a recovered segment store in its access-method interface.
     pub fn from_store(store: SegmentStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            merge_capacity_blocked: false,
+            seal_capacity_blocked: false,
+            fail_merge_with_capacity: false,
+            fail_seal_with_capacity: false,
+            merge_attempts: 0,
+            seal_attempts: 0,
+        }
     }
 
     /// Execute exact DAAT and BM25 over the recovered segment.
@@ -66,6 +86,27 @@ impl InvertedIndex {
         self.store.watermark()
     }
 
+    /// Whether a previous seal hit the frame capacity and should not be
+    /// retried by the automatic query-path worker in this process.
+    pub fn seal_capacity_blocked(&self) -> bool {
+        self.seal_capacity_blocked
+    }
+
+    /// Stop automatic seal attempts after a capacity failure.
+    pub fn mark_seal_capacity_blocked(&mut self) {
+        self.seal_capacity_blocked = true;
+    }
+
+    /// Inject a deterministic seal capacity failure for engine tests.
+    pub fn inject_seal_capacity_error(&mut self) {
+        self.fail_seal_with_capacity = true;
+    }
+
+    /// Number of seal calls observed by this handle.
+    pub fn seal_attempts_for_test(&self) -> usize {
+        self.seal_attempts
+    }
+
     /// Persist the current write view and return the last seal marker's end LSN.
     pub fn seal(
         &mut self,
@@ -73,7 +114,57 @@ impl InvertedIndex {
         wal: &pg_storage::wal::WalWriter,
         xid: pg_storage::types::TxnId,
     ) -> Result<Option<Lsn>> {
+        self.seal_attempts += 1;
+        if self.fail_seal_with_capacity {
+            return Err(InvertedError::Capacity(
+                "injected seal capacity failure".to_string(),
+            ));
+        }
         self.store.seal(data_dir, wal, xid)
+    }
+
+    /// Number of active segments in the current manifest.
+    pub fn active_segment_count(&self) -> usize {
+        self.store.manifest().active_segment_ids.len()
+    }
+
+    /// Whether a previous merge hit the frame capacity and should not be
+    /// retried by the automatic query-path worker in this process.
+    pub fn merge_capacity_blocked(&self) -> bool {
+        self.merge_capacity_blocked
+    }
+
+    /// Stop automatic merge attempts after a capacity failure.
+    pub fn mark_merge_capacity_blocked(&mut self) {
+        self.merge_capacity_blocked = true;
+    }
+
+    /// Inject a deterministic capacity failure for engine circuit-breaker tests.
+    pub fn inject_merge_capacity_error(&mut self) {
+        self.fail_merge_with_capacity = true;
+    }
+
+    /// Number of merge calls observed by this handle.
+    pub fn merge_attempts_for_test(&self) -> usize {
+        self.merge_attempts
+    }
+
+    /// Merge all active segments into a new generation when compaction is due.
+    pub fn merge(
+        &mut self,
+        data_dir: &std::path::Path,
+        wal: &pg_storage::wal::WalWriter,
+        xid: pg_storage::types::TxnId,
+    ) -> Result<Option<Lsn>> {
+        {
+            self.merge_attempts += 1;
+            if self.fail_merge_with_capacity {
+                return Err(InvertedError::Capacity(
+                    "injected merge capacity failure".to_string(),
+                ));
+            }
+        }
+        self.store.merge(data_dir, wal, xid)
     }
 }
 

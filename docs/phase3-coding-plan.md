@@ -120,13 +120,13 @@
 | k-way merge | 按 `(term, tid, position)` 流式合并，不全量载入内存；重复 redo entry 按完整键去重，正常 UPDATE 保留不同 TID |
 | 物理删除 | tombstone 从 merge 输出中丢弃；统计汇总与重算交叉校验；merge 间历史统计窗口在 EXPLAIN/文档中可观察 |
 | SegmentManifest | target durable 后先不发布；以 `merged_applied_lsn = max(inputs.applied_lsn)` 计算水位，空 inputs 保持原值，禁止用 merge 完成时的 `synced_lsn()` 跳过新 DML。manifest 使用 `manifest.tmp → fsync → 原子 rename → 父目录 fsync`：一次替换安装 target、移除 inputs、`generation + 1`，替换前读者只见旧 generation，替换后只见新 generation；替换失败旧 manifest 继续有效 |
-| 生命周期与 redo | `Active → Frozen → Sealed → Merging → Retired`；`SegmentSeal=110` 在 seal 时发射且幂等，`SegmentMerge=111` 携带有序 inputs + target，重复安装/退休幂等；失败时 inputs 保持 Sealed |
+| 生命周期与 redo | 文件层输入保持 `Sealed`，manifest 原子切换时逻辑退休 inputs；`SegmentSeal=110` 在 seal 时发射且幂等，`SegmentMerge=111` 携带有序 inputs + target，在 target 与 manifest durable 后发射；redo 严格校验 payload 后为幂等 no-op，发布失败时 inputs 保持 Sealed 且仍在 active 读集合 |
 | 并发与清理 | 单 consumer 与 merge worker 协调 manifest；禁止并发 seal 同 ID 或并发覆盖 generation/applied_lsn；未发布目标按临时文件清理 |
 | 测试 | merge 前后结果和 tie-break 一致、并发 reader×merge×DML、统计一致、target durable 但 manifest 未替换、替换完成、manifest 撕裂/替换失败、重复 seal/merge、SegmentId 不复用；DELETE tombstone 在 merge 输出中物理清除且统计重算正确 |
 
 **验收**：merge 不丢行、不重复、不混代；任何崩溃窗口只见完整旧或新 generation；失败 merge 不产生可见半成品。
 
-**实现补充**：manifest 替换是唯一读集合切换点，redo 也必须遵守；不允许先改 manifest 再写 target，也不允许先 retire inputs 再 durable target。
+**实现补充**：manifest 替换是唯一读集合切换点；target 与 manifest durable 后才追加 `SegmentMerge`，redo 不重复切换。不允许先改 manifest 再写 target，也不允许先 retire inputs 再 durable target。冻结的 111 payload 不含 index OID，不能独立定位 manifest，因此不得把 redo 设计成重新发布 generation。
 
 ---
 
@@ -210,7 +210,9 @@ CARGO_TARGET_DIR=target/msrv-phase3 cargo +1.86.0 check --workspace --all-featur
 - **DAAT 性能债**：当前实现包含 per-term `BTreeSet` 分配和候选×term map 查找，Stage E 需要真流式 DAAT 基线与 WAND 对照；性能优化只能在正确性证据之后进行。
 - **Posting 写入校验**：`Posting::validate` 已抽出为公共函数，Stage B 持久化前必须调用，不能只依赖 decode 时发现损坏。
 - **Tantivy 版本漂移**：基准版本和 lockfile 一并归档，禁止无约束升级造成 MSRV 或质量数字失真。
-- **merge 与读者延迟**：大 segment 流式 merge 仍需测量 I/O 与页缓存污染；优化只能发生在正确性证据之后。
+- **seal/merge 内存、容量与读者延迟**：posting 已按当前 term 流式合并，但 doc-length、term_df 和 TID 版本所有权表仍驻留内存，冻结的 16MiB frame 上限同时约束 delta seal 与单段 merge。seal 与 merge 分别触发进程级熔断：merge 失败后继续使用多段，seal 失败后以完整内存视图服务并保留 durable 水位差距，均记录警告；多 delta 拆分、多 target 输出或 per-term 帧格式根治归 Stage E+。`pending_documents` 尚无独立字节上限，大批量窗口可能持续增长，需后续在 apply 侧限流。服务与 reopen 仍是 O(corpus) 全量内存视图，“bounded memory”仅描述 merge 文件处理；大 segment 的 I/O、内存与页缓存污染归 Stage E 测量。
+- **退休段与孤儿清理**：成功 merge 后清理为 best-effort；reopen 只回收“不在 active 且 ID 小于 active 高水位”的文件，更新 orphan 必须为 SegmentId 防复用而保留。I/O 失败或反复容量失败仍可能留下不可见垃圾，不影响正确性；严格磁盘配额需要后续独立 GC 指标与清理重试。
+- **统计截面可观察性**：EXPLAIN 尚未暴露 generation/active 段集合，当前只通过文档登记 merge 间统计窗口，属于部分满足；后续应在 `InvertedScan` 增加 generation 与段数。
 - **stale 读配置**：`allow_stale` 是有意放宽，默认 `require_fresh` 不得被配置静默覆盖。
 - **TOAST 组包与复用 group**：新 group 缺块与共享旧 group 损坏只能 `Corrupted` 停水位，不得通过忽略 chunk 提高新鲜度。
 - **M6 收口项并行**：24h 复跑/CI 报告/tag 与本计划无依赖，不阻塞各 Stage。
@@ -237,3 +239,8 @@ CARGO_TARGET_DIR=target/msrv-phase3 cargo +1.86.0 check --workspace --all-featur
 | v1.13 | 2026-11-19 | Stage C 审查修复：detoast 改为 Commit 时提交后快照执行，修复 in-flight/abort 毒化；TOAST 按 commit 仅校验受影响 valueid；pending 同时限制 action 数和 16MiB 字节；`allow_stale` 真实读取 sealed 旧代并标注；lag 动态计算且可见延迟按 index OID 记录；多 active segment 按 term 合并且拒绝重复文档；seal 返回 end LSN，避免把自身记录误计为 lag；p95 样本改用 >8KiB 多 chunk 文档。 |
 | v1.14 | 2026-11-19 | 二轮深度审查修复：空 manifest 也持久化 Analyzer 身份，配置失配继续 fail-stop；强制 posting map key 等于 `Posting.tid`，拒绝同 segment 重复 DocLength，统计累加改为 checked；pending 新增 64 XID 全局上限；TOAST 删除身份无法安全恢复时改为全量校验，覆盖 vacuum 后停水位。 |
 | v1.15 | 2026-11-19 | 三轮审查修复：提交快照改为 XID 不在 `xip` 才可用，避免 CLOG/活跃集间隙导致 TOAST 缺块；被 UPDATE 取代且 vacuum 回收的历史版本在重放时跳过，不再楔死；回收 WAL 段时直接报“rebuild required”，不再静默跳段；删除未接线的 `InMemoryWatermarkRegistry`，空 Commit 不取快照，LSN 改用 `record_size()`，删除不可达 HOT-TOAST 分支。风险登记：`persist_generation` 仍是全量重写且受 16MiB frame 上限约束，Stage D 必须引入增量分段而非指望 merge 消除悬崖；`pending_inverted` 全局锁和 index handle 锁跨重放的头阻塞留待 Stage E 并发治理。 |
+| v1.16 | 2026-11-20 | Stage D 实现：seal 改为 upsert/tombstone 增量段，active IDs 严格按旧到新排列；merge 第一遍确定每个 TID 的最新版本，第二遍按 term k-way 流式读写并保持冻结字节格式，tombstone 在输出中物理清除，成功 merge 清理退休段；Engine 在 4 个 active 段时自动 merge，`SegmentMerge` redo 校验有序 inputs+target；补 target/manifest 崩溃窗口、SegmentId 防复用、UPDATE/DELETE/TOAST/reopen 和 reader×merge×DML 回归。doc-length/版本元数据仍驻留内存且受 16MiB frame 限制，全 crash matrix 与性能验收留 Stage E。 |
+| v1.17 | 2026-11-20 | Stage D 审查修复：seal/merge 不再把 consumed 水位直接推到内部 marker end，避免跳过窗口内并发 DML；require-fresh planner 使用刚刷新数据水位，内部 marker 不再误触发 stale；reopen 以 doc-length 识别空 token upsert，多段统计 checked 防溢出；merge 只接受 Sealed inputs，明确 manifest-first、redo 仅校验的 111 契约；补真实 Engine 确定性交错、reopen/merge、溢出、非 Sealed 输入和 redo payload 回归。 |
+| v1.18 | 2026-11-20 | Stage D 二轮审查修复：merge 要求 `max(inputs.applied_lsn) == manifest.applied_lsn`，防止水位下降和重复 WAL 重放；reopen、merge 输入与输出按 TID checked 累加 `term_freq` 并与 doc-length 对账，拒绝语义损坏统计；lag records/bytes 排除不改变文档集合的 SegmentSeal/SegmentMerge，消除内部 marker 导致的指标抖动；补水位覆盖缺口、词频偏大/偏小及显式 flush 后零数据 lag 回归，修正旧 reopen fixture 的词频但保持全部冻结 golden 字节不变。 |
+| v1.19 | 2026-11-20 | Stage D 三轮审查修复：容量错误独立分类并触发进程级熔断和警告，auto-merge 不再楔死查询，后续 DML 继续多段服务；open 与 merge 统一拒绝重复/相交 tombstone；reopen 回收低于 active 高水位的非 active 文件且保留更新 ID 防复用；k-way 每个输出 term 仅克隆一次；登记多 target/per-term 格式根治、EXPLAIN 统计截面和 O(corpus) 服务内存架构。 |
+| v1.20 | 2026-11-20 | Stage D 残留审查修复：delta seal 与 merge 对称处理 `Capacity`——独立 seal 熔断和警告，保留完整内存查询视图及 durable/consumed 水位差，seal 失败时禁止 merge 未密封变更，reopen 重放后同样降级而非楔死；补后续 DML 与 reopen 重放回归，登记 pending 字节限流及多 delta 拆分根治方向。 |

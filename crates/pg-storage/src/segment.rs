@@ -99,9 +99,12 @@ impl SegmentState {
 ///   contract.
 /// - `SegmentMerge = 111`: payload carries **the input `SegmentId` list
 ///   (merge sources, in merge order) followed by the target `SegmentId`**
-///   (the merge output). On redo, the inputs transition to `Retired` and
-///   the target is installed as the merged segment; the record must be
-///   sufficient to reconstruct that outcome idempotently.
+///   (the merge output). The producer durably writes the target and atomically
+///   publishes the manifest before appending this record. Redo strictly
+///   validates the ordered IDs and is otherwise an idempotent no-op: the
+///   manifest, not replay, switches the read set and logically retires inputs.
+///   The frozen payload deliberately has no index OID, so redo cannot locate
+///   or replace a manifest independently.
 ///
 /// Both records replay unconditionally (no transaction context): segment
 /// lifecycle operations are administrative, not transactional.
@@ -121,14 +124,12 @@ pub trait SegmentedStorage: Send + Sync {
     fn seal(&self, id: SegmentId) -> Result<()>;
 
     /// Merge the sealed segments `ids` into one new segment and return the
-    /// target's ID (`Sealed` → `Merging` → `Retired` for each input; the
-    /// target is created `Sealed`). Emits a `SegmentMerge = 111` WAL
-    /// record (payload contract: input `SegmentId` list + target
-    /// `SegmentId` — see the trait docs). Merging any non-`Sealed` input
-    /// is an error. On `Err` return, every input is guaranteed to still be
-    /// `Sealed`: `Merging` is redo-internal idempotency semantics, never a
-    /// state an input can be left in (the one-way machine has no rollback
-    /// edge, so a failed merge must not strand segments).
+    /// target's ID. The target is created `Sealed`; inputs are logically
+    /// retired when the manifest atomically selects the target. Emits a
+    /// `SegmentMerge = 111` WAL record after that publication (payload
+    /// contract: input `SegmentId` list + target `SegmentId` — see the trait
+    /// docs). Merging any non-`Sealed` input is an error. On `Err` return
+    /// before manifest publication, every input remains `Sealed` and active.
     fn merge(&self, ids: &[SegmentId]) -> Result<SegmentId>;
 }
 

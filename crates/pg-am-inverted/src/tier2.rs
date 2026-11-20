@@ -23,9 +23,12 @@ pub struct Watermark {
 /// Point-in-time WAL consumer lag and freshness metrics.
 #[derive(Debug, Clone)]
 pub struct LagMetrics {
-    /// Flushed records not yet applied by this consumer.
+    /// Flushed data-bearing records not yet applied by this consumer.
+    /// Administrative `SegmentSeal`/`SegmentMerge` records are excluded because
+    /// they do not change the query-visible document set.
     pub wal_lag_records: u64,
-    /// Bytes between `applied_lsn` and `synced_lsn`.
+    /// Bytes of the data-bearing records in `wal_lag_records`, excluding
+    /// administrative segment markers.
     pub wal_lag_bytes: u64,
     /// WAL prefix applied by this consumer.
     pub applied_lsn: Lsn,

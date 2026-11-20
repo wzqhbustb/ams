@@ -523,6 +523,7 @@ pub(crate) fn build_request_with_extra(
             Some(OrderByKind::Bm25Score(expr)) => Some(expr.column.as_str()),
             _ => None,
         });
+    let mut snapshot_frontier = engine.storage().wal_writer().synced_lsn();
     let indexes = engine
         .indexes_of(entry)
         .into_iter()
@@ -549,7 +550,12 @@ pub(crate) fn build_request_with_extra(
             {
                 // require_fresh catches up before planning. allow_stale uses
                 // the current sealed generation and preserves the stale marker.
-                Some(engine.refresh_inverted(&idx, entry)?)
+                let metadata = engine.refresh_inverted(&idx, entry)?;
+                // Administrative seal/merge markers may follow the consumed
+                // data frontier. They do not make this refreshed plan stale;
+                // any later heap commit still forces the snapshot fallback.
+                snapshot_frontier = snapshot_frontier.min(metadata.watermark.consumed_lsn);
+                Some(metadata)
             } else {
                 idx.inverted
             };
@@ -570,7 +576,7 @@ pub(crate) fn build_request_with_extra(
         order_by: order_by.clone(),
         limit: *limit,
         allow_stale_inverted: engine.allow_stale_inverted(),
-        snapshot_frontier: engine.storage().wal_writer().synced_lsn(),
+        snapshot_frontier,
         indexes,
     })
 }

@@ -14,6 +14,7 @@ pub mod index;
 pub mod posting;
 pub mod recovery;
 pub mod segment;
+pub(crate) mod segment_io;
 pub mod tier2;
 pub mod wand;
 
@@ -167,16 +168,16 @@ mod tests {
                         first,
                         Posting {
                             tid: first,
-                            term_freq: 1,
-                            positions: vec![0],
+                            term_freq: 9,
+                            positions: (0..9).collect(),
                         },
                     ),
                     (
                         second,
                         Posting {
                             tid: second,
-                            term_freq: 1,
-                            positions: vec![0],
+                            term_freq: 8,
+                            positions: (0..8).collect(),
                         },
                     ),
                 ]),
@@ -634,7 +635,10 @@ mod tests {
         assert_eq!(store.manifest().generation, 2);
         assert_eq!(
             store.manifest().active_segment_ids,
-            vec![pg_storage::segment::SegmentId(2)]
+            vec![
+                pg_storage::segment::SegmentId(1),
+                pg_storage::segment::SegmentId(2)
+            ]
         );
         assert_eq!(store.watermark().durable_applied_lsn, Lsn(128));
         store
@@ -669,7 +673,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             crashed.manifest().active_segment_ids,
-            vec![pg_storage::segment::SegmentId(3)]
+            vec![
+                pg_storage::segment::SegmentId(1),
+                pg_storage::segment::SegmentId(3)
+            ]
         );
         assert_eq!(crashed.search_text("rust", None).unwrap().len(), 1);
         assert_eq!(crashed.search_text("contract", None).unwrap().len(), 1);
@@ -680,7 +687,14 @@ mod tests {
         crashed
             .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
             .unwrap();
-        assert!(crashed.manifest().active_segment_ids.is_empty());
+        assert_eq!(
+            crashed.manifest().active_segment_ids,
+            vec![
+                pg_storage::segment::SegmentId(1),
+                pg_storage::segment::SegmentId(3),
+                pg_storage::segment::SegmentId(4),
+            ]
+        );
         crashed.insert_document(tid(3), "fresh").unwrap();
         crashed.advance_consumed(Lsn(512));
         crashed
@@ -688,7 +702,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             crashed.manifest().active_segment_ids,
-            vec![pg_storage::segment::SegmentId(4)]
+            vec![
+                pg_storage::segment::SegmentId(1),
+                pg_storage::segment::SegmentId(3),
+                pg_storage::segment::SegmentId(4),
+                pg_storage::segment::SegmentId(5),
+            ]
         );
         let reopened =
             SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
@@ -698,7 +717,289 @@ mod tests {
     }
 
     #[test]
-    fn active_segments_merge_terms_and_reject_duplicate_documents() {
+    fn merge_compacts_segments_and_preserves_update_delete_semantics() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_oid = pg_storage::types::Oid(9879);
+        let tid = |slot| pg_storage::types::Tid {
+            page_id: pg_storage::types::PageId(1),
+            slot_id: slot,
+        };
+        let config = pg_storage::config::StorageConfig::new(tmp.path());
+        let wal = pg_storage::wal::WalWriter::open(tmp.path(), &config).unwrap();
+        let mut store = SegmentStore::create(
+            tmp.path(),
+            index_oid,
+            AnalyzerConfig::builtin(),
+            vec![(tid(1), "rust".to_string())],
+            Lsn::FIRST,
+        )
+        .unwrap();
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        for (slot, text, lsn) in [(2, "contract", 128), (3, "other", 256)] {
+            store.insert_document(tid(slot), text).unwrap();
+            store.advance_consumed(Lsn(lsn));
+            store
+                .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+                .unwrap();
+        }
+        assert_eq!(store.manifest().active_segment_ids.len(), 3);
+        let before_merge = store
+            .search_text("rust OR contract OR other", None)
+            .unwrap();
+        assert_eq!(
+            before_merge.iter().map(|hit| hit.tid).collect::<Vec<_>>(),
+            vec![tid(1), tid(2), tid(3)]
+        );
+
+        store
+            .merge(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert_eq!(
+            store.manifest().active_segment_ids,
+            vec![pg_storage::segment::SegmentId(4)]
+        );
+        for retired_id in 1..=3 {
+            assert!(!SegmentStore::segment_metadata_path(
+                tmp.path(),
+                index_oid,
+                pg_storage::segment::SegmentId(retired_id),
+            )
+            .exists());
+        }
+        let mut expected = InMemoryIndex::new(DefaultAnalyzer::mixed());
+        for (slot, text) in [(1, "rust"), (2, "contract"), (3, "other")] {
+            expected.insert_document(tid(slot), text).unwrap();
+        }
+        assert_segment_matches(&tmp, index_oid, 4, &expected);
+        let reopened =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert_eq!(
+            reopened
+                .search_text("rust OR contract OR other", None)
+                .unwrap(),
+            before_merge
+        );
+        assert_eq!(reopened.search_text("other", None).unwrap().len(), 1);
+
+        store.insert_document(tid(1), "updated").unwrap();
+        store.advance_consumed(Lsn(384));
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        store
+            .merge(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert!(store.search_text("rust", None).unwrap().is_empty());
+        let mut updated_expected = InMemoryIndex::new(DefaultAnalyzer::mixed());
+        for (slot, text) in [(1, "updated"), (2, "contract"), (3, "other")] {
+            updated_expected.insert_document(tid(slot), text).unwrap();
+        }
+        assert_segment_matches(&tmp, index_oid, 6, &updated_expected);
+
+        assert!(store.delete_document(tid(2)).unwrap());
+        store.advance_consumed(Lsn(512));
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        store
+            .merge(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        let mut final_expected = InMemoryIndex::new(DefaultAnalyzer::mixed());
+        for (slot, text) in [(1, "updated"), (3, "other")] {
+            final_expected.insert_document(tid(slot), text).unwrap();
+        }
+        assert_segment_matches(&tmp, index_oid, 8, &final_expected);
+        let reopened =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert!(reopened.search_text("contract", None).unwrap().is_empty());
+        assert_eq!(reopened.search_text("updated", None).unwrap().len(), 1);
+        assert_eq!(reopened.search_text("other", None).unwrap().len(), 1);
+        assert!(store
+            .merge(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap()
+            .is_none());
+    }
+
+    fn assert_segment_matches(
+        tmp: &tempfile::TempDir,
+        index_oid: pg_storage::types::Oid,
+        segment_id: u64,
+        expected: &InMemoryIndex<DefaultAnalyzer>,
+    ) {
+        let segment_id = pg_storage::segment::SegmentId(segment_id);
+        let postings: BTreeMap<_, _> = crate::recovery::decode(
+            &std::fs::read(SegmentStore::postings_path(
+                tmp.path(),
+                index_oid,
+                segment_id,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(postings, *expected.postings());
+        let expected_lengths = expected
+            .doc_lengths()
+            .iter()
+            .map(|(tid, token_count)| DocLength {
+                tid: *tid,
+                token_count: *token_count,
+            })
+            .collect::<Vec<_>>();
+        let lengths: Vec<DocLength> = crate::recovery::decode(
+            &std::fs::read(SegmentStore::doc_lengths_path(
+                tmp.path(),
+                index_oid,
+                segment_id,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(lengths, expected_lengths);
+        let tombstones: Vec<pg_storage::types::Tid> = crate::recovery::decode(
+            &std::fs::read(SegmentStore::tombstones_path(
+                tmp.path(),
+                index_oid,
+                segment_id,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(tombstones.is_empty());
+        let metadata = SegmentMeta::decode(
+            &std::fs::read(SegmentStore::segment_metadata_path(
+                tmp.path(),
+                index_oid,
+                segment_id,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let stats = expected.stats();
+        assert_eq!(metadata.doc_count, stats.doc_count);
+        assert_eq!(metadata.row_count, stats.row_count);
+        assert_eq!(metadata.total_tokens, stats.total_tokens);
+        assert_eq!(metadata.posting_count, stats.posting_count);
+    }
+
+    #[test]
+    fn zero_token_upserts_supersede_old_postings_after_reopen_and_merge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_oid = pg_storage::types::Oid(9879);
+        let tid = pg_storage::types::Tid {
+            page_id: pg_storage::types::PageId(1),
+            slot_id: 1,
+        };
+        let other = pg_storage::types::Tid {
+            page_id: pg_storage::types::PageId(1),
+            slot_id: 2,
+        };
+        let config = pg_storage::config::StorageConfig::new(tmp.path());
+        let wal = pg_storage::wal::WalWriter::open(tmp.path(), &config).unwrap();
+        let mut store = SegmentStore::create(
+            tmp.path(),
+            index_oid,
+            AnalyzerConfig::builtin(),
+            vec![(tid, "rust".to_string())],
+            Lsn::FIRST,
+        )
+        .unwrap();
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        store.insert_document(tid, "the").unwrap();
+        store.advance_consumed(Lsn(128));
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert!(store.search_text("rust", None).unwrap().is_empty());
+
+        let mut store =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert!(store.search_text("rust", None).unwrap().is_empty());
+        store.insert_document(tid, "").unwrap();
+        store.advance_consumed(Lsn(256));
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        let mut store =
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert!(store.search_text("rust", None).unwrap().is_empty());
+
+        store.insert_document(other, "contract").unwrap();
+        store.advance_consumed(Lsn(384));
+        store
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        store
+            .merge(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        let merged = SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert!(merged.search_text("rust", None).unwrap().is_empty());
+        assert_eq!(merged.search_text("contract", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recovered_multi_segment_token_totals_are_checked_for_overflow() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_oid = pg_storage::types::Oid(9879);
+        for (segment_id, slot_id) in [(1, 1), (2, 2)] {
+            let segment_id = pg_storage::segment::SegmentId(segment_id);
+            let tid = pg_storage::types::Tid {
+                page_id: pg_storage::types::PageId(1),
+                slot_id,
+            };
+            let metadata = SegmentMeta {
+                doc_count: 1,
+                total_tokens: u64::MAX,
+                row_count: 1,
+                segment_id,
+                ..segment_meta_fixture()
+            };
+            let postings = BTreeMap::<String, BTreeMap<pg_storage::types::Tid, Posting>>::new();
+            let lengths = vec![DocLength {
+                tid,
+                token_count: u64::MAX,
+            }];
+            for (path, bytes) in [
+                (
+                    SegmentStore::segment_metadata_path(tmp.path(), index_oid, segment_id),
+                    metadata.encode().unwrap(),
+                ),
+                (
+                    SegmentStore::postings_path(tmp.path(), index_oid, segment_id),
+                    crate::recovery::encode(&postings).unwrap(),
+                ),
+                (
+                    SegmentStore::doc_lengths_path(tmp.path(), index_oid, segment_id),
+                    crate::recovery::encode(&lengths).unwrap(),
+                ),
+            ] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
+        let manifest = SegmentManifest {
+            generation: 2,
+            active_segment_ids: vec![
+                pg_storage::segment::SegmentId(1),
+                pg_storage::segment::SegmentId(2),
+            ],
+            applied_lsn: Lsn(128),
+        };
+        let path = SegmentStore::manifest_path(tmp.path(), index_oid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, manifest.encode().unwrap()).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin())
+        });
+        assert!(result.is_ok(), "overflow must not panic");
+        assert!(matches!(result.unwrap(), Err(InvertedError::Corrupted(_))));
+    }
+
+    #[test]
+    fn active_segments_merge_terms_and_allow_newer_document_versions() {
         fn write_segment(
             data_dir: &std::path::Path,
             index_oid: pg_storage::types::Oid,
@@ -792,9 +1093,8 @@ mod tests {
             pg_storage::segment::SegmentId(2),
             tid(1),
         );
-        let error =
-            SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap_err();
-        assert!(error.to_string().contains("duplicate"), "{error}");
+        let store = SegmentStore::open(tmp.path(), index_oid, &AnalyzerConfig::builtin()).unwrap();
+        assert_eq!(store.search_text("contract", None).unwrap().len(), 1);
 
         let tmp = tempfile::TempDir::new().unwrap();
         write_segment(

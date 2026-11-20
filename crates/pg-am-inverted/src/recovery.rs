@@ -4,27 +4,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{InvertedError, Result};
 
-const MAGIC: &[u8; 4] = b"PGIV";
-const FORMAT_VERSION: u16 = 1;
-const HEADER_SIZE: usize = 10;
-const TRAILER_SIZE: usize = 4;
-const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAGIC: &[u8; 4] = b"PGIV";
+pub(crate) const FORMAT_VERSION: u16 = 1;
+pub(crate) const HEADER_SIZE: usize = 10;
+pub(crate) const TRAILER_SIZE: usize = 4;
+pub(crate) const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
 /// Serialize a value in the versioned metadata frame and append a CRC32
 /// trailer. The payload length is bounded before it can reach a decoder.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let payload = bincode::serde::encode_to_vec(
-        value,
-        bincode::config::standard().with_limit::<{ MAX_METADATA_BYTES }>(),
-    )
-    .map_err(|error| InvertedError::InvalidArgument(error.to_string()))?;
+    let payload = bincode::serde::encode_to_vec(value, bincode::config::standard())
+        .map_err(|error| InvertedError::InvalidArgument(error.to_string()))?;
     if payload.len() > MAX_METADATA_BYTES {
-        return Err(InvertedError::InvalidArgument(format!(
+        return Err(InvertedError::Capacity(format!(
             "metadata payload exceeds {MAX_METADATA_BYTES} bytes"
         )));
     }
     let payload_len = u32::try_from(payload.len())
-        .map_err(|_| InvertedError::InvalidArgument("metadata payload exceeds u32".to_string()))?;
+        .map_err(|_| InvertedError::Capacity("metadata payload exceeds u32".to_string()))?;
     let crc = crc32fast::hash(&payload);
     let mut bytes = Vec::with_capacity(HEADER_SIZE + payload.len() + TRAILER_SIZE);
     bytes.extend_from_slice(MAGIC);
@@ -180,5 +177,11 @@ mod tests {
         });
         assert!(result.is_ok(), "decoder panicked on an inner String length");
         assert!(matches!(result.unwrap(), Err(InvertedError::Corrupted(_))));
+    }
+
+    #[test]
+    fn oversized_frames_are_capacity_errors() {
+        let error = encode(&vec![0u8; MAX_METADATA_BYTES + 1]).unwrap_err();
+        assert!(matches!(error, InvertedError::Capacity(_)));
     }
 }

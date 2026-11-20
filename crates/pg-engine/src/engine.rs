@@ -1128,6 +1128,8 @@ thread_local! {
         std::cell::Cell::new(None);
     static COMMIT_FINISHED_HOOK: std::cell::Cell<Option<CommitFinishedHook>> =
         std::cell::Cell::new(None);
+    static BEFORE_INVERTED_SEAL_HOOK: std::cell::Cell<Option<fn(&Engine)>> =
+        std::cell::Cell::new(None);
 }
 
 impl Engine {
@@ -1156,6 +1158,7 @@ impl Engine {
         redo_handlers.extend(btree_redo_handlers());
         redo_handlers.extend(pg_am_hnsw::redo::hnsw_redo_handlers());
         redo_handlers.push(Box::new(pg_am_inverted::segment::SegmentSealRedoHandler));
+        redo_handlers.push(Box::new(pg_am_inverted::segment::SegmentMergeRedoHandler));
         redo_handlers.push(Box::new(sequences.redo_handler()));
         let undo_handlers: Vec<Box<dyn UndoHandler>> =
             vec![Box::new(HeapUndoHandler), Box::new(BTreeUndoHandler)];
@@ -4458,6 +4461,76 @@ impl Engine {
             .is_some_and(|pending| pending.contains_key(&snap.current_xid()))
     }
 
+    fn seal_inverted(
+        &self,
+        index_oid: Oid,
+        index: &mut pg_am_inverted::InvertedIndex,
+    ) -> Result<()> {
+        if index.seal_capacity_blocked() {
+            return Ok(());
+        }
+        match index.seal(
+            self.storage.data_dir(),
+            self.storage.wal_writer(),
+            TxnId::INVALID,
+        ) {
+            Ok(_) => Ok(()),
+            Err(pg_am_inverted::InvertedError::Capacity(reason)) => {
+                index.mark_seal_capacity_blocked();
+                let watermark = index.watermark();
+                tracing::warn!(
+                    index_oid = index_oid.0,
+                    consumed_lsn = watermark.consumed_lsn.0,
+                    durable_applied_lsn = watermark.durable_applied_lsn.0,
+                    %reason,
+                    "inverted seal exceeded the frame capacity; serving the in-memory generation and keeping durable replay behind"
+                );
+                Ok(())
+            }
+            Err(error) => Err(EngineError::Corrupted(error.to_string())),
+        }
+    }
+
+    fn merge_inverted_if_due(
+        &self,
+        index_oid: Oid,
+        index: &mut pg_am_inverted::InvertedIndex,
+    ) -> Result<()> {
+        if index.active_segment_count() < 4
+            || index.merge_capacity_blocked()
+            || index.seal_capacity_blocked()
+        {
+            return Ok(());
+        }
+        match index.merge(
+            self.storage.data_dir(),
+            self.storage.wal_writer(),
+            TxnId::INVALID,
+        ) {
+            Ok(_) => Ok(()),
+            Err(pg_am_inverted::InvertedError::Capacity(reason)) => {
+                index.mark_merge_capacity_blocked();
+                tracing::warn!(
+                    index_oid = index_oid.0,
+                    active_segments = index.active_segment_count(),
+                    %reason,
+                    "inverted merge exceeded the frame capacity; continuing with multiple segments"
+                );
+                Ok(())
+            }
+            Err(error) => Err(EngineError::Corrupted(error.to_string())),
+        }
+    }
+
+    #[cfg(test)]
+    fn run_before_inverted_seal_hook(&self) {
+        BEFORE_INVERTED_SEAL_HOOK.with(|hook| {
+            if let Some(hook) = hook.take() {
+                hook(self);
+            }
+        });
+    }
+
     /// Catch one inverted index up to the durable WAL frontier. Heap changes
     /// remain private per XID until Commit; Abort discards them. The consumed
     /// frontier is an end-LSN prefix, so replay starts at it directly (or at
@@ -4481,17 +4554,13 @@ impl Engine {
             )));
         }
         if start == frontier {
-            let seal_end = index
-                .seal(
-                    self.storage.data_dir(),
-                    self.storage.wal_writer(),
-                    TxnId::INVALID,
-                )
-                .map_err(|error| EngineError::Corrupted(error.to_string()))?;
-            if let Some(seal_end) = seal_end {
-                index.advance_consumed(seal_end);
-            }
-            let frontier = seal_end.map_or(frontier, |end| frontier.max(end));
+            #[cfg(test)]
+            self.run_before_inverted_seal_hook();
+            // Seal/merge markers are appended after any concurrently committed
+            // records. Their end LSN must not consume those records unseen;
+            // the next replay pass reads the markers and every preceding DML.
+            self.seal_inverted(index_entry.index_oid, &mut index)?;
+            self.merge_inverted_if_due(index_entry.index_oid, &mut index)?;
             self.record_inverted_lag(
                 index_entry.index_oid,
                 start,
@@ -4718,17 +4787,13 @@ impl Engine {
             }
             index.advance_consumed(record_end);
         }
-        let seal_end = index
-            .seal(
-                self.storage.data_dir(),
-                self.storage.wal_writer(),
-                TxnId::INVALID,
-            )
-            .map_err(|error| EngineError::Corrupted(error.to_string()))?;
-        if let Some(seal_end) = seal_end {
-            index.advance_consumed(seal_end);
-        }
-        let frontier = seal_end.map_or(frontier, |end| frontier.max(end));
+        #[cfg(test)]
+        self.run_before_inverted_seal_hook();
+        // Do not jump consumed_lsn to either administrative marker's end:
+        // another session may have committed DML between our replay frontier
+        // and the marker. The next refresh replays that DML before the marker.
+        self.seal_inverted(index_entry.index_oid, &mut index)?;
+        self.merge_inverted_if_due(index_entry.index_oid, &mut index)?;
         self.record_inverted_lag(
             index_entry.index_oid,
             start,
@@ -7190,23 +7255,31 @@ impl Engine {
             .synced_lsn
             .max(self.storage.wal_writer().synced_lsn());
         metrics.synced_lsn = synced;
-        metrics.wal_lag_bytes = synced.0.saturating_sub(metrics.applied_lsn.0);
-        metrics.wal_lag_records = if synced > metrics.applied_lsn {
+        if synced > metrics.applied_lsn {
             let tail = pg_am_inverted::tier2::FlushedWalTail::new(
                 self.storage.data_dir().join("wal"),
                 self.storage.config().wal_segment_size,
                 Arc::clone(self.storage.wal_writer()),
             );
             let records = pg_storage::tier2::WalTailReader::tail_from(&tail, metrics.applied_lsn);
-            let mut count = 0;
+            let mut count = 0u64;
+            let mut bytes = 0u64;
             for record in records {
-                let _ = record?;
-                count += 1;
+                let record = record?;
+                if !matches!(
+                    record.record_type,
+                    WalRecordType::SegmentSeal | WalRecordType::SegmentMerge
+                ) {
+                    count += 1;
+                    bytes = bytes.saturating_add(record.record_size() as u64);
+                }
             }
-            count
+            metrics.wal_lag_records = count;
+            metrics.wal_lag_bytes = bytes;
         } else {
-            0
-        };
+            metrics.wal_lag_records = 0;
+            metrics.wal_lag_bytes = 0;
+        }
         metrics.watermark_lag_seconds = metrics.last_progress_at.elapsed().as_secs_f64();
         Ok(Some(metrics))
     }
@@ -9303,6 +9376,9 @@ mod tests {
         engine
             .exec(None, "SELECT id FROM t WHERE content @@ 'contract'")
             .unwrap();
+        // Make the administrative seal marker durable before reading lag:
+        // only real data records may contribute to these counters.
+        engine.storage.wal_writer().flush().unwrap();
         let caught_up = engine.inverted_lag_metrics(index_oid).unwrap().unwrap();
         assert_eq!(caught_up.wal_lag_records, 0);
         assert_eq!(caught_up.wal_lag_bytes, 0);
@@ -9411,6 +9487,274 @@ mod tests {
             engine.query_stats().entries().last().unwrap().path,
             ExecutionPath::IndexLookup
         );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_seal_capacity_failure_degrades_and_recovers_by_replay() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        let query_count = |engine: &Engine| {
+            let result = engine
+                .exec(None, "SELECT id FROM t WHERE content @@ 'shared'")
+                .unwrap();
+            let QueryResult::Rows { rows, .. } = result else {
+                panic!("expected full-text rows")
+            };
+            rows.len()
+        };
+        for id in 1..=3 {
+            engine
+                .exec(None, &format!("INSERT INTO t VALUES ({id}, 'shared')"))
+                .unwrap();
+            assert_eq!(query_count(&engine), id);
+        }
+        let handle = engine.inverted_handle(index_oid).unwrap();
+        let attempts_before = handle.lock().seal_attempts_for_test();
+        handle.lock().inject_seal_capacity_error();
+        engine
+            .exec(None, "INSERT INTO t VALUES (4, 'shared')")
+            .unwrap();
+        assert_eq!(query_count(&engine), 4);
+        assert_eq!(handle.lock().seal_attempts_for_test(), attempts_before + 1);
+        assert!(handle.lock().seal_capacity_blocked());
+        let watermark = handle.lock().watermark();
+        assert!(watermark.durable_applied_lsn < watermark.consumed_lsn);
+
+        engine
+            .exec(None, "INSERT INTO t VALUES (5, 'shared')")
+            .unwrap();
+        assert_eq!(query_count(&engine), 5);
+        assert_eq!(handle.lock().seal_attempts_for_test(), attempts_before + 1);
+        assert_eq!(handle.lock().active_segment_count(), 3);
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        let handle = engine.inverted_handle(index_oid).unwrap();
+        handle.lock().inject_seal_capacity_error();
+        assert_eq!(query_count(&engine), 5);
+        assert_eq!(handle.lock().seal_attempts_for_test(), 1);
+        assert!(handle.lock().seal_capacity_blocked());
+        engine
+            .exec(None, "INSERT INTO t VALUES (6, 'shared')")
+            .unwrap();
+        assert_eq!(query_count(&engine), 6);
+        assert_eq!(handle.lock().seal_attempts_for_test(), 1);
+        assert_eq!(handle.lock().active_segment_count(), 3);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_capacity_failure_degrades_to_multi_segment_reads() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        let query_count = |engine: &Engine| {
+            let result = engine
+                .exec(None, "SELECT id FROM t WHERE content @@ 'shared'")
+                .unwrap();
+            let QueryResult::Rows { rows, .. } = result else {
+                panic!("expected full-text rows")
+            };
+            rows.len()
+        };
+        for id in 1..=3 {
+            engine
+                .exec(None, &format!("INSERT INTO t VALUES ({id}, 'shared')"))
+                .unwrap();
+            assert_eq!(query_count(&engine), id);
+        }
+        let handle = engine.inverted_handle(index_oid).unwrap();
+        handle.lock().inject_merge_capacity_error();
+        engine
+            .exec(None, "INSERT INTO t VALUES (4, 'shared')")
+            .unwrap();
+        assert_eq!(query_count(&engine), 4);
+        assert_eq!(handle.lock().merge_attempts_for_test(), 1);
+        assert!(handle.lock().merge_capacity_blocked());
+
+        engine
+            .exec(None, "INSERT INTO t VALUES (5, 'shared')")
+            .unwrap();
+        assert_eq!(query_count(&engine), 5);
+        assert_eq!(handle.lock().merge_attempts_for_test(), 1);
+        assert_eq!(handle.lock().active_segment_count(), 5);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_auto_merge_preserves_updates_deletes_toast_and_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        let query_ids = |engine: &Engine, term: &str| {
+            let result = engine
+                .exec(None, &format!("SELECT id FROM t WHERE content @@ '{term}'"))
+                .unwrap();
+            let QueryResult::Rows { rows, .. } = result else {
+                panic!("expected full-text rows")
+            };
+            let mut ids = rows
+                .into_iter()
+                .map(|row| match row[0] {
+                    Some(Datum::Int4(id)) => id,
+                    ref other => panic!("unexpected id {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        };
+        for id in 1..=4 {
+            let text = if id == 4 {
+                format!("shared {}", "toast ".repeat(2000))
+            } else {
+                format!("shared unique{id}")
+            };
+            engine
+                .exec(None, &format!("INSERT INTO t VALUES ({id}, '{text}')"))
+                .unwrap();
+            assert_eq!(query_ids(&engine, "shared").len(), id as usize);
+        }
+        assert_eq!(
+            engine
+                .inverted_handle(index_oid)
+                .unwrap()
+                .lock()
+                .active_segment_count(),
+            1
+        );
+        engine
+            .exec(None, "UPDATE t SET content = 'changed shared' WHERE id = 1")
+            .unwrap();
+        assert_eq!(query_ids(&engine, "changed"), vec![1]);
+        engine.exec(None, "DELETE FROM t WHERE id = 2").unwrap();
+        assert_eq!(query_ids(&engine, "shared"), vec![1, 3, 4]);
+        assert!(query_ids(&engine, "unique1").is_empty());
+        assert!(query_ids(&engine, "unique2").is_empty());
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert_eq!(query_ids(&engine, "shared"), vec![1, 3, 4]);
+        engine
+            .exec(None, "INSERT INTO t VALUES (5, 'shared reopened')")
+            .unwrap();
+        assert_eq!(query_ids(&engine, "shared"), vec![1, 3, 4, 5]);
+        assert_eq!(
+            engine
+                .inverted_handle(index_oid)
+                .unwrap()
+                .lock()
+                .active_segment_count(),
+            1
+        );
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::IndexLookup
+        );
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert_eq!(query_ids(&engine, "shared"), vec![1, 3, 4, 5]);
+        assert_eq!(query_ids(&engine, "toast"), vec![4]);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_internal_markers_do_not_skip_concurrent_commits() {
+        fn inject_commit(engine: &Engine) {
+            engine
+                .exec(None, "INSERT INTO t VALUES (5, 'shared injected')")
+                .unwrap();
+        }
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                BEFORE_INVERTED_SEAL_HOOK.with(|hook| hook.set(None));
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        let _reset = ResetHook;
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let query_count = |engine: &Engine| {
+            let result = engine
+                .exec(None, "SELECT id FROM t WHERE content @@ 'shared'")
+                .unwrap();
+            let QueryResult::Rows { rows, .. } = result else {
+                panic!("expected full-text rows")
+            };
+            rows.len()
+        };
+        for id in 1..=3 {
+            engine
+                .exec(None, &format!("INSERT INTO t VALUES ({id}, 'shared')"))
+                .unwrap();
+            assert_eq!(query_count(&engine), id);
+        }
+        engine
+            .exec(None, "INSERT INTO t VALUES (4, 'shared')")
+            .unwrap();
+        BEFORE_INVERTED_SEAL_HOOK.with(|hook| hook.set(Some(inject_commit)));
+        // The injected commit lands after the replay frontier but before the
+        // seal/merge markers. This snapshot predates it, so four rows are visible.
+        assert_eq!(query_count(&engine), 4);
+        // The next refresh must consume the injected row rather than jumping
+        // to the administrative marker's end LSN.
+        assert_eq!(query_count(&engine), 5);
+        let index_oid = engine.indexes()[0].index_oid;
+        assert_eq!(
+            engine
+                .inverted_handle(index_oid)
+                .unwrap()
+                .lock()
+                .active_segment_count(),
+            2 // merged generation plus the injected commit's delta
+        );
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::IndexLookup
+        );
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert_eq!(query_count(&engine), 5);
         engine.shutdown();
     }
 

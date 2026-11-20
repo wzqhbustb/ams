@@ -12,6 +12,9 @@ pub enum InvertedError {
     /// Caller supplied invalid arguments or configuration.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// A bounded on-disk structure cannot hold the requested output.
+    #[error("capacity limit exceeded: {0}")]
+    Capacity(String),
     /// A lower-level storage operation failed.
     #[error("storage error: {0}")]
     Storage(String),
@@ -29,7 +32,9 @@ impl InvertedError {
                 pg_am_heap::HeapError::InvalidArgument(message.to_string())
             }
             Self::Corrupted(message) => pg_am_heap::HeapError::Corrupted(message),
-            Self::InvalidArgument(message) => pg_am_heap::HeapError::InvalidArgument(message),
+            Self::InvalidArgument(message) | Self::Capacity(message) => {
+                pg_am_heap::HeapError::InvalidArgument(message)
+            }
             Self::Storage(message) => pg_am_heap::HeapError::Storage(
                 pg_storage::error::StorageError::MetadataCorrupted(message),
             ),
