@@ -49,6 +49,8 @@ pub struct SegmentStore {
     dirty: bool,
     /// Upserts and tombstones not yet included in a durable segment.
     pending_documents: BTreeMap<Tid, Option<String>>,
+    /// Number of pending documents required before a new delta is sealed.
+    flush_threshold: usize,
 }
 
 impl std::fmt::Debug for SegmentStore {
@@ -86,6 +88,7 @@ impl SegmentStore {
             wal_sealed: true,
             dirty: false,
             pending_documents: BTreeMap::new(),
+            flush_threshold: 1,
         }
     }
 
@@ -125,6 +128,7 @@ impl SegmentStore {
             wal_sealed: false,
             dirty: false,
             pending_documents: BTreeMap::new(),
+            flush_threshold: 1,
         };
         store.persist(data_dir, base_lsn)?;
         Ok(store)
@@ -473,6 +477,7 @@ impl SegmentStore {
             wal_sealed: true,
             dirty: false,
             pending_documents: BTreeMap::new(),
+            flush_threshold: 1,
         })
     }
 
@@ -498,6 +503,18 @@ impl SegmentStore {
         self.watermark = watermark;
     }
 
+    /// Set the number of pending documents required before sealing a delta.
+    /// A value of zero is invalid because it would disable the batching contract.
+    pub fn set_flush_threshold(&mut self, threshold: usize) {
+        assert!(threshold > 0, "flush threshold must be greater than zero");
+        self.flush_threshold = threshold;
+    }
+
+    /// Whether unsealed changes are present in the in-memory write view.
+    pub fn has_unsealed_changes(&self) -> bool {
+        !self.pending_documents.is_empty()
+    }
+
     /// Build an empty segment store without inventing a fake index build.
     pub fn build(&self) -> Result<()> {
         Ok(())
@@ -512,6 +529,17 @@ impl SegmentStore {
     pub fn search_text(&self, text: &str, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
         let query = crate::daat::parse_query(self.index.analyzer(), text);
         self.search(&query, limit)
+    }
+
+    /// Evaluate a parsed query with exact WAND for bounded top-k.
+    pub fn search_wand(&self, query: &Query, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
+        self.index.search_wand(query, limit)
+    }
+
+    /// Analyze query text and evaluate exact WAND for bounded top-k.
+    pub fn search_wand_text(&self, text: &str, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
+        let query = crate::daat::parse_query(self.index.analyzer(), text);
+        self.search_wand(&query, limit)
     }
 
     /// Insert one committed document into the in-process write view.
@@ -548,6 +576,14 @@ impl SegmentStore {
     /// so a crash before that rename replays onto the old generation instead
     /// of replaying onto an already-updated file and double-counting documents.
     fn persist_generation(&mut self, data_dir: &Path) -> Result<()> {
+        self.persist_generation_inner(data_dir, |_| Ok(()))
+    }
+
+    fn persist_generation_inner(
+        &mut self,
+        data_dir: &Path,
+        mut crash_hook: impl FnMut(SealCrashPoint) -> Result<()>,
+    ) -> Result<()> {
         if self.pending_documents.is_empty() {
             return Ok(());
         }
@@ -610,6 +646,7 @@ impl SegmentStore {
             &Self::segment_metadata_path(data_dir, self.index_oid, segment_id),
             &metadata.encode()?,
         )?;
+        crash_hook(SealCrashPoint::TargetDurable)?;
         let mut active_segment_ids = self.manifest.active_segment_ids.clone();
         active_segment_ids.push(segment_id);
         let new_manifest = SegmentManifest {
@@ -623,6 +660,7 @@ impl SegmentStore {
             &Self::manifest_path(data_dir, self.index_oid),
             &new_manifest.encode()?,
         )?;
+        crash_hook(SealCrashPoint::ManifestPublished)?;
         self.manifest = new_manifest;
         self.watermark.durable_applied_lsn = applied_lsn;
         self.pending_documents.clear();
@@ -963,6 +1001,11 @@ impl SegmentStore {
         wal: &pg_storage::wal::WalWriter,
         xid: pg_storage::types::TxnId,
     ) -> Result<Option<Lsn>> {
+        if self.dirty && self.pending_documents.len() < self.flush_threshold {
+            // Small write batches remain in memory and are recovered from WAL
+            // after a crash. Deferring their fsync avoids a segment per query.
+            return Ok(None);
+        }
         if self.wal_sealed {
             return Ok(None);
         }
@@ -1006,6 +1049,12 @@ struct SegmentInput {
     token_sums: BTreeMap<Tid, u64>,
     seen_terms: u64,
     seen_postings: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SealCrashPoint {
+    TargetDurable,
+    ManifestPublished,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1564,6 +1613,55 @@ mod tests {
                 invalid.push(0);
             }
             assert!(decode_segment_merge_ids(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn seal_crash_windows_expose_old_or_complete_new_generation() {
+        for point in [
+            SealCrashPoint::TargetDurable,
+            SealCrashPoint::ManifestPublished,
+        ] {
+            let (tmp, wal, mut store) = merge_fixture();
+            store.insert_document(tid(4), "fresh").unwrap();
+            store.advance_consumed(Lsn(384));
+            let manifest_path = SegmentStore::manifest_path(tmp.path(), Oid(9879));
+            let old_manifest = std::fs::read(&manifest_path).unwrap();
+            let error = store
+                .persist_generation_inner(tmp.path(), |current| {
+                    if std::mem::discriminant(&current) == std::mem::discriminant(&point) {
+                        Err(InvertedError::Storage("injected seal crash".to_string()))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert!(matches!(error, InvertedError::Storage(_)));
+            let after = matches!(point, SealCrashPoint::ManifestPublished);
+            if after {
+                let reopened =
+                    SegmentStore::open(tmp.path(), Oid(9879), &AnalyzerConfig::builtin()).unwrap();
+                assert_eq!(
+                    reopened.manifest().active_segment_ids,
+                    vec![SegmentId(1), SegmentId(2), SegmentId(3), SegmentId(4)]
+                );
+                assert_eq!(reopened.search_text("fresh", None).unwrap().len(), 1);
+            } else {
+                assert_eq!(std::fs::read(&manifest_path).unwrap(), old_manifest);
+                let mut reopened =
+                    SegmentStore::open(tmp.path(), Oid(9879), &AnalyzerConfig::builtin()).unwrap();
+                assert!(reopened.search_text("fresh", None).unwrap().is_empty());
+                reopened.insert_document(tid(4), "fresh").unwrap();
+                reopened.advance_consumed(Lsn(384));
+                reopened
+                    .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+                    .unwrap();
+                assert!(reopened
+                    .manifest()
+                    .active_segment_ids
+                    .contains(&SegmentId(5)));
+                assert_eq!(reopened.search_text("fresh", None).unwrap().len(), 1);
+            }
         }
     }
 

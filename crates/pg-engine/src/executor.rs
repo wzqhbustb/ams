@@ -137,27 +137,55 @@ fn execute_inverted(
     };
     let predicate = filter_to_predicate_with_analyzer(entry, &filter, &spec.analyzer_config)?;
     let handle = engine.inverted_handle(spec.index_oid)?;
-    let hits = handle
-        .lock()
-        .search_text(query, None)
-        .map_err(|error| EngineError::Corrupted(error.to_string()))?;
-    let candidate_count = hits.len() as u64;
+    let hits = if spec.limit.is_some() {
+        handle.lock().search_wand_text(query, spec.limit)
+    } else {
+        handle.lock().search_text(query, None)
+    }
+    .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+    let mut candidate_count = hits.len() as u64;
+    // WAND is exact before heap recheck. If any bounded candidate is filtered
+    // out by MVCC, HOT deduplication, or the text predicate, a later document
+    // may belong in the final top-k and a full DAAT repair is required.
+    let repair_with_daat = spec.limit.is_some_and(|k| hits.len() == k);
     let col_types = column_types(entry);
     let mut seen = std::collections::HashSet::new();
-    let mut rows = Vec::new();
-    for hit in hits {
-        let Some(visible_tid) = engine.heap_tuple_visible(snap, hit.tid)? else {
-            continue;
-        };
-        if !seen.insert(visible_tid) {
-            continue;
+    let collect = |hits: Vec<pg_am_inverted::ScoredTid>,
+                   seen: &mut std::collections::HashSet<Tid>|
+     -> Result<(ScanRows, bool)> {
+        let mut rows = Vec::new();
+        let mut filtered = false;
+        for hit in hits {
+            let Some(visible_tid) = engine.heap_tuple_visible(snap, hit.tid)? else {
+                filtered = true;
+                continue;
+            };
+            if !seen.insert(visible_tid) {
+                filtered = true;
+                continue;
+            }
+            let values = engine.read_row_by_tid(snap, entry, &col_types, visible_tid)?;
+            // Visibility alone is insufficient for stale candidates and recycled
+            // slots: the visible document must still satisfy the analyzed query.
+            if predicate.matches(&values[predicate.col_index()]) {
+                rows.push((visible_tid, values));
+            } else {
+                filtered = true;
+            }
         }
-        let values = engine.read_row_by_tid(snap, entry, &col_types, visible_tid)?;
-        // Visibility alone is insufficient for stale candidates and recycled
-        // slots: the visible document must still satisfy the analyzed query.
-        if predicate.matches(&values[predicate.col_index()]) {
-            rows.push((visible_tid, values));
-        }
+        Ok((rows, filtered))
+    };
+    let (mut rows, filtered) = collect(hits, &mut seen)?;
+    if filtered && repair_with_daat {
+        let hits = handle
+            .lock()
+            .search_text(query, None)
+            .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+        candidate_count = hits.len() as u64;
+        // Rebuild the complete candidate set rather than appending to the
+        // shortlist, so visible rows from the first pass cannot mask a peer.
+        seen.clear();
+        rows = collect(hits, &mut seen)?.0;
     }
     Ok((rows, candidate_count))
 }

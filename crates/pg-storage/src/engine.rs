@@ -789,6 +789,15 @@ impl StorageEngine {
         self.checkpoint.trigger_checkpoint()
     }
 
+    /// Trigger a checkpoint with an explicit WAL recycling frontier.
+    pub fn trigger_checkpoint_with_recycle_before(
+        &self,
+        recycle_before: Option<Lsn>,
+    ) -> Result<Lsn> {
+        self.checkpoint
+            .trigger_checkpoint_with_recycle_before(recycle_before)
+    }
+
     /// Start automatic background checkpoints.
     pub fn start_background_checkpointing(&self) -> Result<()> {
         self.checkpoint.start_background_checkpointing()

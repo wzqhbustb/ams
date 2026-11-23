@@ -310,7 +310,7 @@ mod tests {
         let meta_bytes = meta.encode().unwrap();
         assert_eq!(
             hex(&meta_bytes),
-            "5047495601004600000001fb972607056d6978656484d0b3945ec7c3cb3aea7b017027f704cf1af4be25243aa52586cebf9f5557e30202120208636f6e74726163740204727573740178800203fb000171953cd0"
+            "5047495601004600000001fb972607056d69786564488e069b806e2cb1d05066592c86a94dd97adcecef1b5d6e296398a85d6ac3590202120208636f6e74726163740204727573740178800203fb00018deafcb5"
         );
         assert_eq!(posting::SegmentMeta::decode(&meta_bytes).unwrap(), meta);
         let mut bad_version = meta.clone();

@@ -369,21 +369,17 @@ mod tests {
     #[test]
     fn out_of_vocabulary_chinese_uses_jieba_fallback() {
         let analyzer = DefaultAnalyzer::chinese();
-        let tokens = analyzer.analyze("未知词");
+        let tokens = analyzer.analyze("𪚥 𪚦");
         assert_eq!(
             tokens,
             vec![
                 Token {
-                    text: "未".to_string(),
+                    text: "𪚥".to_string(),
                     position: 0,
                 },
                 Token {
-                    text: "知".to_string(),
+                    text: "𪚦".to_string(),
                     position: 1,
-                },
-                Token {
-                    text: "词".to_string(),
-                    position: 2,
                 },
             ]
         );

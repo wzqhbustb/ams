@@ -61,6 +61,16 @@ impl InvertedIndex {
         self.store.search_text(text, limit)
     }
 
+    /// Evaluate a parsed query with exact WAND for bounded top-k.
+    pub fn search_wand(&self, query: &Query, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
+        self.store.search_wand(query, limit)
+    }
+
+    /// Analyze query text and evaluate exact WAND for bounded top-k.
+    pub fn search_wand_text(&self, text: &str, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
+        self.store.search_wand_text(text, limit)
+    }
+
     /// Insert one committed heap document into the in-process write view.
     pub fn insert_document(&mut self, tid: Tid, text: &str) -> Result<()> {
         self.store.insert_document(tid, text)
@@ -84,6 +94,11 @@ impl InvertedIndex {
     /// Return the current consumed and durable watermarks.
     pub fn watermark(&self) -> crate::Watermark {
         self.store.watermark()
+    }
+
+    /// Whether the in-memory write view has changes that are not sealed yet.
+    pub fn has_unsealed_changes(&self) -> bool {
+        self.store.has_unsealed_changes()
     }
 
     /// Whether a previous seal hit the frame capacity and should not be

@@ -17,7 +17,9 @@ use pg_txn::Snapshot;
 use tempfile::TempDir;
 
 fn open(dir: &Path) -> Engine {
-    Engine::open(dir, EngineConfig::new(dir)).unwrap()
+    let mut config = EngineConfig::new(dir);
+    config.inverted_seal_batch_size = 1;
+    Engine::open(dir, config).unwrap()
 }
 
 struct CommitFailGuard;
@@ -968,6 +970,44 @@ fn inverted_inflight_toast_insert_and_abort_recover_cleanly() {
         .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
         .unwrap();
     assert_eq!(rows(result).len(), 1);
+}
+
+#[test]
+fn inverted_old_snapshot_toast_group_survives_update_and_vacuum() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+        .unwrap();
+    let text = format!("needle {}", "x".repeat(9000));
+    engine
+        .exec(None, &format!("INSERT INTO t VALUES (1, '{text}')"))
+        .unwrap();
+    engine
+        .exec(
+            None,
+            "CREATE INDEX content_idx ON t USING inverted (content)",
+        )
+        .unwrap();
+    let txn = engine.begin_txn().unwrap();
+    engine
+        .exec(None, "UPDATE t SET content = 'newterm' WHERE id = 1")
+        .unwrap();
+    engine.vacuum("t").unwrap();
+    let result = engine
+        .exec(Some(&txn), "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap();
+    assert_eq!(rows(result).len(), 1);
+    txn.commit().unwrap();
+    let result = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'newterm'")
+        .unwrap();
+    assert_eq!(rows(result).len(), 1);
+    let result = engine
+        .exec(None, "SELECT id FROM t WHERE content @@ 'needle'")
+        .unwrap();
+    assert!(rows(result).is_empty());
+    engine.shutdown();
 }
 
 #[test]

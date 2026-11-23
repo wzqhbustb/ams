@@ -38,7 +38,7 @@ impl Ord for ScoredTid {
 /// first, then largest TID. `ScoredTid`'s own ordering is score ASC, tid ASC,
 /// so the bounded heap never needs a second result-order comparator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Worst(ScoredTid);
+pub(crate) struct Worst(pub(crate) ScoredTid);
 
 impl PartialOrd for Worst {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -53,6 +53,22 @@ impl Ord for Worst {
             .score
             .total_cmp(&self.0.score)
             .then_with(|| self.0.tid.cmp(&other.0.tid))
+    }
+}
+
+pub(crate) fn push_top_k(heap: &mut BinaryHeap<Worst>, scored: ScoredTid, k: usize) {
+    if heap.len() < k {
+        heap.push(Worst(scored));
+    } else if let Some(Worst(worst)) = heap.peek() {
+        let replace = match scored.score.total_cmp(&worst.score) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => scored.tid < worst.tid,
+            std::cmp::Ordering::Less => false,
+        };
+        if replace {
+            heap.pop();
+            heap.push(Worst(scored));
+        }
     }
 }
 
@@ -327,20 +343,7 @@ impl<A: Analyzer> InMemoryIndex<A> {
                 let mut heap = BinaryHeap::with_capacity(k.min(candidates.len()));
                 for tid in candidates {
                     let score = self.score_document(tid, query, avg_doc_len, doc_count)?;
-                    let scored = ScoredTid { tid, score };
-                    if heap.len() < k {
-                        heap.push(Worst(scored));
-                    } else if let Some(Worst(worst)) = heap.peek() {
-                        let replace = match scored.score.total_cmp(&worst.score) {
-                            std::cmp::Ordering::Greater => true,
-                            std::cmp::Ordering::Equal => scored.tid < worst.tid,
-                            std::cmp::Ordering::Less => false,
-                        };
-                        if replace {
-                            heap.pop();
-                            heap.push(Worst(scored));
-                        }
-                    }
+                    push_top_k(&mut heap, ScoredTid { tid, score }, k);
                 }
                 let mut rows = heap.into_iter().map(|Worst(row)| row).collect::<Vec<_>>();
                 sort_results(&mut rows);
@@ -360,6 +363,37 @@ impl<A: Analyzer> InMemoryIndex<A> {
                 Ok(rows)
             }
         }
+    }
+
+    /// Evaluate a query with exact WAND pruning for bounded top-k. Unlimited
+    /// queries deliberately use the full DAAT path.
+    pub fn search_wand(&self, query: &Query, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
+        crate::wand::search(self, query, limit)
+    }
+
+    /// Analyze query text and evaluate exact WAND for bounded top-k.
+    pub fn search_wand_text(&self, text: &str, limit: Option<usize>) -> Result<Vec<ScoredTid>> {
+        let query = crate::daat::parse_query(self.analyzer(), text);
+        self.search_wand(&query, limit)
+    }
+
+    pub(crate) fn matches_query(&self, tid: Tid, query: &Query) -> bool {
+        match query {
+            Query::And(terms) => self.and_matches(tid, terms),
+            Query::Or(groups) => groups
+                .iter()
+                .filter(|terms| !terms.is_empty())
+                .any(|terms| self.and_matches(tid, terms)),
+        }
+    }
+
+    fn and_matches(&self, tid: Tid, terms: &[String]) -> bool {
+        !terms.is_empty()
+            && terms.iter().all(|term| {
+                self.postings
+                    .get(term)
+                    .is_some_and(|postings| postings.contains_key(&tid))
+            })
     }
 
     fn candidates(&self, query: &Query) -> BTreeSet<Tid> {
@@ -397,7 +431,7 @@ impl<A: Analyzer> InMemoryIndex<A> {
         candidates
     }
 
-    fn score_document(
+    pub(crate) fn score_document(
         &self,
         tid: Tid,
         query: &Query,
@@ -462,7 +496,7 @@ fn query_groups(query: &Query) -> Vec<&[String]> {
     }
 }
 
-fn sort_results(rows: &mut [ScoredTid]) {
+pub(crate) fn sort_results(rows: &mut [ScoredTid]) {
     rows.sort_by(|left, right| {
         right
             .score

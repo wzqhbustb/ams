@@ -1,11 +1,11 @@
 //! Regression tests for Stage 0 full-text parsing and fallback errors.
 use pg_engine::sql::{self, CmpOp, IndexMethod, Literal, OrderByKind, Statement};
-use pg_engine::{Engine, EngineConfig, EngineError};
+use pg_engine::{Datum, Engine, EngineConfig, QueryResult};
 use std::sync::Arc;
 use tempfile::TempDir;
 
 #[test]
-fn extra_where_is_loudly_rejected_end_to_end() {
+fn extra_where_uses_exact_seqscan_fallback_end_to_end() {
     let tmp = TempDir::new().unwrap();
     let engine = Arc::new(Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap());
     engine
@@ -18,14 +18,26 @@ fn extra_where_is_loudly_rejected_end_to_end() {
     for sql in [
         "SELECT * FROM t WHERE id > 5 AND content @@ 'x'",
         "SELECT * FROM t WHERE content @@ 'x' AND id > 5",
-        "EXPLAIN SELECT * FROM t WHERE id > 5 AND content @@ 'x'",
     ] {
-        let error = engine.exec(None, sql).unwrap_err();
+        let result = engine.exec(None, sql).unwrap();
         assert!(
-            matches!(error, EngineError::Unsupported(ref message) if message.contains("additional WHERE predicates")),
-            "unexpected error for {sql}: {error:?}"
+            matches!(result, QueryResult::Rows { ref rows, .. } if rows.is_empty()),
+            "unexpected result for {sql}: {result:?}"
         );
     }
+    let explain = engine
+        .exec(
+            None,
+            "EXPLAIN SELECT * FROM t WHERE id > 5 AND content @@ 'x'",
+        )
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = explain else {
+        panic!("expected EXPLAIN rows")
+    };
+    let Some(Datum::Text(plan)) = &rows[0][0] else {
+        panic!("expected a plan string")
+    };
+    assert!(plan.contains("SeqScan") && plan.contains("ExtraWhere"));
     engine.shutdown();
 }
 

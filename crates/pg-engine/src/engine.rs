@@ -268,6 +268,13 @@ pub struct EngineConfig {
     /// (`require_fresh`): stale reads fall back to SeqScan. This is an
     /// engine-level switch only; no SQL syntax is added.
     pub allow_stale_inverted: bool,
+    /// Whether automatic inverted segment compaction is enabled. Disable only
+    /// for benchmarks or when a deployment explicitly prefers more, smaller
+    /// segments. Default `true`.
+    pub inverted_merge_enabled: bool,
+    /// Number of committed documents accumulated before a delta is sealed.
+    /// Larger batches reduce fsync and segment churn; recovery remains WAL-driven.
+    pub inverted_seal_batch_size: usize,
     /// Analyzer identity expected when recovering inverted segment metadata.
     /// Defaults to the built-in mixed analyzer; custom configurations are
     /// accepted only when the persisted identity matches exactly.
@@ -283,6 +290,8 @@ impl EngineConfig {
             deadlock_detector_interval: pg_txn::DEFAULT_DEADLOCK_INTERVAL,
             query_stats_capacity: DEFAULT_QUERY_STATS_CAPACITY,
             allow_stale_inverted: false,
+            inverted_merge_enabled: true,
+            inverted_seal_batch_size: 128,
             inverted_analyzer: pg_am_inverted::AnalyzerConfig::builtin(),
         }
     }
@@ -695,6 +704,10 @@ pub struct Engine {
     query_stats: QueryStats,
     /// Phase 3 inverted-query freshness policy, retained for the planner.
     allow_stale_inverted: bool,
+    /// Number of committed documents required before sealing a delta.
+    inverted_seal_batch_size: usize,
+    /// Whether query-path automatic segment compaction is enabled.
+    inverted_merge_enabled: bool,
     /// Analyzer identity used when creating new inverted segments.
     inverted_analyzer: pg_am_inverted::AnalyzerConfig,
     sequences: SequenceManager,
@@ -1286,6 +1299,8 @@ impl Engine {
             index_undo: Arc::new(Mutex::new(HashMap::new())),
             query_stats: QueryStats::new(config.query_stats_capacity),
             allow_stale_inverted: config.allow_stale_inverted,
+            inverted_seal_batch_size: config.inverted_seal_batch_size,
+            inverted_merge_enabled: config.inverted_merge_enabled,
             inverted_analyzer: config.inverted_analyzer,
             sequences,
         };
@@ -1677,7 +1692,17 @@ impl Engine {
     /// wired at open via `set_commit_barrier`). This is the only supported
     /// checkpoint path; background checkpointing is never started.
     pub fn checkpoint(&self) -> Result<()> {
-        self.storage.trigger_checkpoint()?;
+        let recycle_before = self
+            .indexes
+            .read()
+            .iter()
+            .filter_map(|index| {
+                let lsn = index.inverted.as_ref()?.watermark.durable_applied_lsn;
+                lsn.is_valid().then_some(lsn)
+            })
+            .min();
+        self.storage
+            .trigger_checkpoint_with_recycle_before(recycle_before)?;
         Ok(())
     }
 
@@ -3080,6 +3105,7 @@ impl Engine {
                     self.storage.wal_writer().synced_lsn(),
                 )
                 .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+                store.set_flush_threshold(self.inverted_seal_batch_size);
                 store
                     .seal(
                         self.storage.data_dir(),
@@ -4410,12 +4436,13 @@ impl Engine {
                 "inverted index {index_oid}"
             )));
         }
-        let store = pg_am_inverted::SegmentStore::open(
+        let mut store = pg_am_inverted::SegmentStore::open(
             self.storage.data_dir(),
             index_oid,
             &self.inverted_analyzer,
         )
         .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+        store.set_flush_threshold(self.inverted_seal_batch_size);
         let handle = Arc::new(Mutex::new(pg_am_inverted::InvertedIndex::from_store(store)));
         self.inverted_handles
             .lock()
@@ -4496,9 +4523,11 @@ impl Engine {
         index_oid: Oid,
         index: &mut pg_am_inverted::InvertedIndex,
     ) -> Result<()> {
-        if index.active_segment_count() < 4
+        if !self.inverted_merge_enabled
+            || index.active_segment_count() < 4
             || index.merge_capacity_blocked()
             || index.seal_capacity_blocked()
+            || index.has_unsealed_changes()
         {
             return Ok(());
         }
@@ -4542,12 +4571,19 @@ impl Engine {
     ) -> Result<InvertedIndexMetadata> {
         let handle = self.inverted_handle(index_entry.index_oid)?;
         let mut index = handle.lock();
-        // Include a caller's own unflushed writes in pending, so the snapshot
-        // check above cannot accidentally treat its read-write transaction
-        // as read-only.
-        self.storage.wal_writer().flush()?;
         let start = index.watermark().consumed_lsn;
-        let frontier = self.storage.wal_writer().synced_lsn();
+        let current = self.storage.wal_writer().current_lsn();
+        let frontier = if start == current {
+            // No new records need replay or fsync. Most read-only queries take
+            // this path instead of paying a full group-commit round.
+            start
+        } else {
+            // Include a caller's own unflushed writes in pending, so the snapshot
+            // check above cannot accidentally treat its read-write transaction
+            // as read-only.
+            self.storage.wal_writer().flush()?;
+            self.storage.wal_writer().synced_lsn()
+        };
         if start > frontier {
             return Err(EngineError::Corrupted(format!(
                 "inverted consumed LSN {start} exceeds synced frontier {frontier}"
@@ -8387,7 +8423,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn open(dir: &std::path::Path) -> Engine {
-        Engine::open(dir, EngineConfig::new(dir)).unwrap()
+        let mut config = EngineConfig::new(dir);
+        config.inverted_seal_batch_size = 1;
+        Engine::open(dir, config).unwrap()
     }
 
     fn create_l2_table(engine: &Engine) {
@@ -9491,6 +9529,62 @@ mod tests {
     }
 
     #[test]
+    fn inverted_wand_top_k_repairs_visibility_filtered_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        for (id, text) in [
+            (1, "shared shared shared"),
+            (2, "shared shared"),
+            (3, "shared"),
+            (4, "shared"),
+        ] {
+            engine
+                .exec(None, &format!("INSERT INTO t VALUES ({id}, '{text}')"))
+                .unwrap();
+        }
+        let query_ids = |engine: &Engine| {
+            let result = engine
+                .exec(
+                    None,
+                    "SELECT id FROM t WHERE content @@ 'shared' ORDER BY bm25_score(content, 'shared') DESC LIMIT 2",
+                )
+                .unwrap();
+            let QueryResult::Rows { rows, .. } = result else {
+                panic!("expected WAND rows")
+            };
+            rows.into_iter()
+                .map(|row| match row[0] {
+                    Some(Datum::Int4(id)) => id,
+                    ref other => panic!("unexpected id {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(query_ids(&engine), vec![1, 2]);
+        engine.shutdown();
+        let mut config = EngineConfig::new(tmp.path());
+        config.allow_stale_inverted = true;
+        let engine = Engine::open(tmp.path(), config).unwrap();
+        engine.exec(None, "DELETE FROM t WHERE id = 1").unwrap();
+        // The stale WAND shortlist contains the deleted leader. MVCC filtering
+        // must trigger a full DAAT repair rather than returning a short page.
+        assert_eq!(query_ids(&engine), vec![2, 3]);
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            ExecutionPath::IndexLookup
+        );
+        engine.shutdown();
+    }
+
+    #[test]
     fn inverted_seal_capacity_failure_degrades_and_recovers_by_replay() {
         let tmp = TempDir::new().unwrap();
         let engine = open(tmp.path());
@@ -9598,6 +9692,57 @@ mod tests {
         assert_eq!(query_count(&engine), 5);
         assert_eq!(handle.lock().merge_attempts_for_test(), 1);
         assert_eq!(handle.lock().active_segment_count(), 5);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_drop_and_recreate_does_not_resurrect_old_documents() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let old_oid = engine.indexes()[0].index_oid;
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, 'oldterm')")
+            .unwrap();
+        engine.drop_table("t").unwrap();
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let new_oid = engine.indexes()[0].index_oid;
+        assert_ne!(old_oid, new_oid);
+        engine
+            .exec(None, "INSERT INTO t VALUES (2, 'newterm')")
+            .unwrap();
+        let count = |engine: &Engine, term: &str| {
+            let result = engine
+                .exec(None, &format!("SELECT id FROM t WHERE content @@ '{term}'"))
+                .unwrap();
+            let QueryResult::Rows { rows, .. } = result else {
+                panic!("expected full-text rows")
+            };
+            rows.len()
+        };
+        assert_eq!(count(&engine, "oldterm"), 0);
+        assert_eq!(count(&engine, "newterm"), 1);
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert_eq!(count(&engine, "oldterm"), 0);
+        assert_eq!(count(&engine, "newterm"), 1);
         engine.shutdown();
     }
 
