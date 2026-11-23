@@ -204,7 +204,7 @@ CARGO_TARGET_DIR=target/msrv-phase3 cargo +1.86.0 check --workspace --all-featur
 - **WAND upper-bound**：错误上界会直接漏行，必须 DAAT 全量对拍，尤其同分与非有限值。
 - **词典/分析器升级**：配置 hash 变化必须显式重建，不能在线混用。
 - **英文 CJK 与日韩/西里尔文本**：`english` 将连续 CJK 段视为不透明 token；Kana/Hangul/西里尔进入 Latin 分支且 stemming 近似空转，日韩及混合语种召回属于当前非目标，不能按英文检索质量验收。
-- **小词典与 OOV 回退**：`custom.dict` 当前仅覆盖 5 个词，词典外中文可能退回单字切分并放大 df；已补回退行为测试，Stage E 前必须替换为真实、带版本的词典资产并重跑中文质量基准。
+- **词典与 OOV 回退**：`custom.dict` 已替换为带来源 commit、LICENSE 与 SHA256 的真实 jieba 词典资产；词典外中文仍可能退回单字切分并放大 df，连续 CJK 生僻字回退已有精确回归，中文/混合 NDCG 使用冻结语料单独验收。
 - **position 语义**：Latin stop-word 留位置空洞，CJK 空 token 不占位；未来 phrase 查询必须显式登记并测试该差异。
 - **Analyzer 失配 fail-stop**：任一索引的 analyzer hash 失配会阻止整个 Engine 打开，当前选择是显式重建；若未来需要可用性隔离，应另评估“隔离该索引 + require_fresh 回退”，不得静默换分析器。
 - **DAAT 性能债**：当前实现包含 per-term `BTreeSet` 分配和候选×term map 查找，Stage E 需要真流式 DAAT 基线与 WAND 对照；性能优化只能在正确性证据之后进行。
@@ -215,7 +215,8 @@ CARGO_TARGET_DIR=target/msrv-phase3 cargo +1.86.0 check --workspace --all-featur
 - **统计截面可观察性**：EXPLAIN 尚未暴露 generation/active 段集合，当前只通过文档登记 merge 间统计窗口，属于部分满足；后续应在 `InvertedScan` 增加 generation 与段数。
 - **stale 读配置**：`allow_stale` 是有意放宽，默认 `require_fresh` 不得被配置静默覆盖。
 - **TOAST 组包与复用 group**：新 group 缺块与共享旧 group 损坏只能 `Corrupted` 停水位，不得通过忽略 chunk 提高新鲜度。
-- **M6 收口项并行**：24h 复跑/CI 报告/tag 与本计划无依赖，不阻塞各 Stage。
+- **checkpoint × CREATE INDEX recycle floor 竞态（P3）**：recycle floor 在 `trigger_checkpoint` 前计算；若 CREATE INDEX 在 floor 计算后、checkpoint begin 前完成，其 backfill base 可能低于 begin_lsn 却未纳入 floor，所需 WAL 段可能被回收，后续倒排刷新以 `rebuild required` 响亮失败。该失败不静默、可重建自愈，当前接受并登记。若未来需要根治，应在 storage checkpoint 锁内以回调计算 floor，或让 CREATE 与 checkpoint 锁同步，不能把提前读取的水位冒充新索引覆盖。
+- **SnapshotFallback 的 candidate_count 观测口径（P3）**：被弃用的 inverted 尝试所对应的 candidate_count 随 `plan.spec` 覆盖而丢失，EXPLAIN 只呈现最终回退路径，与 B+Tree 回退取舍一致，不构成结果正确性问题。若未来需要解释“曾尝试索引”的规模，应单独增加 attempted-candidates 诊断字段，而不是复用最终计划的统计。
 
 ---
 
@@ -251,3 +252,8 @@ CARGO_TARGET_DIR=target/msrv-phase3 cargo +1.86.0 check --workspace --all-featur
 | v1.25 | 2026-11-23 | 容量生命周期修复：seal/merge 的容量熔断由永久布尔标志改为 5 秒冷却重试，成功后自动清除；新增删除缩小后冷却恢复测试，避免索引缩小后仍永久停止 compaction。 |
 | v1.26 | 2026-11-23 | Stage E 性能审查修复：`AnalyzerConfig` 以 `OnceLock` 缓存冻结配置 hash，`DefaultAnalyzer::from_config` 对精确内置身份共享 `Arc` 实例，消除每次 WHERE 的词典 SHA256 和每次 seal 的词典重载；`filter_to_predicate` 统一从 Engine 索引元数据选择 analyzer，补缓存身份及中文非词干谓词回归。重测 SciFact NDCG 差异仍为 0.00171049，WAND/Tantivy mean/p95 比为 1.242/1.532；Tier 2 merge on/off 的 6000 commits 均约 60.005s、99.99 commits/s，commit→visible p95 分别为 496.013ms/270.778ms，两种变体均通过 1s 目标。v1.22 的瓶颈结论受词典开销污染并由本次数据取代，当前同步模型决策不变。 |
 | v1.27 | 2026-11-23 | Stage E P3 收尾：所有 `DefaultAnalyzer` 构造路径共享 `OnceLock<Arc<Jieba>>`，保留精确内置 Analyzer 实例缓存；OOV 回归改用连续 U+3400/U+3401 CJK 字符，真实覆盖 jieba 单字回退。seal 在 generation 发布后立即清 `dirty`、置 `wal_sealed`，marker 发射独立判定，补 marker 失败后的重复 seal、merge 和 reopen 回归。基准注明 NDCG 是质量可比而非评分器等价（本方停用词不计入 `doc_len`，Tantivy 保留于 `fieldnorm`）；登记 `inverted_lag_metrics` 每次 O(lag) 重读、逐记录高频轮询可退化为 O(lag²)，当前规模暂不优化。 |
+| v1.28 | 2026-11-23 | Stage F 两轮对抗审查：一审发现 inverted 候选扫描缺少 B+Tree 同款 post-scan XID 复核，删除+refresh 后旧快照可能漏行，现丢弃索引结果并走 MVCC 完整堆回退；二审发现 `bm25_scores` 独立评分同型窗口，XID 变化时改为堆内重算，避免缺失/零分。reopen 改用严格 streaming posting reader，避免直接 `BTreeMap` 反序列化掩盖重复 term/TID，补双负例。新增 12 篇冻结中文/混合文档、6 个 AND/OR/空结果查询，Tantivy 使用同一 mixed token stream，NDCG@10 平均差异 0.00000000。最终门禁与归档证据写入 `docs/stage_spec.md`。 |
+| v1.29 | 2026-11-23 | Stage F 最终门禁：workspace 默认 feature debug/release、pg-am-inverted debug/release、pg-engine DataFusion debug/release 均 EXIT=0；九 crate 全 feature Clippy/rustdoc、workspace 全 feature check、MSRV 1.86、fmt 与 `git diff --check` 通过。pg-txn 的 redo 测试改用 `pg_storage::sync::Mutex`，默认/全 feature 各 1/1 通过。最终质量 2/2、WAND 性能 1/1，WAND/Tantivy mean/p95 比更新为 1.124/1.092。 |
+| v1.30 | 2026-11-23 | Stage F 深审三项 P2 修复：`SegmentMetaWire` 保留重复 `term_df` 键并在 decode 时拒绝，open/merge 回归与冻结格式/golden 不变；DROP 等待 in-flight consumer 后删除 segment 目录，失败 CREATE 仅清理未提交目录，open 按 live registry 回收崩溃孤儿，避免误删已提交索引。新增空 coverage segment 协议，checkpoint 仅在没有 pending XID 或未密封文档变化时推进 durable，保留 active coverage 不变量；补安静索引、pending 跳过、reopen/merge 和 crash window 回归。当前 `pg-am-inverted` lib 73/73、Engine lib 123/123。 |
+| v1.31 | 2026-11-23 | Stage F 深审最终验证：workspace 默认 feature debug/release、pg-am-inverted debug/release、pg-engine DataFusion debug/release 均 EXIT=0；九 crate 全 feature Clippy/rustdoc、workspace 全 feature check、MSRV 1.86、fmt 与 `git diff --check` 通过。修复 HNSW 既有 `meta_pair_never_reads_torn` 测试未排除空图 sentinel 的测试 bug（生产逻辑不变），连续 10 次复跑通过。 |
+| v1.32 | 2026-11-23 | P3 边界登记：checkpoint 在 trigger 前计算 recycle floor，CREATE INDEX 若在 floor 后、begin 前完成，可能触发可重建的 `rebuild required`，安全网保持响亮而非静默；候选根治为 checkpoint 锁内回调或 CREATE 与 checkpoint 锁同步。SnapshotFallback 覆盖 `plan.spec` 后不再保留被弃用 inverted 尝试的 candidate_count，明确其与 B+Tree 一致的诊断取舍；若未来需要，新增 attempted-candidates 字段。两项均只登记，不改变当前协议。 |

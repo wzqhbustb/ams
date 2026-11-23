@@ -616,6 +616,49 @@ fn push_inverted_pending(
     Ok(())
 }
 
+fn remove_inverted_directory(data_dir: &Path, index_oid: Oid) {
+    let path = data_dir.join("inverted").join(index_oid.0.to_string());
+    if let Err(error) = std::fs::remove_dir_all(&path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(%error, path = %path.display(), "failed to remove inverted index directory");
+        }
+    }
+}
+
+fn remove_orphan_inverted_directories(data_dir: &Path, indexes: &[IndexEntry]) {
+    let live = indexes
+        .iter()
+        .filter(|index| index.kind == AmKind::Inverted)
+        .map(|index| index.index_oid)
+        .collect::<HashSet<_>>();
+    let root = data_dir.join("inverted");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(%error, path = %root.display(), "failed to scan inverted orphan directories");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(oid) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u64>().ok())
+            .map(Oid)
+        else {
+            continue;
+        };
+        if !live.contains(&oid) {
+            remove_inverted_directory(data_dir, oid);
+        }
+    }
+}
+
 /// The assembled engine: storage + catalog + heap AM + txn manager + disk
 /// CLOG + in-memory table registry. Assembly order is documented at the
 /// module level.
@@ -1268,6 +1311,9 @@ impl Engine {
             &registry,
             &config.inverted_analyzer,
         )?;
+        // Failed CREATE and dropped indexes have no live catalog entry. Their
+        // directories are safe to reclaim after the registry is fully built.
+        remove_orphan_inverted_directories(data_dir, &indexes);
 
         // 8. Lock manager (sharing the victim registry) and the deadlock
         //    detector thread (M2c Stage R, §9.3). Started LAST, once both
@@ -1697,6 +1743,45 @@ impl Engine {
     /// wired at open via `set_commit_barrier`). This is the only supported
     /// checkpoint path; background checkpointing is never started.
     pub fn checkpoint(&self) -> Result<()> {
+        // A quiet index may have consumed only unrelated or administrative WAL.
+        // Persist an empty coverage segment before recycling so those records
+        // are no longer needed for inverted recovery. In-flight actions remain
+        // a hard floor because they have not been applied or sealed.
+        for index_entry in self
+            .indexes()
+            .into_iter()
+            .filter(|index| index.kind == AmKind::Inverted)
+        {
+            let handle = self.inverted_handle(index_entry.index_oid)?;
+            let mut index = handle.lock();
+            let watermark = index.watermark();
+            if watermark.durable_applied_lsn >= watermark.consumed_lsn
+                || !index.can_advance_coverage()
+            {
+                continue;
+            }
+            let no_pending = self
+                .pending_inverted
+                .lock()
+                .get(&index_entry.index_oid)
+                .is_none_or(|pending| pending.is_empty());
+            if !no_pending {
+                continue;
+            }
+            index
+                .persist_coverage(
+                    self.storage.data_dir(),
+                    self.storage.wal_writer(),
+                    TxnId::INVALID,
+                )
+                .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+            let metadata = InvertedIndexMetadata {
+                analyzer: index.analyzer_config().clone(),
+                watermark: index.watermark(),
+            };
+            drop(index);
+            self.publish_inverted_watermark(index_entry.index_oid, &metadata);
+        }
         let recycle_before = self
             .indexes
             .read()
@@ -2829,6 +2914,20 @@ impl Engine {
             .filter(|index| index.table_oid == entry.oid)
             .map(|index| index.index_oid)
             .collect();
+        // Wait for in-flight consumers before removing segment files. Lock in
+        // OID order, then remove every live registry entry before cleanup.
+        let mut handle_arcs = self
+            .inverted_handles
+            .lock()
+            .iter()
+            .filter(|(oid, _)| index_oids.contains(oid))
+            .map(|(oid, handle)| (*oid, Arc::clone(handle)))
+            .collect::<Vec<_>>();
+        handle_arcs.sort_by_key(|(oid, _)| *oid);
+        let _inverted_guards = handle_arcs
+            .iter()
+            .map(|(_, handle)| handle.lock())
+            .collect::<Vec<_>>();
         self.heap.drop_relation(entry.oid);
         self.heap.unregister_toast_relation(entry.oid);
         if let Some(toast) = entry.toast {
@@ -2850,6 +2949,9 @@ impl Engine {
         self.inverted_lag
             .lock()
             .retain(|index_oid, _| !index_oids.contains(index_oid));
+        for index_oid in &index_oids {
+            remove_inverted_directory(self.storage.data_dir(), *index_oid);
+        }
         let mut pages = match self.walk_chain(entry.first_page) {
             Ok(pages) => pages,
             Err(error) => {
@@ -3166,7 +3268,15 @@ impl Engine {
                     .retain(|index| index.index_oid != index_oid);
             },
         );
-        result?;
+        if let Err(error) = result {
+            // A success-hook error can happen after the catalog commit. Only
+            // an aborted, non-existent index may be deleted eagerly; all other
+            // orphans are reclaimed by the next open's registry-aware sweep.
+            if !self.relation_name_exists(&index_name).unwrap_or(true) {
+                remove_inverted_directory(self.storage.data_dir(), index_oid);
+            }
+            return Err(error);
+        }
         Ok(index_oid)
     }
 
@@ -9205,6 +9315,13 @@ mod tests {
         assert!(engine.indexes().is_empty());
         assert!(engine.inverted_handles.lock().is_empty());
         assert!(engine.pending_inverted.lock().is_empty());
+        let has_toast = engine.describe_table("t").unwrap().toast.is_some();
+        let failed_index_oid = Oid(table_oid.0 + 1 + u64::from(has_toast));
+        assert!(!tmp
+            .path()
+            .join("inverted")
+            .join(failed_index_oid.0.to_string())
+            .exists());
 
         engine
             .exec(
@@ -9550,6 +9667,93 @@ mod tests {
     }
 
     #[test]
+    fn quiet_index_checkpoint_advances_durable_coverage_and_reopens() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = EngineConfig::new(tmp.path());
+        config.storage.wal_segment_size = 16384;
+        let engine = Engine::open(tmp.path(), config.clone()).unwrap();
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        engine.exec(None, "CREATE TABLE other (id INT4)").unwrap();
+        let initial = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+        assert!(initial.consumed_lsn > initial.durable_applied_lsn);
+
+        let mut previous = initial;
+        for round in 0..2 {
+            for id in round * 20..(round + 1) * 20 {
+                engine
+                    .exec(None, &format!("INSERT INTO other VALUES ({id})"))
+                    .unwrap();
+            }
+            engine
+                .exec(None, "SELECT id FROM t WHERE content @@ 'contract'")
+                .unwrap();
+            engine.checkpoint().unwrap();
+            let current = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+            assert_eq!(current.durable_applied_lsn, current.consumed_lsn);
+            assert!(current.durable_applied_lsn > previous.durable_applied_lsn);
+            previous = current;
+        }
+        engine.shutdown();
+
+        let engine = Engine::open(tmp.path(), config).unwrap();
+        let recovered = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+        assert_eq!(recovered.durable_applied_lsn, recovered.consumed_lsn);
+        assert_eq!(recovered.consumed_lsn, previous.consumed_lsn);
+        engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'contract'")
+            .unwrap();
+        engine.shutdown();
+    }
+
+    #[test]
+    fn checkpoint_skips_coverage_for_pending_actions() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        let before = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+        engine
+            .pending_inverted
+            .lock()
+            .entry(index_oid)
+            .or_default()
+            .entry(TxnId(1))
+            .or_default()
+            .push(InvertedWalAction::Delete {
+                tid: pg_storage::types::Tid {
+                    page_id: pg_storage::types::PageId(1),
+                    slot_id: 1,
+                },
+            });
+        engine.checkpoint().unwrap();
+        let skipped = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+        assert_eq!(skipped.durable_applied_lsn, before.durable_applied_lsn);
+
+        engine.pending_inverted.lock().clear();
+        engine.checkpoint().unwrap();
+        let advanced = engine.indexes()[0].inverted.as_ref().unwrap().watermark;
+        assert_eq!(advanced.durable_applied_lsn, advanced.consumed_lsn);
+        assert!(advanced.durable_applied_lsn > before.durable_applied_lsn);
+        engine.shutdown();
+    }
+
+    #[test]
     fn inverted_wand_top_k_repairs_visibility_filtered_candidates() {
         let tmp = TempDir::new().unwrap();
         let engine = open(tmp.path());
@@ -9843,10 +10047,12 @@ mod tests {
             )
             .unwrap();
         let old_oid = engine.indexes()[0].index_oid;
+        let old_dir = tmp.path().join("inverted").join(old_oid.0.to_string());
         engine
             .exec(None, "INSERT INTO t VALUES (1, 'oldterm')")
             .unwrap();
         engine.drop_table("t").unwrap();
+        assert!(!old_dir.exists());
         engine
             .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
             .unwrap();
@@ -9872,9 +10078,12 @@ mod tests {
         };
         assert_eq!(count(&engine, "oldterm"), 0);
         assert_eq!(count(&engine, "newterm"), 1);
+        std::fs::create_dir_all(old_dir.join("segments")).unwrap();
+        std::fs::write(old_dir.join("segments").join("orphan.tmp"), b"orphan").unwrap();
         engine.shutdown();
 
         let engine = open(tmp.path());
+        assert!(!old_dir.exists());
         assert_eq!(count(&engine, "oldterm"), 0);
         assert_eq!(count(&engine, "newterm"), 1);
         engine.shutdown();

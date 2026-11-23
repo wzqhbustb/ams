@@ -107,6 +107,12 @@ impl InvertedIndex {
         self.store.has_unsealed_changes()
     }
 
+    /// Whether an empty coverage segment may be published without skipping
+    /// document changes or a failed seal transition.
+    pub fn can_advance_coverage(&self) -> bool {
+        self.store.can_advance_coverage()
+    }
+
     /// Whether a previous seal hit the frame capacity and is still cooling down.
     pub fn seal_capacity_blocked(&self) -> bool {
         self.seal_capacity_retry_after
@@ -151,6 +157,17 @@ impl InvertedIndex {
             self.seal_capacity_retry_after = None;
         }
         result
+    }
+
+    /// Advance durable coverage over a metadata-only WAL prefix and emit its
+    /// seal marker. The engine calls this only when no per-XID action is pending.
+    pub fn persist_coverage(
+        &mut self,
+        data_dir: &std::path::Path,
+        wal: &pg_storage::wal::WalWriter,
+        xid: pg_storage::types::TxnId,
+    ) -> Result<Option<Lsn>> {
+        self.store.persist_coverage(data_dir, wal, xid)
     }
 
     /// Number of active segments in the current manifest.

@@ -86,6 +86,67 @@ mod tests {
         assert_eq!(store.manifest().applied_lsn, Lsn(128));
     }
 
+    #[test]
+    fn open_rejects_duplicate_posting_terms_and_tids() {
+        for duplicate_term in [true, false] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_active_store_with_meta(tmp.path(), Lsn(128), segment_meta_golden_shape());
+            let (postings, _) = golden_payload();
+            let mut rows = postings
+                .into_iter()
+                .map(|(term, documents)| (term, documents.into_iter().collect::<Vec<_>>()))
+                .collect::<Vec<_>>();
+            if duplicate_term {
+                let first = rows[0].clone();
+                rows.insert(0, first);
+            } else {
+                let first = rows[0].1[0].clone();
+                rows[0].1.push(first);
+            }
+            std::fs::write(
+                SegmentStore::postings_path(
+                    tmp.path(),
+                    pg_storage::types::Oid(9879),
+                    pg_storage::segment::SegmentId(7),
+                ),
+                crate::recovery::encode(&rows).unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                SegmentStore::open(
+                    tmp.path(),
+                    pg_storage::types::Oid(9879),
+                    &AnalyzerConfig::builtin(),
+                ),
+                Err(InvertedError::Corrupted(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn open_rejects_duplicate_term_df_keys() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_active_store_with_meta(tmp.path(), Lsn(128), segment_meta_golden_shape());
+        let path = SegmentStore::segment_metadata_path(
+            tmp.path(),
+            pg_storage::types::Oid(9879),
+            pg_storage::segment::SegmentId(7),
+        );
+        let metadata = SegmentMeta::decode(&std::fs::read(&path).unwrap()).unwrap();
+        let mut wire = crate::posting::SegmentMetaWire::from(metadata);
+        let duplicate = wire.term_df[0].clone();
+        wire.term_df.push(duplicate);
+        std::fs::write(&path, crate::recovery::encode(&wire).unwrap()).unwrap();
+        assert!(matches!(
+            SegmentStore::open(
+                tmp.path(),
+                pg_storage::types::Oid(9879),
+                &AnalyzerConfig::builtin(),
+            ),
+            Err(InvertedError::Corrupted(_))
+        ));
+    }
+
     fn write_active_store_with_state(
         data_dir: &std::path::Path,
         manifest_lsn: Lsn,

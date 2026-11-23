@@ -7,11 +7,10 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-
 use pg_storage::config::StorageConfig;
 use pg_storage::page_allocator::PageAllocator;
 use pg_storage::recovery::{ActiveXactTable, DirtyPageTable, IncompleteSplitTracker, RedoContext};
+use pg_storage::sync::Mutex;
 use pg_storage::types::{Lsn, TxnId};
 use pg_storage::wal::record::WalRecord;
 use pg_storage::wal::writer::WalWriter;

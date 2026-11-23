@@ -107,6 +107,74 @@ pub struct SegmentMeta {
     pub byte_count: u64,
 }
 
+/// Wire form that preserves duplicate `term_df` keys for validation. Its
+/// bincode layout is identical to `SegmentMeta`; only the decoded container
+/// differs (`Vec` of pairs instead of a silently deduplicating `BTreeMap`).
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct SegmentMetaWire {
+    format_version: u16,
+    index_oid: Oid,
+    segment_id: SegmentId,
+    analyzer: AnalyzerConfig,
+    state: SegmentState,
+    doc_count: u64,
+    total_tokens: u64,
+    pub(crate) term_df: Vec<(String, u64)>,
+    created_from_lsn: Lsn,
+    applied_lsn: Lsn,
+    row_count: u64,
+    posting_count: u64,
+    byte_count: u64,
+}
+
+impl From<SegmentMeta> for SegmentMetaWire {
+    fn from(meta: SegmentMeta) -> Self {
+        Self {
+            format_version: meta.format_version,
+            index_oid: meta.index_oid,
+            segment_id: meta.segment_id,
+            analyzer: meta.analyzer,
+            state: meta.state,
+            doc_count: meta.doc_count,
+            total_tokens: meta.total_tokens,
+            term_df: meta.term_df.into_iter().collect(),
+            created_from_lsn: meta.created_from_lsn,
+            applied_lsn: meta.applied_lsn,
+            row_count: meta.row_count,
+            posting_count: meta.posting_count,
+            byte_count: meta.byte_count,
+        }
+    }
+}
+
+impl SegmentMetaWire {
+    fn into_meta(self) -> crate::Result<SegmentMeta> {
+        let mut term_df = BTreeMap::new();
+        for (term, df) in self.term_df {
+            if term_df.insert(term.clone(), df).is_some() {
+                return Err(crate::InvertedError::Corrupted(format!(
+                    "duplicate term_df key {term:?}"
+                )));
+            }
+        }
+        Ok(SegmentMeta {
+            format_version: self.format_version,
+            index_oid: self.index_oid,
+            segment_id: self.segment_id,
+            analyzer: self.analyzer,
+            state: self.state,
+            doc_count: self.doc_count,
+            total_tokens: self.total_tokens,
+            term_df,
+            created_from_lsn: self.created_from_lsn,
+            applied_lsn: self.applied_lsn,
+            row_count: self.row_count,
+            posting_count: self.posting_count,
+            byte_count: self.byte_count,
+        })
+    }
+}
+
 impl SegmentMeta {
     /// Encode this segment's metadata in the versioned metadata frame.
     pub fn encode(&self) -> crate::Result<Vec<u8>> {
@@ -116,7 +184,7 @@ impl SegmentMeta {
     /// Decode segment metadata and validate its container and semantic
     /// version, analyzer identity, exact length, and CRC32.
     pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
-        let meta: Self = crate::recovery::decode(bytes)?;
+        let meta = crate::recovery::decode::<SegmentMetaWire>(bytes)?.into_meta()?;
         if meta.format_version != SEGMENT_FORMAT_VERSION {
             return Err(crate::InvertedError::Corrupted(format!(
                 "unsupported segment metadata version {}",
@@ -127,5 +195,36 @@ impl SegmentMeta {
             crate::InvertedError::Corrupted(format!("invalid analyzer metadata: {error}"))
         })?;
         Ok(meta)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_term_df_keys_are_rejected() {
+        let meta = SegmentMeta {
+            format_version: SEGMENT_FORMAT_VERSION,
+            index_oid: Oid(9879),
+            segment_id: SegmentId(1),
+            analyzer: AnalyzerConfig::builtin(),
+            state: SegmentState::Sealed,
+            doc_count: 1,
+            total_tokens: 1,
+            term_df: BTreeMap::from([("contract".to_string(), 1)]),
+            created_from_lsn: Lsn::INVALID,
+            applied_lsn: Lsn::FIRST,
+            row_count: 1,
+            posting_count: 1,
+            byte_count: 0,
+        };
+        let mut wire = SegmentMetaWire::from(meta);
+        wire.term_df.push(("contract".to_string(), 1));
+        let bytes = crate::recovery::encode(&wire).unwrap();
+        assert!(matches!(
+            SegmentMeta::decode(&bytes),
+            Err(crate::InvertedError::Corrupted(_))
+        ));
     }
 }

@@ -51,6 +51,21 @@ Both indexes used the same document text, `en_stem` / `mixed` analysis, and OR-o
 
 This is a **retrieval-quality comparability** gate, not a scorer-equivalence gate. Our analyzer removes stopwords before computing `doc_len`, while Tantivy's `en_stem` path retains them in `fieldnorm`; Tantivy's length normalization therefore includes stopwords that ours excludes. This systematic asymmetry affects ranking: query `1359`, for example, scores 1.0 with our index versus 0.6309297535714575 with Tantivy. The ±0.005 result must be interpreted as comparable retrieval quality under this fieldnorm difference, not as identical BM25 scoring semantics.
 
+## Chinese/mixed quality
+
+```bash
+cargo test -p pg-am-inverted --release --test quality chinese_mixed_ndcg_matches_tantivy -- --ignored --nocapture
+```
+
+Result:
+
+- 12 frozen Chinese/mixed documents and 6 queries, covering AND, OR, mixed Latin/CJK, and an empty result
+- Mean absolute NDCG@10 difference: **0.00000000**
+- Acceptance threshold: 0.005 — **PASS**
+- All six query scores matched exactly in this run
+
+The fixture is defined inline in `crates/pg-am-inverted/tests/quality.rs`. Tantivy indexes the exact token stream produced by our `mixed` analyzer through its `whitespace` tokenizer, so document lengths and fieldnorms cover the same tokens. This measures retrieval-quality comparability rather than analyzer independence.
+
 ## Latency against Tantivy
 
 ```bash
@@ -61,11 +76,11 @@ Result: **PASS** — WAND mean latency is below the 3× Tantivy budget.
 
 | Engine | Mean | p95 |
 |---|---:|---:|
-| Tantivy | 36.340µs | 79.959µs |
-| DAAT | 45.404µs | 120.000µs |
-| WAND | 45.146µs | 122.500µs |
+| Tantivy | 29.805µs | 54.541µs |
+| DAAT | 27.478µs | 80.583µs |
+| WAND | 33.503µs | 59.542µs |
 
-Ratios: WAND/Tantivy mean **1.242**, p95 **1.532**. The sample contains 100 qrel-covered claims, five iterations each, over the vendored 5,183-document corpus. These are post-cache-fix measurements.
+Ratios: WAND/Tantivy mean **1.124**, p95 **1.092**. The sample contains 100 qrel-covered claims, five iterations each, over the vendored 5,183-document corpus. These are the final Stage F post-cache-fix measurements.
 
 ## Tier 2 load
 

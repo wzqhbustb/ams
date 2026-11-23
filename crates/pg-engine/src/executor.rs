@@ -23,6 +23,8 @@ use crate::sql::{CmpOp, DistanceOp, Expr, Filter, Literal, OrderByExpr, OrderByK
 thread_local! {
     static POST_BTREE_SCAN_HOOK: std::cell::Cell<Option<fn(&Engine)>> =
         std::cell::Cell::new(None);
+    static BEFORE_INVERTED_CANDIDATE_SCAN_HOOK: std::cell::Cell<Option<fn(&Engine)>> =
+        std::cell::Cell::new(None);
 }
 
 /// Materialized `(visible_tid, decoded_values)` rows.
@@ -102,7 +104,15 @@ pub(crate) fn execute(
         ScanSpec::Inverted(spec) => {
             let (rows, candidate_count) = execute_inverted(engine, snap, entry, spec)?;
             spec.candidate_count = candidate_count;
-            rows
+            if engine.txn_manager().current_xid() == snap.xmax() {
+                rows
+            } else {
+                // A concurrent refresh may have removed candidates that are
+                // still visible to this snapshot. Mirror the B+Tree recheck:
+                // discard the index result and use the MVCC-complete heap.
+                fallback_reason = Some(crate::planner::SeqScanReason::SnapshotFallback);
+                execute_seq_with_extra(engine, snap, table, entry, filter, extra_filter)?
+            }
         }
     };
     if let Some(reason) = fallback_reason {
@@ -136,6 +146,12 @@ fn execute_inverted(
         value: spec.query.clone(),
     };
     let predicate = filter_to_predicate_with_analyzer(entry, &filter, &spec.analyzer_config)?;
+    #[cfg(test)]
+    BEFORE_INVERTED_CANDIDATE_SCAN_HOOK.with(|hook| {
+        if let Some(hook) = hook.get() {
+            hook(engine);
+        }
+    });
     let handle = engine.inverted_handle(spec.index_oid)?;
     let hits = if spec.limit.is_some() {
         handle.lock().search_wand_text(query, spec.limit)
@@ -247,6 +263,12 @@ pub(crate) fn bm25_scores(
             .ok_or_else(|| {
                 EngineError::IndexNotFound(format!("inverted index on {:?}", expr.column))
             })?;
+        #[cfg(test)]
+        BEFORE_INVERTED_CANDIDATE_SCAN_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook(engine);
+            }
+        });
         let hits = engine
             .inverted_handle(index_entry.index_oid)?
             .lock()
@@ -257,7 +279,12 @@ pub(crate) fn bm25_scores(
                 scores.insert(visible_tid, hit.score);
             }
         }
-        return Ok(scores);
+        if engine.txn_manager().current_xid() == snap.xmax() {
+            return Ok(scores);
+        }
+        // The candidate source changed after the snapshot. Do not return
+        // missing or zero scores for rows that the heap still sees.
+        scores.clear();
     }
 
     let analyzer = engine.inverted_analyzer_for(entry.oid, &expr.column);
@@ -1339,6 +1366,110 @@ mod tests {
         }
         assert_eq!(output.rows.len(), 1);
         assert_eq!(output.rows[0].1[0], Some(Datum::Int8(1)));
+    }
+
+    fn delete_and_refresh_inverted(engine: &Engine) {
+        BEFORE_INVERTED_CANDIDATE_SCAN_HOOK.with(|hook| hook.set(None));
+        engine
+            .exec(None, "DELETE FROM hook_t WHERE id = 1")
+            .unwrap();
+        let entry = engine.describe_table("hook_t").unwrap();
+        for index in engine.indexes() {
+            engine.refresh_inverted(&index, &entry).unwrap();
+        }
+    }
+
+    #[test]
+    fn inverted_post_scan_xid_recheck_falls_back_after_writer() {
+        let tmp = TempDir::new().unwrap();
+        let engine = Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap();
+        engine
+            .exec(None, "CREATE TABLE hook_t (id INT8, v TEXT)")
+            .unwrap();
+        engine
+            .exec(None, "INSERT INTO hook_t VALUES (1, 'rust')")
+            .unwrap();
+        engine
+            .exec(None, "CREATE INDEX v_idx ON hook_t USING inverted (v)")
+            .unwrap();
+        let entry = engine.describe_table("hook_t").unwrap();
+        let (snap, _guard) = engine
+            .txn_manager()
+            .snapshot(pg_storage::types::TxnId::INVALID);
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                BEFORE_INVERTED_CANDIDATE_SCAN_HOOK.with(|hook| hook.set(None));
+            }
+        }
+        let _reset = ResetHook;
+        BEFORE_INVERTED_CANDIDATE_SCAN_HOOK
+            .with(|hook| hook.set(Some(delete_and_refresh_inverted)));
+        let output = execute(
+            &engine,
+            &snap,
+            "hook_t",
+            &entry,
+            &Some(Filter {
+                column: "v".to_string(),
+                op: CmpOp::FullText,
+                value: Literal::Str("rust".to_string()),
+            }),
+            &None,
+            &None,
+            &None,
+        )
+        .unwrap();
+        match output.plan.spec {
+            ScanSpec::Seq(spec) => assert_eq!(spec.reason, SeqScanReason::SnapshotFallback),
+            _ => panic!("post-scan XID change must use the heap fallback"),
+        }
+        assert_eq!(output.rows.len(), 1);
+        assert_eq!(output.rows[0].1[0], Some(Datum::Int8(1)));
+    }
+
+    #[test]
+    fn bm25_scores_rechecks_xid_after_candidate_scan() {
+        let tmp = TempDir::new().unwrap();
+        let engine = Engine::open(tmp.path(), EngineConfig::new(tmp.path())).unwrap();
+        engine
+            .exec(None, "CREATE TABLE hook_t (id INT8, v TEXT)")
+            .unwrap();
+        engine
+            .exec(None, "INSERT INTO hook_t VALUES (1, 'rust')")
+            .unwrap();
+        engine
+            .exec(None, "CREATE INDEX v_idx ON hook_t USING inverted (v)")
+            .unwrap();
+        let entry = engine.describe_table("hook_t").unwrap();
+        let (snap, _guard) = engine
+            .txn_manager()
+            .snapshot(pg_storage::types::TxnId::INVALID);
+        let initial_tid = engine.scan_inner(&snap, "hook_t", None).unwrap()[0].0;
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                BEFORE_INVERTED_CANDIDATE_SCAN_HOOK.with(|hook| hook.set(None));
+            }
+        }
+        let _reset = ResetHook;
+        BEFORE_INVERTED_CANDIDATE_SCAN_HOOK
+            .with(|hook| hook.set(Some(delete_and_refresh_inverted)));
+        let scores = bm25_scores(
+            &engine,
+            &snap,
+            "hook_t",
+            &entry,
+            &crate::sql::Bm25ScoreExpr {
+                column: "v".to_string(),
+                query: Literal::Str("rust".to_string()),
+                alias: None,
+                desc: false,
+            },
+            true,
+        )
+        .unwrap();
+        assert!(scores.get(&initial_tid).is_some_and(|score| *score > 0.0));
     }
 
     #[test]

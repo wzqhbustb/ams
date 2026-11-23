@@ -360,9 +360,16 @@ impl SegmentStore {
                 analyzer = Some(meta.analyzer.clone());
             }
 
-            let segment_postings: BTreeMap<_, _> = crate::recovery::decode(&read_bytes(
+            // Reuse the strict streaming reader even though reopen builds the
+            // full map: direct BTreeMap deserialization would silently replace
+            // duplicate terms/TIDs before semantic validation could see them.
+            let mut segment_postings = BTreeMap::new();
+            let mut posting_reader = crate::segment_io::PostingsReader::open(
                 &Self::postings_path(data_dir, index_oid, *segment_id),
-            )?)?;
+            )?;
+            while let Some((term, documents)) = posting_reader.next_term()? {
+                segment_postings.insert(term, documents.into_iter().collect::<BTreeMap<_, _>>());
+            }
             let segment_doc_lengths: Vec<DocLength> = crate::recovery::decode(&read_bytes(
                 &Self::doc_lengths_path(data_dir, index_oid, *segment_id),
             )?)?;
@@ -522,6 +529,12 @@ impl SegmentStore {
         !self.pending_documents.is_empty()
     }
 
+    /// Whether the consumed prefix can be published as an empty coverage
+    /// segment without skipping document changes or a failed seal transition.
+    pub fn can_advance_coverage(&self) -> bool {
+        !self.dirty && self.pending_documents.is_empty()
+    }
+
     /// Build an empty segment store without inventing a fake index build.
     pub fn build(&self) -> Result<()> {
         Ok(())
@@ -672,6 +685,116 @@ impl SegmentStore {
         self.watermark.durable_applied_lsn = applied_lsn;
         self.pending_documents.clear();
         Ok(())
+    }
+
+    /// Persist an empty segment that advances durable coverage over a fully
+    /// consumed, metadata-only WAL prefix. The caller must also rule out any
+    /// in-flight per-XID actions for this index; committed but unsealed document
+    /// changes are rejected here. This lets checkpoint reclaim quiet-index WAL
+    /// without weakening the active-segment coverage invariant.
+    pub fn persist_coverage(
+        &mut self,
+        data_dir: &Path,
+        wal: &pg_storage::wal::WalWriter,
+        xid: pg_storage::types::TxnId,
+    ) -> Result<Option<Lsn>> {
+        self.persist_coverage_inner(data_dir, wal, xid, |_| Ok(()))
+    }
+
+    fn persist_coverage_inner(
+        &mut self,
+        data_dir: &Path,
+        wal: &pg_storage::wal::WalWriter,
+        xid: pg_storage::types::TxnId,
+        mut crash_hook: impl FnMut(SealCrashPoint) -> Result<()>,
+    ) -> Result<Option<Lsn>> {
+        if !self.can_advance_coverage() {
+            return Err(InvertedError::InvalidArgument(
+                "document changes must be sealed before advancing coverage".to_string(),
+            ));
+        }
+        let previous_lsn = self.watermark.durable_applied_lsn;
+        let applied_lsn = self.watermark.consumed_lsn;
+        if previous_lsn > applied_lsn {
+            return Err(InvertedError::Corrupted(
+                "durable watermark exceeds consumed watermark".to_string(),
+            ));
+        }
+        if previous_lsn == applied_lsn {
+            return Ok(None);
+        }
+        let segment_id = self.next_segment_id(data_dir)?;
+        let postings_bytes =
+            crate::recovery::encode(&BTreeMap::<String, BTreeMap<Tid, Posting>>::new())?;
+        let doc_length_bytes = crate::recovery::encode(&Vec::<DocLength>::new())?;
+        let tombstone_bytes = crate::recovery::encode(&Vec::<Tid>::new())?;
+        write_atomic(
+            &Self::postings_path(data_dir, self.index_oid, segment_id),
+            &postings_bytes,
+        )?;
+        write_atomic(
+            &Self::doc_lengths_path(data_dir, self.index_oid, segment_id),
+            &doc_length_bytes,
+        )?;
+        write_atomic(
+            &Self::tombstones_path(data_dir, self.index_oid, segment_id),
+            &tombstone_bytes,
+        )?;
+        let metadata = SegmentMeta {
+            format_version: crate::posting::SEGMENT_FORMAT_VERSION,
+            index_oid: self.index_oid,
+            segment_id,
+            analyzer: self.analyzer.clone(),
+            state: SegmentState::Sealed,
+            doc_count: 0,
+            total_tokens: 0,
+            term_df: BTreeMap::new(),
+            created_from_lsn: previous_lsn,
+            applied_lsn,
+            row_count: 0,
+            posting_count: 0,
+            byte_count: (postings_bytes.len() + doc_length_bytes.len() + tombstone_bytes.len())
+                as u64,
+        };
+        write_atomic(
+            &Self::segment_metadata_path(data_dir, self.index_oid, segment_id),
+            &metadata.encode()?,
+        )?;
+        crash_hook(SealCrashPoint::TargetDurable)?;
+        let mut active_segment_ids = self.manifest.active_segment_ids.clone();
+        active_segment_ids.push(segment_id);
+        let new_manifest = SegmentManifest {
+            generation: self.manifest.generation.checked_add(1).ok_or_else(|| {
+                InvertedError::Corrupted("manifest generation overflow".to_string())
+            })?,
+            active_segment_ids,
+            applied_lsn,
+        };
+        write_atomic(
+            &Self::manifest_path(data_dir, self.index_oid),
+            &new_manifest.encode()?,
+        )?;
+        crash_hook(SealCrashPoint::ManifestPublished)?;
+        self.manifest = new_manifest;
+        self.watermark.durable_applied_lsn = applied_lsn;
+        self.wal_sealed = true;
+
+        let payload =
+            bincode::serde::encode_to_vec(segment_id, pg_storage::wal::record::bincode_config())
+                .map_err(|error| InvertedError::Storage(error.to_string()))?;
+        let record = pg_storage::wal::record::WalRecord {
+            lsn: Lsn::INVALID,
+            prev_lsn: Lsn::INVALID,
+            txn_id: xid,
+            record_type: pg_storage::wal::record::WalRecordType::SegmentSeal,
+            flags: 0,
+            payload,
+        };
+        let record_len = record.record_size() as u64;
+        let start = wal
+            .append(record)
+            .map_err(|error| InvertedError::Storage(error.to_string()))?;
+        Ok(Some(start.advance(record_len)))
     }
 
     /// Merge all active segments into one target using a bounded-memory
@@ -1553,6 +1676,84 @@ mod tests {
     }
 
     #[test]
+    fn coverage_segments_survive_reopen_and_merge() {
+        let (tmp, wal, mut store) = merge_fixture();
+        store.advance_consumed(Lsn(384));
+        store
+            .persist_coverage(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert_eq!(store.watermark().durable_applied_lsn, Lsn(384));
+        assert_eq!(store.manifest().active_segment_ids.len(), 4);
+
+        let mut reopened =
+            SegmentStore::open(tmp.path(), Oid(9879), &AnalyzerConfig::builtin()).unwrap();
+        assert_eq!(reopened.watermark().durable_applied_lsn, Lsn(384));
+        for term in ["rust", "contract", "other"] {
+            assert_eq!(reopened.search_text(term, None).unwrap().len(), 1);
+        }
+        reopened.insert_document(tid(4), "fresh").unwrap();
+        reopened.advance_consumed(Lsn(512));
+        reopened
+            .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        reopened
+            .merge(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        assert_eq!(reopened.watermark().durable_applied_lsn, Lsn(512));
+        assert_eq!(reopened.manifest().active_segment_ids.len(), 1);
+        for term in ["rust", "contract", "other", "fresh"] {
+            assert_eq!(reopened.search_text(term, None).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn coverage_crash_windows_expose_old_or_complete_new_generation() {
+        for point in [
+            SealCrashPoint::TargetDurable,
+            SealCrashPoint::ManifestPublished,
+        ] {
+            let (tmp, wal, mut store) = merge_fixture();
+            store.advance_consumed(Lsn(384));
+            let manifest_path = SegmentStore::manifest_path(tmp.path(), Oid(9879));
+            let old_manifest = std::fs::read(&manifest_path).unwrap();
+            let error = store
+                .persist_coverage_inner(tmp.path(), &wal, pg_storage::types::TxnId(1), |current| {
+                    if std::mem::discriminant(&current) == std::mem::discriminant(&point) {
+                        Err(InvertedError::Storage(
+                            "injected coverage crash".to_string(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert!(matches!(error, InvertedError::Storage(_)));
+            let after = matches!(point, SealCrashPoint::ManifestPublished);
+            let mut reopened =
+                SegmentStore::open(tmp.path(), Oid(9879), &AnalyzerConfig::builtin()).unwrap();
+            assert_eq!(
+                reopened.watermark().durable_applied_lsn,
+                if after { Lsn(384) } else { Lsn(256) }
+            );
+            assert_eq!(
+                reopened.manifest().active_segment_ids.len(),
+                if after { 4 } else { 3 }
+            );
+            if !after {
+                assert_eq!(std::fs::read(&manifest_path).unwrap(), old_manifest);
+            }
+            for term in ["rust", "contract", "other"] {
+                assert_eq!(reopened.search_text(term, None).unwrap().len(), 1);
+            }
+            reopened.advance_consumed(Lsn(384));
+            reopened
+                .persist_coverage(tmp.path(), &wal, pg_storage::types::TxnId(1))
+                .unwrap();
+            assert_eq!(reopened.watermark().durable_applied_lsn, Lsn(384));
+        }
+    }
+
+    #[test]
     fn open_and_merge_reject_duplicate_or_ambiguous_tombstones() {
         let (tmp, wal, mut store) = merge_fixture();
         let path = SegmentStore::tombstones_path(tmp.path(), Oid(9879), SegmentId(1));
@@ -1566,6 +1767,21 @@ mod tests {
             SegmentStore::open(tmp.path(), Oid(9879), &AnalyzerConfig::builtin()),
             Err(InvertedError::Corrupted(_))
         ));
+        assert!(matches!(
+            store.merge(tmp.path(), &wal, pg_storage::types::TxnId(1)),
+            Err(InvertedError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn merge_rejects_duplicate_term_df_keys() {
+        let (tmp, wal, mut store) = merge_fixture();
+        let path = SegmentStore::segment_metadata_path(tmp.path(), Oid(9879), SegmentId(1));
+        let metadata = SegmentMeta::decode(&std::fs::read(&path).unwrap()).unwrap();
+        let mut wire = crate::posting::SegmentMetaWire::from(metadata);
+        let duplicate = wire.term_df[0].clone();
+        wire.term_df.push(duplicate);
+        std::fs::write(&path, crate::recovery::encode(&wire).unwrap()).unwrap();
         assert!(matches!(
             store.merge(tmp.path(), &wal, pg_storage::types::TxnId(1)),
             Err(InvertedError::Corrupted(_))
