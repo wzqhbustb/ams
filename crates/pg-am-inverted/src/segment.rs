@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pg_storage::segment::{SegmentId, SegmentState};
 use pg_storage::types::{Lsn, Oid, Tid};
@@ -42,8 +43,9 @@ pub struct SegmentStore {
     index_oid: Oid,
     analyzer: AnalyzerConfig,
     watermark: Watermark,
-    index: InMemoryIndex<DefaultAnalyzer>,
-    /// Whether every active segment already has its idempotent seal record.
+    index: InMemoryIndex<Arc<DefaultAnalyzer>>,
+    /// Whether no segment publication or initial marker work is outstanding.
+    /// Marker emission is advisory after a generation has been published.
     wal_sealed: bool,
     /// Whether the in-memory document set differs from the durable generation.
     dirty: bool,
@@ -505,9 +507,14 @@ impl SegmentStore {
 
     /// Set the number of pending documents required before sealing a delta.
     /// A value of zero is invalid because it would disable the batching contract.
-    pub fn set_flush_threshold(&mut self, threshold: usize) {
-        assert!(threshold > 0, "flush threshold must be greater than zero");
+    pub fn set_flush_threshold(&mut self, threshold: usize) -> Result<()> {
+        if threshold == 0 {
+            return Err(InvertedError::InvalidArgument(
+                "flush threshold must be greater than zero".to_string(),
+            ));
+        }
         self.flush_threshold = threshold;
+        Ok(())
     }
 
     /// Whether unsealed changes are present in the in-memory write view.
@@ -1001,6 +1008,16 @@ impl SegmentStore {
         wal: &pg_storage::wal::WalWriter,
         xid: pg_storage::types::TxnId,
     ) -> Result<Option<Lsn>> {
+        self.seal_inner(data_dir, wal, xid, || Ok(()))
+    }
+
+    fn seal_inner(
+        &mut self,
+        data_dir: &Path,
+        wal: &pg_storage::wal::WalWriter,
+        xid: pg_storage::types::TxnId,
+        mut crash_hook: impl FnMut() -> Result<()>,
+    ) -> Result<Option<Lsn>> {
         if self.dirty && self.pending_documents.len() < self.flush_threshold {
             // Small write batches remain in memory and are recovered from WAL
             // after a crash. Deferring their fsync avoids a segment per query.
@@ -1009,11 +1026,16 @@ impl SegmentStore {
         if self.wal_sealed {
             return Ok(None);
         }
+        let emit_markers = self.dirty || self.manifest.generation == 1;
         if self.dirty {
             self.persist_generation(data_dir)?;
+            // Segment publication is the required state transition. The
+            // idempotent validation marker does not gate later seal or merge.
+            self.dirty = false;
+            self.wal_sealed = true;
         }
         let mut last_seal_end = None;
-        if self.dirty || self.manifest.generation == 1 {
+        if emit_markers {
             for segment_id in self.manifest.active_segment_ids.iter().copied() {
                 let payload = bincode::serde::encode_to_vec(
                     segment_id,
@@ -1029,6 +1051,7 @@ impl SegmentStore {
                     payload,
                 };
                 let record_len = record.record_size() as u64;
+                crash_hook()?;
                 let start = wal
                     .append(record)
                     .map_err(|error| InvertedError::Storage(error.to_string()))?;
@@ -1494,6 +1517,39 @@ mod tests {
             SegmentStore::open(tmp.path(), Oid(9879), &AnalyzerConfig::builtin()).unwrap();
         assert_eq!(reopened.search_text("pending", None).unwrap().len(), 1);
         assert_eq!(reopened.manifest().active_segment_ids, vec![SegmentId(5)]);
+    }
+
+    #[test]
+    fn seal_marker_failure_leaves_published_generation_clean() {
+        let (tmp, wal, mut store) = merge_fixture();
+        store.insert_document(tid(4), "fresh").unwrap();
+        store.advance_consumed(Lsn(384));
+        let error = store
+            .seal_inner(tmp.path(), &wal, pg_storage::types::TxnId(1), || {
+                Err(InvertedError::Storage(
+                    "injected seal marker failure".to_string(),
+                ))
+            })
+            .unwrap_err();
+        assert!(matches!(error, InvertedError::Storage(_)));
+        assert!(!store.dirty);
+        assert!(store.wal_sealed);
+        assert!(store.pending_documents.is_empty());
+
+        let manifest = store.manifest().clone();
+        assert_eq!(
+            store
+                .seal(tmp.path(), &wal, pg_storage::types::TxnId(1))
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.manifest(), &manifest);
+        store
+            .merge(tmp.path(), &wal, pg_storage::types::TxnId(1))
+            .unwrap();
+        let reopened =
+            SegmentStore::open(tmp.path(), Oid(9879), &AnalyzerConfig::builtin()).unwrap();
+        assert_eq!(reopened.search_text("fresh", None).unwrap().len(), 1);
     }
 
     #[test]

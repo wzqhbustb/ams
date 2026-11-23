@@ -1,6 +1,7 @@
 //! Text analysis contracts shared by indexing and query execution.
 
 use std::io::BufReader;
+use std::sync::{Arc, OnceLock};
 
 use jieba_rs::Jieba;
 use rust_stemmers::{Algorithm, Stemmer};
@@ -29,6 +30,8 @@ pub struct AnalyzerConfig {
     pub config_hash: [u8; 32],
 }
 
+static ANALYZER_CONFIGS: OnceLock<[AnalyzerConfig; 3]> = OnceLock::new();
+
 impl AnalyzerConfig {
     /// Build a named built-in configuration and bind it to the frozen assets.
     pub fn named(name: &str) -> Result<Self> {
@@ -37,9 +40,27 @@ impl AnalyzerConfig {
                 "unknown analyzer name {name:?}"
             )));
         }
-        Ok(Self {
-            name: name.to_string(),
-            config_hash: compute_config_hash(name),
+        let [english, chinese, mixed] = ANALYZER_CONFIGS.get_or_init(|| {
+            [
+                AnalyzerConfig {
+                    name: "english".to_string(),
+                    config_hash: compute_config_hash("english"),
+                },
+                AnalyzerConfig {
+                    name: "chinese".to_string(),
+                    config_hash: compute_config_hash("chinese"),
+                },
+                AnalyzerConfig {
+                    name: "mixed".to_string(),
+                    config_hash: compute_config_hash("mixed"),
+                },
+            ]
+        });
+        Ok(match name {
+            "english" => english.clone(),
+            "chinese" => chinese.clone(),
+            "mixed" => mixed.clone(),
+            _ => unreachable!("name was validated above"),
         })
     }
 
@@ -71,8 +92,8 @@ impl AnalyzerConfig {
                 "analyzer configuration hash must not be zero".to_string(),
             ));
         }
-        let expected = compute_config_hash(&self.name);
-        if self.config_hash != expected {
+        let expected = Self::named(&self.name)?;
+        if self.config_hash != expected.config_hash {
             return Err(InvertedError::InvalidArgument(
                 "analyzer configuration mismatch: name does not match configuration hash"
                     .to_string(),
@@ -138,9 +159,13 @@ pub trait Analyzer: Send + Sync {
 /// dictionary and stop-word configuration.
 pub struct DefaultAnalyzer {
     config: AnalyzerConfig,
-    jieba: Jieba,
+    jieba: Arc<Jieba>,
     stemmer: Stemmer,
 }
+
+static SHARED_JIEBA: OnceLock<Arc<Jieba>> = OnceLock::new();
+static SHARED_ANALYZERS: [OnceLock<Arc<DefaultAnalyzer>>; 3] =
+    [OnceLock::new(), OnceLock::new(), OnceLock::new()];
 
 impl DefaultAnalyzer {
     /// English Snowball analyzer with stop-word filtering.
@@ -158,16 +183,36 @@ impl DefaultAnalyzer {
         Self::new(AnalyzerConfig::builtin())
     }
 
-    /// Construct the built-in analyzer matching a persisted configuration.
-    pub fn from_config(config: AnalyzerConfig) -> Self {
-        Self::new(config)
+    /// Construct or reuse the analyzer matching a persisted configuration.
+    /// Only exact built-in identities share the process-wide instances.
+    pub fn from_config(config: AnalyzerConfig) -> Arc<Self> {
+        let Ok(expected) = AnalyzerConfig::named(&config.name) else {
+            return Arc::new(Self::new(config));
+        };
+        if config != expected {
+            return Arc::new(Self::new(config));
+        }
+        let slot = match config.name.as_str() {
+            "english" => 0,
+            "chinese" => 1,
+            "mixed" => 2,
+            _ => unreachable!("named accepted only built-in analyzer names"),
+        };
+        SHARED_ANALYZERS[slot]
+            .get_or_init(|| Arc::new(Self::new(config)))
+            .clone()
     }
 
     fn new(config: AnalyzerConfig) -> Self {
-        let mut jieba = Jieba::empty();
-        jieba
-            .load_dict(&mut BufReader::new(BUILTIN_DICTIONARY.as_bytes()))
-            .expect("vendored jieba dictionary must be valid");
+        let jieba = SHARED_JIEBA
+            .get_or_init(|| {
+                let mut jieba = Jieba::empty();
+                jieba
+                    .load_dict(&mut BufReader::new(BUILTIN_DICTIONARY.as_bytes()))
+                    .expect("vendored jieba dictionary must be valid");
+                Arc::new(jieba)
+            })
+            .clone();
         Self {
             config,
             jieba,
@@ -231,6 +276,16 @@ impl Analyzer for DefaultAnalyzer {
 
     fn config(&self) -> &AnalyzerConfig {
         &self.config
+    }
+}
+
+impl Analyzer for Arc<DefaultAnalyzer> {
+    fn analyze(&self, text: &str) -> Vec<Token> {
+        self.as_ref().analyze(text)
+    }
+
+    fn config(&self) -> &AnalyzerConfig {
+        self.as_ref().config()
     }
 }
 
@@ -352,6 +407,38 @@ mod tests {
     }
 
     #[test]
+    fn from_config_shares_only_exact_builtin_analyzers() {
+        for config in [
+            AnalyzerConfig::english(),
+            AnalyzerConfig::chinese(),
+            AnalyzerConfig::builtin(),
+        ] {
+            let first = DefaultAnalyzer::from_config(config.clone());
+            let second = DefaultAnalyzer::from_config(config);
+            assert!(Arc::ptr_eq(&first, &second));
+        }
+
+        let mut mismatched = AnalyzerConfig::builtin();
+        mismatched.config_hash[0] ^= 1;
+        let custom = DefaultAnalyzer::from_config(mismatched);
+        let builtin = DefaultAnalyzer::from_config(AnalyzerConfig::builtin());
+        assert!(!Arc::ptr_eq(&custom, &builtin));
+    }
+
+    #[test]
+    fn all_constructors_share_the_jieba_dictionary() {
+        let english = DefaultAnalyzer::english();
+        let chinese = DefaultAnalyzer::chinese();
+        let mixed = DefaultAnalyzer::mixed();
+        let mut custom_config = AnalyzerConfig::builtin();
+        custom_config.config_hash[0] ^= 1;
+        let custom = DefaultAnalyzer::from_config(custom_config);
+        assert!(Arc::ptr_eq(&english.jieba, &chinese.jieba));
+        assert!(Arc::ptr_eq(&english.jieba, &mixed.jieba));
+        assert!(Arc::ptr_eq(&english.jieba, &custom.jieba));
+    }
+
+    #[test]
     fn english_hash_excludes_unused_chinese_dictionary() {
         assert_eq!(
             compute_config_hash_with_dictionary("english", "different dictionary"),
@@ -369,16 +456,16 @@ mod tests {
     #[test]
     fn out_of_vocabulary_chinese_uses_jieba_fallback() {
         let analyzer = DefaultAnalyzer::chinese();
-        let tokens = analyzer.analyze("𪚥 𪚦");
+        let tokens = analyzer.analyze("㐀㐁");
         assert_eq!(
             tokens,
             vec![
                 Token {
-                    text: "𪚥".to_string(),
+                    text: "㐀".to_string(),
                     position: 0,
                 },
                 Token {
-                    text: "𪚦".to_string(),
+                    text: "㐁".to_string(),
                     position: 1,
                 },
             ]

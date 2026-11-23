@@ -1156,6 +1156,11 @@ impl Engine {
     /// Panics if `config.clog_buffer_frames` is outside [4, 1024]
     /// (validation lives in [`ClogBuffer::open`], tech-selection §6.3).
     pub fn open(data_dir: &Path, config: EngineConfig) -> Result<Self> {
+        if config.inverted_seal_batch_size == 0 {
+            return Err(EngineError::InvalidArgument(
+                "inverted_seal_batch_size must be greater than zero".to_string(),
+            ));
+        }
         // 1. Disk CLOG first: WAL replay during storage recovery records
         //    terminal states into it (idempotently).
         let clog = Arc::new(ClogBuffer::open(data_dir, config.clog_buffer_frames)?);
@@ -3105,7 +3110,9 @@ impl Engine {
                     self.storage.wal_writer().synced_lsn(),
                 )
                 .map_err(|error| EngineError::Corrupted(error.to_string()))?;
-                store.set_flush_threshold(self.inverted_seal_batch_size);
+                store
+                    .set_flush_threshold(self.inverted_seal_batch_size)
+                    .map_err(|error| EngineError::InvalidArgument(error.to_string()))?;
                 store
                     .seal(
                         self.storage.data_dir(),
@@ -4442,7 +4449,9 @@ impl Engine {
             &self.inverted_analyzer,
         )
         .map_err(|error| EngineError::Corrupted(error.to_string()))?;
-        store.set_flush_threshold(self.inverted_seal_batch_size);
+        store
+            .set_flush_threshold(self.inverted_seal_batch_size)
+            .map_err(|error| EngineError::InvalidArgument(error.to_string()))?;
         let handle = Arc::new(Mutex::new(pg_am_inverted::InvertedIndex::from_store(store)));
         self.inverted_handles
             .lock()
@@ -7280,6 +7289,10 @@ impl Engine {
     }
 
     /// Read a point-in-time lag snapshot for one inverted index.
+    ///
+    /// This diagnostic rescans the unconsumed WAL range on every call
+    /// (`O(lag)`); polling once per appended record can therefore make a large
+    /// lag window quadratic to observe. It is not a hot-path counter API.
     pub fn inverted_lag_metrics(
         &self,
         index_oid: Oid,
@@ -7946,8 +7959,16 @@ impl Engine {
 
 /// Build a `Predicate` from a parsed `Filter`, resolving the column name
 /// to a 0-based index and converting the literal.
-pub(crate) fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate> {
-    filter_to_predicate_with_analyzer(entry, filter, &pg_am_inverted::AnalyzerConfig::builtin())
+pub(crate) fn filter_to_predicate(
+    engine: &Engine,
+    entry: &TableEntry,
+    filter: &Filter,
+) -> Result<Predicate> {
+    filter_to_predicate_with_analyzer(
+        entry,
+        filter,
+        &engine.inverted_analyzer_for(entry.oid, &filter.column),
+    )
 }
 
 /// Build a predicate with the analyzer belonging to a particular inverted index.
@@ -9585,6 +9606,108 @@ mod tests {
     }
 
     #[test]
+    fn inverted_merge_capacity_failure_recovers_after_cooldown() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        for id in 1..=3 {
+            engine
+                .exec(None, &format!("INSERT INTO t VALUES ({id}, 'shared')"))
+                .unwrap();
+            let result = engine
+                .exec(None, "SELECT id FROM t WHERE content @@ 'shared'")
+                .unwrap();
+            assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.len() == id as usize));
+        }
+        let handle = engine.inverted_handle(index_oid).unwrap();
+        handle.lock().inject_merge_capacity_error();
+        engine
+            .exec(None, "INSERT INTO t VALUES (4, 'shared')")
+            .unwrap();
+        let result = engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'shared'")
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.len() == 4));
+        assert_eq!(handle.lock().merge_attempts_for_test(), 1);
+        assert!(handle.lock().merge_capacity_blocked());
+
+        handle.lock().clear_injected_merge_capacity_error();
+        engine.exec(None, "DELETE FROM t WHERE id < 5").unwrap();
+        std::thread::sleep(Duration::from_millis(5100));
+        engine
+            .exec(None, "INSERT INTO t VALUES (5, 'shared')")
+            .unwrap();
+        let result = engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'shared'")
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.len() == 1));
+        assert_eq!(handle.lock().merge_attempts_for_test(), 2);
+        assert!(!handle.lock().merge_capacity_blocked());
+        assert_eq!(handle.lock().active_segment_count(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn inverted_seal_capacity_failure_recovers_after_cooldown() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT4, content TEXT)")
+            .unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let index_oid = engine.indexes()[0].index_oid;
+        for id in 1..=3 {
+            engine
+                .exec(None, &format!("INSERT INTO t VALUES ({id}, 'shared')"))
+                .unwrap();
+            let result = engine
+                .exec(None, "SELECT id FROM t WHERE content @@ 'shared'")
+                .unwrap();
+            assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.len() == id as usize));
+        }
+        let handle = engine.inverted_handle(index_oid).unwrap();
+        let attempts_before = handle.lock().seal_attempts_for_test();
+        handle.lock().inject_seal_capacity_error();
+        engine
+            .exec(None, "INSERT INTO t VALUES (4, 'shared')")
+            .unwrap();
+        let result = engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'shared'")
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.len() == 4));
+        assert_eq!(handle.lock().seal_attempts_for_test(), attempts_before + 1);
+        assert!(handle.lock().seal_capacity_blocked());
+
+        handle.lock().clear_injected_seal_capacity_error();
+        engine.exec(None, "DELETE FROM t WHERE id < 5").unwrap();
+        std::thread::sleep(Duration::from_millis(5100));
+        engine
+            .exec(None, "INSERT INTO t VALUES (5, 'shared')")
+            .unwrap();
+        let result = engine
+            .exec(None, "SELECT id FROM t WHERE content @@ 'shared'")
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows, .. } if rows.len() == 1));
+        assert_eq!(handle.lock().seal_attempts_for_test(), attempts_before + 2);
+        assert!(!handle.lock().seal_capacity_blocked());
+        engine.shutdown();
+    }
+
+    #[test]
     fn inverted_seal_capacity_failure_degrades_and_recovers_by_replay() {
         let tmp = TempDir::new().unwrap();
         let engine = open(tmp.path());
@@ -9646,6 +9769,17 @@ mod tests {
         assert_eq!(handle.lock().seal_attempts_for_test(), 1);
         assert_eq!(handle.lock().active_segment_count(), 3);
         engine.shutdown();
+    }
+
+    #[test]
+    fn zero_inverted_seal_batch_size_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = EngineConfig::new(tmp.path());
+        config.inverted_seal_batch_size = 0;
+        let Err(error) = Engine::open(tmp.path(), config) else {
+            panic!("expected zero seal batch size to be rejected")
+        };
+        assert!(matches!(error, EngineError::InvalidArgument(_)));
     }
 
     #[test]
@@ -10206,6 +10340,36 @@ mod tests {
             assert_eq!(metadata.watermark.consumed_lsn, Lsn(128));
             engine.shutdown();
         }
+    }
+
+    #[test]
+    fn fulltext_predicate_uses_the_index_analyzer() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = EngineConfig::new(tmp.path());
+        config.inverted_analyzer = pg_am_inverted::AnalyzerConfig::chinese();
+        let engine = Engine::open(tmp.path(), config).unwrap();
+        engine.exec(None, "CREATE TABLE t (content TEXT)").unwrap();
+        engine
+            .exec(
+                None,
+                "CREATE INDEX content_idx ON t USING inverted (content)",
+            )
+            .unwrap();
+        let entry = engine.table_entry("t").unwrap();
+        let filter = Filter {
+            column: "content".to_string(),
+            op: CmpOp::FullText,
+            value: Literal::Str("databases".to_string()),
+        };
+        let predicate = filter_to_predicate(&engine, &entry, &filter).unwrap();
+        assert!(matches!(
+            &predicate,
+            Predicate::FullText { analyzer, .. }
+                if *analyzer == pg_am_inverted::AnalyzerConfig::chinese()
+        ));
+        assert!(!predicate.matches(&Some(Datum::Text("database".to_string()))));
+        assert!(predicate.matches(&Some(Datum::Text("databases".to_string()))));
+        engine.shutdown();
     }
 
     #[test]

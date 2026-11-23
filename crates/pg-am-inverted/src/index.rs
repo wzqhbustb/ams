@@ -1,5 +1,7 @@
 //! Inverted access-method lifecycle and freshness hook.
 
+use std::time::{Duration, Instant};
+
 use pg_am_heap::access_method::{
     AccessMethod, BuildContext, DeleteContext, InsertContext, ScanContext,
 };
@@ -13,11 +15,15 @@ use crate::segment::SegmentStore;
 
 /// Inverted access method. Direct DML stays out of this AM: writes arrive
 /// through heap WAL and Tier 2 instead of direct API calls.
+const CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Inverted access method. Direct DML stays out of this AM: writes arrive
+/// through heap WAL and Tier 2 instead of direct API calls.
 #[derive(Debug)]
 pub struct InvertedIndex {
     store: SegmentStore,
-    merge_capacity_blocked: bool,
-    seal_capacity_blocked: bool,
+    merge_capacity_retry_after: Option<Instant>,
+    seal_capacity_retry_after: Option<Instant>,
     fail_merge_with_capacity: bool,
     fail_seal_with_capacity: bool,
     merge_attempts: usize,
@@ -29,8 +35,8 @@ impl InvertedIndex {
     pub fn new(index_oid: Oid) -> Self {
         Self {
             store: SegmentStore::new(index_oid),
-            merge_capacity_blocked: false,
-            seal_capacity_blocked: false,
+            merge_capacity_retry_after: None,
+            seal_capacity_retry_after: None,
             fail_merge_with_capacity: false,
             fail_seal_with_capacity: false,
             merge_attempts: 0,
@@ -42,8 +48,8 @@ impl InvertedIndex {
     pub fn from_store(store: SegmentStore) -> Self {
         Self {
             store,
-            merge_capacity_blocked: false,
-            seal_capacity_blocked: false,
+            merge_capacity_retry_after: None,
+            seal_capacity_retry_after: None,
             fail_merge_with_capacity: false,
             fail_seal_with_capacity: false,
             merge_attempts: 0,
@@ -101,20 +107,25 @@ impl InvertedIndex {
         self.store.has_unsealed_changes()
     }
 
-    /// Whether a previous seal hit the frame capacity and should not be
-    /// retried by the automatic query-path worker in this process.
+    /// Whether a previous seal hit the frame capacity and is still cooling down.
     pub fn seal_capacity_blocked(&self) -> bool {
-        self.seal_capacity_blocked
+        self.seal_capacity_retry_after
+            .is_some_and(|deadline| deadline > Instant::now())
     }
 
-    /// Stop automatic seal attempts after a capacity failure.
+    /// Stop automatic seal attempts briefly after a capacity failure.
     pub fn mark_seal_capacity_blocked(&mut self) {
-        self.seal_capacity_blocked = true;
+        self.seal_capacity_retry_after = Some(Instant::now() + CAPACITY_RETRY_DELAY);
     }
 
     /// Inject a deterministic seal capacity failure for engine tests.
     pub fn inject_seal_capacity_error(&mut self) {
         self.fail_seal_with_capacity = true;
+    }
+
+    /// Clear the injected seal failure so a later retry can succeed.
+    pub fn clear_injected_seal_capacity_error(&mut self) {
+        self.fail_seal_with_capacity = false;
     }
 
     /// Number of seal calls observed by this handle.
@@ -135,7 +146,11 @@ impl InvertedIndex {
                 "injected seal capacity failure".to_string(),
             ));
         }
-        self.store.seal(data_dir, wal, xid)
+        let result = self.store.seal(data_dir, wal, xid);
+        if result.is_ok() {
+            self.seal_capacity_retry_after = None;
+        }
+        result
     }
 
     /// Number of active segments in the current manifest.
@@ -143,20 +158,25 @@ impl InvertedIndex {
         self.store.manifest().active_segment_ids.len()
     }
 
-    /// Whether a previous merge hit the frame capacity and should not be
-    /// retried by the automatic query-path worker in this process.
+    /// Whether a previous merge hit the frame capacity and is still cooling down.
     pub fn merge_capacity_blocked(&self) -> bool {
-        self.merge_capacity_blocked
+        self.merge_capacity_retry_after
+            .is_some_and(|deadline| deadline > Instant::now())
     }
 
-    /// Stop automatic merge attempts after a capacity failure.
+    /// Stop automatic merge attempts briefly after a capacity failure.
     pub fn mark_merge_capacity_blocked(&mut self) {
-        self.merge_capacity_blocked = true;
+        self.merge_capacity_retry_after = Some(Instant::now() + CAPACITY_RETRY_DELAY);
     }
 
     /// Inject a deterministic capacity failure for engine circuit-breaker tests.
     pub fn inject_merge_capacity_error(&mut self) {
         self.fail_merge_with_capacity = true;
+    }
+
+    /// Clear the injected merge failure so a later retry can succeed.
+    pub fn clear_injected_merge_capacity_error(&mut self) {
+        self.fail_merge_with_capacity = false;
     }
 
     /// Number of merge calls observed by this handle.
@@ -179,7 +199,11 @@ impl InvertedIndex {
                 ));
             }
         }
-        self.store.merge(data_dir, wal, xid)
+        let result = self.store.merge(data_dir, wal, xid);
+        if result.is_ok() {
+            self.merge_capacity_retry_after = None;
+        }
+        result
     }
 }
 

@@ -6,7 +6,7 @@
 - OS: Darwin 23.5.0
 - Rust: 1.97.1 (8bab26f4f 2026-07-14)
 - Tantivy: 0.25.0
-- Stage D baseline commit: `f167f387eb01bf3b6525e2c97a66091aebfa95f8`
+- Measurement baseline: `2f9c939` (+ current worktree fixes)
 
 ## Assets
 
@@ -49,6 +49,8 @@ Result:
 
 Both indexes used the same document text, `en_stem` / `mixed` analysis, and OR-of-AND query semantics.
 
+This is a **retrieval-quality comparability** gate, not a scorer-equivalence gate. Our analyzer removes stopwords before computing `doc_len`, while Tantivy's `en_stem` path retains them in `fieldnorm`; Tantivy's length normalization therefore includes stopwords that ours excludes. This systematic asymmetry affects ranking: query `1359`, for example, scores 1.0 with our index versus 0.6309297535714575 with Tantivy. The ±0.005 result must be interpreted as comparable retrieval quality under this fieldnorm difference, not as identical BM25 scoring semantics.
+
 ## Latency against Tantivy
 
 ```bash
@@ -59,11 +61,11 @@ Result: **PASS** — WAND mean latency is below the 3× Tantivy budget.
 
 | Engine | Mean | p95 |
 |---|---:|---:|
-| Tantivy | 32.322µs | 64.792µs |
-| DAAT | 29.641µs | 95.750µs |
-| WAND | 32.281µs | 62.917µs |
+| Tantivy | 36.340µs | 79.959µs |
+| DAAT | 45.404µs | 120.000µs |
+| WAND | 45.146µs | 122.500µs |
 
-Ratios: WAND/Tantivy mean **0.999**, p95 **0.971**. The sample contains 100 qrel-covered claims, five iterations each, over the vendored 5,183-document corpus.
+Ratios: WAND/Tantivy mean **1.242**, p95 **1.532**. The sample contains 100 qrel-covered claims, five iterations each, over the vendored 5,183-document corpus. These are post-cache-fix measurements.
 
 ## Tier 2 load
 
@@ -75,13 +77,19 @@ The Tier 2 workload is defined in `crates/pg-engine/tests/phase3_tier2.rs`:
 - merge enabled and disabled variants
 - `commit_finished_at → visible_at` latency samples
 
-Results: **FAIL — the p95 < 1s target is not met.**
+Results after the analyzer-cache fix: **PASS — both variants meet the p95 < 1s target.**
 
 The current runs use 25 batches of 15 commits per client. Each batch's last visible commit verifies the whole preceding prefix, avoiding an OR-of-15 query while preserving the commit-to-visible evidence.
 
 | Variant | Elapsed | Effective commits/s | commit_to_visible p95 |
 |---|---:|---:|---:|
-| merge enabled | 413.842836291s | 14.50 | 26.517700958s |
-| merge disabled | 805.423736959s | 7.45 | 23.032686584s |
+| merge enabled | 60.005542625s | 99.99 | 496.013458ms |
+| merge disabled | 60.005421500s | 99.99 | 270.778458ms |
 
-Both variants have 6,000 valid visibility samples. The dominant cost is the concurrent refresh/visibility path, not merge itself: merge-disabled is slower, not faster. This remains an open performance blocker; Stage E is not accepted as complete.
+Both variants have 6,000 valid visibility samples. The earlier 26.5177s/23.0327s p95 figures were polluted by repeated dictionary SHA256 computation and per-seal dictionary parsing, and are superseded by these runs. The 60-second elapsed floor is the workload's offered-rate schedule. These clean results support retaining the synchronous consumer; no background consumer is introduced.
+
+## Current product decision (2026-11-23)
+
+The primary deployment shape is **one agent with low-frequency writes**. The 16-client/high-rate workload is retained as a stress reference, not as a current product acceptance blocker. The synchronous consumer remains the production choice; `allow_stale` is not used as a performance switch. The cache-fix rerun also meets the stress workload's original p95 target, so this decision no longer relies on the polluted failure measurements.
+
+A future high-concurrency option is recorded without implementation: one single-writer background consumer per index, Condvar-based freshness waits, bounded timeout with exact SeqScan fallback, DROP lifecycle handling, dynamic backoff, pending limits, and deterministic recovery tests. It will be implemented only if multi-agent, high-rate writes become a real requirement.

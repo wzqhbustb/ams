@@ -385,7 +385,7 @@ impl PgExecutionPlan {
         .map_err(df_error)?
         .rows;
         for filter in filters.iter().skip(1) {
-            let predicate = filter_to_predicate(&entry, filter).map_err(df_error)?;
+            let predicate = filter_to_predicate(&engine, &entry, filter).map_err(df_error)?;
             let index = predicate.col_index();
             rows.retain(|(_, values)| predicate.matches(&values[index]));
         }

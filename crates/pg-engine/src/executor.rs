@@ -675,7 +675,7 @@ pub(crate) fn explain(
     }
     let predicate = filter
         .as_ref()
-        .map(|filter| filter_to_predicate(entry, filter))
+        .map(|filter| filter_to_predicate(engine, entry, filter))
         .transpose()?;
     let request =
         build_request_with_extra(engine, table, entry, filter, extra_filter, order_by, limit)?;
@@ -746,7 +746,7 @@ fn execute_btree(
     entry: &TableEntry,
     filter: &Filter,
 ) -> Result<Option<ScanRows>> {
-    let predicate = filter_to_predicate(entry, filter)?;
+    let predicate = filter_to_predicate(engine, entry, filter)?;
     let key = match encode_key(predicate.value()) {
         Ok(key) => key,
         Err(pg_am_btree::BTreeError::KeyTooLarge(_)) => return Ok(None),
