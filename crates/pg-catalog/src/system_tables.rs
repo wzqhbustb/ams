@@ -49,6 +49,8 @@ pub const BTREE_AM_OID: Oid = Oid(403);
 /// `pg_am` OID of the HNSW vector access method (M6 Stage C — engine-side
 /// registration; the `CREATE INDEX ... USING hnsw` SQL form is Phase 4a Stage B).
 pub const HNSW_AM_OID: Oid = Oid(9878);
+/// `pg_am` OID of the inverted access method (Phase 3).
+pub const INVERTED_AM_OID: Oid = Oid(9879);
 
 /// `pg_class.relkind` for an ordinary table.
 pub const RELKIND_TABLE: &str = "r";

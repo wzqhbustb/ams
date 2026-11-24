@@ -319,7 +319,7 @@ impl Catalog {
 
 /// Verify the snapshot contains the fixed bootstrap content: every
 /// system relation by OID with attribute rows matching the hardcoded
-/// schema, all built-in types, and both access methods.
+/// schema, all built-in types, and all registered access methods.
 ///
 /// Extra rows (e.g. user tables from Stage I+ DDL) are tolerated — only
 /// the system content is checked.
@@ -386,14 +386,29 @@ fn validate_content(
             "pg_type row for vector does not match builtin definition".to_string(),
         ));
     }
-    for am_oid in [
-        crate::system_tables::HEAP_AM_OID,
-        crate::system_tables::BTREE_AM_OID,
-        crate::system_tables::HNSW_AM_OID,
+    for (am_oid, expected_name) in [
+        (crate::system_tables::HEAP_AM_OID, "heap"),
+        (crate::system_tables::BTREE_AM_OID, "btree"),
+        (crate::system_tables::HNSW_AM_OID, "hnsw"),
+        (crate::system_tables::INVERTED_AM_OID, "inverted"),
     ] {
-        if !access_methods.iter().any(|a| a.oid == am_oid) {
+        let Some(row) = access_methods.iter().find(|am| am.oid == am_oid) else {
+            // Phase 3 added INVERTED after Phase 4a directories were already
+            // deployed. Those directories cannot contain an inverted index;
+            // let them open unchanged. If an index row nevertheless references
+            // an unregistered AM, Engine::build_index_registry rejects it as
+            // unknown instead of falling back to B+Tree.
+            if am_oid == crate::system_tables::INVERTED_AM_OID {
+                continue;
+            }
             return Err(CatalogError::Corrupted(format!(
                 "catalog is missing access method {am_oid}"
+            )));
+        };
+        if row.name != expected_name {
+            return Err(CatalogError::Corrupted(format!(
+                "access method {am_oid} has amname {:?}, expected {expected_name:?}",
+                row.name
             )));
         }
     }

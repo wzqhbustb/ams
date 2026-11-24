@@ -208,6 +208,49 @@ fn rust_postgres_full_crud_and_txn_control() {
 }
 
 #[test]
+fn rust_postgres_inverted_backfill_and_bm25_end_to_end() {
+    run_with_watchdog("inverted+BM25", || {
+        let (_tmp, engine, port) = spawn_server();
+        let mut client = connect(port);
+        client
+            .batch_execute("CREATE TABLE agent_memory (id INT4, content TEXT)")
+            .unwrap();
+        client
+            .batch_execute(
+                "INSERT INTO agent_memory VALUES (1, 'rust contract'), (2, 'other document')",
+            )
+            .unwrap();
+        client
+            .batch_execute("CREATE INDEX content_idx ON agent_memory USING inverted (content)")
+            .unwrap();
+
+        let msgs = client
+            .simple_query(
+                "SELECT id, bm25_score(content, 'contract') AS score FROM agent_memory WHERE content @@ 'contract' ORDER BY bm25_score(content, 'contract') DESC",
+            )
+            .unwrap();
+        let rows = rows_of(&msgs);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_deref(), Some("1"));
+        assert!(rows[0][1].as_ref().unwrap().parse::<f64>().unwrap() > 0.0);
+
+        let rows = client
+            .query(
+                "SELECT id, bm25_score(content, $1) AS score FROM agent_memory WHERE content @@ $1 ORDER BY bm25_score(content, $1) DESC",
+                &[&"contract"],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<_, i32>(0), 1);
+        assert!(rows[0].get::<_, f64>(1) > 0.0);
+        assert_eq!(
+            engine.query_stats().entries().last().unwrap().path,
+            pg_engine::ExecutionPath::IndexLookup
+        );
+    });
+}
+
+#[test]
 fn rust_postgres_probe_statements_error_but_connection_survives() {
     run_with_watchdog("probes", || {
         let (_tmp, _engine, port) = spawn_server();

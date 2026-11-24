@@ -112,12 +112,16 @@ fn test_bootstrap_from_empty_dir() {
         assert_eq!(row.len, ty.len);
     }
 
-    // pg_am has exactly heap(2) and btree(403).
-    assert_eq!(catalog.access_methods().len(), 3); // heap + btree + hnsw (M6 Stage C)
+    // pg_am has heap, btree, hnsw, and the Phase 3 inverted AM.
+    assert_eq!(catalog.access_methods().len(), 4); // + inverted (Phase 3)
     assert_eq!(catalog.access_methods()[0].oid, Oid(2));
     assert_eq!(catalog.access_methods()[0].name, "heap");
     assert_eq!(catalog.access_methods()[1].oid, Oid(403));
     assert_eq!(catalog.access_methods()[1].name, "btree");
+    assert_eq!(catalog.access_methods()[2].oid, Oid(9878));
+    assert_eq!(catalog.access_methods()[2].name, "hnsw");
+    assert_eq!(catalog.access_methods()[3].oid, Oid(9879));
+    assert_eq!(catalog.access_methods()[3].name, "inverted");
 
     // Fresh allocator starts at the first user OID.
     assert_eq!(catalog.oid_allocator().current(), Oid::FIRST_USER);
@@ -185,7 +189,7 @@ fn test_second_open_does_not_rebootstrap() {
             PG_CLASS.columns.len()
         );
         assert_eq!(catalog.types().len(), BUILTIN_TYPES.len() + 1); // + the vector row (M6 Stage C)
-        assert_eq!(catalog.access_methods().len(), 3); // heap + btree + hnsw (M6 Stage C)
+        assert_eq!(catalog.access_methods().len(), 4); // + inverted (Phase 3)
     }
 }
 
@@ -286,7 +290,7 @@ fn test_half_state_recovery() {
             PG_CLASS.columns.len()
         );
         assert_eq!(catalog.types().len(), BUILTIN_TYPES.len() + 1); // + the vector row (M6 Stage C)
-        assert_eq!(catalog.access_methods().len(), 3); // heap + btree + hnsw (M6 Stage C)
+        assert_eq!(catalog.access_methods().len(), 4); // + inverted (Phase 3)
                                                        // Bootstrap reused the pre-allocated pages rather than allocating new
                                                        // ones.
         assert_eq!(engine.page_allocator().lock().next_page_id(), PageId(7));
@@ -326,7 +330,7 @@ fn assert_full_system_catalog(catalog: &Catalog) {
         PG_CLASS.columns.len()
     );
     assert_eq!(catalog.types().len(), BUILTIN_TYPES.len() + 1); // + the vector row (M6 Stage C)
-    assert_eq!(catalog.access_methods().len(), 3); // heap + btree + hnsw (M6 Stage C)
+    assert_eq!(catalog.access_methods().len(), 4); // + inverted (Phase 3)
 }
 
 /// Garbage line pointers that happen to decode as `Dead` would silently
@@ -411,7 +415,7 @@ fn test_partial_flush_half_state_triggers_rebootstrap() {
             PG_CLASS.columns.len()
         );
         assert_eq!(catalog.types().len(), BUILTIN_TYPES.len() + 1); // + the vector row (M6 Stage C)
-        assert_eq!(catalog.access_methods().len(), 3); // heap + btree + hnsw (M6 Stage C)
+        assert_eq!(catalog.access_methods().len(), 4); // + inverted (Phase 3)
     }
 }
 

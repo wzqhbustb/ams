@@ -15,6 +15,8 @@
 
 ## Phase overview
 
+The remaining implementation sequence is shown below. Existing phase IDs are retained for historical references; `5b-1` through `5b-3` are implementation stages, not new phase names.
+
 ```
 Phase 1: storage foundation + row store + transactions + B+Tree
          ├── M1: physical layer (Page/WAL/BufferPool/LSN)
@@ -37,21 +39,30 @@ Phase 3: full-text inverted index
          └── Segment merge + GC
 
 Phase 4a: SQL layer + PG Wire Protocol (basics)
-Phase 4b: Multi-Path Fusion + cross-modal planner
+
+Phase 5b-1: Graph AM + multi-AM GC coordinator
+         (Phase 4a and ≥2 AM are ready)
+         ├── Graph AM (lightweight) + graph query syntax
+         └── multi-AM GC coordinator + online Vacuum
+
+Phase 5b-2: forgetting curve + memory layering
+         (after the GC coordinator and mark_for_gc contract)
+
+Phase 6: full protocol layer + multi-agent isolation
+         (Phase 4a gate; may run alongside Phase 5b-1/5b-2)
 
 Phase 5a: time series + column store + distillation stub
-         (Phase 1 gate; may start alongside Phase 2/3/4a)
+         (Phase 1 gate; scheduled after Phase 6 for implementation focus)
          ├── kernel: TimeSeries AM + TTL, columnar projection prototype
          └── SDK: memory distillation (stub may start in parallel early)
 
-Phase 5b: graph + GC + forgetting/layering + Fusion integration
-         (needs 4a / ≥2 AM / 4b landing progressively)
-         ├── kernel: Graph AM (lightweight) + graph query syntax,
-         │   time-range query routing, multi-AM GC coordinator
-         ├── SDK: forgetting curve, memory layering (after the GC coordinator)
-         └── Fusion integration: graph/time-series into Fusion (after 4b)
+Phase 4b: Multi-Path Fusion + cross-modal planner
+         (after TimeSeries, Graph, HNSW and inverted are all available)
 
-Phase 6: full protocol layer + multi-agent isolation
+Phase 5b-3: Fusion integration + Phase 5b final acceptance
+         (after Phase 5a and Phase 4b)
+         ├── Graph into Fusion
+         └── Time series into Fusion
 
 Phase 7: production hardening
          ├── 7a: observability + backup/restore
@@ -69,10 +80,10 @@ Phase 7: production hardening
 | Phase 1 (M1+M2+M3) | 6 months | 9–12 months | 15+ months | 🔴 High (transactions/recovery is the core) |
 | Phase 2 (HNSW) | 9 months | 12–15 months | 24+ months | 🔴 High (long pole) |
 | Phase 3 (Inverted) | 4 months | 6–8 months | 10 months | 🟡 Medium (new segment model) |
-| Phase 4a+4b (SQL+PG → Fusion) | 4 months | 6–8 months | 12 months | 🟡 Medium (DataFusion integration) |
-| Phase 5a (TS+columnar+distill stub, parallel with 2/3/4a) | 1.5 months | 2–3 months | 4 months | 🟡 Medium (parallel with the main line) |
 | Phase 5b (graph+GC+forgetting/layering+Fusion) | 2 months | 3–4 months | 6 months | 🟡 Medium (SDK/kernel boundary, many gates) |
 | Phase 6 (protocol+isolation) | 6 months | 9–12 months | 18+ months | 🔴 High (full protocol) |
+| Phase 5a (TS+columnar+distill stub) | 1.5 months | 2–3 months | 4 months | 🟡 Medium (parallel with the main line) |
+| Phase 4a+4b (SQL+PG → Fusion) | 4 months | 6–8 months | 12 months | 🟡 Medium (DataFusion integration) |
 | Phase 7 (production) | ongoing | 12+ months | ongoing | 🟢 Low (continuous optimization) |
 
 **Total P50: 55–75 months / about 5–6 years (1–2 senior Rust engineers)**
@@ -81,7 +92,7 @@ Phase 7: production hardening
 
 ---
 
-## Current progress (2026-10-27)
+## Current progress (2026-11-24)
 
 | Phase | Status | Notes |
 |---|---|---|
@@ -89,15 +100,17 @@ Phase 7: production hardening
 | Phase 2a (In-memory HNSW) | ✅ Complete | Self-built HNSW (no third-party library), siftsmall recall@10 = 0.9990; L2/Cosine distance functions; snapshot loading |
 | Phase 2b (WAL + persistence) | ✅ Complete | Page-resident graph + 8 WAL record types + crash recovery; 25/1000 SIGKILL crash rounds; post-recovery recall bit-identical to baseline |
 | Phase 2c (concurrency + Tier 1) | 🚧 Closing | Concurrency protocol (shared handle + sharded latches + four loom models), Tier 1 transaction integration (in-row NodeId + sidecar map + IndexUndo), visibility-filtered search pipeline, vacuum extensions (leak accounting / local rebuild / dead-row backfill) — all delivered and reviewed; pgvector comparison landed (recall 0.9990 vs 0.9940, insert-throughput gap; see phase2-m6-benchmarks.md). **Still open**: first 24h stress run stalled at the watchdog (root cause under investigation), CI coverage report (needs a PR), the `phase2-m6` release tag (to be cut once CI is green, via branch + PR) |
-| Phase 3 (full-text inverted) | ⏳ Next milestone | Tech selection starting: segment-based inverted AM + BM25/WAND, Tier 2 WAL catch-up + watermark, merge/vacuum, NDCG comparison |
-| Phase 4a (SQL+PG Wire) | ⏳ Not started | Depends on the Phase 3 main line |
-| Phase 4b (Fusion + Planner) | ⏳ Not started | Depends on Phase 4a |
-| Phase 5a (TS+columnar+distill stub) | ⏳ Can start anytime | Phase 1 gate, parallel with Phase 2/3/4a; segment merge may reuse the Phase 3 architecture or a simple seal+TTL variant |
-| Phase 5b (graph+GC+forgetting/layering+Fusion) | ⏳ Not started | Graph queries/time routing need Phase 4a; multi-AM GC coordinator needs ≥2 AM (already satisfied); Fusion tails need Phase 4b |
-| Phase 6 (full protocol+isolation) | ⏳ Not started | Needs Phase 4a's PG Wire foundation and SQL layer |
-| Phase 7 (production) | ⏳ Not started | After 4b + 5b + 6 |
+| Phase 3 (full-text inverted) | ✅ Complete | Inverted AM + BM25/WAND, Tier 2 WAL catch-up + watermark, segment merge/GC, crash recovery, SciFact and Chinese/mixed NDCG, WAND and Tier 2 benchmarks, adversarial reviews and full regression — final commit `65cab77` |
+| Phase 4a (SQL+PG Wire) | ✅ Complete | Mini SQL, B+Tree/HNSW/inverted single-path planning, PG Wire Simple/Extended Query, TOAST, DataFusion integration, Sequence/SERIAL, full regression |
+| Phase 5b-1 (Graph AM + multi-AM GC) | ⏳ Next | Phase 4a and ≥2 AM are ready; Graph storage/query syntax and unified GC can start independently |
+| Phase 5b-2 (forgetting + layering) | ⏳ Not started | After the GC coordinator and `mark_for_gc` contract |
+| Phase 6 (full protocol+isolation) | ⏳ Not started | Needs Phase 4a's PG Wire foundation and SQL layer; may run alongside Phase 5b-1/5b-2 |
+| Phase 5a (TS+columnar+distill stub) | ⏳ Not started | Scheduled after Phase 6 for implementation focus; segment merge may reuse the Phase 3 architecture or a simple seal+TTL variant |
+| Phase 4b (Fusion + Planner) | ⏳ Not started | Scheduled after Phase 5a; MultiIndexScan and cross-modal planner |
+| Phase 5b-3 (Fusion integration + final acceptance) | ⏳ Not started | Graph and Time-series into Fusion require Phase 5a and Phase 4b |
+| Phase 7 (production) | ⏳ Not started | After Phase 4b, Phase 5b and Phase 6 |
 
-**Near-term order**: main line Phase 3 → 4a → 4b; Phase 5a can be inserted in parallel anytime; Phase 5b/6 follow 4a, Fusion tails follow 4b; M6's three closing items (PR/CI report, 24h rerun, tag) proceed in parallel with Phase 3, not blocking each other.
+**Remaining implementation order**: Phase 5b-1 → Phase 5b-2 → Phase 6 → Phase 5a → Phase 4b → Phase 5b-3 → Phase 7. Phase 5b-1/5b-2 and Phase 6 may run in parallel; Phase 5b-3 must wait for both Phase 5a and Phase 4b. M6's closing items (PR/CI report, 24h rerun, tag) proceed independently and do not block this sequence.
 
 ---
 
@@ -111,10 +124,12 @@ Phase 7: production hardening
 | Phase 2 | (Tier 1 async IO) | (ext) Per-tx delta | ✓ HNSW (Epoch + node locks) | HNSW Vacuum |
 | Phase 3 | (Tier 2 async IO) | (ext) Watermark | ✓ Inverted Index (BM25) | Segment merge |
 | Phase 4a | — | — | (single-path selection) | DataFusion + PG Wire Extended + EXPLAIN |
-| Phase 4b | — | (ext) Cost hooks | (multi-path fusion) | MultiIndexScan + Fusion + Planner |
-| Phase 5a | — | — | ✓ TimeSeries | Columnar projection prototype |
-| Phase 5b | — | (ext) Multi-AM GC coordination | ✓ Graph (lightweight) | Fusion integration: time series + graph |
+| Phase 5b-1 | — | (ext) Multi-AM GC coordination | ✓ Graph (lightweight) | Graph AM + online Vacuum |
+| Phase 5b-2 | — | (ext) mark_for_gc | (stable) | Forgetting curve + memory layering |
 | Phase 6 | — | (ext) RLS predicate | (stable) | MCP Server + full PG Wire |
+| Phase 5a | — | — | ✓ TimeSeries | Columnar projection prototype |
+| Phase 4b | — | (ext) Cost hooks | (multi-path fusion) | MultiIndexScan + Fusion + Planner |
+| Phase 5b-3 | — | (ext) Multi-AM GC coordination | ✓ Graph + TimeSeries | Fusion integration: time series + graph |
 | Phase 7a | — | — | — | Backup/restore + monitoring |
 | Phase 7b | (performance) | — | ✓ Columnar Projection | SIMD / io_uring / huge pages |
 | Phase 7c | — | ✓ Full CBO + statistics | (compression) SQ/PQ | Cross-modal cost model |
@@ -125,47 +140,30 @@ Phase 7: production hardening
 ## Phase dependencies
 
 ```
-Main line (must be linear):
-Phase 1 ──→ Phase 2 ──→ Phase 3 ──→ Phase 4a ──→ Phase 4b
-(foundation+row) (vector)   (full-text) (SQL+PG)   (Fusion)
+Completed main line:
+Phase 1 ──→ Phase 2 ──→ Phase 3 ──→ Phase 4a
+(foundation+row) (vector)   (full-text) (SQL+PG)
 
-Parallel tracks (do not block the main line; start early if capacity allows):
+Remaining implementation order:
+Phase 5b-1 (Graph AM + multi-AM GC)
+  → Phase 5b-2 (forgetting curve + memory layering)
+  → Phase 6 (full protocol + multi-agent isolation)
+  → Phase 5a (TimeSeries + columnar projection + distillation stub)
+  → Phase 4b (MultiIndexScan + cross-modal planner)
+  → Phase 5b-3 (Graph/Time-series into Fusion + final acceptance)
+  → Phase 7 (production hardening)
 
-Phase 5a (Phase 1 gate, may start with Phase 2/3/4a):
-  ├── TimeSeries AM + TTL ─────── parallel with Phase 2/3/4;
-  │                               note: segment merge logic is reused after
-  │                               Phase 3 completes, or implemented as a simple
-  │                               variant (time-partition seal + TTL cleanup only)
-  ├── Columnar projection proto ── parallel with Phase 2/3
-  └── Distillation SDK ─────────── external LLM; the stub may start early
+Parallel option: Phase 5b-1/5b-2 and Phase 6 may run in parallel.
 
-Phase 5b · 4a gate (needs the SQL layer, not 4b):
-  ├── Graph AM (lightweight) + graph query syntax ── needs the SQL layer ready
-  └── Time-range query routing ──────────────────── planner predicate routing = 4a's job
-
-Phase 5b · ≥2 AM gate (orthogonal to 4b, a vacuum-era concern):
-  └── Multi-AM GC coordinator ── can start once ≥2 AMs have landed;
-                                  only then do the forgetting curve / memory-layering
-                                  SDKs get a real mark_for_gc trait to call
-
-Phase 5b · 4b gate (only the two Fusion integration tails):
-  ├── Graph into Fusion ──── feed Graph output into 4b's MultiIndexScan operator
-  └── Time series into Fusion ─ feed TimeSeries output into 4b's MultiIndexScan operator
-
-Phase 6 (4a gate, starts in the same batch as Phase 5b · 4a):
-  ├── Full PG Protocol ─── needs Phase 4a's PG Wire foundation
-  └── MCP Server ──────── needs Phase 4a's SQL layer
-
-Note: Phase 5b and 4b have a【partial, one-way】dependency: only the
-"graph/time-series into Fusion" tails wait for 4b; every other Phase 5b
-deliverable depends on Phase 4a or ≥2 AM and may start in parallel with 4b.
-Conversely, 4b does not depend on Phase 5 (4b only needs HNSW + inverted + planner).
-Graph AM as a whole is gated on 4a (the "interfaces may be extensible but
-implementations never land early" principle); if the team accepts the SQL
-integration rework risk, the Graph AM storage layer + BFS/DFS primitives may
-start at 5a, with only the graph query syntax left to 5b.
-
-Phase 4b + Phase 5b + Phase 6 → Phase 7
+Dependency rules:
+- Phase 5b-1 needs Phase 4a and ≥2 AM (both already satisfied).
+- Phase 5b-2 needs the GC coordinator and a real mark_for_gc trait.
+- Phase 6 needs Phase 4a's PG Wire foundation and SQL layer.
+- Phase 5a only requires Phase 1, but is scheduled after Phase 6 for focus.
+- Phase 4b does not depend on Phase 5, but is scheduled after Phase 5a so
+  every modality is available for its interfaces and acceptance scenarios.
+- Phase 5b-3 needs both Phase 5a (TimeSeries) and Phase 4b (MultiIndexScan).
+- Phase 7 starts after Phase 4b, Phase 5b and Phase 6 are complete.
 ```
 
 ---

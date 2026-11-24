@@ -1931,3 +1931,80 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - `cargo +1.86.0 check --workspace --all-features`、当前工具链全 feature 编译、八 crate Clippy/rustdoc、fmt 与 `git diff --check` 均通过。
 - DataFusion 点查 20 次均值 **0.598ms**（最终依赖版本，<5ms）；自研 B+Tree 点查 **10.693µs**。siftsmall SQL ANN **recall@10 = 0.9990**，均值 **0.298ms**、p95 **0.413ms**，每次查询仍断言 `ExecutionPath::IndexLookup`。
 - 覆盖率口径不变：既有 coverage job 仅覆盖 pg-am-hnsw 的 `--fail-under 90`，未将其宣称为 pg-engine/pg-wire/pg-am-heap 的 Phase 4a 覆盖率；本机不伪造该 CI 报告。
+
+## Phase 3 Stage 0：倒排格式、语义与 CI 冻结
+
+- **交付**：新建 `pg-am-inverted` crate 并注册 workspace/CI matrix；冻结 Analyzer 身份、posting、segment metadata、manifest、CRC frame、WAL/Tier 2 接口及二进制 golden。Engine 增加 `@@`、`Bm25Score`、TEXT 参数推断与 `ExtraWhere` 精确回退；pg-wire 的 BM25 描述固定 FLOAT8/OID 701。
+- **关键约束**：未知 analyzer/hash、非法版本、坏长度、坏 CRC、非规范计数或位置顺序均响亮拒绝，不允许 `@@` 静默退化为字符串相等。格式与统计口径先在 Stage 0 固化，后续实现不得绕开。
+- **验证**：格式 golden、非法输入、AST/参数化、简单与 Extended Describe、旧目录兼容及 MSRV 全 feature 编译均通过；`INVERTED_AM_OID=9879` 与 CI 分支注册完成。
+
+## Phase 3 Stage A：Analyzer、BM25 与 DAAT
+
+- **交付**：英文 Snowball/stop-word、中文 jieba、混合 Analyzer 与 vendored 词典；严格位置与 posting 校验、溢出原子拒绝、文档长度/统计、布尔 AND/OR、精确 BM25 与 DAAT top-k。全查询 term 去重，TID 用于同分决胜。
+- **审查回流**：统一 `posting_count=(term,doc)` 条目数并修正 golden 自洽；OR 全局去重保证幂等；修复 Storage 错误分类、超长文档/频率溢出后的污染状态及词典资产未跟踪问题。后续将配置 hash、精确内置 Analyzer 和 Jieba 字典分别缓存，非内置配置不会污染共享身份。
+- **验证**：Tantivy BM25 已知答案对拍、单 term/AND/OR/重复/空结果/同分/LIMIT 边界、中文与真实连续 CJK OOV 单字回退均通过；无断言探针未计入验收。
+
+## Phase 3 Stage B：segment 持久化、backfill 与查询
+
+- **交付**：`SegmentStore` 持久化初始 manifest、postings、doc-length 和 analyzer；`AccessExclusive` backfill 在锁内完成堆扫描/detoast、catalog 写入及 registry/handle 发布，commit 失败在锁释放前回滚。查询固定 manifest read set，支持精确 BM25、EXPLAIN 和无索引/旧快照 SeqScan 回退。
+- **关键约束**：初始水位来自真实 WAL frontier，空 backfill 也保留可重放起点；segment 文件与 manifest 使用临时文件、fsync、原子 rename 和目录 fsync。老目录无 inverted 元数据仍可打开。
+- **验证**：commit-failure × 等待写者、DROP 后重建、TOAST backfill、空/多文档、参数化查询、Extended/Simple 类型描述及 reopen 均通过；commit `753d2bc`。
+
+## Phase 3 Stage C：Tier 2 consumer、TOAST 与 watermark
+
+- **交付**：只读已 flush WAL 的跨段 tail；per-XID 有界 pending、Commit 应用/Abort 丢弃、动作数/字节数/XID 数限制；UPDATE 先删旧 posting 再插新版本。区分 `consumed_lsn` 与 `durable_applied_lsn`，默认 `require_fresh`，显式 `allow_stale` 才允许旧 generation。
+- **TOAST 与恢复**：chunk 变更按 valueid 触发可见组验证；commit 快照等待 XID 离开活跃集，缺块响亮 `Corrupted` 并停水位；已被取代版本跳过 detoast，由后续记录收敛。WAL 起点被回收时响亮要求重建，checkpoint 回收下界同时受 inverted durable 水位约束。
+- **审查回流**：修复 commit 快照竞态、历史版本 vacuum 楔死、静默跳段、空提交无谓快照和 HOT/TOAST 分支；补容量降级、TOAST 缺块、DROP 重建及跨段 checkpoint/reopen 回归。commit `c3fc4b2`。
+
+## Phase 3 Stage D：增量 seal、k-way merge 与原子 manifest
+
+- **交付**：pending upsert/tombstone 形成增量段，active IDs 严格按旧到新；merge 第一遍确定每 TID 最新版本，第二遍按 term 流式 k-way 输出，物理清除 tombstone。target durable 后原子替换 manifest，SegmentId 防复用，redo 仅校验 110/111 marker 而不重复发布。
+- **审查回流**：统一 reopen/merge 的统计、tombstone、重复项与水位覆盖校验；merge 要求 `max(inputs.applied_lsn)==manifest.applied_lsn`。seal/merge 容量错误分别降级并以 5 秒冷却重试，未持久化变更禁止 merge；marker WAL 失败后 generation 仍清晰为已发布，不留下 `dirty=true + pending=空` 的陈旧组合。
+- **验证**：seal/manifest 崩溃窗口、UPDATE/DELETE/TOAST、空 token upsert、reader×merge×DML、退休段/orphan、marker 失败后重复 seal/merge/reopen 及容量恢复均通过；commit `f167f38`。
+
+## Phase 3 Stage E：WAND、crash matrix 与检索基准
+
+- **交付**：有界 OR 查询使用精确 BM25 上界 WAND，AND 与无 LIMIT 保留 DAAT；上界等于阈值仍评估并执行 TID tie-break。MVCC 过滤导致 top-k 短页时以全量 DAAT 重建，不以首批可见行遮蔽同侪。
+- **正确性与恢复**：单 term/AND/OR/重复/空/自然及构造同分、LIMIT 0/1/k/超大/None 与生成语料逐项对拍；覆盖 seal/manifest crash、DROP 重建、TOAST 旧快照 vacuum、checkpoint 回收门控及 reader×merge×DML。
+- **验证数字**：SciFact 300 queries 的 NDCG@10 平均绝对差 **0.00171049**（阈值 0.005）；该门槛表示质量可比而非评分器等价，本方停用词不计 `doc_len`，Tantivy `en_stem` 将其保留在 `fieldnorm`。WAND/Tantivy mean/p95 延迟比 **1.242/1.532**（预算 3×）。Tier 2 merge on/off 的 6000 commits 均约 60.005s、99.99 commits/s，commit→visible p95 **496.013ms/270.778ms**，均通过 1s 目标。早期 26.5s/23.0s 数字已被词典 hash/解析开销污染，由本轮干净复测取代。
+- **性能收尾**：AnalyzerConfig hash、精确内置 Analyzer 与共享 Jieba 字典分层缓存，消除 WHERE/seal 重复开销；同步 consumer 保留，异步后台 consumer 仅登记为未来高并发备选。commit `2f9c939` 与审查修复 `8903384`。
+
+## Phase 3 Stage F：全量门禁、两轮对抗审查与归档
+
+**状态**：✅ 完成（2026-11-23；两轮审查与本地全量验收闭合；CI 待提交后执行；未 commit——等用户确认）。
+
+### 第一轮审查与修复
+
+1. **inverted post-scan 快照竞态（P1）**：候选扫描只在执行前检查 XID；若删除事务在检查后提交并由另一查询 refresh，旧快照可能永久失去本应可见的候选。现与 B+Tree 一样在扫描后复核 `current_xid==snapshot.xmax`，变化时丢弃索引结果并走 MVCC 完整堆回退。确定性探针先删除并直接 refresh，修复前返回 InvertedScan 空结果，修复后 SeqScan/SnapshotFallback 返回旧行。
+2. **reopen 掩盖重复 posting（P2）**：直接反序列化为 `BTreeMap` 会在语义校验前覆盖重复 term/TID。现 reopen 统一使用严格 streaming posting reader，保留重复、乱序、频率与位置校验后再构建内存视图；重复 term 与重复 TID 两个负例均先红后绿，既有 golden 字节不变。
+
+### 第二轮复核与基准缺口
+
+- **BM25 独立评分同型竞态（P1）**：`bm25_scores` 另行读取倒排候选，主扫描复核无法覆盖它。现评分后再次检查 XID，变化时丢弃分数并从当前快照的堆文档重算，避免旧行得到缺失/零分；新增直接评分探针，修复后旧 TID 仍获得正分。主扫描与评分两条路径均已收口。
+- **中文/混合质量基准补齐**：新增 12 篇冻结文档与 6 个 AND/OR/空结果查询。Tantivy 以 `whitespace` 消费本方 `mixed` Analyzer 的精确 token stream，保证 doc length/fieldnorm 同口径；NDCG@10 平均绝对差 **0.00000000**，通过 0.005 门槛。
+- **复核范围**：backfill、pending、TOAST、watermark、manifest、旧快照、WAND upper-bound 与 crash 路径未发现其他新增 P1/P2/P3；既有开放限制仍按本计划风险表登记，不冒充已解决。
+
+### 最终验收证据
+
+- `cargo test --workspace` 与 `cargo test --workspace --release` 均 EXIT=0、零失败；`cargo test -p pg-am-inverted` debug/release、`cargo test -p pg-engine --features datafusion` debug/release 也均 EXIT=0、零失败。相关新增回归累计：`pg-am-inverted` lib **68/68**，Engine lib **121/121**。
+- `cargo check --workspace --all-features`、九 crate 全 feature Clippy `-D warnings` 与 rustdoc `-D warnings`、MSRV 1.86 实编译、fmt、`git diff --check` 全部通过。静态门禁发现 pg-txn redo 测试直接使用 `parking_lot::Mutex` 与全 feature sync alias 不兼容，已改为 `pg_storage::sync::Mutex`；该测试默认/全 feature 各 **1/1** 通过。
+- 最终质量 **2/2**：SciFact NDCG@10 平均差 **0.00171049**，中文/混合 **0.00000000**。最终 WAND 性能 **1/1**：Tantivy mean/p95 = 29.805µs/54.541µs，DAAT = 27.478µs/80.583µs，WAND = 33.503µs/59.542µs；WAND/Tantivy mean/p95 比 **1.124/1.092**，通过 3× 预算。Tier 2 的 Stage E 干净复测数字继续有效，未重复冒充新测量。
+- **覆盖率口径**：未新增 pg-am-inverted coverage job，既有 pg-am-hnsw `--fail-under 90` 结果不被借用为 Phase 3 覆盖率证明；本机不伪造 CI 报告。
+
+### 追加深审与二次修复（2026-11-23）
+
+1. **重复 `term_df` 元数据（P2）**：`SegmentMeta` 直接解码为 `BTreeMap` 会在校验前覆盖重复键，探针实测 `[(contract,999),(contract,1)]` 曾被接受。现以 `SegmentMetaWire` 保留原始 pair 序列并逐键拒绝重复，bincode 布局与 golden 完全不变；decode、open、merge 三类回归均通过。
+2. **倒排文件生命周期（P2）**：DROP 与失败 CREATE 原先永久遗留 `inverted/<oid>`。现 DROP 按 OID 顺序等待 in-flight consumer 后清理目录；失败 CREATE 先检查目录对应的 catalog 是否真实不存在，避免 success-hook 在 commit 后报错时误删有效索引；open 在 live registry 完整恢复后回收无目录条目。补 DROP 后立即消失、失败 CREATE、人工孤儿及 reopen 回收回归。
+3. **安静索引 durable 水位（P2）**：无本表 DML 时 consumed 推进但 durable 不推进，checkpoint 的回收下界因此永久停滞。新增空 coverage segment：无 pending XID、未密封文档变化或失败 seal 状态时，checkpoint 原子发布空段并推进 durable，保留 active coverage 校验，不直接把 consumed 冒充 durable。覆盖安静索引多轮 checkpoint、pending 跳过、reopen/merge 与 target/manifest 崩溃窗口。
+
+### 追加深审最终验证
+
+- `pg-am-inverted` lib **73/73**、Engine lib **123/123**；coverage 专项、DROP/失败 CREATE、安静索引和 pending 均通过。
+- `cargo test --workspace` 与 `cargo test --workspace --release` 均 EXIT=0、零失败；`cargo test -p pg-am-inverted` debug/release 与 `cargo test -p pg-engine --features datafusion` debug/release 均 EXIT=0、零失败。
+- `cargo check --workspace --all-features`、九 crate 全 feature Clippy/rustdoc `-D warnings`、MSRV 1.86 实编译、fmt、`git diff --check` 全部通过。
+- 全量回归首次发现 HNSW `meta_pair_never_reads_torn` 失败，定位为既有测试未排除空图 `NodeId::INVALID` sentinel，非产品撕裂读；测试增加空图 max_level=0 分支后连续 **10/10** 复跑通过，生产代码未改。
+
+### P3 已知边界登记
+
+- **checkpoint × CREATE INDEX 的 recycle floor 窄竞态**：floor 在 `trigger_checkpoint` 前读取；CREATE INDEX 若在 floor 读取后、checkpoint begin 前完成，其 backfill base 可能低于 begin_lsn 而未计入 floor，所需 WAL 段可能被回收，随后倒排刷新以 `rebuild required` 响亮报错。该失败不静默且可通过重建索引自愈，安全网行为符合预期，当前仅登记不扩大锁协议。候选根治是 storage checkpoint 锁内回调计算 floor，或 CREATE 与 checkpoint 锁同步。
+- **SnapshotFallback 的 candidate_count 口径**：`executor.rs` 在回退前记录的 candidate_count 会随 `plan.spec` 覆盖而丢失，EXPLAIN 无法看到被弃用 inverted 尝试的候选规模；这与 B+Tree 回退路径的设计取舍一致，只影响诊断，不影响结果。若未来需要该观测，应新增 attempted-candidates 字段并单独测试。

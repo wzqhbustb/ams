@@ -1,0 +1,32 @@
+[package]
+name = "pg-am-inverted"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust inverted index access method — BM25 / segment / Tier 2"
+
+[dependencies]
+pg-storage = { path = "../pg-storage" }
+pg-am-heap = { path = "../pg-am-heap" }
+pg-txn = { path = "../pg-txn" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+bincode = "2"
+crc32fast = "1"
+sha2 = "0.11"
+jieba-rs = { version = "=0.10.1", default-features = false }
+rust-stemmers = "1.2.0"
+
+[build-dependencies]
+jieba-macros = "=0.10.1"
+
+[dev-dependencies]
+tempfile = "3"
+tantivy = { version = "=0.25.0" }
+time = "=0.3.45"
+uuid = "=1.24.0"
+bon = "=3.3.1"
+darling = "=0.20.11"
+serde_json = "1"

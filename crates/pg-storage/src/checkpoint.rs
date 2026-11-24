@@ -363,6 +363,15 @@ impl CheckpointCoordinator {
     /// the snapshot (in-memory push) and WAL replay (post-begin_lsn record),
     /// producing a duplicate freelist entry on recovery.
     pub fn trigger_checkpoint(&self) -> Result<Lsn> {
+        self.trigger_checkpoint_with_recycle_before(None)
+    }
+
+    /// Trigger a checkpoint and recycle WAL only after the supplied consumer
+    /// frontier. `None` preserves the default redo-point behavior.
+    pub fn trigger_checkpoint_with_recycle_before(
+        &self,
+        recycle_before: Option<Lsn>,
+    ) -> Result<Lsn> {
         // Serialize checkpoints so that manual and background checkpoints do not
         // interleave and produce redundant or overlapping checkpoint records.
         let _lock = self.checkpoint_lock.lock();
@@ -584,7 +593,8 @@ impl CheckpointCoordinator {
         info!(%begin_lsn, %flushed, "checkpoint completed");
 
         // 10. Recycle WAL segments that are no longer needed for recovery.
-        self.wal_writer.recycle_before(begin_lsn)?;
+        let recycle_lsn = recycle_before.map_or(begin_lsn, |floor| begin_lsn.min(floor));
+        self.wal_writer.recycle_before(recycle_lsn)?;
 
         // 11. Prune old ATT/DPT snapshot files, keeping the most recent
         //     checkpoints' files (tech-selection §11.4 P2-7). Synchronous,

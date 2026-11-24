@@ -2649,11 +2649,15 @@ mod tests {
             s.spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     let (ep, ml) = reader_index.meta_pair();
-                    assert_eq!(
-                        ml,
-                        (ep % 60) as u8,
-                        "torn pair: entry_point {ep} with max_level {ml}"
-                    );
+                    if ep == u32::MAX {
+                        assert_eq!(ml, 0, "empty graph must have max_level zero");
+                    } else {
+                        assert_eq!(
+                            ml,
+                            (ep % 60) as u8,
+                            "torn pair: entry_point {ep} with max_level {ml}"
+                        );
+                    }
                 }
             });
         });

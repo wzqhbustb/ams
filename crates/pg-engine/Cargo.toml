@@ -28,6 +28,9 @@ pg-am-btree = { path = "../pg-am-btree" }
 # Phase 2 M5 Stage 0 (2026-09-11): HNSW redo handlers register into
 # Engine::open (tech-selection §2 — the second M5 dependency edge).
 pg-am-hnsw = { path = "../pg-am-hnsw" }
+# Phase 3 Stage 0: frozen analyzer/watermark contracts shared with the
+# inverted-index registry and planner. The dependency points only this way.
+pg-am-inverted = { path = "../pg-am-inverted" }
 
 # error types
 thiserror = "2"

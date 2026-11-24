@@ -1,9 +1,9 @@
 //! Phase 4a: the AM registry and the single-path selector.
 //!
 //! The planner's shape is deliberately a REGISTRY + selector, never an
-//! if/else on AM type (the Phase 4a pluggability constraint): a new AM
-//! (Phase 3's inverted index) registers later by adding an `AmRegistration`
-//! entry, without touching the selector's core dispatch structure.
+//! if/else on AM type (the Phase 4a pluggability constraint): Phase 3's
+//! inverted index adds an `AmRegistration` entry without touching the
+//! selector's core dispatch structure.
 
 use crate::error::{EngineError, Result};
 use crate::sql::{DistanceOp, Expr, Filter, Literal, OrderByKind, VectorOpclass};
@@ -15,6 +15,8 @@ pub enum AmKind {
     BTree,
     /// The HNSW vector access method.
     Hnsw,
+    /// The inverted full-text access method.
+    Inverted,
 }
 
 /// A registered access method. The registration owns both shape matching
@@ -28,11 +30,42 @@ pub struct AmRegistration {
     pub scan: fn(&ScanRequest) -> Result<ScanPlan>,
 }
 
+/// Inverted-only metadata shared by the registry and planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvertedIndexMetadata {
+    /// Analyzer implementation and configuration hash used for all postings.
+    pub analyzer: pg_am_inverted::AnalyzerConfig,
+    /// In-process and durable WAL positions covered by the index.
+    pub watermark: pg_am_inverted::Watermark,
+}
+
+impl InvertedIndexMetadata {
+    /// Metadata recovered from the active manifest and segment metadata.
+    pub(crate) fn from_store(store: &pg_am_inverted::SegmentStore) -> Self {
+        Self {
+            analyzer: store.analyzer_config().clone(),
+            watermark: store.watermark(),
+        }
+    }
+
+    /// Empty in-memory metadata used only by unit tests.
+    #[cfg(test)]
+    pub(crate) fn initial() -> Self {
+        Self::from_store(&pg_am_inverted::SegmentStore::new(
+            pg_storage::types::Oid::INVALID,
+        ))
+    }
+}
+
 /// The index metadata needed by the single-path planner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexMetadata {
     /// The access method that owns this index.
     pub kind: AmKind,
+    /// The index relation OID used by AM-specific scan specifications.
+    pub index_oid: pg_storage::types::Oid,
+    /// Inverted analyzer/watermark metadata; `Some` exactly for inverted AMs.
+    pub inverted: Option<InvertedIndexMetadata>,
     /// The indexed column name.
     pub column: String,
     /// The vector opclass, for HNSW indexes.
@@ -48,10 +81,17 @@ pub struct ScanRequest {
     pub table: String,
     /// The optional predicate applied by the scan.
     pub predicate: Option<Filter>,
+    /// An additional predicate joined by `AND`; inverted queries must fall
+    /// back to an exact sequential scan when this is present.
+    pub extra_predicate: Option<Filter>,
     /// The optional ordering requested by the query.
     pub order_by: Option<OrderByKind>,
     /// The optional maximum number of result rows.
     pub limit: Option<usize>,
+    /// Whether an inverted plan may intentionally use stale segments.
+    pub allow_stale_inverted: bool,
+    /// Durable WAL frontier required by this query's snapshot.
+    pub snapshot_frontier: pg_storage::types::Lsn,
     /// Metadata for indexes available on this table.
     pub indexes: Vec<IndexMetadata>,
 }
@@ -68,6 +108,8 @@ pub enum ScanSpec {
     BTree(BTreeScanSpec),
     /// An HNSW approximate nearest-neighbor scan.
     Hnsw(HnswScanSpec),
+    /// An inverted full-text scan with exact DAAT/BM25 and heap recheck.
+    Inverted(InvertedScanSpec),
     /// A sequential heap scan.
     Seq(SeqScanSpec),
 }
@@ -105,11 +147,36 @@ pub struct HnswScanSpec {
     pub max_retry_rounds: u8,
 }
 
+/// The frozen execution contract for an inverted scan (Phase 3 Stage 0).
+/// Stage B constructs this only after index metadata and freshness checks.
+pub struct InvertedScanSpec {
+    /// The inverted index relation OID.
+    pub index_oid: pg_storage::types::Oid,
+    /// Indexed TEXT column.
+    pub column: String,
+    /// Full-text query after typed parameter binding.
+    pub query: Literal,
+    /// Stable analyzer configuration identity shared by index and query.
+    pub analyzer_config: pg_am_inverted::AnalyzerConfig,
+    /// Optional top-k bound.
+    pub limit: Option<usize>,
+    /// In-process WAL prefix consumed by the index.
+    pub consumed_lsn: pg_storage::types::Lsn,
+    /// WAL frontier required by the query snapshot.
+    pub snapshot_frontier: pg_storage::types::Lsn,
+    /// Whether this plan intentionally permits a stale index read.
+    pub stale_index: bool,
+    /// Number of candidates considered before heap visibility recheck.
+    pub candidate_count: u64,
+}
+
 /// The parameters for a sequential heap scan, including the complete
 /// filter/order/limit shape needed by the fallback executor.
 pub struct SeqScanSpec {
     /// The optional predicate applied while scanning.
     pub predicate: Option<Filter>,
+    /// The optional second predicate joined by `AND`.
+    pub extra_predicate: Option<Filter>,
     /// The optional ordering applied after filtering.
     pub order_by: Option<OrderByKind>,
     /// The optional maximum number of result rows.
@@ -136,7 +203,8 @@ pub enum SeqScanReason {
     MissingLimit,
     /// ANN selection only supports ascending distance order.
     Desc,
-    /// ANN selection cannot be combined with an additional WHERE predicate.
+    /// ANN or full-text selection cannot be combined with an additional
+    /// WHERE predicate; execution must use the exact heap fallback.
     ExtraWhere,
     /// The snapshot is too old for an eager-removal B+Tree to be a complete
     /// candidate source, so execution must use the heap instead.
@@ -159,9 +227,21 @@ impl ScanPlan {
                 "HnswScan (ef={}, opclass={:?}, query={:?}, k={}, candidates={}, max_retry_rounds={})",
                 s.ef, s.opclass, s.query, s.k, s.candidates, s.max_retry_rounds
             ),
+            ScanSpec::Inverted(s) => format!(
+                "InvertedScan (index_oid={}, column={:?}, analyzer={:?}, query={:?}, limit={:?}, consumed_lsn={}, snapshot_frontier={}, stale_index={}, candidates={})",
+                s.index_oid.0,
+                s.column,
+                s.analyzer_config,
+                s.query,
+                s.limit,
+                s.consumed_lsn.0,
+                s.snapshot_frontier.0,
+                s.stale_index,
+                s.candidate_count
+            ),
             ScanSpec::Seq(s) => format!(
-                "SeqScan (reason={:?}, predicate={:?}, order_by={:?}, limit={:?}, est_rows={}, est_pages={})",
-                s.reason, s.predicate, s.order_by, s.limit, s.est_rows, s.est_pages
+                "SeqScan (reason={:?}, predicate={:?}, extra_predicate={:?}, order_by={:?}, limit={:?}, est_rows={}, est_pages={})",
+                s.reason, s.predicate, s.extra_predicate, s.order_by, s.limit, s.est_rows, s.est_pages
             ),
         }
     }
@@ -170,6 +250,11 @@ impl ScanPlan {
 /// The built-in access-method registry. A later AM adds a registration here
 /// without changing the selector's dispatch structure.
 pub const AM_REGISTRY: &[AmRegistration] = &[
+    AmRegistration {
+        kind: AmKind::Inverted,
+        matches: inverted_matches,
+        scan: plan_inverted,
+    },
     AmRegistration {
         kind: AmKind::BTree,
         matches: btree_matches,
@@ -206,6 +291,7 @@ fn seq_plan(req: &ScanRequest, reason: SeqScanReason) -> ScanPlan {
     ScanPlan {
         spec: ScanSpec::Seq(SeqScanSpec {
             predicate: req.predicate.clone(),
+            extra_predicate: req.extra_predicate.clone(),
             order_by: req.order_by.clone(),
             limit: req.limit,
             est_rows: 0,
@@ -219,6 +305,70 @@ fn index_on<'a>(req: &'a ScanRequest, kind: AmKind, column: &str) -> Option<&'a 
     req.indexes
         .iter()
         .find(|index| index.kind == kind && index.column.eq_ignore_ascii_case(column))
+}
+
+fn inverted_matches(req: &ScanRequest) -> bool {
+    req.predicate
+        .as_ref()
+        .is_some_and(|predicate| predicate.op == crate::sql::CmpOp::FullText)
+        || matches!(req.order_by, Some(OrderByKind::Bm25Score(_)))
+}
+
+/// Plan an exact inverted scan, or an exact heap fallback when the index
+/// cannot satisfy this query's freshness and predicate shape.
+fn plan_inverted(req: &ScanRequest) -> Result<ScanPlan> {
+    if req.extra_predicate.is_some() {
+        return Ok(seq_plan(req, SeqScanReason::ExtraWhere));
+    }
+    let Some(predicate) = &req.predicate else {
+        return Err(EngineError::Unsupported(
+            "bm25_score requires a full-text predicate".to_string(),
+        ));
+    };
+    if predicate.op != crate::sql::CmpOp::FullText {
+        return Err(EngineError::Unsupported(
+            "bm25_score ordering requires a full-text predicate".to_string(),
+        ));
+    }
+    if !matches!(predicate.value, Literal::Str(_) | Literal::Param(_)) {
+        return Err(EngineError::InvalidArgument(
+            "full-text right operand must be text or a typed text parameter".to_string(),
+        ));
+    }
+    let Some(index) = index_on(req, AmKind::Inverted, &predicate.column) else {
+        return Ok(seq_plan(req, SeqScanReason::NoIndex));
+    };
+    let Some(metadata) = &index.inverted else {
+        return Err(EngineError::Corrupted(format!(
+            "inverted index on {:?} lacks analyzer/watermark metadata",
+            predicate.column
+        )));
+    };
+    metadata.analyzer.validate().map_err(|error| {
+        EngineError::Corrupted(format!("invalid inverted analyzer metadata: {error}"))
+    })?;
+    if metadata.watermark.durable_applied_lsn > metadata.watermark.consumed_lsn {
+        return Err(EngineError::Corrupted(
+            "inverted durable watermark exceeds consumed watermark".to_string(),
+        ));
+    }
+    let stale = metadata.watermark.consumed_lsn < req.snapshot_frontier;
+    if stale && !req.allow_stale_inverted {
+        return Ok(seq_plan(req, SeqScanReason::SnapshotFallback));
+    }
+    Ok(ScanPlan {
+        spec: ScanSpec::Inverted(InvertedScanSpec {
+            index_oid: index.index_oid,
+            column: predicate.column.clone(),
+            query: predicate.value.clone(),
+            analyzer_config: metadata.analyzer.clone(),
+            limit: req.limit,
+            consumed_lsn: metadata.watermark.consumed_lsn,
+            snapshot_frontier: req.snapshot_frontier,
+            stale_index: stale,
+            candidate_count: 0,
+        }),
+    })
 }
 
 fn btree_matches(req: &ScanRequest) -> bool {
@@ -243,7 +393,7 @@ fn plan_hnsw(req: &ScanRequest) -> Result<ScanPlan> {
     let Some(OrderByKind::Expr(expr)) = &req.order_by else {
         return plan_btree(req);
     };
-    if req.predicate.is_some() {
+    if req.predicate.is_some() || req.extra_predicate.is_some() {
         return Ok(seq_plan(req, SeqScanReason::ExtraWhere));
     }
     if req.limit.is_none() {
@@ -297,6 +447,9 @@ fn plan_hnsw(req: &ScanRequest) -> Result<ScanPlan> {
 
 /// Plan an ordinary predicate through B+Tree, or a plain sequential scan.
 fn plan_btree(req: &ScanRequest) -> Result<ScanPlan> {
+    if req.extra_predicate.is_some() {
+        return Ok(seq_plan(req, SeqScanReason::ExtraWhere));
+    }
     let Some(predicate) = &req.predicate else {
         return Ok(seq_plan(req, SeqScanReason::Plain));
     };
@@ -322,6 +475,8 @@ mod tests {
     fn hnsw_metadata(opclass: VectorOpclass, ef: usize) -> IndexMetadata {
         IndexMetadata {
             kind: AmKind::Hnsw,
+            index_oid: pg_storage::types::Oid(1),
+            inverted: None,
             column: "v".to_string(),
             opclass: Some(opclass),
             ef_search_default: Some(ef),
@@ -331,6 +486,8 @@ mod tests {
     fn btree_metadata(column: &str) -> IndexMetadata {
         IndexMetadata {
             kind: AmKind::BTree,
+            index_oid: pg_storage::types::Oid(2),
+            inverted: None,
             column: column.to_string(),
             opclass: None,
             ef_search_default: None,
@@ -351,6 +508,7 @@ mod tests {
         ScanRequest {
             table: "t".to_string(),
             predicate,
+            extra_predicate: None,
             order_by: Some(OrderByKind::Expr(OrderByExpr {
                 op,
                 left: Expr::Column("v".to_string()),
@@ -358,6 +516,8 @@ mod tests {
                 desc,
             })),
             limit,
+            allow_stale_inverted: false,
+            snapshot_frontier: pg_storage::types::Lsn::INVALID,
             indexes,
         }
     }
@@ -374,15 +534,19 @@ mod tests {
         ScanRequest {
             table: "t".to_string(),
             predicate: Some(filter()),
+            extra_predicate: None,
             order_by: None,
             limit: None,
+            allow_stale_inverted: false,
+            snapshot_frontier: pg_storage::types::Lsn::INVALID,
             indexes,
         }
     }
 
     #[test]
     fn registry_dispatches_builtin_access_methods() {
-        assert_eq!(AM_REGISTRY.len(), 2);
+        assert_eq!(AM_REGISTRY.len(), 3);
+        assert_eq!(AM_REGISTRY[0].kind, AmKind::Inverted);
         let ann = plan_for_predicate(&req_with_expr(
             DistanceOp::L2,
             Some(10),
@@ -409,8 +573,11 @@ mod tests {
         let req = ScanRequest {
             table: "custom".to_string(),
             predicate: Some(filter()),
+            extra_predicate: None,
             order_by: None,
             limit: None,
+            allow_stale_inverted: false,
+            snapshot_frontier: pg_storage::types::Lsn::INVALID,
             indexes: vec![],
         };
         let registration = AmRegistration {
@@ -662,13 +829,93 @@ mod tests {
         assert!(plan.explain().contains("predicate=Some"));
     }
 
+    fn fulltext_request(indexes: Vec<IndexMetadata>) -> ScanRequest {
+        ScanRequest {
+            table: "agent_memory".to_string(),
+            predicate: Some(Filter {
+                column: "content".to_string(),
+                op: CmpOp::FullText,
+                value: Literal::Str("contract".to_string()),
+            }),
+            extra_predicate: None,
+            order_by: None,
+            limit: Some(10),
+            allow_stale_inverted: false,
+            snapshot_frontier: pg_storage::types::Lsn::INVALID,
+            indexes,
+        }
+    }
+
+    fn inverted_metadata() -> IndexMetadata {
+        IndexMetadata {
+            kind: AmKind::Inverted,
+            index_oid: pg_storage::types::Oid(9879),
+            inverted: Some(InvertedIndexMetadata::initial()),
+            column: "content".to_string(),
+            opclass: None,
+            ef_search_default: None,
+        }
+    }
+
+    #[test]
+    fn fulltext_extra_where_is_always_an_exact_seqscan_fallback() {
+        let mut req = fulltext_request(vec![inverted_metadata()]);
+        req.extra_predicate = Some(filter());
+        let plan = plan_for_predicate(&req).unwrap();
+        let ScanSpec::Seq(spec) = plan.spec else {
+            panic!("expected ExtraWhere SeqScan")
+        };
+        assert_eq!(spec.reason, SeqScanReason::ExtraWhere);
+        assert_eq!(spec.predicate, req.predicate);
+        assert_eq!(spec.extra_predicate, req.extra_predicate);
+    }
+
+    #[test]
+    fn fulltext_without_an_index_falls_back_without_executing_as_equality() {
+        let plan = plan_for_predicate(&fulltext_request(Vec::new())).unwrap();
+        let ScanSpec::Seq(spec) = plan.spec else {
+            panic!("expected NoIndex SeqScan")
+        };
+        assert_eq!(spec.reason, SeqScanReason::NoIndex);
+    }
+
+    #[test]
+    fn fresh_inverted_metadata_constructs_a_real_scan() {
+        let plan = plan_for_predicate(&fulltext_request(vec![inverted_metadata()])).unwrap();
+        let ScanSpec::Inverted(spec) = &plan.spec else {
+            panic!("expected InvertedScan")
+        };
+        assert_eq!(spec.index_oid, pg_storage::types::Oid(9879));
+        assert!(!spec.stale_index);
+        assert!(plan.explain().contains("InvertedScan"));
+    }
+
+    #[test]
+    fn stale_policy_reaches_inverted_planning() {
+        let mut req = fulltext_request(vec![inverted_metadata()]);
+        req.snapshot_frontier = pg_storage::types::Lsn(128);
+        let plan = plan_for_predicate(&req).unwrap();
+        assert!(matches!(plan.spec, ScanSpec::Seq(_)));
+
+        req.allow_stale_inverted = true;
+        let plan = plan_for_predicate(&req).unwrap();
+        let ScanSpec::Inverted(spec) = &plan.spec else {
+            panic!("allow_stale must retain InvertedScan")
+        };
+        assert!(spec.stale_index);
+        assert!(plan.explain().contains("stale_index=true"));
+    }
+
     #[test]
     fn plain_select_is_seqscan_plain() {
         let req = ScanRequest {
             table: "t".to_string(),
             predicate: None,
+            extra_predicate: None,
             order_by: None,
             limit: None,
+            allow_stale_inverted: false,
+            snapshot_frontier: pg_storage::types::Lsn::INVALID,
             indexes: vec![],
         };
         let plan = plan_for_predicate(&req).unwrap();
