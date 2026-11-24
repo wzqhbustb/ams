@@ -6,16 +6,19 @@ multi-modal engine for **AI-agent memory** (vector + full-text + graph +
 time-series, with structured metadata).
 
 > **Status (build in public):** Phase 1 is complete (tag `phase1-m3`),
-> Phase 2 is essentially complete, and **Phase 4a is complete** (latest
-> commit `d9996b9`). The HNSW vector index ships page-resident storage,
-> WAL-based crash recovery, concurrent DML, and visibility-filtered ANN
-> search. Phase 4a adds self-owned TP execution, HNSW SQL, Extended Query,
-> TOAST, optional DataFusion AP execution, and WAL-first sequences/SERIAL.
-> What exists today is a working, crash-safe storage/transaction **library**
-> plus a PostgreSQL wire-protocol server — `psql` and standard PG drivers can
-> connect and run CRUD, transactions, parameterized queries, and ANN.
-> Remaining Phase 2 closeout items (parallel work): the 24h stress rerun, CI
-> coverage report, and `phase2-m6` tag. See [Roadmap](#roadmap).
+> Phase 2 is essentially complete, **Phase 3 is complete** (final commit
+> `65cab77`), and **Phase 4a is complete**. The HNSW vector index ships
+> page-resident storage, WAL-based crash recovery, concurrent DML, and
+> visibility-filtered ANN search. Phase 3 adds BM25 full-text retrieval with
+> exact DAAT/WAND, persistent inverted segments, Tier 2 WAL consumption,
+> TOAST support, and checkpoint-safe recovery. Phase 4a adds self-owned TP
+> execution, HNSW SQL, Extended Query, TOAST, optional DataFusion AP
+> execution, and WAL-first sequences/SERIAL. What exists today is a working,
+> crash-safe storage/transaction **library** plus a PostgreSQL wire-protocol
+> server — `psql` and standard PG drivers can connect and run CRUD,
+> transactions, parameterized queries, ANN, and full-text search. Remaining
+> Phase 2 closeout items (parallel work): the 24h stress rerun, CI coverage
+> report, and `phase2-m6` tag. See [Roadmap](#roadmap).
 
 ---
 
@@ -53,28 +56,33 @@ proven.
 | Phase 2 M4 | In-memory HNSW foundations (`pg-am-hnsw`) | ✅ done |
 | Phase 2 M5 | HNSW WAL + page-resident persistence + crash recovery | ✅ done |
 | Phase 2 M6 | Concurrency control + Tier 1 transaction integration + vacuum extensions | 🚧 closing (24h stress rerun, CI coverage, `phase2-m6` tag pending) |
-| Phase 4a | SQL TP/ANN + Extended Query + TOAST + DataFusion AP + Sequence/SERIAL | ✅ done (`d9996b9`) |
+| Phase 3 | BM25 full-text + inverted segments + Tier 2 WAL + merge/GC | ✅ done (`65cab77`) |
+| Phase 4a | SQL TP/ANN + Extended Query + TOAST + DataFusion AP + Sequence/SERIAL | ✅ done |
 
 ## Architecture
 
-Seven library crates in the stack, strictly layered (a lower layer never
+Eight library crates in the stack, strictly layered (a lower layer never
 depends on a higher one), plus a wire-protocol server on top. `pg-am-hnsw`
-(Phase 2) is a full access-method crate of its own — page-resident graph
-storage, eight WAL record types, crash recovery, shared-handle concurrent
-insert/delete, and the audit/reachability tooling:
+and `pg-am-inverted` are full access-method crates of their own —
+page-resident graph storage, eight HNSW WAL record types, inverted segment
+persistence, DAAT/WAND evaluation, and crash-safe recovery:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  pg-wire     PostgreSQL v3 Simple + Extended Query     │
 │              psql / PG drivers (pg-server)             │
 ├─────────────────────────────────────────────────────────┤
-│  pg-engine   catalog + AMs + txn, SQL TP/ANN,          │
+│  pg-engine   catalog + AMs + txn, SQL TP/ANN/full-text,│
 │              optional DataFusion AP, TOAST, sequences  │
 ├─────────────────────────────────────────────────────────┤
-│  pg-am-heap  │  pg-am-btree          │  pg-catalog      │
-│  slotted     │  latch-coupled Blink   │  system tables, │
-│  page, HOT,  │  split WAL + CLR,      │  AccessMethod   │
-│  FOR SHARE   │  loom model-checked    │  trait          │
+│  pg-am-hnsw  │  pg-am-inverted      │  pg-catalog      │
+│  graph pages │  BM25, segments,     │  system tables, │
+│  + recovery  │  DAAT/WAND, Tier 2   │  AccessMethod   │
+├─────────────────────────────────────────────────────────┤
+│  pg-am-heap  │  pg-am-btree                             │
+│  slotted     │  latch-coupled Blink                     │
+│  page, HOT,  │  split WAL + CLR, loom model-checked     │
+│  FOR SHARE   │                                         │
 ├─────────────────────────────────────────────────────────┤
 │  pg-txn      XID, disk CLOG, XID snapshot, visibility,  │
 │              lock manager, deadlock detection           │
@@ -121,6 +129,16 @@ insert/delete, and the audit/reachability tooling:
   (in-edge redirection that reuses `SetNeighbors` records — no new WAL record
   types), and the dead-row channel with update-reuse discrimination (a NodeId
   reused by a live UPDATE version is never tombstoned under it).
+- **Inverted full-text search (Phase 3)**: BM25 with exact DAAT and WAND
+  evaluation, English Snowball/stop-word analysis, Chinese jieba and mixed
+  analyzers, persistent inverted segments, tombstone-aware k-way merge, and
+  deterministic TID tie-breaking.
+- **Tier 2 freshness and recovery**: WAL-driven inverted updates with
+  consumed/durable watermarks, TOAST-aware document assembly, checkpoint
+  coverage segments for quiet indexes, snapshot-safe candidate rechecks, and
+  `rebuild required` errors instead of silent WAL loss. SQL supports
+  `content @@ 'query'`, `bm25_score(...)`, typed parameters, and exact
+  SeqScan/ExtraWhere fallbacks.
 - **Engine API**: `CREATE TABLE` / `CREATE INDEX`, `INSERT` / `SELECT` /
   `UPDATE` / `DELETE` — both as typed methods and via a SQL-string `exec(...)`;
   `DROP TABLE` as a typed method only (not yet in the SQL subset).
@@ -137,8 +155,8 @@ insert/delete, and the audit/reachability tooling:
 - **PG Wire (Phase 4a)**: Simple and Extended Query with typed parameters,
   parameter/result format negotiation, portal lifecycle, failed-transaction
   recovery, and pgvector-compatible VECTOR encodings. `psql`, psycopg2,
-  node-postgres, and rust-postgres can run CRUD, transactions, and ANN.
-  COPY and TLS remain Phase 6 work.
+  node-postgres, and rust-postgres can run CRUD, transactions, ANN, and
+  full-text search. COPY and TLS remain Phase 6 work.
 - **Vacuum (M3)**: offline `Engine::vacuum(table)` — dead-tuple scan at a
   snapshot-registered horizon, index cleanup, in-page compaction and page
   freeing. Online/incremental vacuum is Phase 5b.
@@ -196,21 +214,30 @@ The full plan (with rationale, time estimates, and risk register) is in
 | Phase | What it delivers | Status |
 |-------|------------------|--------|
 | **1 — Storage base + row store + tx + B+Tree** | Page / WAL / BufferPool (M1) · MVCC + crash recovery + locking (M2) · vacuum + observability + minimal PG Wire (M3) | ✅ done (tag `phase1-m3`) |
-| **2 — HNSW vector index** | in-memory graph (2a) → WAL + persistence (2b) → concurrency control (2c) | ✅ done (M4/M5/M6) |
-| **3 — Inverted index** | BM25 full-text, segment-based storage, merge | ⏳ next milestone (tech selection starting) |
-| **4 — SQL + multi-path fusion** | SQL TP/ANN + Extended Query + TOAST + DataFusion AP + Sequence/SERIAL (4a) → fusion planner (4b) | ✅ 4a done (`d9996b9`); 4b planned |
-| **5a — Time-series + columnar** (parallel with 2/3/4a) | TTL partitions, columnar projection, distillation SDK stub | 📋 planned (can start anytime) |
-| **5b — Graph + GC + memory lifecycle** | lightweight graph AM, multi-AM GC, forgetting/layering SDK, fusion hooks | 📋 planned |
-| **6 — Protocol + multi-agent isolation** | full PG protocol, MCP server, row-level security | 📋 planned |
+| **2 — HNSW vector index** | in-memory graph (2a) → WAL + persistence (2b) → concurrency control (2c) | 🚧 closing (24h rerun, CI coverage, `phase2-m6` tag) |
+| **3 — Inverted index** | BM25 + exact DAAT/WAND, inverted segments, Tier 2 WAL, merge/GC, crash recovery | ✅ done (`65cab77`) |
+| **4a — SQL + PG Wire basics** | SQL TP/ANN + Extended Query + TOAST + DataFusion AP + Sequence/SERIAL | ✅ done |
+| **5b-1 — Graph + unified GC** | lightweight graph AM, multi-AM GC coordinator, online Vacuum | ⏳ next |
+| **5b-2 — Forgetting + layering** | forgetting curve and memory layering after `mark_for_gc` | 📋 planned |
+| **6 — Protocol + multi-agent isolation** | full PG protocol, MCP server, row-level security | 📋 planned (parallel with 5b-1/5b-2) |
+| **5a — Time-series + columnar** | TTL partitions, columnar projection, distillation SDK stub | 📋 planned (after Phase 6) |
+| **4b — Multi-path fusion + planner** | MultiIndexScan, fusion strategies, cross-modal planner | 📋 planned (after Phase 5a) |
+| **5b-3 — Fusion integration + acceptance** | Graph and Time-series into Fusion | 📋 planned (after 5a + 4b) |
 | **7 — Production** | observability, compression, CBO, high availability | 📋 planned |
 
-The latest closeout is **Phase 4a** (`d9996b9`): full workspace and
-DataFusion-feature debug/release tests, two adversarial reviews, MSRV 1.86,
-and siftsmall ANN acceptance are all green. In parallel, Phase 2 still has
-its previously documented closeout items: the 100-concurrent 24h stress
-rerun, CI coverage report, and `phase2-m6` tag. The siftsmall/pgvector
-comparison is in `docs/phase2-m6-benchmarks.md` (recall 0.9990 vs 0.9940,
-with the insert-throughput gap recorded honestly).
+The latest closeout is **Phase 3** (`65cab77`): workspace and DataFusion
+debug/release tests, nine-crate Clippy/rustdoc checks, MSRV 1.86, two
+adversarial review rounds plus deep follow-up review, and crash/recovery
+coverage are all green. SciFact NDCG@10 mean absolute difference is
+**0.00171049**, Chinese/mixed NDCG difference is **0.00000000**, and
+WAND/Tantivy mean/p95 latency ratios are **1.124/1.092**. Tier 2
+commit-to-visible p95 is **496.013ms** with merge enabled and **270.778ms**
+with merge disabled. See `docs/phase3-benchmarks.md` for the complete
+evidence. In parallel, Phase 2 still has its previously documented closeout
+items: the 100-concurrent 24h stress rerun, CI coverage report, and
+`phase2-m6` tag. The siftsmall/pgvector comparison is in
+`docs/phase2-m6-benchmarks.md` (recall 0.9990 vs 0.9940, with the
+insert-throughput gap recorded honestly).
 
 Per-stage design decisions and deviations from PostgreSQL are documented in
 [docs/](docs/), particularly `docs/stage_spec.md` (what was actually built).
@@ -240,6 +267,11 @@ Correctness is the priority, so the test surface is heavy:
   redirect×insert).
 - **`proptest`**: property-based tests for the page allocator and WAL record
   round-trips.
+- **Phase 3 acceptance**: exact WAND/DAAT differential matrices, SciFact and
+  Chinese/mixed NDCG benchmarks, Tantivy latency comparison, Tier 2
+  commit-to-visible latency, seal/manifest crash windows, duplicate/corrupt
+  metadata rejection, quiet-index checkpoint recycling, and full workspace
+  and DataFusion debug/release regression.
 - **Phase 4a acceptance**: full workspace and DataFusion-feature debug/release
   tests, MSRV 1.86 compilation, protocol golden bytes, TOAST crash recovery,
   Sequence/SERIAL crash tests, and siftsmall ANN recall. DataFusion point
