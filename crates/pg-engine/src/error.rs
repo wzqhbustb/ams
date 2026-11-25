@@ -80,6 +80,10 @@ pub enum EngineError {
     #[error("index {0} already exists")]
     IndexExists(String),
 
+    /// `create_graph` named an existing graph.
+    #[error("graph {0:?} already exists")]
+    GraphExists(String),
+
     /// `index_lookup` named a (table, column) pair with no index.
     #[error("no index on {0}")]
     IndexNotFound(String),

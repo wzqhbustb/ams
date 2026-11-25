@@ -2866,6 +2866,7 @@ dependencies = [
  "futures",
  "parking_lot",
  "pg-am-btree",
+ "pg-am-graph",
  "pg-am-heap",
  "pg-am-hnsw",
  "pg-am-inverted",

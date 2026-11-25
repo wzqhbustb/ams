@@ -17,7 +17,8 @@ use crate::traversal::GraphTraversalRequest;
 pub const GRAPH_AM_OID: Oid = Oid(9880);
 
 /// A graph handle backed by the common GraphItem heap relation and its side
-/// file. Graph DML and real adjacency execution are implemented in later stages.
+/// file. pg-engine orchestrates DML through its graph adapter; real adjacency
+/// execution remains a later-stage responsibility.
 #[derive(Debug, Clone)]
 pub struct GraphStore {
     data_dir: PathBuf,

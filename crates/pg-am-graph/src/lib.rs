@@ -2,7 +2,8 @@
 //!
 //! Stage 0 freezes GraphItem, identity/out/in key bytes, side-file recovery,
 //! traversal result/budget shapes, and explicit unsupported AM operations.
-//! Graph DML, BFS/DFS, and physical GC execution belong to later stages.
+//! Stage A adds DDL/DML through the pg-engine graph adapter; BFS/DFS and
+//! physical GC execution belong to later stages.
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]

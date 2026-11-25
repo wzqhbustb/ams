@@ -55,8 +55,8 @@ impl WireError {
             EngineError::TableNotFound(_) => "42P01", // undefined_table
             EngineError::TableExists(_) => "42P07",   // duplicate_table
             EngineError::IndexNotFound(_) => "42P01", // undefined_table-ish
-            EngineError::IndexExists(_) => "42P07",   // duplicate_table-ish
-            EngineError::Unsupported(_) => "0A000",   // feature_not_supported
+            EngineError::IndexExists(_) | EngineError::GraphExists(_) => "42P07", // duplicate_table-ish
+            EngineError::Unsupported(_) => "0A000", // feature_not_supported
             EngineError::InvalidArgument(_) | EngineError::InvalidPredicate(_) => "42601", // syntax_error
             _ => "XX000", // internal_error
         }

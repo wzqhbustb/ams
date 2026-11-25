@@ -1,7 +1,7 @@
 # Phase 5b-1 Coding Plan：Graph AM 与 multi-AM GC coordinator
 
-版本：v1.7（2026-11-25）
-依据：`docs/phase5b-1-tech-selection.md` v1.8（含 Graph side file、GraphKeyCodec、Graph 完整性、增量 GC 预算、双代际 PageFreeV2）
+版本：v1.12（2026-11-25）
+依据：`docs/phase5b-1-tech-selection.md` v1.13（含 Graph side file、GraphKeyCodec、Graph 完整性、增量 GC 预算、双代际 PageFreeV2）
 前置：Phase 1/2/3 与 Phase 4a 已完成并合入。Phase 2 的 24h 压测、CI coverage、`phase2-m6` tag 并行推进，不阻塞本计划。
 
 ---
@@ -59,9 +59,9 @@
 
 | 任务 | 交付物 |
 |---|---|
-| `CREATE GRAPH` | 在一个 DDL 事务创建内部 heap relation、identity/out/in 三个 GraphKeyCodec 索引、GraphEntry 与 edge sequence；`DIRECTED` 默认，`UNDIRECTED` 可选；锁内发布 registry/handle，失败完整回滚。**graph name 必须唯一**，重名 CREATE 返回 `IndexExists`，DROP 后允许复名 |
-| Graph registry | side file 持久化 `format_version/oid/name/directed/first_page/edge_sequence_oid`；内存 `GraphEntry` 从目录重建，禁止从 filename 猜图关系。side file 不存在按无 Graph 处理，损坏则 fail-stop；不得从 `pg_class` 猜 Graph 类型 |
-| Graph 专用索引维护 | **不得复用假设“一个索引对应一列值”的普通 `collect_index_keys` 路径**。在 GraphStore/engine 适配层从完整 GraphItem 派生 identity/out/in 三组字节键；建索引、DML、失败 loser cleanup 与 GC 共用同一维护入口。回收必须先提取死行三套键并令三个 B+Tree 删除 durable，再执行 heap compact/unlink/free；属性更新若键未变化不重写索引。补 loser 补偿及“索引清理先于堆失效”的 crash 回归 |
+| `CREATE GRAPH` | 在一个 DDL 事务创建内部 heap relation、identity/out/in 三个 GraphKeyCodec 索引、GraphEntry 与 edge sequence；`DIRECTED` 默认，`UNDIRECTED` 可选；锁内发布 registry/handle，失败完整回滚。**graph name 必须唯一**，重名 CREATE 返回 `GraphExists`，DROP 后允许复名 |
+| Graph registry | side file 持久化 `format_version/oid/name/directed/first_page/edge_sequence_oid`；内存 `GraphEntry` 从目录重建，禁止从 filename 猜图关系。side file 不存在且无对应 Graph catalog 时按无 Graph/孤儿处理；catalog 存在但 side file 缺失按 `Corrupted` fail-stop。不得从 `pg_class` 猜 Graph 类型 |
+| Graph 专用索引维护 | **不得复用假设“一个索引对应一列值”的普通 `collect_index_keys` 路径**。在 GraphStore/engine 适配层从完整 GraphItem 派生 identity/out/in 三组字节键；建索引、DML、失败 loser cleanup 与 GC 共用同一维护入口。回收必须先提取死行三套键并令三个 B+Tree 删除 durable，再执行 heap compact/unlink/free；属性更新若键未变化，HOT 同页更新不重写索引；非 HOT 更新只插入新 TID 项，旧项由 vacuum 回收，删除也保留旧项至 vacuum，避免未提交操作隐藏已提交版本。补 loser 补偿及“索引清理先于堆失效”的 crash 回归 |
 | `GRAPH ADD NODE` | `AccessExclusive` 内以 `record_type=node AND id=node_id` 查重并插入 node；重复 node ID 返回 `InvalidArgument`，验证与插入不离开锁，不能把同名 edge 当成节点 |
 | `GRAPH ADD EDGE` | `AccessExclusive` 内以 `record_type=node AND id=node_id` 验证两端节点存在并分配 edge ID 插入；任何一端不存在都拒绝；edge ID 只从 sequence 获取 |
 | `GRAPH UPDATE NODE` | `RowExclusive` 更新节点属性，保持 node ID、src/dst 不变；属性更新复用 TOAST 和索引维护 |
@@ -76,6 +76,8 @@
 - DDL/DML commit failure 后无幽灵 registry、sequence 或索引，且可以重试。
 
 **实现补充**：首版用 `AccessExclusive` 串行化这三类 DML，属于明确接受的写并发降级；不得为了吞吐改回无锁查重。
+
+**Stage A 实现记录**：Graph 内部关系命名为 `__graph_<oid>`，edge sequence 为 `__graph_<oid>_edges`；三个索引登记为 `AmKind::Graph + Bytea`，普通表 INSERT/UPDATE/DELETE、DROP TABLE 和其他索引创建均显式拒绝进入该内部关系。auto-commit 与显式 Graph DML 都在表锁等待结束后重取快照并保留原 curcid 做完整性校验，确保同事务先前写入可见；非 HOT 更新和删除保留旧索引项，由 vacuum 回收，避免未提交操作隐藏已提交版本；普通 SELECT 继续保持显式事务的 SI 快照。恢复覆盖 side-file 孤儿清理、loser 删除补偿和 vacuum 清理窗口；进程崩溃回归通过 `test-harness` feature 隔离，普通测试另覆盖 DDL/DML、TOAST、回滚、无向图、自环、旧快照、并发 CREATE GRAPH、参数化 DML 和 registry 损坏负例。
 
 ---
 
@@ -237,3 +239,8 @@ CARGO_TARGET_DIR=target/msrv-phase5b cargo +1.86.0 check --workspace --all-featu
 | v1.5 | 2026-11-24 | Stage 0 复审修复：DataFusion JSONB 列判定改为按表限定，修复同名 TEXT 列被误拦并补回归；窗口 partition/order、`~`/`~~`、UNION/CASE 的 JSONB→TEXT 静默降级登记为 Stage B 遗留事项。 |
 | v1.6 | 2026-11-25 | Stage 0 复审修复：放弃表名匹配与表达式形状黑名单，改为按 plan schema 字段元数据执行“纯投影 + `IS [NOT] NULL`”白名单；覆盖表别名、派生表、CTE 且保持同名 TEXT 列兼容。窗口 partition/order、`~`/`~~`、UNION/CASE 及其他 JSONB 运算统一响亮拒绝，并补端到端回归。 |
 | v1.7 | 2026-11-25 | Stage 0 复审修复：inverted 清理识别共享 `.pg_rust_tmp` 与真实 spool 文件名；CreateGraph 纳入 wire DDL 规则；Stage B 明确 graph registry 对执行/EXPLAIN/wire 的存在性校验。登记 JSONB 递归/数值输入、二进制结果、旧目录和类型关键字边界；GcPageWork 要求 dead_tids 严格升序。Stage A 冻结 Graph 整行派生三键的独立索引维护路径及“索引删除 durable 先于堆失效”顺序。 |
+| v1.8 | 2026-11-25 | Stage A 实现：Graph DDL、registry、DML、派生索引维护、TOAST 与恢复落地。内部关系和 sequence 命名固定，Graph 索引导用 `AmKind::Graph + Bytea`；auto-commit 锁后重取快照，HOT 与跨页更新分别维护索引。补事务、并发、loser、vacuum crash、无向图、自环和旧快照回归，进程崩溃钩子归 `test-harness`。 |
+| v1.9 | 2026-11-25 | Stage A 审查修复：补 registry 损坏负例（缺 side file、first_page 不一致、缺索引、缺 sequence），缺失 side file 的 live catalog 改为 `Corrupted` fail-stop；补并发 CREATE GRAPH 唯一性与参数化 DML/回滚。锁后重取快照保留原 curcid，修复显式事务内后续 DML 不可见先前写入的问题。 |
+| v1.10 | 2026-11-25 | Stage A 深度审查修复：邻接扫描遇到非 20 字节 key 改为 `Corrupted`，避免级联删除静默漏边；side file 存在性校验同时从 Graph 索引和内部 Graph catalog relation 推导，覆盖全部索引与 side file 联合损坏。补对应回归。 |
+| v1.11 | 2026-11-25 | Stage A 并发修复：非 HOT 更新只插入新 TID 项，删除也保留旧项至 vacuum，未提交操作不再隐藏已提交版本；补跨页更新与未提交删除的并发回归。图重名错误消息明确为 graph，移除恒真的 refresh_after_lock 死参数。 |
+| v1.12 | 2026-11-25 | Stage A 审查收尾：新增 `GraphExists` 错误变体并保留 wire SQLSTATE 映射；并发回归改为两个事务删除同一条边，明确未提交删除的可见性语义；文档同步删除旧项保留至 vacuum。 |

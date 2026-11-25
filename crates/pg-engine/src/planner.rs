@@ -17,6 +17,8 @@ pub enum AmKind {
     Hnsw,
     /// The inverted full-text access method.
     Inverted,
+    /// GraphItem-derived byte-key indexes; never selected as ordinary B+Trees.
+    Graph,
 }
 
 /// A registered access method. The registration owns both shape matching

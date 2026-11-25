@@ -31,6 +31,8 @@ pg-am-hnsw = { path = "../pg-am-hnsw" }
 # Phase 3 Stage 0: frozen analyzer/watermark contracts shared with the
 # inverted-index registry and planner. The dependency points only this way.
 pg-am-inverted = { path = "../pg-am-inverted" }
+# Phase 5b-1 Stage A: GraphItem/key codec, side-file metadata, and graph AM OID.
+pg-am-graph = { path = "../pg-am-graph" }
 
 # error types
 thiserror = "2"
@@ -89,3 +91,4 @@ harness = false
 
 [features]
 datafusion = ["dep:datafusion", "dep:async-trait", "dep:futures", "dep:tokio", "dep:uuid"]
+test-harness = []

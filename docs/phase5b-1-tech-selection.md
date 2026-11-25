@@ -1,6 +1,6 @@
 # Phase 5b-1 技术选型：Graph AM 与 multi-AM GC coordinator
 
-版本：v1.8（2026-11-25）
+版本：v1.13（2026-11-25）
 状态：技术选型草案，供后续 coding plan 与 Stage 拆分直接引用
 前置事实：Phase 1（存储/MVCC/B+Tree）、Phase 2（HNSW）、Phase 3（inverted）与 Phase 4a（SQL TP/ANN、Extended Query、TOAST、DataFusion AP、Sequence/SERIAL）已完成。当前已满足 Graph 所需的 SQL 层和 multi-AM GC 所需的 ≥2 AM 条件。Phase 2 的 24h 压测、CI coverage 与 `phase2-m6` tag 继续并行，不阻塞本阶段。
 
@@ -153,7 +153,7 @@ in       = record_type:u32 + dst:u64 + id:u64
 - 节点删除可以在一个事务内级联删除全部关联边，杜绝 dangling edge。
 - identity/out/in 三个 GraphKeyCodec 索引即可支持 OUT/IN/BOTH；`record_type` 区分节点和边，不与 HNSW 的 NodeId 或 heap TID 混用。**所有读取必须同时带 `record_type` 过滤**：节点查重/存在性用 `record_type=node AND id=node_id`，邻接与级联删除用 `record_type=edge AND (src=node_id OR dst=node_id)`，禁止把节点当成自环边。
 
-**Graph 专用派生索引维护路径**：引擎现有 `collect_index_keys` 假设“一个索引对应一列的值”，不能直接复用于从整行派生字节键的三个 Graph 索引。Stage A 必须在 GraphStore 与 engine 的适配层提供独立维护入口，从完整 GraphItem 统一派生 identity/out/in key，并让建索引、DML 插入/更新/删除、失败补偿（loser cleanup）和 GC 清理全部复用同一 codec 与维护逻辑，禁止退化为按某一 Datum 列生成键。回收时先从尚未失效的 GraphItem 提取三套键，完成三个 B+Tree 的索引删除并 durable，之后才允许 heap compact、unlink 或 free；属性更新若三套键均未变化，不做无意义的索引删除/重插。
+**Graph 专用派生索引维护路径**：引擎现有 `collect_index_keys` 假设“一个索引对应一列的值”，不能直接复用于从整行派生字节键的三个 Graph 索引。Stage A 必须在 GraphStore 与 engine 的适配层提供独立维护入口，从完整 GraphItem 统一派生 identity/out/in key，并让建索引、DML 插入/更新/删除、失败补偿（loser cleanup）和 GC 清理全部复用同一 codec 与维护逻辑，禁止退化为按某一 Datum 列生成键。回收时先从尚未失效的 GraphItem 提取三套键，完成三个 B+Tree 的索引删除并 durable，之后才允许 heap compact、unlink 或 free；属性更新若三套键均未变化，HOT 同页更新不做索引删除/重插；非 HOT 更新与删除均只插入新 TID 项或保留旧项至 vacuum，避免未提交更新或删除让其他事务误判节点不存在。
 
 `GRAPH_AM_OID=9880` 注册到 `pg_am`。Graph OID 同时是内部 heap relation OID；GraphEntry 至少包含 `oid/name/directed/first_page/edge_sequence_oid`。
 
@@ -172,11 +172,11 @@ GraphMetadata {
 }
 ```
 
-- `CREATE GRAPH <name> [DIRECTED|UNDIRECTED]` 在一个 DDL 事务内创建 heap relation、identity/out/in 三个邻接索引、GraphEntry、metadata.bin 和 edge-ID sequence。**graph name 必须唯一**，重名 CREATE 返回 `IndexExists`，DROP 后允许复名。
+- `CREATE GRAPH <name> [DIRECTED|UNDIRECTED]` 在一个 DDL 事务内创建 heap relation、identity/out/in 三个邻接索引、GraphEntry、metadata.bin 和 edge-ID sequence。**graph name 必须唯一**，重名 CREATE 返回 `GraphExists`，DROP 后允许复名。
 - **sequence high_water 是 edge ID 的唯一权威**，side file 不另存 `next_edge_id`，避免双事实源。GraphEntry 只引用 `edge_sequence_oid`；崩溃或回滚允许空洞，禁止重用。
 - sequence 与 graph 同生命周期，DROP 时按现有 SERIAL ownership 规则清理。
 - 节点 ID 由调用方提供并强制唯一；edge ID 由 engine 分配。自环合法，BFS/DFS 由 visited 防死循环。
-- side file 不存在按无 Graph 处理；损坏或格式版本不支持则 fail-stop，不得从 `pg_class` 猜 Graph 类型。
+- side file 不存在且没有对应 Graph catalog 时按无 Graph/孤儿处理；catalog 中存在 Graph relation 但 side file 缺失按 `Corrupted` fail-stop。损坏或格式版本不支持同样 fail-stop，不得从 `pg_class` 猜 Graph 类型。
 - `pg_rust_relpages.first_page` 是 heap 页链权威；side file 的 `first_page` 只保存 Graph 注册快照。Stage A reopen 必须比对两处，不一致按 `Corrupted` 拒绝，禁止用 side file 覆盖目录。
 
 这样避免改动 `SYSTEM_TABLES` 固定页 1–6 的 bootstrap 协议，也不把 Graph 元数据建立在首页读取/页链兼容性的不确定性之上。
@@ -571,3 +571,8 @@ PageFreeV2 {
 | v1.6 | 2026-11-24 | Stage 0 复审修复：DataFusion JSONB 列判定改为按表限定，修复同名 TEXT 列被误拦并补回归；窗口 partition/order、`~`/`~~`、UNION/CASE 的 JSONB→TEXT 静默降级登记为 Stage B 遗留事项。 |
 | v1.7 | 2026-11-25 | Stage 0 复审修复：放弃表名匹配与表达式形状黑名单，改为按 plan schema 字段元数据执行“纯投影 + `IS [NOT] NULL`”白名单；覆盖表别名、派生表、CTE 且保持同名 TEXT 列兼容。窗口 partition/order、`~`/`~~`、UNION/CASE 及其他 JSONB 运算统一响亮拒绝，并补端到端回归。 |
 | v1.8 | 2026-11-25 | Stage 0 复审修复：inverted 清理识别共享 `.pg_rust_tmp` 与真实 spool 文件名；CreateGraph 纳入 wire DDL 规则；Stage B 明确 graph registry 对执行/EXPLAIN/wire 的存在性校验。登记 JSONB 递归/数值输入、二进制结果、旧目录和类型关键字边界；GcPageWork 要求 dead_tids 严格升序。Stage A 冻结 Graph 整行派生三键的独立索引维护路径及“索引删除 durable 先于堆失效”顺序。 |
+| v1.9 | 2026-11-25 | Stage A 实现：Graph DDL、registry、DML、派生索引维护、TOAST 与恢复落地。内部关系和 sequence 命名固定，Graph 索引导用 `AmKind::Graph + Bytea`；Graph DML 锁后重取快照校验完整性，HOT 与跨页更新分别维护索引。补事务、并发、loser、vacuum crash、无向图、自环和旧快照回归，进程崩溃钩子归 `test-harness`。 |
+| v1.10 | 2026-11-25 | Stage A 审查修复：补 registry 损坏负例（缺 side file、first_page 不一致、缺索引、缺 sequence），缺失 side file 的 live catalog 改为 `Corrupted` fail-stop；补并发 CREATE GRAPH 唯一性与参数化 DML/回滚。锁后重取快照保留原 curcid，修复显式事务内后续 DML 不可见先前写入的问题。 |
+| v1.11 | 2026-11-25 | Stage A 深度审查修复：邻接扫描遇到非 20 字节 key 改为 `Corrupted`，避免级联删除静默漏边；side file 存在性校验同时从 Graph 索引和内部 Graph catalog relation 推导，覆盖全部索引与 side file 联合损坏。补对应回归。 |
+| v1.12 | 2026-11-25 | Stage A 并发修复：非 HOT 更新只插入新 TID 项，删除也保留旧项至 vacuum，未提交操作不再隐藏已提交版本；补跨页更新与未提交删除的并发回归。图重名错误消息明确为 graph，移除恒真的 refresh_after_lock 死参数。 |
+| v1.13 | 2026-11-25 | Stage A 审查收尾：新增 `GraphExists` 错误变体并保留 wire SQLSTATE 映射；并发回归改为两个事务删除同一条边，明确未提交删除的可见性语义；文档同步删除旧项保留至 vacuum。 |

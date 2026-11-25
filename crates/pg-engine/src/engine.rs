@@ -117,6 +117,8 @@
 //! so a `DROP TABLE` racing them can still produce `TableNotFound` —
 //! unchanged from M2b.
 
+pub(crate) mod graph;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -472,7 +474,8 @@ pub struct IndexEntry {
     pub column: String,
     /// The indexed column's codec type (the B+Tree key type). An HNSW index
     /// is marked by `ColumnType::Vector(dim)` (M6 Stage C); an inverted index
-    /// uses `ColumnType::Text` and never interprets it as a B+Tree key.
+    /// uses `ColumnType::Text` and never interprets it as a B+Tree key; Graph
+    /// indexes use `ColumnType::Bytea` for GraphKeyCodec-derived byte keys.
     pub key_type: ColumnType,
     /// The index's meta page (`pg_rust_relpages.first_page` of the index).
     pub meta_page: PageId,
@@ -698,6 +701,8 @@ pub struct Engine {
     deadlock_detector: DeadlockDetector,
     /// Name → table. Rebuilt from the catalog at open; kept in sync by DDL.
     registry: RwLock<HashMap<String, TableEntry>>,
+    /// User-visible graph name → graph metadata and its internal heap relation.
+    graphs: RwLock<HashMap<String, graph::GraphEntry>>,
     /// All live indexes (M2b Stage M wave 2). Rebuilt at open by scanning
     /// the `pg_index` heap chain; `create_index` appends. Indexes on dropped
     /// tables linger harmlessly: `index_lookup` resolves the table first.
@@ -1173,10 +1178,10 @@ fn pending_map_remove(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-harness"))]
 type CommitFinishedHook = fn(&Engine, TxnId);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-harness"))]
 thread_local! {
     static BEFORE_AUTO_COMMIT_HOOK: std::cell::Cell<Option<fn()>> =
         std::cell::Cell::new(None);
@@ -1188,6 +1193,21 @@ thread_local! {
         std::cell::Cell::new(None);
     static BEFORE_INVERTED_SEAL_HOOK: std::cell::Cell<Option<fn(&Engine)>> =
         std::cell::Cell::new(None);
+    static AFTER_GRAPH_INDEX_CLEANUP_HOOK: std::cell::Cell<Option<fn()>> =
+        std::cell::Cell::new(None);
+}
+
+/// Exit the process immediately before the next auto-commit, leaving a loser
+/// transaction for recovery-time Graph index compensation tests.
+#[cfg(feature = "test-harness")]
+pub fn crash_before_auto_commit_for_test() {
+    BEFORE_AUTO_COMMIT_HOOK.with(|hook| hook.set(Some(|| std::process::exit(1))));
+}
+
+/// Exit the process after Graph index cleanup but before heap reclamation.
+#[cfg(feature = "test-harness")]
+pub fn crash_after_graph_index_cleanup_for_test() {
+    AFTER_GRAPH_INDEX_CLEANUP_HOOK.with(|hook| hook.set(Some(|| std::process::exit(1))));
 }
 
 impl Engine {
@@ -1337,6 +1357,7 @@ impl Engine {
             lock_manager,
             deadlock_detector,
             registry: RwLock::new(registry),
+            graphs: RwLock::new(HashMap::new()),
             indexes: RwLock::new(indexes),
             hnsw_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             inverted_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -1358,6 +1379,13 @@ impl Engine {
             sequences,
         };
         engine.initialize_sequences()?;
+        let graphs = {
+            let tables = engine.registry.read();
+            let indexes = engine.indexes.read();
+            graph::recover_graph_registry(data_dir, &tables, &indexes, &engine.sequences)?
+        };
+        engine.graphs.write().extend(graphs);
+        graph::remove_orphan_graph_directories(data_dir, &engine.graphs.read());
 
         // 7b. Stage D migration for pre-TOAST directories. New tables already
         //     carry reltoastrelid; legacy TOASTable tables get the hidden heap
@@ -1673,6 +1701,7 @@ impl Engine {
                 BTREE_AM_OID => (AmKind::BTree, "btree"),
                 HNSW_AM_OID => (AmKind::Hnsw, "hnsw"),
                 INVERTED_AM_OID => (AmKind::Inverted, "inverted"),
+                pg_am_graph::GRAPH_AM_OID => (AmKind::Graph, "graph"),
                 other => {
                     return Err(EngineError::Corrupted(format!(
                         "index {index_oid}: unknown access method {other}"
@@ -1718,6 +1747,14 @@ impl Engine {
             } else {
                 None
             };
+            if matches!(kind, AmKind::Graph)
+                && (key_type != ColumnType::Bytea
+                    || graph::graph_key_kind_from_column(&attr.name).is_none())
+            {
+                return Err(EngineError::Corrupted(format!(
+                    "graph index {index_oid} has invalid key type or column"
+                )));
+            }
             indexes.push(IndexEntry {
                 kind,
                 inverted,
@@ -2760,6 +2797,11 @@ impl Engine {
             .get(name)
             .cloned()
             .ok_or_else(|| EngineError::TableNotFound(name.to_string()))?;
+        if graph::is_graph_relation(self, &entry) {
+            return Err(EngineError::Unsupported(
+                "graph relations cannot be dropped as ordinary tables".to_string(),
+            ));
+        }
         let sequence_states = RefCell::new(None);
         let serial_sequences = RefCell::new(Vec::new());
 
@@ -3011,6 +3053,11 @@ impl Engine {
     pub fn create_index(&self, table: &str, column: &str) -> Result<Oid> {
         let _ddl = self.ddl_lock.lock();
         let entry = self.table_entry(table)?;
+        if graph::is_graph_relation(self, &entry) {
+            return Err(EngineError::Unsupported(
+                "graph relations use only identity/out/in graph indexes".to_string(),
+            ));
+        }
         let col_index = entry
             .columns
             .iter()
@@ -3151,6 +3198,11 @@ impl Engine {
     ) -> Result<Oid> {
         let _ddl = self.ddl_lock.lock();
         let entry = self.table_entry(table)?;
+        if graph::is_graph_relation(self, &entry) {
+            return Err(EngineError::Unsupported(
+                "graph relations use only identity/out/in graph indexes".to_string(),
+            ));
+        }
         let col_index = entry
             .columns
             .iter()
@@ -3321,6 +3373,11 @@ impl Engine {
     ) -> Result<(Oid, PageId)> {
         let _ddl = self.ddl_lock.lock();
         let entry = self.table_entry(table)?;
+        if graph::is_graph_relation(self, &entry) {
+            return Err(EngineError::Unsupported(
+                "graph relations use only identity/out/in graph indexes".to_string(),
+            ));
+        }
         let col_index = entry
             .columns
             .iter()
@@ -5302,6 +5359,11 @@ impl Engine {
     fn insert_inner(&self, snap: &Snapshot, entry: &TableEntry, values: &[Value]) -> Result<Tid> {
         let col_types = column_types(entry);
         let indexes = self.indexes_of(entry);
+        if indexes.iter().any(|(index, _)| index.kind == AmKind::Graph) {
+            return Err(EngineError::Unsupported(
+                "graph relations require GRAPH DML, not ordinary table INSERT".to_string(),
+            ));
+        }
 
         // M6 Stage C (tech-selection §7/§11): at most ONE hnsw index per
         // table (the row carries a single trailing NodeId, §7 (b)). The
@@ -5454,6 +5516,11 @@ impl Engine {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
         let indexes = self.indexes_of(&entry);
+        if indexes.iter().any(|(index, _)| index.kind == AmKind::Graph) {
+            return Err(EngineError::Unsupported(
+                "graph relations require GRAPH DML, not ordinary table UPDATE/DELETE".to_string(),
+            ));
+        }
 
         // Read both forms: raw pointers may be reused by the new version,
         // while index maintenance and change detection need detoasted values.
@@ -5634,6 +5701,11 @@ impl Engine {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
         let indexes = self.indexes_of(&entry);
+        if indexes.iter().any(|(index, _)| index.kind == AmKind::Graph) {
+            return Err(EngineError::Unsupported(
+                "graph relations require GRAPH DML, not ordinary table UPDATE/DELETE".to_string(),
+            ));
+        }
         let hnsw = indexes
             .iter()
             .find(|(idx, _)| matches!(idx.key_type, ColumnType::Vector(_)));
@@ -5801,6 +5873,28 @@ impl Engine {
             // Phase 4: push-mode index cleanup, one descent per (key, tid)
             // per index (batch interfaces are Phase 5b, §4.3).
             for (idx, col_index) in &self.indexes_of(&entry) {
+                if matches!(idx.kind, AmKind::Graph) {
+                    let kind = graph::graph_key_kind_from_column(&idx.column).ok_or_else(|| {
+                        EngineError::Corrupted(format!(
+                            "graph index {} has unknown key column {:?}",
+                            idx.index_oid, idx.column
+                        ))
+                    })?;
+                    let mut index = self.open_btree(idx)?;
+                    for (tid, values) in &keys {
+                        let item = graph::graph_item_from_values(values)?;
+                        let key = pg_am_graph::GraphKeyCodec::encode(kind, &item)
+                            .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+                        match index.delete(&key, *tid) {
+                            Ok(()) => stats.index_entries_removed += 1,
+                            Err(BTreeError::EntryNotFound) => {
+                                stats.index_entries_already_gone += 1;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    continue;
+                }
                 // Inverted indexes are reclaimed by segment merge, never by
                 // opening their metadata as a B+Tree.
                 if matches!(idx.kind, AmKind::Inverted) {
@@ -5904,6 +5998,15 @@ impl Engine {
                 }
             }
 
+            #[cfg(any(test, feature = "test-harness"))]
+            if self
+                .indexes_of(&entry)
+                .iter()
+                .any(|(index, _)| index.kind == AmKind::Graph)
+            {
+                Self::run_after_graph_index_cleanup_hook();
+            }
+
             // Phase 5: compaction + unlink + free (kill set re-derived
             // from `dead` inside reclaim — do not pre-filter it here).
             self.heap.reclaim(rel, &dead)?;
@@ -5933,7 +6036,7 @@ impl Engine {
 
     /// Open the B+Tree handle for a registry index entry.
     fn open_btree(&self, idx: &IndexEntry) -> Result<pg_am_btree::BTreeIndex> {
-        if !matches!(idx.kind, AmKind::BTree) {
+        if !matches!(idx.kind, AmKind::BTree | AmKind::Graph) {
             return Err(EngineError::InvalidArgument(format!(
                 "index {:?} is {:?}, not a B+Tree",
                 idx.index_oid, idx.kind
@@ -6273,6 +6376,24 @@ impl Engine {
             let old_values = self.read_row_by_tid_physical(entry, col_types, tid)?;
             let index_tid = self.hot_chain_root(tid)?;
             for (idx, col_index) in &indexes {
+                if matches!(idx.kind, AmKind::Graph) {
+                    let kind = graph::graph_key_kind_from_column(&idx.column).ok_or_else(|| {
+                        EngineError::Corrupted(format!(
+                            "graph index {} has unknown key column {:?}",
+                            idx.index_oid, idx.column
+                        ))
+                    })?;
+                    let item = graph::graph_item_from_values(&old_values)?;
+                    let key = pg_am_graph::GraphKeyCodec::encode(kind, &item)
+                        .map_err(|error| EngineError::Corrupted(error.to_string()))?;
+                    let mut index = self.open_btree(idx)?;
+                    if index.lookup_all(&key)?.contains(&index_tid) {
+                        continue;
+                    }
+                    index.insert_with_budget(&key, index_tid, UNDO_INSERT_RESTART_BUDGET)?;
+                    compensated += 1;
+                    continue;
+                }
                 // HNSW and inverted have their own recovery channels; never
                 // compensate them through this B+Tree-only loop.
                 if matches!(idx.kind, AmKind::Inverted) {
@@ -6926,16 +7047,14 @@ impl Engine {
                 })?;
                 Ok(QueryResult::Affected(count))
             }
-            Statement::CreateGraph { .. }
+            graph @ (Statement::CreateGraph { .. }
             | Statement::GraphAddNode { .. }
             | Statement::GraphAddEdge { .. }
             | Statement::GraphUpdateNode { .. }
             | Statement::GraphDeleteNode { .. }
             | Statement::GraphDeleteEdge { .. }
             | Statement::GraphBfs(_)
-            | Statement::GraphDfs(_) => Err(EngineError::Unsupported(
-                "Graph execution is not implemented in Stage 0".to_string(),
-            )),
+            | Statement::GraphDfs(_)) => self.execute_graph_auto(graph),
         }
     }
 
@@ -7002,7 +7121,8 @@ impl Engine {
             }
             Statement::CreateTable { .. }
             | Statement::CreateIndex { .. }
-            | Statement::CreateSequence { .. } => {
+            | Statement::CreateSequence { .. }
+            | Statement::CreateGraph { .. } => {
                 drop(snap);
                 Err(EngineError::InvalidArgument(
                     "DDL inside explicit transactions is not supported in M2b; run DDL in auto-commit mode (exec(None, ...))".to_string(),
@@ -7122,16 +7242,13 @@ impl Engine {
                 }
                 Ok(QueryResult::Affected(count))
             }
-            Statement::CreateGraph { .. }
-            | Statement::GraphAddNode { .. }
+            graph @ (Statement::GraphAddNode { .. }
             | Statement::GraphAddEdge { .. }
             | Statement::GraphUpdateNode { .. }
             | Statement::GraphDeleteNode { .. }
             | Statement::GraphDeleteEdge { .. }
             | Statement::GraphBfs(_)
-            | Statement::GraphDfs(_) => Err(EngineError::Unsupported(
-                "Graph execution is not implemented in Stage 0".to_string(),
-            )),
+            | Statement::GraphDfs(_)) => self.execute_graph_txn(&snap, handle.xid(), graph),
         }
     }
 
@@ -7402,7 +7519,7 @@ impl Engine {
     /// panic mid-transaction leaves in-memory state no one can vouch for,
     /// and the process-level failure policy (same as a WAL-fatal error)
     /// applies rather than a best-effort cleanup that might make it worse.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     fn run_before_auto_commit_hook() {
         BEFORE_AUTO_COMMIT_HOOK.with(|hook| {
             if let Some(hook) = hook.get() {
@@ -7411,7 +7528,16 @@ impl Engine {
         });
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
+    fn run_after_graph_index_cleanup_hook() {
+        AFTER_GRAPH_INDEX_CLEANUP_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook();
+            }
+        });
+    }
+
+    #[cfg(any(test, feature = "test-harness"))]
     fn run_commit_finished_hook(&self, xid: TxnId) {
         COMMIT_FINISHED_HOOK.with(|hook| {
             if let Some(hook) = hook.get() {
@@ -7534,7 +7660,7 @@ impl Engine {
         };
         match op_result {
             Ok(v) => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-harness"))]
                 Self::run_before_auto_commit_hook();
                 let result = self.txn.commit_txn(xid);
                 if result.is_err() {
@@ -7557,7 +7683,7 @@ impl Engine {
                     }
                 }
                 let hook_result = if result.is_ok() {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-harness"))]
                     self.run_commit_finished_hook(xid);
                     // M6 Stage C: deferred post-commit graph actions run
                     // after the commit is durable AND before the table
