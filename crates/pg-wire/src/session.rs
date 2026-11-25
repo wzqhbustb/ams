@@ -545,7 +545,7 @@ impl Session {
                 })?
             } else {
                 let supported_oid =
-                    matches!(supplied, 20 | 23 | 25 | 701) || supplied == vector_oid;
+                    matches!(supplied, 20 | 23 | 25 | 114 | 701) || supplied == vector_oid;
                 let supplied_type = column_type_for_oid(supplied, vector_dim).map_err(|err| {
                     if supported_oid {
                         StatementError::protocol(err.to_string())
@@ -581,6 +581,7 @@ impl Session {
                     | ColumnType::Int8
                     | ColumnType::Float8
                     | ColumnType::Text
+                    | ColumnType::Jsonb
                     | ColumnType::Vector(_)
             ) {
                 return Err(StatementError::unsupported(format!(
@@ -831,6 +832,7 @@ impl Session {
                     Statement::CreateTable { .. }
                         | Statement::CreateIndex { .. }
                         | Statement::CreateSequence { .. }
+                        | Statement::CreateGraph { .. }
                 ) {
                     return Err(StatementError::unsupported(
                         "DDL in an extended implicit transaction is not supported",
@@ -964,6 +966,7 @@ impl Session {
                     Statement::CreateTable { .. }
                         | Statement::CreateIndex { .. }
                         | Statement::CreateSequence { .. }
+                        | Statement::CreateGraph { .. }
                 );
                 if is_ddl {
                     if self.failed_txn {

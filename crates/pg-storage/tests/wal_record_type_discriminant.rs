@@ -9,7 +9,7 @@ use pg_storage::wal::record::WalRecordType;
 
 /// Every declared variant and its on-disk value. Keep in sync with
 /// `WalRecordType` in `crates/pg-storage/src/wal/record.rs`.
-const ALL_TYPES: [(WalRecordType, u8); 33] = [
+const ALL_TYPES: [(WalRecordType, u8); 34] = [
     (WalRecordType::HeapInsert, 1),
     (WalRecordType::HeapUpdate, 2),
     (WalRecordType::HeapDelete, 3),
@@ -29,6 +29,7 @@ const ALL_TYPES: [(WalRecordType, u8); 33] = [
     (WalRecordType::BTreeSplitCLR, 50),
     (WalRecordType::BTreeSplitCopy, 51),
     (WalRecordType::BTreeSplitCommit, 52),
+    (WalRecordType::BTreePageCleanup, 60),
     (WalRecordType::LogicalHnsw, 100),
     (WalRecordType::LogicalInverted, 101),
     (WalRecordType::LogicalGraph, 102),

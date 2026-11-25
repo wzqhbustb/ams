@@ -48,6 +48,36 @@ pub enum Statement {
     CreateSequence {
         name: String,
     },
+    CreateGraph {
+        name: String,
+        directed: bool,
+    },
+    GraphAddNode {
+        graph: String,
+        node_id: Literal,
+        properties: Literal,
+    },
+    GraphAddEdge {
+        graph: String,
+        source_node_id: Literal,
+        target_node_id: Literal,
+        properties: Literal,
+    },
+    GraphUpdateNode {
+        graph: String,
+        node_id: Literal,
+        properties: Literal,
+    },
+    GraphDeleteNode {
+        graph: String,
+        node_id: Literal,
+    },
+    GraphDeleteEdge {
+        graph: String,
+        edge_id: Literal,
+    },
+    GraphBfs(GraphTraversal),
+    GraphDfs(GraphTraversal),
     SequenceQuery {
         function: SequenceFunction,
         sequence: String,
@@ -90,6 +120,23 @@ pub enum Statement {
         /// Optional `WITH (fulltext_index = 'bm25')` declaration for inverted.
         fulltext_index: Option<String>,
     },
+}
+
+/// Direction of graph adjacency expansion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphDirection {
+    Out,
+    In,
+    Both,
+}
+
+/// Shared BFS/DFS AST. Execution is introduced after the Stage 0 format freeze.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphTraversal {
+    pub graph: String,
+    pub start_node_id: Literal,
+    pub direction: GraphDirection,
+    pub max_depth: u32,
 }
 
 /// A sequence function evaluated as a single-row, no-FROM query.
@@ -282,6 +329,19 @@ enum Token {
     Serial,
     Default,
     Null,
+    Graph,
+    Add,
+    Node,
+    Edge,
+    Properties,
+    Directed,
+    Undirected,
+    Bfs,
+    Dfs,
+    Out,
+    In,
+    Both,
+    MaxDepth,
     // Type names
     Type(ColumnType),
     // Literals
@@ -325,13 +385,22 @@ const MAX_PARAMETER_COUNT: usize = u16::MAX as usize;
 struct Tokenizer<'a> {
     chars: std::str::Chars<'a>,
     peek: Option<char>,
+    token_index: usize,
+    first_word: Option<String>,
+    graph_statement: bool,
 }
 
 impl<'a> Tokenizer<'a> {
     fn new(input: &'a str) -> Self {
         let mut chars = input.chars();
         let peek = chars.next();
-        Self { chars, peek }
+        Self {
+            chars,
+            peek,
+            token_index: 0,
+            first_word: None,
+            graph_statement: false,
+        }
     }
 
     fn bump(&mut self) -> Option<char> {
@@ -431,6 +500,7 @@ impl<'a> Tokenizer<'a> {
                             "unexpected character {c:?} in SQL"
                         )));
                     }
+                    self.token_index += 1;
                 }
             }
         }
@@ -550,7 +620,16 @@ impl<'a> Tokenizer<'a> {
                 break;
             }
         }
-        let token = match s.to_ascii_uppercase().as_str() {
+        let upper = s.to_ascii_uppercase();
+        if self.first_word.is_none() {
+            self.first_word = Some(upper.clone());
+        }
+        if upper == "GRAPH" && self.is_graph_statement_start() {
+            self.graph_statement = true;
+            return Ok(Token::Graph);
+        }
+        let graph = self.graph_statement;
+        let token = match upper.as_str() {
             "BEGIN" => Token::Begin,
             "COMMIT" => Token::Commit,
             "ROLLBACK" => Token::Rollback,
@@ -580,11 +659,25 @@ impl<'a> Tokenizer<'a> {
             "SERIAL" => Token::Serial,
             "DEFAULT" => Token::Default,
             "NULL" => Token::Null,
+            "GRAPH" if graph => Token::Graph,
+            "ADD" if graph => Token::Add,
+            "NODE" if graph => Token::Node,
+            "EDGE" if graph => Token::Edge,
+            "PROPERTIES" if graph => Token::Properties,
+            "DIRECTED" if graph => Token::Directed,
+            "UNDIRECTED" if graph => Token::Undirected,
+            "BFS" if graph => Token::Bfs,
+            "DFS" if graph => Token::Dfs,
+            "OUT" if graph => Token::Out,
+            "IN" if graph => Token::In,
+            "BOTH" if graph => Token::Both,
+            "MAX_DEPTH" if graph => Token::MaxDepth,
             "INT" | "INT4" | "INTEGER" => Token::Type(ColumnType::Int4),
             "BIGINT" | "INT8" => Token::Type(ColumnType::Int8),
             "FLOAT8" => Token::Type(ColumnType::Float8),
             "TEXT" | "VARCHAR" => Token::Type(ColumnType::Text),
             "BYTEA" => Token::Type(ColumnType::Bytea),
+            "JSONB" => Token::Type(ColumnType::Jsonb),
             "TIMESTAMPTZ" => Token::Type(ColumnType::Timestamptz),
             "UUID" => Token::Type(ColumnType::Uuid),
             // Unquoted identifiers fold to lowercase (PostgreSQL semantics;
@@ -622,6 +715,24 @@ impl<'a> Tokenizer<'a> {
             _ => Token::Ident(s.to_ascii_lowercase()),
         };
         Ok(token)
+    }
+
+    fn is_graph_statement_start(&self) -> bool {
+        match self.token_index {
+            0 => true,
+            1 if matches!(self.first_word.as_deref(), Some("CREATE") | Some("EXPLAIN")) => {
+                !self.next_non_whitespace_is_lparen()
+            }
+            _ => false,
+        }
+    }
+
+    fn next_non_whitespace_is_lparen(&self) -> bool {
+        self.peek
+            .into_iter()
+            .chain(self.chars.clone())
+            .find(|character| !character.is_whitespace())
+            == Some('(')
     }
 }
 
@@ -671,6 +782,19 @@ impl Parser {
     fn eat_ident(&mut self) -> Result<String> {
         match self.bump() {
             Token::Ident(s) => Ok(s),
+            Token::Graph => Ok("graph".to_string()),
+            Token::Add => Ok("add".to_string()),
+            Token::Node => Ok("node".to_string()),
+            Token::Edge => Ok("edge".to_string()),
+            Token::Properties => Ok("properties".to_string()),
+            Token::Directed => Ok("directed".to_string()),
+            Token::Undirected => Ok("undirected".to_string()),
+            Token::Bfs => Ok("bfs".to_string()),
+            Token::Dfs => Ok("dfs".to_string()),
+            Token::Out => Ok("out".to_string()),
+            Token::In => Ok("in".to_string()),
+            Token::Both => Ok("both".to_string()),
+            Token::MaxDepth => Ok("max_depth".to_string()),
             other => Err(EngineError::InvalidArgument(format!(
                 "expected identifier, got {other:?}"
             ))),
@@ -699,6 +823,7 @@ impl Parser {
                 Ok(Statement::Explain(Box::new(self.parse_statement()?)))
             }
             Token::Create => self.parse_create(),
+            Token::Graph => self.parse_graph(),
             Token::Insert => self.parse_insert(),
             Token::Select => self.parse_select(),
             Token::Update => self.parse_update(),
@@ -715,8 +840,9 @@ impl Parser {
             Token::Table => self.parse_create_table(),
             Token::Index => self.parse_create_index(),
             Token::Sequence => self.parse_create_sequence(),
+            Token::Graph => self.parse_create_graph(),
             other => Err(EngineError::InvalidArgument(format!(
-                "expected TABLE, INDEX or SEQUENCE after CREATE, got {other:?}"
+                "expected TABLE, INDEX, SEQUENCE or GRAPH after CREATE, got {other:?}"
             ))),
         }
     }
@@ -726,6 +852,179 @@ impl Parser {
         let name = self.eat_ident()?;
         self.eat(&Token::Eof)?;
         Ok(Statement::CreateSequence { name })
+    }
+
+    fn parse_create_graph(&mut self) -> Result<Statement> {
+        self.bump(); // GRAPH
+        let name = self.eat_ident()?;
+        let directed = match self.peek() {
+            Token::Directed => {
+                self.bump();
+                true
+            }
+            Token::Undirected => {
+                self.bump();
+                false
+            }
+            Token::Eof => true,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "expected DIRECTED, UNDIRECTED, or end of CREATE GRAPH, got {other:?}"
+                )));
+            }
+        };
+        self.eat(&Token::Eof)?;
+        Ok(Statement::CreateGraph { name, directed })
+    }
+
+    fn parse_graph(&mut self) -> Result<Statement> {
+        self.bump(); // GRAPH
+        match self.peek().clone() {
+            Token::Add => self.parse_graph_add(),
+            Token::Update => self.parse_graph_update_node(),
+            Token::Delete => self.parse_graph_delete(),
+            Token::Bfs => self.parse_graph_traversal(true),
+            Token::Dfs => self.parse_graph_traversal(false),
+            other => Err(EngineError::InvalidArgument(format!(
+                "expected ADD, UPDATE, DELETE, BFS, or DFS after GRAPH, got {other:?}"
+            ))),
+        }
+    }
+
+    fn parse_graph_add(&mut self) -> Result<Statement> {
+        self.bump(); // ADD
+        let node = match self.bump() {
+            Token::Node => true,
+            Token::Edge => false,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "expected NODE or EDGE after GRAPH ADD, got {other:?}"
+                )));
+            }
+        };
+        let graph = self.eat_ident()?;
+        let first = self.parse_graph_id()?;
+        if node {
+            let properties = self.parse_graph_properties()?;
+            self.eat(&Token::Eof)?;
+            Ok(Statement::GraphAddNode {
+                graph,
+                node_id: first,
+                properties,
+            })
+        } else {
+            let second = self.parse_graph_id()?;
+            let properties = self.parse_graph_properties()?;
+            self.eat(&Token::Eof)?;
+            Ok(Statement::GraphAddEdge {
+                graph,
+                source_node_id: first,
+                target_node_id: second,
+                properties,
+            })
+        }
+    }
+
+    fn parse_graph_update_node(&mut self) -> Result<Statement> {
+        self.bump(); // UPDATE
+        self.eat(&Token::Node)?;
+        let graph = self.eat_ident()?;
+        let node_id = self.parse_graph_id()?;
+        let properties = self.parse_graph_properties()?;
+        self.eat(&Token::Eof)?;
+        Ok(Statement::GraphUpdateNode {
+            graph,
+            node_id,
+            properties,
+        })
+    }
+
+    fn parse_graph_delete(&mut self) -> Result<Statement> {
+        self.bump(); // DELETE
+        let node = match self.bump() {
+            Token::Node => true,
+            Token::Edge => false,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "expected NODE or EDGE after GRAPH DELETE, got {other:?}"
+                )));
+            }
+        };
+        let graph = self.eat_ident()?;
+        let id = self.parse_graph_id()?;
+        self.eat(&Token::Eof)?;
+        if node {
+            Ok(Statement::GraphDeleteNode { graph, node_id: id })
+        } else {
+            Ok(Statement::GraphDeleteEdge { graph, edge_id: id })
+        }
+    }
+
+    fn parse_graph_traversal(&mut self, bfs: bool) -> Result<Statement> {
+        self.bump(); // BFS or DFS
+        let graph = self.eat_ident()?;
+        let start_node_id = self.parse_graph_id()?;
+        let direction = match self.bump() {
+            Token::Out => GraphDirection::Out,
+            Token::In => GraphDirection::In,
+            Token::Both => GraphDirection::Both,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "expected OUT, IN, or BOTH in graph traversal, got {other:?}"
+                )));
+            }
+        };
+        self.eat(&Token::MaxDepth)?;
+        let max_depth = match self.bump() {
+            Token::Int(depth) if (0..=3).contains(&depth) => depth as u32,
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "MAX_DEPTH requires an integer in 0..=3, got {other:?}"
+                )));
+            }
+        };
+        self.eat(&Token::Eof)?;
+        let traversal = GraphTraversal {
+            graph,
+            start_node_id,
+            direction,
+            max_depth,
+        };
+        if bfs {
+            Ok(Statement::GraphBfs(traversal))
+        } else {
+            Ok(Statement::GraphDfs(traversal))
+        }
+    }
+
+    fn parse_graph_id(&mut self) -> Result<Literal> {
+        let literal = self.parse_literal()?;
+        if matches!(literal, Literal::Int(_) | Literal::Param(_)) {
+            Ok(literal)
+        } else {
+            Err(EngineError::InvalidArgument(format!(
+                "graph IDs require an INT8 literal or parameter, got {literal:?}"
+            )))
+        }
+    }
+
+    fn parse_graph_properties(&mut self) -> Result<Literal> {
+        self.eat(&Token::Properties)?;
+        let literal = self.parse_literal()?;
+        match &literal {
+            Literal::Str(text) => {
+                serde_json::from_str::<serde_json::Value>(text).map_err(|error| {
+                    EngineError::InvalidArgument(format!("invalid graph JSONB properties: {error}"))
+                })?;
+            }
+            Literal::Param(_) => {}
+            other => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "graph PROPERTIES requires a JSONB text literal or parameter, got {other:?}"
+                )));
+            }
+        }
+        Ok(literal)
     }
 
     fn parse_create_table(&mut self) -> Result<Statement> {
@@ -1346,12 +1645,36 @@ pub(crate) fn max_parameter_index(stmt: &Statement) -> usize {
             .unwrap_or(0)
             .max(filter_max(filter)),
         Statement::Delete { filter, .. } => filter_max(filter),
+        Statement::GraphAddNode {
+            node_id,
+            properties,
+            ..
+        }
+        | Statement::GraphUpdateNode {
+            node_id,
+            properties,
+            ..
+        } => literal_max(node_id).max(literal_max(properties)),
+        Statement::GraphAddEdge {
+            source_node_id,
+            target_node_id,
+            properties,
+            ..
+        } => literal_max(source_node_id)
+            .max(literal_max(target_node_id))
+            .max(literal_max(properties)),
+        Statement::GraphDeleteNode { node_id, .. } => literal_max(node_id),
+        Statement::GraphDeleteEdge { edge_id, .. } => literal_max(edge_id),
+        Statement::GraphBfs(traversal) | Statement::GraphDfs(traversal) => {
+            literal_max(&traversal.start_node_id)
+        }
         Statement::Begin
         | Statement::Commit
         | Statement::Rollback
         | Statement::CreateTable { .. }
         | Statement::CreateIndex { .. }
         | Statement::CreateSequence { .. }
+        | Statement::CreateGraph { .. }
         | Statement::SequenceQuery { .. } => 0,
     }
 }
@@ -1868,5 +2191,150 @@ mod tests {
         assert_eq!(order.query, projection.query);
         assert!(order.desc);
         assert!(order.alias.is_none());
+    }
+
+    #[test]
+    fn graph_ast_freezes_ddl_dml_traversal_and_jsonb() {
+        assert_eq!(
+            parse("CREATE GRAPH g").unwrap(),
+            Statement::CreateGraph {
+                name: "g".to_string(),
+                directed: true,
+            }
+        );
+        assert_eq!(
+            parse("CREATE GRAPH g UNDIRECTED").unwrap(),
+            Statement::CreateGraph {
+                name: "g".to_string(),
+                directed: false,
+            }
+        );
+        for name in ["in", "out", "both", "node", "edge", "properties"] {
+            assert_eq!(
+                parse(&format!("CREATE GRAPH {name}")).unwrap(),
+                Statement::CreateGraph {
+                    name: name.to_string(),
+                    directed: true,
+                }
+            );
+        }
+        assert!(matches!(
+            parse("GRAPH ADD NODE g 1 PROPERTIES '{\"name\":\"A\"}'").unwrap(),
+            Statement::GraphAddNode {
+                node_id: Literal::Int(1),
+                properties: Literal::Str(_),
+                ..
+            }
+        ));
+        let edge = parse("GRAPH ADD EDGE g $1 $2 PROPERTIES $3").unwrap();
+        assert_eq!(max_parameter_index(&edge), 3);
+        assert!(matches!(
+            edge,
+            Statement::GraphAddEdge {
+                source_node_id: Literal::Param(1),
+                target_node_id: Literal::Param(2),
+                properties: Literal::Param(3),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse("GRAPH UPDATE NODE g 1 PROPERTIES '{\"name\":\"B\"}'").unwrap(),
+            Statement::GraphUpdateNode { .. }
+        ));
+        assert!(matches!(
+            parse("GRAPH DELETE NODE g 1").unwrap(),
+            Statement::GraphDeleteNode { .. }
+        ));
+        assert!(matches!(
+            parse("GRAPH DELETE EDGE g 7").unwrap(),
+            Statement::GraphDeleteEdge {
+                edge_id: Literal::Int(7),
+                ..
+            }
+        ));
+
+        let Statement::GraphBfs(traversal) = parse("GRAPH BFS g 1 BOTH MAX_DEPTH 3").unwrap()
+        else {
+            panic!("expected GRAPH BFS")
+        };
+        assert_eq!(traversal.direction, GraphDirection::Both);
+        assert_eq!(traversal.max_depth, 3);
+        assert!(matches!(
+            parse("GRAPH DFS g 1 IN MAX_DEPTH 0").unwrap(),
+            Statement::GraphDfs(_)
+        ));
+        assert!(matches!(
+            parse("EXPLAIN GRAPH BFS g 1 OUT MAX_DEPTH 2").unwrap(),
+            Statement::Explain(inner) if matches!(*inner, Statement::GraphBfs(_))
+        ));
+
+        let Statement::CreateTable { columns, .. } =
+            parse("CREATE TABLE events (payload JSONB)").unwrap()
+        else {
+            panic!("expected JSONB CREATE TABLE")
+        };
+        assert_eq!(columns[0].col_type, ColumnType::Jsonb);
+    }
+
+    #[test]
+    fn graph_parser_rejects_invalid_depth_json_and_ids() {
+        for sql in [
+            "GRAPH BFS g 1 OUT MAX_DEPTH 4",
+            "GRAPH BFS g 1 OUT MAX_DEPTH -1",
+            "GRAPH ADD NODE g 1 PROPERTIES 'not json'",
+            "GRAPH ADD NODE g 'not an id' PROPERTIES '{}'",
+            "GRAPH ADD EDGE g 1 2 PROPERTIES NULL",
+        ] {
+            assert!(parse(sql).is_err(), "must reject: {sql}");
+        }
+    }
+
+    #[test]
+    fn graph_keywords_remain_plain_identifiers_outside_graph_statements() {
+        let Statement::CreateTable { name, columns } =
+            parse("CREATE TABLE graph (in INT, out TEXT, edge JSONB)").unwrap()
+        else {
+            panic!("expected CREATE TABLE with graph-like identifiers")
+        };
+        assert_eq!(name, "graph");
+        assert_eq!(columns[0].name, "in");
+        assert_eq!(columns[1].name, "out");
+        assert_eq!(columns[2].name, "edge");
+
+        let Statement::Select {
+            columns: SelectCols::Cols(columns),
+            ..
+        } = parse(
+            "SELECT graph, add, node, properties, directed, undirected, bfs, dfs, both, max_depth FROM t",
+        )
+        .unwrap()
+        else {
+            panic!("expected SELECT with graph-like column names")
+        };
+        assert_eq!(columns.len(), 10);
+        for (index, name) in [
+            "graph",
+            "add",
+            "node",
+            "properties",
+            "directed",
+            "undirected",
+            "bfs",
+            "dfs",
+            "both",
+            "max_depth",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(columns[index], SelectItem::Column(name.to_string()));
+        }
+        assert!(matches!(
+            parse("SELECT in FROM t").unwrap(),
+            Statement::Select {
+                columns: SelectCols::Cols(_),
+                ..
+            }
+        ));
     }
 }

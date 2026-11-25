@@ -253,6 +253,173 @@ fn complex_filters_aliases_aggregates_and_joins_work() {
 
 #[cfg(feature = "datafusion")]
 #[test]
+fn jsonb_stays_jsonb_over_utf8_arrow_transport() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine
+        .create_table(
+            "events",
+            &[
+                column("id", ColumnType::Int8),
+                column("payload", ColumnType::Jsonb),
+            ],
+        )
+        .unwrap();
+    let json = "{ \"z\": 1, \"a\": [true, null] }".to_string();
+    engine
+        .insert(
+            "events",
+            &[Some(Datum::Int8(1)), Some(Datum::Jsonb(json.clone()))],
+        )
+        .unwrap();
+    let result = engine
+        .exec_datafusion(None, "SELECT payload FROM events WHERE id = 1")
+        .unwrap();
+    assert_eq!(rows(result), vec![vec![Some(Datum::Jsonb(json.clone()))]]);
+    assert!(matches!(
+        engine.exec_datafusion(None, "SELECT payload FROM events ORDER BY payload"),
+        Err(EngineError::Unsupported(_))
+    ));
+    assert!(matches!(
+        engine.exec_datafusion(None, "SELECT payload FROM events WHERE payload = '{}'"),
+        Err(EngineError::Unsupported(_))
+    ));
+    engine
+        .create_table(
+            "other",
+            &[
+                column("id", ColumnType::Int8),
+                column("payload", ColumnType::Jsonb),
+            ],
+        )
+        .unwrap();
+    engine
+        .insert(
+            "other",
+            &[Some(Datum::Int8(1)), Some(Datum::Jsonb(json.clone()))],
+        )
+        .unwrap();
+    let join_result = engine.exec_datafusion(
+        None,
+        "SELECT events.payload FROM events JOIN other ON events.payload = other.payload",
+    );
+    assert!(matches!(join_result, Err(EngineError::Unsupported(_))));
+    for sql in [
+        "SELECT CAST(payload AS VARCHAR) FROM events",
+        "SELECT payload || 'x' FROM events",
+        "SELECT length(payload) FROM events",
+        "SELECT DISTINCT payload FROM events",
+        "SELECT payload FROM events GROUP BY payload",
+        "SELECT events.payload FROM events JOIN other ON events.id = other.id ORDER BY events.payload",
+        "SELECT payload FROM events WHERE payload LIKE '%7B%'",
+        "SELECT payload FROM events WHERE payload IN ('{}')",
+        "SELECT payload FROM events WHERE payload BETWEEN '{}' AND '{\"z\":1}'",
+        "SELECT payload FROM events WHERE payload IS DISTINCT FROM '{}'",
+    ] {
+        assert!(
+            matches!(engine.exec_datafusion(None, sql), Err(EngineError::Unsupported(_))),
+            "JSONB operation must be rejected: {sql}"
+        );
+    }
+    engine
+        .create_table(
+            "users",
+            &[
+                column("payload", ColumnType::Text),
+                column("name", ColumnType::Text),
+            ],
+        )
+        .unwrap();
+    engine
+        .insert(
+            "users",
+            &[
+                Some(Datum::Text("hi".to_string())),
+                Some(Datum::Text("ann".to_string())),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        rows(
+            engine
+                .exec_datafusion(None, "SELECT payload FROM users WHERE payload = 'hi'")
+                .unwrap()
+        ),
+        vec![vec![Some(Datum::Text("hi".to_string()))]]
+    );
+    assert_eq!(
+        rows(
+            engine
+                .exec_datafusion(None, "SELECT payload FROM users ORDER BY payload")
+                .unwrap()
+        ),
+        vec![vec![Some(Datum::Text("hi".to_string()))]]
+    );
+    assert_eq!(
+        rows(
+            engine
+                .exec_datafusion(None, "SELECT length(payload) FROM users")
+                .unwrap()
+        ),
+        vec![vec![Some(Datum::Int4(2))]]
+    );
+    assert_eq!(
+        rows(
+            engine
+                .exec_datafusion(None, "SELECT payload FROM users GROUP BY payload")
+                .unwrap()
+        ),
+        vec![vec![Some(Datum::Text("hi".to_string()))]]
+    );
+    assert_eq!(
+        rows(
+            engine
+                .exec_datafusion(None, "SELECT name FROM users WHERE name = 'ann'")
+                .unwrap()
+        ),
+        vec![vec![Some(Datum::Text("ann".to_string()))]]
+    );
+
+    for sql in [
+        "SELECT e.payload FROM events e WHERE e.payload = '{}'",
+        "SELECT e.payload FROM events e ORDER BY e.payload",
+        "SELECT e.payload FROM events e GROUP BY e.payload",
+        "SELECT length(e.payload) FROM events e",
+        "SELECT e.payload || 'x' FROM events e",
+        "SELECT e.payload FROM events e WHERE e.payload LIKE '%a%'",
+        "SELECT t.payload FROM (SELECT payload FROM events) t WHERE t.payload = '{}'",
+        "WITH x AS (SELECT payload FROM events) SELECT payload FROM x WHERE payload = '{}'",
+        "SELECT e.payload FROM events e JOIN users u ON e.payload = u.payload",
+        "SELECT count(*) OVER (PARTITION BY payload) FROM events",
+        "SELECT sum(id) OVER (ORDER BY payload) FROM events",
+        "SELECT payload FROM events WHERE payload ~ 'a'",
+        "SELECT payload FROM events WHERE payload ~~ '%a%'",
+        "SELECT payload FROM events UNION ALL SELECT payload FROM users",
+        "SELECT CASE WHEN id = 1 THEN payload ELSE '{}' END FROM events",
+    ] {
+        assert!(
+            matches!(
+                engine.exec_datafusion(None, sql),
+                Err(EngineError::Unsupported(_))
+            ),
+            "JSONB operation must be rejected through aliases and composed expressions: {sql}"
+        );
+    }
+    for sql in [
+        "SELECT e.payload FROM events e WHERE e.payload IS NOT NULL",
+        "SELECT t.payload FROM (SELECT payload FROM events) t",
+        "WITH x AS (SELECT payload FROM events) SELECT payload FROM x",
+    ] {
+        assert_eq!(
+            rows(engine.exec_datafusion(None, sql).unwrap()),
+            vec![vec![Some(Datum::Jsonb(json.clone()))]],
+            "plain JSONB projection must survive aliases and CTEs: {sql}"
+        );
+    }
+}
+
+#[cfg(feature = "datafusion")]
+#[test]
 fn in_flight_and_aborted_rows_follow_snapshot_visibility() {
     let tmp = TempDir::new().unwrap();
     let engine = open(tmp.path());

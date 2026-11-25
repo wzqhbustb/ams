@@ -5,8 +5,12 @@
 //! Arrow batches back to engine values. SnapshotGuards live in the provider
 //! and execution plan until DataFusion drops the resulting stream.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+
+const JSONB_FIELD_METADATA_KEY: &str = "pg_rust.column_type";
+const JSONB_FIELD_METADATA_VALUE: &str = "jsonb";
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -55,6 +59,47 @@ pub(crate) async fn execute_datafusion(
     sql: &str,
 ) -> Result<QueryResult> {
     let statement = crate::sql::parse(sql).ok();
+    if let Some(crate::sql::Statement::Select {
+        table,
+        order_by: Some(crate::sql::OrderByKind::Column(order_by)),
+        ..
+    }) = &statement
+    {
+        let entry = engine.describe_table(table).ok_or_else(|| {
+            EngineError::InvalidPredicate(format!("table {table:?} does not exist"))
+        })?;
+        if entry.columns.iter().any(|column| {
+            column.name.eq_ignore_ascii_case(&order_by.column)
+                && column.col_type == ColumnType::Jsonb
+        }) {
+            return Err(EngineError::Unsupported(format!(
+                "ORDER BY JSONB column {:?} is not supported",
+                order_by.column
+            )));
+        }
+    }
+    if let Some(crate::sql::Statement::Select {
+        table,
+        filter,
+        extra_filter,
+        ..
+    }) = &statement
+    {
+        let entry = engine.describe_table(table).ok_or_else(|| {
+            EngineError::InvalidPredicate(format!("table {table:?} does not exist"))
+        })?;
+        for filter in [filter, extra_filter].into_iter().flatten() {
+            if entry.columns.iter().any(|column| {
+                column.name.eq_ignore_ascii_case(&filter.column)
+                    && column.col_type == ColumnType::Jsonb
+            }) {
+                return Err(EngineError::Unsupported(format!(
+                    "JSONB predicate on column {:?} is not supported",
+                    filter.column
+                )));
+            }
+        }
+    }
     let (columns, order_by, lock) = match statement {
         Some(crate::sql::Statement::Select {
             columns,
@@ -128,6 +173,7 @@ pub(crate) async fn execute_datafusion(
         .await
         .map_err(engine_error)?;
     SQLOptions::new().verify_plan(&plan).map_err(engine_error)?;
+    reject_jsonb_operations(&plan).map_err(|error| EngineError::Unsupported(error.to_string()))?;
     let plan = rewrite_uuid_string_predicates(plan).map_err(engine_error)?;
     let frame = context
         .execute_logical_plan(plan)
@@ -139,6 +185,117 @@ pub(crate) async fn execute_datafusion(
     // query owner before any subsequent vacuum can run.
     drop(context);
     batches_to_query_result(&batches, &result_schema)
+}
+
+fn reject_jsonb_operations(plan: &LogicalPlan) -> datafusion::common::Result<()> {
+    plan.clone()
+        .transform_up_with_subqueries(|plan| {
+            let schema = expression_schema(&plan);
+            if matches!(plan, LogicalPlan::Distinct(_) | LogicalPlan::Union(_))
+                && (schema_has_jsonb(&schema) || schema_has_jsonb(plan.schema()))
+            {
+                return Err(DataFusionError::Plan(
+                    "JSONB set operations are not supported".to_string(),
+                ));
+            }
+            if let LogicalPlan::Projection(projection) = &plan {
+                for expr in &projection.expr {
+                    validate_jsonb_projection(expr, &schema)?;
+                }
+                return Ok(Transformed::no(plan));
+            }
+            if let LogicalPlan::Join(join) = &plan {
+                for (left, right) in &join.on {
+                    validate_jsonb_expression(left, &schema)?;
+                    validate_jsonb_expression(right, &schema)?;
+                }
+            }
+            if let LogicalPlan::Sort(sort) = &plan {
+                for sort_expr in &sort.expr {
+                    validate_jsonb_expression(&sort_expr.expr, &schema)?;
+                }
+            }
+            if let LogicalPlan::Aggregate(aggregate) = &plan {
+                for expr in aggregate.group_expr.iter().chain(&aggregate.aggr_expr) {
+                    validate_jsonb_expression(expr, &schema)?;
+                }
+            }
+            plan.map_expressions(|expr| {
+                validate_jsonb_expression(&expr, &schema)?;
+                Ok(Transformed::no(expr))
+            })
+        })
+        .map(|_| ())
+}
+
+// JSONB is transported as Utf8, so any operation other than returning a column
+// unchanged or testing it for NULL would silently acquire TEXT semantics.
+fn validate_jsonb_projection(expr: &Expr, schema: &DFSchema) -> datafusion::common::Result<()> {
+    match expr {
+        Expr::Column(column) if is_jsonb_column(column, schema) => Ok(()),
+        Expr::Alias(alias) => validate_jsonb_projection(&alias.expr, schema),
+        _ => validate_jsonb_expression(expr, schema),
+    }
+}
+
+fn validate_jsonb_expression(expr: &Expr, schema: &DFSchema) -> datafusion::common::Result<()> {
+    if let Expr::Column(column) = expr {
+        if is_jsonb_column(column, schema) {
+            return Err(DataFusionError::Plan(
+                "JSONB operation is not supported".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    if let Expr::IsNull(inner) | Expr::IsNotNull(inner) = expr {
+        if let Expr::Column(column) = &**inner {
+            if is_jsonb_column(column, schema) {
+                return Ok(());
+            }
+        }
+    }
+    if let Expr::WindowFunction(function) = expr {
+        for expr in &function.params.partition_by {
+            validate_jsonb_expression(expr, schema)?;
+        }
+        for sort_expr in &function.params.order_by {
+            validate_jsonb_expression(&sort_expr.expr, schema)?;
+        }
+    }
+    expr.clone()
+        .map_children(|child| {
+            validate_jsonb_expression(&child, schema)?;
+            Ok(Transformed::no(child))
+        })
+        .map(|_| ())
+}
+
+fn expression_schema(plan: &LogicalPlan) -> DFSchema {
+    let schema = merge_schema(&plan.inputs());
+    if schema.fields().is_empty() {
+        plan.schema().as_ref().clone()
+    } else {
+        schema
+    }
+}
+
+fn is_jsonb_column(column: &datafusion::common::Column, schema: &DFSchema) -> bool {
+    schema
+        .index_of_column(column)
+        .map(|index| is_jsonb_field(schema.field(index)))
+        .unwrap_or(false)
+}
+
+fn schema_has_jsonb(schema: &DFSchema) -> bool {
+    schema.fields().iter().any(|field| is_jsonb_field(field))
+}
+
+fn is_jsonb_field(field: &Field) -> bool {
+    field
+        .metadata()
+        .get(JSONB_FIELD_METADATA_KEY)
+        .map(String::as_str)
+        == Some(JSONB_FIELD_METADATA_VALUE)
 }
 
 fn rewrite_uuid_string_predicates(plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
@@ -285,7 +442,7 @@ impl TableProvider for PgTableProvider {
         Ok(filters
             .iter()
             .map(|expr| {
-                if df_filter(expr).is_some() {
+                if df_filter(expr, &self.entry).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -301,7 +458,10 @@ impl TableProvider for PgTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        let filters = filters.iter().filter_map(df_filter).collect::<Vec<_>>();
+        let filters = filters
+            .iter()
+            .filter_map(|expr| df_filter(expr, &self.entry))
+            .collect::<Vec<_>>();
         Ok(Arc::new(PgExecutionPlan::new(
             Arc::clone(&self.engine),
             self.table.clone(),
@@ -498,11 +658,22 @@ fn arrow_field(column: &crate::engine::ColumnDef) -> Option<Field> {
         ColumnType::Uuid => DataType::FixedSizeBinary(16),
         ColumnType::Text => DataType::Utf8,
         ColumnType::Bytea => DataType::Binary,
+        // Utf8 is only the Arrow transport. Field metadata preserves JSONB's
+        // engine type so result decoding cannot silently turn it into TEXT.
+        ColumnType::Jsonb => DataType::Utf8,
         ColumnType::Vector(_) => {
             DataType::List(Arc::new(Field::new("item", DataType::Float32, true)))
         }
     };
-    Some(Field::new(&column.name, data_type, true))
+    let field = Field::new(&column.name, data_type, true);
+    Some(if column.col_type == ColumnType::Jsonb {
+        field.with_metadata(HashMap::from([(
+            JSONB_FIELD_METADATA_KEY.to_string(),
+            JSONB_FIELD_METADATA_VALUE.to_string(),
+        )]))
+    } else {
+        field
+    })
 }
 
 fn projected_schema(entry: &TableEntry, projection: Option<&[usize]>) -> SchemaRef {
@@ -637,6 +808,24 @@ fn arrow_column(
                 })
                 .collect::<datafusion::common::Result<Vec<_>>>()?,
         ))),
+        ColumnType::Jsonb => Ok(Arc::new(StringArray::from(
+            rows.iter()
+                .map(|(_, values)| {
+                    values
+                        .get(index)
+                        .ok_or_else(|| df_error(format!("row has no column {index}")))?
+                        .as_ref()
+                        .map(|datum| match datum {
+                            // Heap decode already validated this JSONB. Avoid
+                            // parsing it a second time on the Arrow scan path;
+                            // `array_to_value` validates again at the result boundary.
+                            Datum::Jsonb(value) => Ok(value.clone()),
+                            other => Err(df_error(format!("expected JSONB, got {other:?}"))),
+                        })
+                        .transpose()
+                })
+                .collect::<datafusion::common::Result<Vec<_>>>()?,
+        ))),
         ColumnType::Vector(_) => {
             let lists = rows
                 .iter()
@@ -676,7 +865,7 @@ fn batches_to_query_result(batches: &[RecordBatch], schema: &SchemaRef) -> Resul
         for row in 0..batch.num_rows() {
             let mut values = Vec::with_capacity(batch.num_columns());
             for (index, array) in batch.columns().iter().enumerate() {
-                let col_type = arrow_column_type(fields[index].data_type())?;
+                let col_type = arrow_column_type(&fields[index])?;
                 values.push(array_to_value(array, row, col_type)?);
             }
             rows.push(values);
@@ -685,8 +874,21 @@ fn batches_to_query_result(batches: &[RecordBatch], schema: &SchemaRef) -> Resul
     Ok(QueryResult::Rows { columns, rows })
 }
 
-fn arrow_column_type(data_type: &DataType) -> Result<ColumnType> {
-    match data_type {
+fn arrow_column_type(field: &Field) -> Result<ColumnType> {
+    if field
+        .metadata()
+        .get(JSONB_FIELD_METADATA_KEY)
+        .map(String::as_str)
+        == Some(JSONB_FIELD_METADATA_VALUE)
+    {
+        if field.data_type() != &DataType::Utf8 {
+            return Err(EngineError::Unsupported(
+                "JSONB Arrow field must use Utf8 transport".to_string(),
+            ));
+        }
+        return Ok(ColumnType::Jsonb);
+    }
+    match field.data_type() {
         DataType::Int32 => Ok(ColumnType::Int4),
         DataType::Int64 => Ok(ColumnType::Int8),
         DataType::Float64 => Ok(ColumnType::Float8),
@@ -745,6 +947,18 @@ fn array_to_value(array: &ArrayRef, row: usize, col_type: ColumnType) -> Result<
                 })?;
             Ok(Some(Datum::Text(array.value(row).to_string())))
         }
+        ColumnType::Jsonb => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    EngineError::Corrupted("Arrow JSONB Utf8 array downcast failed".to_string())
+                })?;
+            let value = array.value(row).to_string();
+            serde_json::from_str::<serde_json::Value>(&value)
+                .map_err(|error| EngineError::Corrupted(format!("invalid Arrow JSONB: {error}")))?;
+            Ok(Some(Datum::Jsonb(value)))
+        }
         ColumnType::Uuid => {
             let array = array
                 .as_any()
@@ -783,7 +997,7 @@ fn array_to_value(array: &ArrayRef, row: usize, col_type: ColumnType) -> Result<
     }
 }
 
-fn df_filter(expr: &Expr) -> Option<SqlFilter> {
+fn df_filter(expr: &Expr, entry: &TableEntry) -> Option<SqlFilter> {
     let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
         return None;
     };
@@ -792,6 +1006,13 @@ fn df_filter(expr: &Expr) -> Option<SqlFilter> {
         (Expr::Literal(scalar, _), Expr::Column(column)) => (column, scalar, true),
         _ => return None,
     };
+    if entry.columns.iter().any(|candidate| {
+        candidate.name.eq_ignore_ascii_case(&column.name) && candidate.col_type == ColumnType::Jsonb
+    }) {
+        // JSONB has no comparison or JSON-specific predicate pushdown in this
+        // release. Utf8 is only the Arrow transport, never a TEXT coercion.
+        return None;
+    }
     let op = match (op, reversed) {
         (Operator::Eq, _) => CmpOp::Eq,
         (Operator::Lt, false) => CmpOp::Lt,
@@ -831,6 +1052,7 @@ mod tests {
             (ColumnType::Uuid, "UUID"),
             (ColumnType::Text, "TEXT"),
             (ColumnType::Bytea, "BYTEA"),
+            (ColumnType::Jsonb, "JSONB"),
             (ColumnType::Vector(2), "VECTOR"),
         ];
         for (col_type, expected) in cases {
@@ -864,5 +1086,84 @@ mod tests {
                 other => panic!("expected Execution error for {expected}: {other}"),
             }
         }
+    }
+
+    #[test]
+    fn jsonb_predicates_are_not_exact_pushdowns() {
+        let entry = TableEntry {
+            oid: pg_storage::types::Oid::INVALID,
+            first_page: pg_storage::types::PageId::INVALID,
+            columns: vec![
+                crate::engine::ColumnDef {
+                    name: "payload".to_string(),
+                    col_type: ColumnType::Jsonb,
+                },
+                crate::engine::ColumnDef {
+                    name: "content".to_string(),
+                    col_type: ColumnType::Text,
+                },
+            ],
+            defaults: vec![None, None],
+            toast: None,
+        };
+        let predicate = |column| {
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(datafusion::common::Column::new_unqualified(
+                    column,
+                ))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("{}".to_string())),
+                    None,
+                )),
+            })
+        };
+        assert!(df_filter(&predicate("payload"), &entry).is_none());
+        assert!(df_filter(&predicate("content"), &entry).is_some());
+    }
+
+    #[test]
+    fn native_jsonb_comparisons_are_rejected_from_field_metadata() {
+        let schema = DFSchema::try_from_qualified_schema(
+            "events",
+            &Schema::new(vec![
+                Field::new("payload", DataType::Utf8, true).with_metadata(HashMap::from([(
+                    JSONB_FIELD_METADATA_KEY.to_string(),
+                    JSONB_FIELD_METADATA_VALUE.to_string(),
+                )])),
+                Field::new("content", DataType::Utf8, true),
+            ]),
+        )
+        .unwrap();
+        let column = |name| Expr::Column(datafusion::common::Column::new(Some("events"), name));
+        let predicate = |name| {
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(column(name)),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("{}".to_string())),
+                    None,
+                )),
+            })
+        };
+        assert!(validate_jsonb_expression(&predicate("payload"), &schema).is_err());
+        assert!(validate_jsonb_expression(&predicate("content"), &schema).is_ok());
+        assert!(validate_jsonb_projection(&column("payload"), &schema).is_ok());
+        assert!(
+            validate_jsonb_expression(&Expr::IsNotNull(Box::new(column("payload"))), &schema)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn non_utf8_jsonb_arrow_shape_is_unsupported_not_corruption() {
+        let field = Field::new("payload", DataType::Int32, true).with_metadata(HashMap::from([(
+            JSONB_FIELD_METADATA_KEY.to_string(),
+            JSONB_FIELD_METADATA_VALUE.to_string(),
+        )]));
+        assert!(matches!(
+            arrow_column_type(&field),
+            Err(EngineError::Unsupported(_))
+        ));
     }
 }

@@ -47,6 +47,16 @@ pub fn ensure_data_dir(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Return the temporary path used by [`write_atomic`] for `path`.
+///
+/// Cleanup code must use this helper instead of reconstructing the suffix so
+/// crash leftovers stay recognizable if the atomic-write convention changes.
+pub fn atomic_temp_path(path: &Path) -> PathBuf {
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".pg_rust_tmp");
+    PathBuf::from(tmp_name)
+}
+
 /// Atomically write `contents` to `path`.
 ///
 /// The implementation writes to a temporary file in the same directory,
@@ -60,10 +70,7 @@ pub fn ensure_data_dir(data_dir: &Path) -> Result<()> {
 /// concurrent caller. Do not use this helper for multi-writer paths without
 /// adding a unique temp suffix.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    // Use a suffix that is unlikely to collide with real user files.
-    let mut tmp_name = path.as_os_str().to_os_string();
-    tmp_name.push(".pg_rust_tmp");
-    let tmp = PathBuf::from(tmp_name);
+    let tmp = atomic_temp_path(path);
 
     // Ensure the parent directory exists. The caller is still responsible for
     // fsyncing higher-level directory state if needed.

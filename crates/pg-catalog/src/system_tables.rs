@@ -51,6 +51,8 @@ pub const BTREE_AM_OID: Oid = Oid(403);
 pub const HNSW_AM_OID: Oid = Oid(9878);
 /// `pg_am` OID of the inverted access method (Phase 3).
 pub const INVERTED_AM_OID: Oid = Oid(9879);
+/// `pg_am` OID of the graph access method (Phase 5b-1).
+pub const GRAPH_AM_OID: Oid = Oid(9880);
 
 /// `pg_class.relkind` for an ordinary table.
 pub const RELKIND_TABLE: &str = "r";

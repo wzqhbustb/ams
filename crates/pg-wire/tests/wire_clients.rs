@@ -285,7 +285,7 @@ fn rust_postgres_all_types_text_roundtrip() {
         engine
             .exec(
                 None,
-                "CREATE TABLE t (i4 INT, i8 BIGINT, s TEXT, ts TIMESTAMPTZ, u UUID, b BYTEA)",
+                "CREATE TABLE t (i4 INT, i8 BIGINT, s TEXT, ts TIMESTAMPTZ, u UUID, b BYTEA, j JSONB)",
             )
             .unwrap();
         engine
@@ -300,6 +300,9 @@ fn rust_postgres_all_types_text_roundtrip() {
                         uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
                     )),
                     Some(Datum::Bytea(vec![0x00, 0xff, 0x10])),
+                    Some(Datum::Jsonb(
+                        "{ \"z\": 1, \"a\": [true, null] }".to_string(),
+                    )),
                 ],
             )
             .unwrap();
@@ -317,6 +320,7 @@ fn rust_postgres_all_types_text_roundtrip() {
                 Some("1700000000123456".to_string()),
                 Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
                 Some("\\x00ff10".to_string()),
+                Some("{ \"z\": 1, \"a\": [true, null] }".to_string()),
             ]]
         );
     });

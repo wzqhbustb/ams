@@ -237,6 +237,8 @@ pub enum ColumnType {
     Text,
     /// Variable-length binary.
     Bytea,
+    /// Variable-length, validated JSON text retained without normalization.
+    Jsonb,
     /// Fixed-width vector of `f32` (M6 Stage 0): `dim × 4` bytes inline,
     /// little-endian per component. `dim` is part of the type identity —
     /// two `Vector` columns with different dims are different types, which
@@ -264,7 +266,7 @@ impl ColumnType {
             ColumnType::Int4 => Some(4),
             ColumnType::Int8 | ColumnType::Float8 | ColumnType::Timestamptz => Some(8),
             ColumnType::Uuid => Some(16),
-            ColumnType::Text | ColumnType::Bytea => None,
+            ColumnType::Text | ColumnType::Bytea | ColumnType::Jsonb => None,
             ColumnType::Vector(dim) => Some(dim as usize * 4),
         }
     }
@@ -297,6 +299,8 @@ pub enum Datum {
     Text(String),
     /// Variable-length binary.
     Bytea(Vec<u8>),
+    /// Validated JSON text retained exactly as supplied.
+    Jsonb(String),
     /// Fixed-width `f32` vector (M6 Stage 0); the length must equal the
     /// column's `ColumnType::Vector(dim)` — enforced by the encode-side
     /// datum/column match.
@@ -321,6 +325,7 @@ impl PartialEq for Datum {
             (Datum::Uuid(a), Datum::Uuid(b)) => a == b,
             (Datum::Text(a), Datum::Text(b)) => a == b,
             (Datum::Bytea(a), Datum::Bytea(b)) => a == b,
+            (Datum::Jsonb(a), Datum::Jsonb(b)) => a == b,
             (Datum::Vector(a), Datum::Vector(b)) => a == b,
             (Datum::External(a), Datum::External(b)) => a == b,
             _ => false,
@@ -345,6 +350,7 @@ impl PartialOrd for Datum {
             (Datum::Uuid(a), Datum::Uuid(b)) => Some(a.cmp(b)),
             (Datum::Text(a), Datum::Text(b)) => Some(a.cmp(b)),
             (Datum::Bytea(a), Datum::Bytea(b)) => Some(a.cmp(b)),
+            (Datum::Jsonb(a), Datum::Jsonb(b)) => Some(a.cmp(b)),
             // Cross-type comparisons return None: never triggered when
             // comparing values of ONE column (they share a variant by
             // construction); the engine's ORDER BY falls back to `Equal`
@@ -367,9 +373,10 @@ impl Datum {
             Datum::Uuid(_) => ColumnType::Uuid,
             Datum::Text(_) => ColumnType::Text,
             Datum::Bytea(_) => ColumnType::Bytea,
+            Datum::Jsonb(_) => ColumnType::Jsonb,
             Datum::Vector(v) => ColumnType::Vector(v.len() as u32),
             // An external pointer stands in for a TOASTable column; the schema
-            // (Text, Bytea, or Vector) decides how detoasted bytes are read.
+            // (Text, Bytea, Jsonb, or Vector) decides how detoasted bytes are read.
             Datum::External(_) => ColumnType::Bytea,
         }
     }
@@ -530,6 +537,12 @@ fn encode_tuple_impl(
             Datum::Uuid(v) => out.extend_from_slice(v.as_bytes()),
             Datum::Text(s) => write_inline_varlena(&mut out, s.as_bytes())?,
             Datum::Bytea(b) => write_inline_varlena(&mut out, b)?,
+            Datum::Jsonb(s) => {
+                serde_json::from_str::<serde_json::Value>(s).map_err(|error| {
+                    HeapError::InvalidArgument(format!("invalid JSONB: {error}"))
+                })?;
+                write_inline_varlena(&mut out, s.as_bytes())?;
+            }
             Datum::Vector(v) => {
                 // Bit-exact little-endian per component; the length was
                 // pinned to the column dim by the match above.
@@ -664,7 +677,7 @@ pub fn decode_tuple(
                             }
                             Datum::Vector(v)
                         }
-                        ColumnType::Text | ColumnType::Bytea => unreachable!(),
+                        ColumnType::Text | ColumnType::Bytea | ColumnType::Jsonb => unreachable!(),
                     }
                 }
             }
@@ -690,6 +703,15 @@ pub fn decode_tuple(
                             })?)
                         }
                         ColumnType::Bytea => Datum::Bytea(payload.to_vec()),
+                        ColumnType::Jsonb => {
+                            let value = String::from_utf8(payload.to_vec()).map_err(|_| {
+                                HeapError::Corrupted("JSONB column is not valid UTF-8".to_string())
+                            })?;
+                            serde_json::from_str::<serde_json::Value>(&value).map_err(|error| {
+                                HeapError::Corrupted(format!("invalid JSONB column: {error}"))
+                            })?;
+                            Datum::Jsonb(value)
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -791,6 +813,34 @@ mod tests {
         let (header, decoded) = decode_tuple(&bytes, &columns).unwrap();
         assert_eq!(header.t_xmin, TxnId(7));
         assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn jsonb_roundtrip_preserves_text_and_rejects_invalid_json() {
+        let original = "{ \"b\": 1, \"a\": [true, null] }".to_string();
+        let columns = [ColumnType::Jsonb];
+        let values = vec![Some(Datum::Jsonb(original.clone()))];
+        let bytes = encode_tuple(sample_header(), &columns, &values).unwrap();
+        let (_, decoded) = decode_tuple(&bytes, &columns).unwrap();
+        assert_eq!(decoded, values);
+        assert_eq!(decoded[0], Some(Datum::Jsonb(original)));
+
+        assert!(encode_tuple(
+            sample_header(),
+            &columns,
+            &[Some(Datum::Jsonb("not json".to_string()))],
+        )
+        .is_err());
+        let invalid = encode_tuple(
+            sample_header(),
+            &[ColumnType::Text],
+            &[Some(Datum::Text("not json".to_string()))],
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_tuple(&invalid, &columns),
+            Err(HeapError::Corrupted(_))
+        ));
     }
 
     #[test]

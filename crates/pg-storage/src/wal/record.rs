@@ -8,6 +8,7 @@ use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
+use crate::gc::GcOperationId;
 use crate::types::{align_up, Lsn, Oid, PageId, Tid, TxnId};
 
 /// Size of the fixed record header in bytes.
@@ -69,6 +70,11 @@ pub enum WalRecordType {
     BTreeSplitCopy = 51,
     /// B+Tree split commit (M2 logic; value reserved).
     BTreeSplitCommit = 52,
+
+    /// B+Tree parent separator/downlink cleanup (Phase 5b-1). Kept separate
+    /// from heap-only `HeapCleanup` so redo and DPT classification cannot mix
+    /// the two page formats. Redo lands in Stage D.
+    BTreePageCleanup = 60,
 
     /// Logical HNSW operation (Phase 2+).
     LogicalHnsw = 100,
@@ -150,6 +156,7 @@ impl WalRecordType {
             50 => Ok(WalRecordType::BTreeSplitCLR),
             51 => Ok(WalRecordType::BTreeSplitCopy),
             52 => Ok(WalRecordType::BTreeSplitCommit),
+            60 => Ok(WalRecordType::BTreePageCleanup),
             100 => Ok(WalRecordType::LogicalHnsw),
             101 => Ok(WalRecordType::LogicalInverted),
             102 => Ok(WalRecordType::LogicalGraph),
@@ -183,6 +190,202 @@ pub struct PageAllocRecord {
 pub struct PageFreeRecord {
     /// The page that was freed.
     pub page_id: PageId,
+}
+
+/// Version tag embedded in the V2 page-free payload. `PageFree = 41` keeps its
+/// discriminant; old fixed-width `PageFreeRecord` values remain readable.
+/// Versions must stay below 128: legacy multi-byte varints always have the
+/// continuation bit set, so a V2 leading `version = 2` cannot collide with them.
+pub const PAGE_FREE_V2_VERSION: u16 = 2;
+
+/// Payload for generation-checked, idempotent page reclamation (Phase 5b-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageFreeV2Record {
+    /// Payload version; exactly [`PAGE_FREE_V2_VERSION`].
+    pub version: u16,
+    /// Relation that owned the page at collection time.
+    pub relation_oid: Oid,
+    /// Page being returned to the allocator.
+    pub page_id: PageId,
+    /// Predecessor/left sibling verified before release.
+    pub prev_page_id: PageId,
+    /// Successor/right sibling verified before release.
+    pub next_page_id: PageId,
+    /// Relation generation when collection began.
+    pub base_generation: u64,
+    /// Relation generation after unlink; equals base when no unlink occurred.
+    pub post_unlink_generation: u64,
+    /// Derived `(relation_oid,base_generation,page_id)` idempotency key.
+    pub operation_id: GcOperationId,
+}
+
+impl PageFreeV2Record {
+    /// Validate version, operation identity, and the two-generation protocol.
+    pub fn validate(&self) -> Result<()> {
+        if self.version != PAGE_FREE_V2_VERSION {
+            return Err(StorageError::Serialize(format!(
+                "PageFreeV2 version {} is not {PAGE_FREE_V2_VERSION}",
+                self.version
+            )));
+        }
+        if self.relation_oid != self.operation_id.relation_oid
+            || self.page_id != self.operation_id.page_id
+        {
+            return Err(StorageError::Serialize(
+                "PageFreeV2 operation_id does not match relation/page".to_string(),
+            ));
+        }
+        validate_gc_operation(
+            &self.operation_id,
+            self.base_generation,
+            self.post_unlink_generation,
+        )
+    }
+
+    /// Encode the frozen payload after validation.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        bincode::serde::encode_to_vec(self, bincode_config())
+            .map_err(|error| StorageError::Serialize(error.to_string()))
+    }
+
+    /// Decode with a bounded reader and exact-consumption check.
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let (record, consumed) = bincode::serde::decode_from_slice::<Self, _>(
+            payload,
+            bincode_config().with_limit::<{ crate::types::PAGE_SIZE }>(),
+        )
+        .map_err(|error| StorageError::Serialize(error.to_string()))?;
+        if consumed != payload.len() {
+            return Err(StorageError::Serialize(format!(
+                "PageFreeV2 has {} trailing bytes",
+                payload.len() - consumed
+            )));
+        }
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+/// Payload for `BTreePageCleanup = 60`: a durable parent separator/downlink
+/// update, never a heap-page cleanup. `operation_id.page_id` is the old child
+/// being unlinked; `parent_slot` identifies the exact parent entry to replace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BTreePageCleanupRecord {
+    /// B+Tree parent page modified by this record.
+    pub parent_page_id: PageId,
+    /// Slot of the parent entry being updated or removed.
+    pub parent_slot: u16,
+    /// New separator bytes. Empty is a valid leftmost separator.
+    pub new_separator_key: Vec<u8>,
+    /// New child for the downlink. `PageId::INVALID` removes the entry and is
+    /// the only shape allowed to have no replacement child.
+    pub new_child_page_id: PageId,
+    /// Left sibling whose `next_page` pointer is relinked during unlink.
+    pub sibling_page_id: PageId,
+    /// Relation generation before the empty-leaf unlink.
+    pub base_generation: u64,
+    /// Relation generation after unlink.
+    pub post_unlink_generation: u64,
+    /// Idempotency key shared with the subsequent `PageFreeV2` operation.
+    pub operation_id: GcOperationId,
+}
+
+impl BTreePageCleanupRecord {
+    /// Validate key size, parent identity, operation generations, and the
+    /// replacement-child shape.
+    pub fn validate(&self) -> Result<()> {
+        if self.parent_page_id == PageId::INVALID {
+            return Err(StorageError::Serialize(
+                "BTreePageCleanup parent_page_id must be valid".to_string(),
+            ));
+        }
+        if self.new_separator_key.len() > MAX_CLR_SEPARATOR_KEY_BYTES {
+            return Err(StorageError::Serialize(format!(
+                "BTreePageCleanup separator is {} bytes, maximum {MAX_CLR_SEPARATOR_KEY_BYTES}",
+                self.new_separator_key.len()
+            )));
+        }
+        if self.new_child_page_id == PageId::INVALID && !self.new_separator_key.is_empty() {
+            return Err(StorageError::Serialize(
+                "BTreePageCleanup downlink removal must not carry a new separator".to_string(),
+            ));
+        }
+        if self.new_child_page_id == self.operation_id.page_id {
+            return Err(StorageError::Serialize(
+                "BTreePageCleanup replacement child must differ from the unlinked page".to_string(),
+            ));
+        }
+        if self.new_child_page_id == self.parent_page_id {
+            return Err(StorageError::Serialize(
+                "BTreePageCleanup replacement child cannot be the parent itself".to_string(),
+            ));
+        }
+        if self.sibling_page_id == PageId::INVALID {
+            return Err(StorageError::Serialize(
+                "BTreePageCleanup requires the sibling whose next pointer changes".to_string(),
+            ));
+        }
+        if self.sibling_page_id == self.operation_id.page_id
+            || self.sibling_page_id == self.parent_page_id
+        {
+            return Err(StorageError::Serialize(
+                "BTreePageCleanup sibling must differ from unlinked and parent pages".to_string(),
+            ));
+        }
+        validate_gc_operation(
+            &self.operation_id,
+            self.base_generation,
+            self.post_unlink_generation,
+        )
+    }
+
+    /// Encode the frozen payload after validation.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        bincode::serde::encode_to_vec(self, bincode_config())
+            .map_err(|error| StorageError::Serialize(error.to_string()))
+    }
+
+    /// Decode with bounded allocation and exact-consumption checks.
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let (record, consumed) = bincode::serde::decode_from_slice::<Self, _>(
+            payload,
+            bincode_config().with_limit::<{ crate::types::PAGE_SIZE }>(),
+        )
+        .map_err(|error| StorageError::Serialize(error.to_string()))?;
+        if consumed != payload.len() {
+            return Err(StorageError::Serialize(format!(
+                "BTreePageCleanup has {} trailing bytes",
+                payload.len() - consumed
+            )));
+        }
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+fn validate_gc_operation(
+    operation_id: &GcOperationId,
+    base_generation: u64,
+    post_unlink_generation: u64,
+) -> Result<()> {
+    if operation_id.relation_oid == Oid::INVALID || operation_id.page_id == PageId::INVALID {
+        return Err(StorageError::Serialize(
+            "GC operation_id contains an invalid relation or page".to_string(),
+        ));
+    }
+    if operation_id.base_generation != base_generation {
+        return Err(StorageError::Serialize(
+            "GC operation_id base_generation does not match payload".to_string(),
+        ));
+    }
+    if post_unlink_generation < base_generation {
+        return Err(StorageError::Serialize(
+            "GC post_unlink_generation precedes base_generation".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Payload for a `FullPageImage` record.
@@ -2554,6 +2757,104 @@ mod tests {
             BTreeSplitCLRRecord::decode(&payload).is_err(),
             "a separator key past the bound must be rejected"
         );
+    }
+
+    fn gc_operation() -> GcOperationId {
+        GcOperationId {
+            relation_oid: Oid(42),
+            base_generation: 7,
+            page_id: PageId(9),
+        }
+    }
+
+    #[test]
+    fn page_free_v2_golden_bytes_and_validation() {
+        let record = PageFreeV2Record {
+            version: PAGE_FREE_V2_VERSION,
+            relation_oid: Oid(42),
+            page_id: PageId(9),
+            prev_page_id: PageId(8),
+            next_page_id: PageId(10),
+            base_generation: 7,
+            post_unlink_generation: 8,
+            operation_id: gc_operation(),
+        };
+        let bytes = record.encode().unwrap();
+        assert_eq!(bytes, vec![2, 42, 9, 8, 10, 7, 8, 42, 7, 9]);
+        assert_eq!(PageFreeV2Record::decode(&bytes).unwrap(), record);
+
+        let mut bad_version = record;
+        bad_version.version = 1;
+        let bytes = bincode::serde::encode_to_vec(bad_version, bincode_config()).unwrap();
+        assert!(PageFreeV2Record::decode(&bytes).is_err());
+        let mut bad_operation = record;
+        bad_operation.operation_id.base_generation = 8;
+        let bytes = bincode::serde::encode_to_vec(bad_operation, bincode_config()).unwrap();
+        assert!(PageFreeV2Record::decode(&bytes).is_err());
+        let mut bad_generation = record;
+        bad_generation.post_unlink_generation = 6;
+        let bytes = bincode::serde::encode_to_vec(bad_generation, bincode_config()).unwrap();
+        assert!(PageFreeV2Record::decode(&bytes).is_err());
+        let mut trailing = record.encode().unwrap();
+        trailing.push(0);
+        assert!(PageFreeV2Record::decode(&trailing).is_err());
+    }
+
+    #[test]
+    fn btree_page_cleanup_golden_bytes_and_bounded_decode() {
+        let record = BTreePageCleanupRecord {
+            parent_page_id: PageId(5),
+            parent_slot: 0,
+            new_separator_key: vec![1, 2, 3],
+            new_child_page_id: PageId(6),
+            sibling_page_id: PageId(7),
+            base_generation: 7,
+            post_unlink_generation: 8,
+            operation_id: gc_operation(),
+        };
+        let bytes = record.encode().unwrap();
+        assert_eq!(bytes, vec![5, 0, 3, 1, 2, 3, 6, 7, 7, 8, 42, 7, 9]);
+        assert_eq!(BTreePageCleanupRecord::decode(&bytes).unwrap(), record);
+
+        let empty_separator = BTreePageCleanupRecord {
+            new_separator_key: Vec::new(),
+            ..record.clone()
+        };
+        assert!(empty_separator.encode().is_ok());
+        let removal = BTreePageCleanupRecord {
+            new_separator_key: Vec::new(),
+            new_child_page_id: PageId::INVALID,
+            ..record.clone()
+        };
+        assert!(removal.encode().is_ok());
+        let invalid_removal = BTreePageCleanupRecord {
+            new_child_page_id: PageId::INVALID,
+            ..record.clone()
+        };
+        let bytes = bincode::serde::encode_to_vec(invalid_removal, bincode_config()).unwrap();
+        assert!(BTreePageCleanupRecord::decode(&bytes).is_err());
+        let same_child = BTreePageCleanupRecord {
+            new_child_page_id: PageId(9),
+            ..record.clone()
+        };
+        let bytes = bincode::serde::encode_to_vec(same_child, bincode_config()).unwrap();
+        assert!(BTreePageCleanupRecord::decode(&bytes).is_err());
+        let missing_sibling = BTreePageCleanupRecord {
+            sibling_page_id: PageId::INVALID,
+            ..record.clone()
+        };
+        let bytes = bincode::serde::encode_to_vec(missing_sibling, bincode_config()).unwrap();
+        assert!(BTreePageCleanupRecord::decode(&bytes).is_err());
+
+        let oversized = BTreePageCleanupRecord {
+            new_separator_key: vec![0; MAX_CLR_SEPARATOR_KEY_BYTES + 1],
+            ..record.clone()
+        };
+        let bytes = bincode::serde::encode_to_vec(oversized, bincode_config()).unwrap();
+        assert!(BTreePageCleanupRecord::decode(&bytes).is_err());
+        let mut trailing = record.encode().unwrap();
+        trailing.push(0);
+        assert!(BTreePageCleanupRecord::decode(&trailing).is_err());
     }
 
     #[test]

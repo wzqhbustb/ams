@@ -52,8 +52,8 @@ use pg_storage::types::{Tid, TxnId, PAGE_SIZE};
 
 use crate::builtin_types::BUILTIN_TYPES;
 use crate::system_tables::{
-    SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, HNSW_AM_OID, INVERTED_AM_OID, LAST_SYSTEM_PAGE,
-    RELKIND_TABLE, SYSTEM_TABLES,
+    SystemTableDef, BTREE_AM_OID, GRAPH_AM_OID, HEAP_AM_OID, HNSW_AM_OID, INVERTED_AM_OID,
+    LAST_SYSTEM_PAGE, RELKIND_TABLE, SYSTEM_TABLES,
 };
 use crate::Result;
 
@@ -298,6 +298,10 @@ fn bootstrap_rows(def: &SystemTableDef) -> Vec<Vec<Option<Datum>>> {
                 Some(Datum::Int8(INVERTED_AM_OID.0 as i64)),
                 Some(Datum::Text("inverted".to_string())),
             ],
+            vec![
+                Some(Datum::Int8(GRAPH_AM_OID.0 as i64)),
+                Some(Datum::Text("graph".to_string())),
+            ],
         ],
         // pg_index / pg_rust_relpages (and any future table): schema only, no
         // bootstrap rows.
@@ -319,9 +323,9 @@ mod tests {
             bootstrap_rows(&crate::system_tables::PG_ATTRIBUTE).len(),
             6 + 7 + 3 + 2 + 5 + 4
         );
-        // Seven built-in scalar types plus the dynamically-dimensioned VECTOR.
-        assert_eq!(bootstrap_rows(&crate::system_tables::PG_TYPE).len(), 8);
-        assert_eq!(bootstrap_rows(&crate::system_tables::PG_AM).len(), 4);
+        // Eight built-in scalar types plus the dynamically-dimensioned VECTOR.
+        assert_eq!(bootstrap_rows(&crate::system_tables::PG_TYPE).len(), 9);
+        assert_eq!(bootstrap_rows(&crate::system_tables::PG_AM).len(), 5);
         assert!(bootstrap_rows(&crate::system_tables::PG_INDEX).is_empty());
         assert!(bootstrap_rows(&crate::system_tables::PG_RELPAGES).is_empty());
     }

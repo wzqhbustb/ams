@@ -140,7 +140,9 @@ use pg_am_heap::{
     heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM,
 };
 use pg_am_inverted::Analyzer as _;
-use pg_catalog::builtin_types::{column_type_of_attr, BUILTIN_TYPES, FLOAT8_OID, VECTOR_OID};
+use pg_catalog::builtin_types::{
+    column_type_of_attr, BUILTIN_TYPES, FLOAT8_OID, JSONB_OID, VECTOR_OID,
+};
 use pg_catalog::system_tables::{
     SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, HNSW_AM_OID, INVERTED_AM_OID, PG_ATTRIBUTE,
     PG_CLASS, PG_INDEX, PG_RELPAGES, RELKIND_INDEX, RELKIND_TABLE,
@@ -2676,6 +2678,7 @@ impl Engine {
         schema: &[ColumnDef],
     ) -> Result<(PageId, Option<ToastRelation>)> {
         ensure_float8_storage_supported(self.catalog.type_by_oid(FLOAT8_OID).is_some(), schema)?;
+        ensure_jsonb_storage_supported(self.catalog.type_by_oid(JSONB_OID).is_some(), schema)?;
         let first_page = self.heap.create_heap(oid)?;
         let toast = toast_oid
             .map(|rel_oid| {
@@ -6618,6 +6621,27 @@ impl Engine {
         })
     }
 
+    fn explain_graph(stmt: &Statement) -> Option<QueryResult> {
+        let (algorithm, traversal) = match stmt {
+            Statement::GraphBfs(traversal) => ("BFS", traversal),
+            Statement::GraphDfs(traversal) => ("DFS", traversal),
+            _ => return None,
+        };
+        let direction = match traversal.direction {
+            sql::GraphDirection::Out => "OUT",
+            sql::GraphDirection::In => "IN",
+            sql::GraphDirection::Both => "BOTH",
+        };
+        let plan = format!(
+            "GraphTraversal algorithm={algorithm} graph={} direction={direction} max_depth={} indexes=identity,out,in est_candidates=unknown",
+            traversal.graph, traversal.max_depth
+        );
+        Some(QueryResult::Rows {
+            columns: vec!["plan".to_string()],
+            rows: vec![vec![Some(Datum::Text(plan))]],
+        })
+    }
+
     fn exec_auto(
         &self,
         session: &mut SqlSession,
@@ -6641,6 +6665,9 @@ impl Engine {
                 self.sequence_query(session, function, &sequence)
             }
             Statement::Explain(inner) => {
+                if let Some(result) = Self::explain_graph(&inner) {
+                    return Ok(result);
+                }
                 let Statement::Select {
                     table,
                     columns,
@@ -6899,6 +6926,16 @@ impl Engine {
                 })?;
                 Ok(QueryResult::Affected(count))
             }
+            Statement::CreateGraph { .. }
+            | Statement::GraphAddNode { .. }
+            | Statement::GraphAddEdge { .. }
+            | Statement::GraphUpdateNode { .. }
+            | Statement::GraphDeleteNode { .. }
+            | Statement::GraphDeleteEdge { .. }
+            | Statement::GraphBfs(_)
+            | Statement::GraphDfs(_) => Err(EngineError::Unsupported(
+                "Graph execution is not implemented in Stage 0".to_string(),
+            )),
         }
     }
 
@@ -6933,6 +6970,9 @@ impl Engine {
                 self.sequence_query(session, function, &sequence)
             }
             Statement::Explain(inner) => {
+                if let Some(result) = Self::explain_graph(&inner) {
+                    return Ok(result);
+                }
                 let Statement::Select {
                     table,
                     columns,
@@ -7082,6 +7122,16 @@ impl Engine {
                 }
                 Ok(QueryResult::Affected(count))
             }
+            Statement::CreateGraph { .. }
+            | Statement::GraphAddNode { .. }
+            | Statement::GraphAddEdge { .. }
+            | Statement::GraphUpdateNode { .. }
+            | Statement::GraphDeleteNode { .. }
+            | Statement::GraphDeleteEdge { .. }
+            | Statement::GraphBfs(_)
+            | Statement::GraphDfs(_) => Err(EngineError::Unsupported(
+                "Graph execution is not implemented in Stage 0".to_string(),
+            )),
         }
     }
 
@@ -7107,6 +7157,12 @@ impl Engine {
             if matches!(column.col_type, ColumnType::Vector(_)) {
                 return Err(EngineError::InvalidArgument(format!(
                     "ORDER BY VECTOR column {:?} is not supported; use a distance operator instead",
+                    ob.column
+                )));
+            }
+            if column.col_type == ColumnType::Jsonb {
+                return Err(EngineError::Unsupported(format!(
+                    "ORDER BY JSONB column {:?} is not supported",
                     ob.column
                 )));
             }
@@ -7905,6 +7961,22 @@ fn ensure_float8_storage_supported(has_float8_type: bool, schema: &[ColumnDef]) 
     Ok(())
 }
 
+/// Refuse JSONB storage when a legacy catalog has no OID 114 row. Graph and
+/// ordinary JSONB columns share this gate; projected JSON text is unaffected.
+fn ensure_jsonb_storage_supported(has_jsonb_type: bool, schema: &[ColumnDef]) -> Result<()> {
+    if !has_jsonb_type
+        && schema
+            .iter()
+            .any(|column| column.col_type == ColumnType::Jsonb)
+    {
+        return Err(EngineError::Unsupported(
+            "legacy catalog has no JSONB pg_type row; JSONB column storage is unavailable in this catalog format"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Map a codec column type to its built-in `pg_type` OID and `attlen`
 /// (§5.1; the built-in set has exactly one type per codec type).
 fn type_oid_of(col_type: ColumnType) -> Result<(TypeOid, i32)> {
@@ -7948,6 +8020,12 @@ fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
         (Literal::Float(f), ColumnType::Float8) => Ok(Some(Datum::Float8(*f))),
         (Literal::Str(s), ColumnType::Text) => Ok(Some(Datum::Text(s.clone()))),
         (Literal::Str(s), ColumnType::Bytea) => Ok(Some(Datum::Bytea(s.clone().into_bytes()))),
+        (Literal::Str(s), ColumnType::Jsonb) => {
+            serde_json::from_str::<serde_json::Value>(s).map_err(|error| {
+                EngineError::InvalidArgument(format!("invalid JSONB literal: {error}"))
+            })?;
+            Ok(Some(Datum::Jsonb(s.clone())))
+        }
         // M6 Stage C: a vector literal must match the column's dim exactly
         // (encode_tuple's Vector arm re-checks, but the dim error is
         // clearer here).
@@ -8128,6 +8206,12 @@ pub(crate) fn filter_to_predicate_with_analyzer(
         },
         Literal::Str(s) => match col_type {
             ColumnType::Text => Datum::Text(s.clone()),
+            ColumnType::Jsonb => {
+                return Err(EngineError::InvalidPredicate(format!(
+                    "JSONB column {:?} does not support comparison predicates",
+                    filter.column
+                )))
+            }
             _ => {
                 return Err(EngineError::InvalidPredicate(format!(
                     "column {:?} is not text",
@@ -8291,12 +8375,45 @@ fn infer_statement_parameters(
             let entry = engine.table_entry(table)?;
             infer_filter_parameter(&entry, filter, inference)?;
         }
+        Statement::GraphAddNode {
+            node_id,
+            properties,
+            ..
+        }
+        | Statement::GraphUpdateNode {
+            node_id,
+            properties,
+            ..
+        } => {
+            inference.infer(node_id, ColumnType::Int8)?;
+            inference.infer(properties, ColumnType::Jsonb)?;
+        }
+        Statement::GraphAddEdge {
+            source_node_id,
+            target_node_id,
+            properties,
+            ..
+        } => {
+            inference.infer(source_node_id, ColumnType::Int8)?;
+            inference.infer(target_node_id, ColumnType::Int8)?;
+            inference.infer(properties, ColumnType::Jsonb)?;
+        }
+        Statement::GraphDeleteNode { node_id, .. } => {
+            inference.infer(node_id, ColumnType::Int8)?;
+        }
+        Statement::GraphDeleteEdge { edge_id, .. } => {
+            inference.infer(edge_id, ColumnType::Int8)?;
+        }
+        Statement::GraphBfs(traversal) | Statement::GraphDfs(traversal) => {
+            inference.infer(&traversal.start_node_id, ColumnType::Int8)?;
+        }
         Statement::Begin
         | Statement::Commit
         | Statement::Rollback
         | Statement::CreateTable { .. }
         | Statement::CreateIndex { .. }
         | Statement::CreateSequence { .. }
+        | Statement::CreateGraph { .. }
         | Statement::SequenceQuery { .. } => {}
     }
     Ok(())
@@ -8395,6 +8512,14 @@ fn parameter_to_literal(
         Datum::Int8(value) => (ColumnType::Int8, Literal::Int(*value)),
         Datum::Float8(value) => (ColumnType::Float8, Literal::Float(*value)),
         Datum::Text(value) => (ColumnType::Text, Literal::Str(value.clone())),
+        Datum::Jsonb(value) => {
+            serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
+                EngineError::InvalidArgument(format!(
+                    "parameter ${index} has invalid JSONB: {error}"
+                ))
+            })?;
+            (ColumnType::Jsonb, Literal::Str(value.clone()))
+        }
         Datum::Vector(value) => {
             ensure_finite_vector_components(value, &format!("parameter ${index} vector"))?;
             let dim = u32::try_from(value.len()).map_err(|_| {
@@ -8471,12 +8596,45 @@ fn replace_parameters(stmt: &mut Statement, literals: &[Literal]) -> Result<()> 
                 replace_parameter(&mut filter.value, literals)?;
             }
         }
+        Statement::GraphAddNode {
+            node_id,
+            properties,
+            ..
+        }
+        | Statement::GraphUpdateNode {
+            node_id,
+            properties,
+            ..
+        } => {
+            replace_parameter(node_id, literals)?;
+            replace_parameter(properties, literals)?;
+        }
+        Statement::GraphAddEdge {
+            source_node_id,
+            target_node_id,
+            properties,
+            ..
+        } => {
+            replace_parameter(source_node_id, literals)?;
+            replace_parameter(target_node_id, literals)?;
+            replace_parameter(properties, literals)?;
+        }
+        Statement::GraphDeleteNode { node_id, .. } => {
+            replace_parameter(node_id, literals)?;
+        }
+        Statement::GraphDeleteEdge { edge_id, .. } => {
+            replace_parameter(edge_id, literals)?;
+        }
+        Statement::GraphBfs(traversal) | Statement::GraphDfs(traversal) => {
+            replace_parameter(&mut traversal.start_node_id, literals)?;
+        }
         Statement::Begin
         | Statement::Commit
         | Statement::Rollback
         | Statement::CreateTable { .. }
         | Statement::CreateIndex { .. }
         | Statement::CreateSequence { .. }
+        | Statement::CreateGraph { .. }
         | Statement::SequenceQuery { .. } => {}
     }
     Ok(())
@@ -8535,7 +8693,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_catalog_rejects_only_float8_column_storage() {
+    fn legacy_catalog_rejects_newer_type_storage() {
         let float8 = [ColumnDef {
             name: "distance".to_string(),
             col_type: ColumnType::Float8,
@@ -8544,11 +8702,20 @@ mod tests {
         assert!(matches!(err, EngineError::Unsupported(_)));
         ensure_float8_storage_supported(true, &float8).unwrap();
 
+        let jsonb = [ColumnDef {
+            name: "payload".to_string(),
+            col_type: ColumnType::Jsonb,
+        }];
+        let err = ensure_jsonb_storage_supported(false, &jsonb).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)));
+        ensure_jsonb_storage_supported(true, &jsonb).unwrap();
+
         let ordinary = [ColumnDef {
             name: "id".to_string(),
             col_type: ColumnType::Int4,
         }];
         ensure_float8_storage_supported(false, &ordinary).unwrap();
+        ensure_jsonb_storage_supported(false, &ordinary).unwrap();
     }
 
     use tempfile::TempDir;
@@ -8992,6 +9159,51 @@ mod tests {
                 &[ColumnDef {
                     name: "distance".to_string(),
                     col_type: ColumnType::Float8,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
+        let after = engine.storage().page_allocator().lock().next_page_id();
+        assert_eq!(before, after);
+
+        let guard = engine.storage.buffer_pool().pin(def.first_page).unwrap();
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+        let mut jsonb_tid = None;
+        for slot in 0..SlottedPage::slot_count(page) as u16 {
+            let Some(bytes) = SlottedPage::tuple(page, slot).unwrap() else {
+                continue;
+            };
+            let (_, values) = decode_tuple(bytes, &columns).unwrap();
+            if matches!(values.first(), Some(Some(Datum::Int8(114)))) {
+                jsonb_tid = Some(Tid {
+                    page_id: def.first_page,
+                    slot_id: slot,
+                });
+                break;
+            }
+        }
+        drop(guard);
+        let jsonb_tid = jsonb_tid.expect("fresh catalog contains JSONB");
+        let mut guard = engine
+            .storage
+            .buffer_pool()
+            .pin_mut(jsonb_tid.page_id)
+            .unwrap();
+        let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().unwrap();
+        SlottedPage::delete_tuple(page, jsonb_tid.slot_id).unwrap();
+        drop(guard);
+        engine.checkpoint().unwrap();
+        engine.shutdown();
+
+        let engine = open(tmp.path());
+        assert!(engine.catalog.type_by_oid(JSONB_OID).is_none());
+        let before = engine.storage().page_allocator().lock().next_page_id();
+        let err = engine
+            .create_table(
+                "legacy_jsonb",
+                &[ColumnDef {
+                    name: "payload".to_string(),
+                    col_type: ColumnType::Jsonb,
                 }],
             )
             .unwrap_err();
@@ -10897,6 +11109,89 @@ mod tests {
         });
         let stats = engine.vacuum("t").unwrap();
         assert_eq!(stats.index_entries_removed, 0);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn jsonb_columns_roundtrip_through_params_and_toast() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE events (id INT4, payload JSONB)")
+            .unwrap();
+        let json = format!("{{\"text\":\"{}\",\"ok\":true}}", "x".repeat(3_000));
+        engine
+            .exec_with_params(
+                None,
+                "INSERT INTO events VALUES (1, $1)",
+                &[Some(Datum::Jsonb(json.clone()))],
+            )
+            .unwrap();
+        let result = engine
+            .exec(None, "SELECT payload FROM events WHERE id = 1")
+            .unwrap();
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected JSONB rows")
+        };
+        assert_eq!(rows, vec![vec![Some(Datum::Jsonb(json))]]);
+        assert!(engine
+            .exec(None, "INSERT INTO events VALUES (2, 'not json')")
+            .is_err());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn jsonb_order_by_is_explicitly_unsupported() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE events (id INT4, payload JSONB)")
+            .unwrap();
+        assert!(matches!(
+            engine.exec(None, "SELECT payload FROM events ORDER BY payload"),
+            Err(EngineError::Unsupported(_))
+        ));
+        let error = engine
+            .exec(None, "SELECT payload FROM events WHERE payload = '{}'")
+            .unwrap_err();
+        assert!(matches!(error, EngineError::InvalidPredicate(_)), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("JSONB column \"payload\" does not support comparison predicates"),
+            "{error}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn graph_parameters_and_explain_are_frozen_without_execution() {
+        let tmp = TempDir::new().unwrap();
+        let engine = open(tmp.path());
+        let stmt = sql::parse("GRAPH ADD NODE g $1 PROPERTIES $2").unwrap();
+        assert_eq!(
+            engine.parameter_types(&stmt).unwrap(),
+            vec![Some(ColumnType::Int8), Some(ColumnType::Jsonb)]
+        );
+        let result = engine
+            .exec(None, "EXPLAIN GRAPH BFS g 1 OUT MAX_DEPTH 3")
+            .unwrap();
+        let QueryResult::Rows { columns, rows } = result else {
+            panic!("expected Graph EXPLAIN")
+        };
+        assert_eq!(columns, vec!["plan"]);
+        let Some(Datum::Text(plan)) = &rows[0][0] else {
+            panic!("expected plan text")
+        };
+        assert!(plan.contains("algorithm=BFS"));
+        assert!(plan.contains("direction=OUT"));
+        assert!(plan.contains("max_depth=3"));
+        assert!(plan.contains("indexes=identity,out,in"));
+        assert!(plan.contains("est_candidates=unknown"));
+        assert!(matches!(
+            engine.exec(None, "GRAPH BFS g 1 OUT MAX_DEPTH 3"),
+            Err(EngineError::Unsupported(_))
+        ));
         engine.shutdown();
     }
 }

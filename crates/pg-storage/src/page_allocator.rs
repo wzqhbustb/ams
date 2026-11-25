@@ -323,11 +323,23 @@ impl PageAllocator {
                 self.apply_page_alloc(rec.page_id)
             }
             WalRecordType::PageFree => {
-                let (rec, _) = bincode::serde::decode_from_slice::<PageFreeRecord, _>(
+                if crate::wal::record::PageFreeV2Record::decode(&record.payload).is_ok() {
+                    return Err(StorageError::RecoveryRequired(
+                        "PageFreeV2 requires its Stage D generation/operation redo protocol; legacy PageFree redo must not interpret its version byte as PageId(2)"
+                            .to_string(),
+                    ));
+                }
+                let (rec, consumed) = bincode::serde::decode_from_slice::<PageFreeRecord, _>(
                     &record.payload,
                     bincode_config(),
                 )
                 .map_err(|e| StorageError::Serialize(e.to_string()))?;
+                if consumed != record.payload.len() {
+                    return Err(StorageError::Serialize(format!(
+                        "PageFree payload has {} trailing bytes",
+                        record.payload.len() - consumed
+                    )));
+                }
                 self.apply_page_free(rec.page_id);
                 Ok(())
             }
@@ -509,6 +521,43 @@ mod tests {
         .unwrap();
         allocator.replay_record(&end).unwrap();
         assert_eq!(allocator.next_page_id(), PageId(1));
+        assert!(allocator.freelist.is_empty());
+    }
+
+    #[test]
+    fn page_free_v2_never_replays_as_legacy_page_id_two() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let wal = Arc::new(WalWriter::open(tmp.path(), &cfg).unwrap());
+        let mut allocator = PageAllocator::open(tmp.path(), &cfg, wal).unwrap();
+        let payload = crate::wal::record::PageFreeV2Record {
+            version: crate::wal::record::PAGE_FREE_V2_VERSION,
+            relation_oid: crate::types::Oid(42),
+            page_id: PageId(9),
+            prev_page_id: PageId(8),
+            next_page_id: PageId(10),
+            base_generation: 7,
+            post_unlink_generation: 8,
+            operation_id: crate::gc::GcOperationId {
+                relation_oid: crate::types::Oid(42),
+                base_generation: 7,
+                page_id: PageId(9),
+            },
+        }
+        .encode()
+        .unwrap();
+        let record = WalRecord {
+            lsn: Lsn::INVALID,
+            prev_lsn: Lsn::INVALID,
+            txn_id: crate::types::TxnId::INVALID,
+            record_type: crate::wal::record::WalRecordType::PageFree,
+            flags: 0,
+            payload,
+        };
+        assert!(matches!(
+            allocator.replay_record(&record),
+            Err(StorageError::RecoveryRequired(_))
+        ));
         assert!(allocator.freelist.is_empty());
     }
 

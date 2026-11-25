@@ -1109,11 +1109,7 @@ impl SegmentStore {
             let path = entry.path();
             // Every published or orphaned artifact reserves its ID. Reusing an
             // ID after a pre-manifest crash could overwrite that orphan.
-            if let Some(id) = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.parse::<u64>().ok())
-            {
+            if let Some(id) = segment_artifact_id(&path) {
                 highest = highest.max(id);
             }
         }
@@ -1327,16 +1323,25 @@ fn remove_retired_segments(data_dir: &Path, index_oid: Oid, segment_ids: &[Segme
             postings.clone(),
             SegmentStore::doc_lengths_path(data_dir, index_oid, *segment_id),
             SegmentStore::tombstones_path(data_dir, index_oid, *segment_id),
-            postings.with_extension("tmp"),
-            postings.with_extension("spool"),
         ] {
             // The new manifest is already authoritative. Cleanup is best-effort:
             // an I/O failure may leave an invisible orphan, but must not turn a
             // committed merge into an apparent failure. The target's higher ID
             // still prevents ID reuse, so the orphan cannot affect correctness.
+            let _ = std::fs::remove_file(pg_storage::io::atomic_temp_path(&path));
+            let _ = std::fs::remove_file(path);
+        }
+        for path in [
+            postings.with_extension("tmp"),
+            postings.with_extension("spool"),
+        ] {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+fn segment_artifact_id(path: &Path) -> Option<u64> {
+    path.file_name()?.to_str()?.split('.').next()?.parse().ok()
 }
 
 /// Best-effort cleanup after a complete active generation has been validated.
@@ -1361,11 +1366,7 @@ fn remove_orphan_segments(data_dir: &Path, index_oid: Oid, manifest: &SegmentMan
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(id) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse::<u64>().ok())
-        else {
+        let Some(id) = segment_artifact_id(&path) else {
             continue;
         };
         if id < high_water.0 && !active.contains(&SegmentId(id)) {
@@ -1380,35 +1381,8 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        InvertedError::InvalidArgument(format!("{} has no parent directory", path.display()))
-    })?;
-    std::fs::create_dir_all(parent).map_err(|error| {
-        InvertedError::Storage(format!("cannot create {}: {error}", parent.display()))
-    })?;
-    let temporary = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&temporary).map_err(|error| {
-        InvertedError::Storage(format!("cannot create {}: {error}", temporary.display()))
-    })?;
-    std::io::Write::write_all(&mut file, bytes).map_err(|error| {
-        InvertedError::Storage(format!("cannot write {}: {error}", temporary.display()))
-    })?;
-    file.sync_all().map_err(|error| {
-        InvertedError::Storage(format!("cannot fsync {}: {error}", temporary.display()))
-    })?;
-    std::fs::rename(&temporary, path).map_err(|error| {
-        InvertedError::Storage(format!(
-            "cannot rename {} to {}: {error}",
-            temporary.display(),
-            path.display()
-        ))
-    })?;
-    let directory = std::fs::File::open(parent).map_err(|error| {
-        InvertedError::Storage(format!("cannot open {}: {error}", parent.display()))
-    })?;
-    directory.sync_all().map_err(|error| {
-        InvertedError::Storage(format!("cannot fsync {}: {error}", parent.display()))
-    })
+    pg_storage::io::write_atomic(path, bytes)
+        .map_err(|error| InvertedError::Storage(error.to_string()))
 }
 
 fn validate_segment_stats(meta: &SegmentMeta) -> Result<()> {
@@ -2017,7 +1991,7 @@ mod tests {
             let path = entry.unwrap().path();
             assert!(!matches!(
                 path.extension().and_then(|extension| extension.to_str()),
-                Some("tmp" | "spool")
+                Some("tmp" | "spool" | "pg_rust_tmp")
             ));
         }
     }
@@ -2025,18 +1999,28 @@ mod tests {
     #[test]
     fn reopen_cleans_only_orphans_below_active_high_water() {
         let (tmp, wal, mut store) = merge_fixture();
+        let directory = tmp.path().join("inverted/9879/segments");
+        let retired_temp = directory.join("1.postings.pg_rust_tmp");
+        std::fs::write(&retired_temp, b"retired").unwrap();
         store
             .merge(tmp.path(), &wal, pg_storage::types::TxnId(1))
             .unwrap();
-        let directory = tmp.path().join("inverted/9879/segments");
-        let old_orphan = directory.join("2.spool");
-        let high_orphan = directory.join("5.spool");
-        std::fs::write(&old_orphan, b"old").unwrap();
-        std::fs::write(&high_orphan, b"high").unwrap();
+        assert!(!retired_temp.exists());
+        let old_orphans = [
+            directory.join("2.postings.pg_rust_tmp"),
+            directory.join("2.postings.spool"),
+            directory.join("2.meta.pg_rust_tmp"),
+        ];
+        let high_orphan = directory.join("5.postings.pg_rust_tmp");
+        for path in old_orphans.iter().chain([&high_orphan]) {
+            std::fs::write(path, b"orphan").unwrap();
+        }
 
         let mut reopened =
             SegmentStore::open(tmp.path(), Oid(9879), &AnalyzerConfig::builtin()).unwrap();
-        assert!(!old_orphan.exists());
+        for path in &old_orphans {
+            assert!(!path.exists(), "orphan was not removed: {}", path.display());
+        }
         assert!(high_orphan.exists());
         reopened.insert_document(tid(4), "fresh").unwrap();
         reopened.advance_consumed(Lsn(512));

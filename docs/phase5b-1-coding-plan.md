@@ -1,7 +1,7 @@
 # Phase 5b-1 Coding Plan：Graph AM 与 multi-AM GC coordinator
 
-版本：v1.2（2026-11-24）
-依据：`docs/phase5b-1-tech-selection.md` v1.3（含 Graph side file、GraphKeyCodec、Graph 完整性、增量 GC 预算、双代际 PageFreeV2）
+版本：v1.7（2026-11-25）
+依据：`docs/phase5b-1-tech-selection.md` v1.8（含 Graph side file、GraphKeyCodec、Graph 完整性、增量 GC 预算、双代际 PageFreeV2）
 前置：Phase 1/2/3 与 Phase 4a 已完成并合入。Phase 2 的 24h 压测、CI coverage、`phase2-m6` tag 并行推进，不阻塞本计划。
 
 ---
@@ -30,17 +30,18 @@
 | 任务 | 交付物 |
 |---|---|
 | crate 注册 | 新建 `crates/pg-am-graph`，加入 workspace members；模块骨架 `error.rs`、`model.rs`、`store.rs`、`traversal.rs`、`lib.rs`。依赖只允许 `pg-storage`、`pg-txn`、`pg-am-heap`、`pg-am-btree`，禁止依赖 `pg-engine` 或 DataFusion |
+| 依赖锁定 | 生产依赖 `serde_json = "1"`（当前 lockfile 为 1.0.150），用于 JSONB 写入、解码和参数校验；同时登记于 `pg-am-heap`、`pg-engine`、`pg-wire`、`pg-am-graph` 的 Cargo.toml |
 | GraphItem | 冻结 `record_type: Int4`、`id: Int8`、`src: Int8`、`dst: Int8`、`properties: Jsonb`；`node.record_type=1`、`edge.record_type=2`，node 的 `id=src=dst`。**所有读取必须同时带 `record_type` 过滤**：节点查重/存在性用 `record_type=node AND id=node_id`，邻接与级联删除用 `record_type=edge AND (src=node_id OR dst=node_id)`，禁止把节点当成自环边 |
 | GraphEntry/目录 | 冻结 `GRAPH_AM_OID=9880` 与 **Graph side file** `graph/<oid>/metadata.bin { format_version,oid,name,directed,first_page,edge_sequence_oid }`，复用 inverted analyzer/manifest 的 version+CRC+atomic write 先例；**不新增 `pg_graphs` 系统表、不改 bootstrap**。Graph OID 与内部 heap relation OID 相同；`LogicalGraph=102` 仅保留给未来元数据，邻接 DML 继续使用 heap WAL |
 | GraphKeyCodec | 冻结三个自定义字节 key（当前 B+Tree 只支持单列 key，禁止假设 composite Datum）：`identity = record_type:u32 + id:u64`、`out = record_type:u32 + src:u64 + id:u64`、`in = record_type:u32 + dst:u64 + id:u64`，字段使用既有 sign-flipped big-endian。identity 同时服务节点查重与 edge_id 精确删除；out/in 的索引序天然是 `(neighbor_id,edge_id)`，不需要额外内存排序 |
 | Graph AM 方法契约 | `build` 初始化 GraphStore 与目录；`search` 只负责 BFS/DFS；`insert/delete/scan` 显式返回 `Unsupported`，Graph DML 只走 GraphStore API；`freshness()` 返回 `None`（同步 AM，不走 Tier 2），禁止空 Ok、空 Vec 或伪造 heap tuple |
-| JSONB | 新增 `ColumnType::Jsonb`、`Datum::Jsonb(String)`、DDL `JSONB`、文本合法性与 TOAST varlena；PG Wire 使用 OID **114** 文本结果，不实现二进制 JSONB 或 JSONPath |
+| JSONB | 新增 `ColumnType::Jsonb`、`Datum::Jsonb(String)`、DDL `JSONB`、文本合法性与 TOAST varlena；PG Wire 使用 OID **114** 文本结果，不实现二进制 JSONB 或 JSONPath。登记兼容边界：`serde_json` 默认递归/数值范围限制会拒绝部分标准合法 JSON；请求 JSONB 二进制结果时整条查询返回 `Unsupported`，不按 PostgreSQL 回退文本；缺 OID 114 的旧目录不能存储 JSONB，本阶段无迁移路径；`jsonb` 与 TEXT/VECTOR 一样保留为类型名关键字，不能作标识符 |
 | SQL AST | 冻结 `CreateGraph`、`GraphAddNode`、`GraphAddEdge`、`GraphUpdateNode`、`GraphDeleteNode`、`GraphDeleteEdge`、`GraphBfs`、`GraphDfs`；方向 `OUT/IN/BOTH`、`MAX_DEPTH 0..3`、属性 JSONB literal |
 | 遍历 AST/结果 | 内部结果 `GraphHit { source_tid: Tid, node_id: Int8, depth: Int4, path: Jsonb }`，`source_tid` 供未来 Fusion 统一回表；当前 SQL 投影仍为 `(node_id,depth,path)`，不改变 wire schema。冻结 BFS 最短路径与 DFS 前序、邻接 `(neighbor_id,edge_id)` 升序 |
 | 遍历预算 | `GraphTraversalOptions { max_results=100_000, max_visited_nodes=1_000_000, max_response_bytes=16MiB }`，只从 engine config 读取；超限统一 `Capacity` |
-| GC contract | 在 `pg-storage/src/gc.rs` 冻结 `GcRelation`、`GcRequest`、`GcPageWork`、`GcWork`、`GcStats`、`GcParticipant::collect/reclaim`；`GcPageWork` 只含当前页 `dead_tids` 与 `estimated_bytes`。`GcWork.pages` 使用 `BTreeMap<PageId,GcPageWork>`，collect 与 reclaim 共用同一去重页序，禁止重复 compact/unlink/free |
+| GC contract | 在 `pg-storage/src/gc.rs` 冻结 `GcRelation`、`GcRequest`、`GcPageWork`、`GcWork`、`GcStats`、`GcParticipant::collect/reclaim`；`GcRequest` 含 `base_generation/max_pages/max_estimated_bytes/start_after`，`GcWork` 含 `base_generation` 与 `next_page` 续游标；`GcPageWork` 只含当前页严格升序的 `dead_tids` 与 `estimated_bytes`，validate 必须拒绝乱序和重复。`GcWork.pages` 使用 `BTreeMap<PageId,GcPageWork>`，collect 与 reclaim 共用同一去重页序，禁止重复 compact/unlink/free |
 | PageFreeV2 | 冻结 `version=2`、`relation_oid`、`page_id`、`prev_page_id`、`next_page_id`、`base_generation`、`post_unlink_generation`、`operation_id`；`operation_id=(relation_oid,base_generation,page_id)` |
-| BTreePageCleanup | 冻结新判别值 **60** 与 `parent_page_id/new_separator_key/base_generation/post_unlink_generation/operation_id`；只用于 B+Tree 父 separator/downlink，不与 heap 专用 `HeapCleanup` 混用；新占号须登记原因与 golden bytes |
+| BTreePageCleanup | 冻结新判别值 **60** 与 `parent_page_id/parent_slot/new_separator_key/new_child_page_id/sibling_page_id/base_generation/post_unlink_generation/operation_id`；只用于 B+Tree 父 separator/downlink 与 sibling next 指针，不与 heap 专用 `HeapCleanup` 混用；新占号须登记原因与 golden bytes |
 | Time-range 预留 | 冻结 `created_at >= low AND created_at <= high` 的规范化与精确 SeqScan 回退；只为未来 TimeSeries 注册保留位置，不创建 `AmKind::TimeSeries` 实现。规范化归入 Stage B，必须保持 `extra_filter` 的 AND 与 NULL 语义 |
 | CI 注册 | 新 crate 加入 clippy/test/doc matrix、fmt、MSRV workspace check；`pg-am-graph` 无 loom feature，归 all-features 分支。若需要覆盖率，另建 pg-am-graph 专用 job，不能沿用 hnsw 数字 |
 | Golden tests | GraphItem codec、JSONB 合法性、Graph AST、遍历结果形状、GC contract、PageFreeV2 bytes、未知 AM、非法深度、非法 JSON、非法版本/长度/CRC |
@@ -60,13 +61,14 @@
 |---|---|
 | `CREATE GRAPH` | 在一个 DDL 事务创建内部 heap relation、identity/out/in 三个 GraphKeyCodec 索引、GraphEntry 与 edge sequence；`DIRECTED` 默认，`UNDIRECTED` 可选；锁内发布 registry/handle，失败完整回滚。**graph name 必须唯一**，重名 CREATE 返回 `IndexExists`，DROP 后允许复名 |
 | Graph registry | side file 持久化 `format_version/oid/name/directed/first_page/edge_sequence_oid`；内存 `GraphEntry` 从目录重建，禁止从 filename 猜图关系。side file 不存在按无 Graph 处理，损坏则 fail-stop；不得从 `pg_class` 猜 Graph 类型 |
+| Graph 专用索引维护 | **不得复用假设“一个索引对应一列值”的普通 `collect_index_keys` 路径**。在 GraphStore/engine 适配层从完整 GraphItem 派生 identity/out/in 三组字节键；建索引、DML、失败 loser cleanup 与 GC 共用同一维护入口。回收必须先提取死行三套键并令三个 B+Tree 删除 durable，再执行 heap compact/unlink/free；属性更新若键未变化不重写索引。补 loser 补偿及“索引清理先于堆失效”的 crash 回归 |
 | `GRAPH ADD NODE` | `AccessExclusive` 内以 `record_type=node AND id=node_id` 查重并插入 node；重复 node ID 返回 `InvalidArgument`，验证与插入不离开锁，不能把同名 edge 当成节点 |
 | `GRAPH ADD EDGE` | `AccessExclusive` 内以 `record_type=node AND id=node_id` 验证两端节点存在并分配 edge ID 插入；任何一端不存在都拒绝；edge ID 只从 sequence 获取 |
 | `GRAPH UPDATE NODE` | `RowExclusive` 更新节点属性，保持 node ID、src/dst 不变；属性更新复用 TOAST 和索引维护 |
 | `GRAPH DELETE EDGE` | `RowExclusive` 按 `edge_id` 精确删除，禁止按 src/dst 猜测删除多条边 |
 | `GRAPH DELETE NODE` | `AccessExclusive` 内以 `record_type=edge AND (src=node_id OR dst=node_id)` 枚举并级联删除关联边，再删除节点；锁内不得补插新边 |
 | DML 事务 | auto-commit 与显式事务复用现有提交/回滚/失败语义；`CREATE GRAPH` 的 registry/sequence 回滚镜像 inverted/HNSW 先例，commit failure 后可重试 |
-| 属性 | 节点与边属性支持 NULL、空对象、嵌套对象和大 JSON/TOAST；非法 JSON 响亮拒绝，不引入隐式 TEXT 转换 |
+| 属性 | 节点与边属性支持 JSON `null`、空对象 `{}`、嵌套对象和大 JSON/TOAST；非法 JSON 响亮拒绝，不引入隐式 TEXT 转换；SQL `NULL` 不是合法属性输入 |
 
 **验收**：
 - 节点/边及 identity/out/in 索引在 reopen 后一致；节点删除无 dangling edge。
@@ -87,8 +89,8 @@
 | 路径结果 | 生成 `(node_id,depth,path)`；path 包含 start 与当前节点；大属性只在结果需要时 detoast |
 | 预算与分页边界 | 实现结果数、visited、响应字节硬预算；构造 path、队列、响应前检查，超限返回 `Capacity`，不返回伪完整结果。分页 resume token 若实现，必须含 `(direction,last_depth,last_node_id)` |
 | PG Wire | Graph 查询、参数化 start ID、RowDescription：node_id INT8、depth INT4、path JSONB 文本；Simple/Extended 空结果与非空结果一致 |
-| DataFusion/Arrow | 在 `arrow_column`、`array_to_value`、`df_filter` 白名单注册 JSONB：仅以 **Utf8 作为 JSON 文本传输类型**，输入/输出仍经 JSONB 合法性校验，禁止在 engine SQL 层隐式 TEXT 转换；JSONB 专用谓词/函数下推返回 `Unsupported`，不得借 Utf8 偷换语义 |
-| QueryStats/EXPLAIN | Graph 查询进入 SQL text path 统计并新增 `ExecutionPath::GraphTraversal`；`EXPLAIN GRAPH BFS` 输出 direction/max_depth/identity/out/in 索引与估计候选数，禁止漏报或伪装成普通 SeqScan |
+| DataFusion/Arrow | 在 `arrow_column`、`array_to_value`、`df_filter` 白名单注册 JSONB：仅以 **Utf8 作为 JSON 文本传输类型**，输入/输出仍经 JSONB 合法性校验，禁止在 engine SQL 层隐式 TEXT 转换。按 plan schema 字段元数据识别 JSONB，只允许纯投影（含表别名、派生表、CTE）与 `IS [NOT] NULL`；比较、CAST、函数、排序、分组、窗口、JOIN key、DISTINCT/UNION/CASE 等一律返回 `Unsupported`，不得借 Utf8 偷换语义 |
+| QueryStats/EXPLAIN | Graph 查询进入 SQL text path 统计并新增 `ExecutionPath::GraphTraversal`；`EXPLAIN GRAPH BFS` 输出 direction/max_depth/identity/out/in 索引与估计候选数，禁止漏报或伪装成普通 SeqScan。**engine 的执行与 EXPLAIN 都必须查询 graph registry 并拒绝不存在/非 Graph 名称；wire relation 预检必须覆盖 `GraphBfs/GraphDfs` 及 EXPLAIN 包裹形态，补 `nosuchgraph` 的结构化错误回归** |
 | Time-range 规范化 | 在 Stage B 实现 `created_at BETWEEN low AND high` 到 `created_at >= low AND created_at <= high` 的改写；复用现有 extra_filter AND/NULL 语义与精确 SeqScan 回退，测试 extra_filter 语义不打架 |
 | reopen | 节点、边、属性、遍历顺序与结果在 reopen 后保持一致；未知 graph/start/深度响亮报错，空图返回空集 |
 
@@ -111,7 +113,7 @@
 | B+Tree 回收 | dead key 删除、页内 dead-space compaction；dead-entry 清理不修改父指针 |
 | Inverted | segment merge 清除 tombstone、manifest 原子替换与 durable coverage 水位；禁止按 heap posting vacuum 处理 |
 | HNSW | 复用 tombstone、redirect、dead-row channel 与 map 水位清理；不新增 HNSW→heap 依赖、不重建图、不改变 recall |
-| Graph | GraphItem 与 identity/out/in 索引走 heap+B+Tree 协议；Graph metadata 与 sequence 同步回收 |
+| Graph | 复用 Stage A 的专用派生索引维护入口，从死 GraphItem 提取 identity/out/in 三键并先令三个 B+Tree 删除 durable，再走 heap compact/unlink/free；禁止普通单列 `collect_index_keys` 路径；Graph metadata 与 sequence 同步回收 |
 | 故障与背压 | 可重试 I/O/锁等待保留工作项；元数据/链/payload/generation 矛盾返回 `Corrupted`，不得伪装成功 |
 
 **验收**：
@@ -126,8 +128,8 @@
 | 任务 | 交付物 |
 |---|---|
 | 安全合并窗口 | 空 leaf 需要修改父 separator/downlink 时进入短 `AccessExclusive`，按单页/单批限制；空 root、非空 sibling、缺失 separator 或 generation 变化时不合并 |
-| relation/page generation | DML、DROP、页链结构变化时单调递增；collect、索引清理前、物理回收前各复核一次，变化则丢弃并重新 collect |
-| 父指针 | 新增 **`BTreePageCleanup=60`** 承载 separator/downlink 更新并 durable，payload 含 `parent_page_id/new_separator_key/base_generation/post_unlink_generation/operation_id`；不得用 heap 专用 `HeapCleanup` 修改 B+Tree 父页。`PageFreeV2` 只负责最终释放，不承担父指针修改；60 为新占号，必须登记原因与 golden bytes |
+| relation/page generation | 仅在 DROP、新页入链、unlink、free 时单调递增，普通 DML 不递增；collect、索引清理前、物理回收前各复核一次，变化则丢弃并重新 collect。页复用另用独立 `page_generation` 判定，避免持续写入导致回收活锁 |
+| 父指针 | 新增 **`BTreePageCleanup=60`** 承载 separator/downlink 更新并 durable，payload 含 `parent_page_id/parent_slot/new_separator_key/new_child_page_id/sibling_page_id/base_generation/post_unlink_generation/operation_id`；不得用 heap 专用 `HeapCleanup` 修改 B+Tree 父页。`sibling_page_id` 记录左 sibling next 修改并纳入 DPT。`PageFreeV2` 只负责最终释放，不承担父指针修改；60 为新占号，必须登记原因与 golden bytes |
 | PageFreeV2 字段 | 实现 `base_generation`、`post_unlink_generation`、`operation_id`；无 unlink 时 post=base；不得用当前代际精确匹配掩盖本次操作自身推进的代际 |
 | 崩溃状态机 | 实现“未 collect / index cleanup done / compact done / unlink done / free done”逐状态恢复；已完成 operation_id 跳过，代际不符则放弃并重新 collect，metadata/CRC/链矛盾才 `Corrupted` |
 | heap 与 B+Tree 链语义 | heap prev=前驱、next=后继；B+Tree prev/next 为左右 sibling；父 downlink 在 cleanup 中先更新，free 前必须验证当前链和 generation |
@@ -230,3 +232,8 @@ CARGO_TARGET_DIR=target/msrv-phase5b cargo +1.86.0 check --workspace --all-featu
 | v1.0 | 2026-11-24 | 初稿：按技术选型 v1.1 拆出 Stage 0–F 的交付物、验收、CI、依赖锁定和两轮审查；覆盖 Graph 完整性、增量 GC、空 leaf merge、双代际 PageFreeV2、百万边与 crash 验收。 |
 | v1.1 | 2026-11-24 | 审查修复：GraphItem 全部读取增加 `record_type` 过滤，避免节点被当成自环边、同名 edge 被当成节点；Stage 0 明确 Graph AM 的 `build/search/insert/delete/scan/freshness` 契约。`GcWork.pages` 改为 `BTreeMap<PageId,GcPageWork>`，collect/reclaim 共用去重页序，禁止重复回收。内部结果增加 `source_tid` 供未来 Fusion 回表，当前 SQL 投影不变；补单节点零边与仅有 edge 的判别性回归。 |
 | v1.2 | 2026-11-24 | 外部审查修复：以 `graph/<oid>/metadata.bin` 替代 `pg_graphs` 系统表，避开 bootstrap/catalog 改动；冻结 identity/out/in 三套 GraphKeyCodec 与 edge_id 精确删除路径。新增 `BTreePageCleanup=60` 隔离 B+Tree 父 separator/downlink 与 heap cleanup。补 JSONB Arrow 映射、Time-range Stage B 归属、Graph name 唯一性、GraphTraversal EXPLAIN、p99<100ms 合并窗口、百万边度数上限与 R2 交叉登记。 |
+| v1.3 | 2026-11-24 | 深度审查修复：GC 增加预算、resume cursor 和 collect-time generation；`BTreePageCleanup` 增加 `parent_slot/new_child_page_id` 并区分空 separator 与 downlink 删除。GraphStore 创建/构建幂等化；DataFusion 显式拒绝 JSONB 比较；Graph 关键字改为语句上下文相关，恢复普通 SQL 标识符兼容性。 |
+| v1.4 | 2026-11-24 | 裁决 generation 仅在 DROP、新页入链、unlink、free 时递增，普通 DML 不递增，页复用另用 `page_generation`，避免持续写入导致 GC 活锁。`BTreePageCleanup` 增加 `sibling_page_id` 并纳入 DPT。明确方向/MAX_DEPTH 必填及 JSON `null`/`{}` 属性语义；补 Stage 0 实现修订与依赖锁定。 |
+| v1.5 | 2026-11-24 | Stage 0 复审修复：DataFusion JSONB 列判定改为按表限定，修复同名 TEXT 列被误拦并补回归；窗口 partition/order、`~`/`~~`、UNION/CASE 的 JSONB→TEXT 静默降级登记为 Stage B 遗留事项。 |
+| v1.6 | 2026-11-25 | Stage 0 复审修复：放弃表名匹配与表达式形状黑名单，改为按 plan schema 字段元数据执行“纯投影 + `IS [NOT] NULL`”白名单；覆盖表别名、派生表、CTE 且保持同名 TEXT 列兼容。窗口 partition/order、`~`/`~~`、UNION/CASE 及其他 JSONB 运算统一响亮拒绝，并补端到端回归。 |
+| v1.7 | 2026-11-25 | Stage 0 复审修复：inverted 清理识别共享 `.pg_rust_tmp` 与真实 spool 文件名；CreateGraph 纳入 wire DDL 规则；Stage B 明确 graph registry 对执行/EXPLAIN/wire 的存在性校验。登记 JSONB 递归/数值输入、二进制结果、旧目录和类型关键字边界；GcPageWork 要求 dead_tids 严格升序。Stage A 冻结 Graph 整行派生三键的独立索引维护路径及“索引删除 durable 先于堆失效”顺序。 |

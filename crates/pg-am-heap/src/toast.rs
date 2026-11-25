@@ -142,7 +142,7 @@ static TOAST_CHUNK_COLUMNS: [ColumnType; 3] =
 pub fn toastable(column: ColumnType) -> bool {
     matches!(
         column,
-        ColumnType::Text | ColumnType::Bytea | ColumnType::Vector(_)
+        ColumnType::Text | ColumnType::Bytea | ColumnType::Jsonb | ColumnType::Vector(_)
     )
 }
 
@@ -159,6 +159,10 @@ pub fn inline_size(column: ColumnType, datum: &Datum) -> Result<usize> {
             .len()
             .checked_add(4)
             .ok_or_else(|| HeapError::InvalidArgument("bytea size overflow".to_string())),
+        (ColumnType::Jsonb, Datum::Jsonb(value)) => value
+            .len()
+            .checked_add(4)
+            .ok_or_else(|| HeapError::InvalidArgument("jsonb size overflow".to_string())),
         (ColumnType::Vector(dim), Datum::Vector(value)) if value.len() == dim as usize => value
             .len()
             .checked_mul(4)
@@ -173,6 +177,11 @@ fn encode_payload(column: ColumnType, datum: &Datum) -> Result<Vec<u8>> {
     match (column, datum) {
         (ColumnType::Text, Datum::Text(value)) => Ok(value.as_bytes().to_vec()),
         (ColumnType::Bytea, Datum::Bytea(value)) => Ok(value.clone()),
+        (ColumnType::Jsonb, Datum::Jsonb(value)) => {
+            serde_json::from_str::<serde_json::Value>(value)
+                .map_err(|error| HeapError::InvalidArgument(format!("invalid JSONB: {error}")))?;
+            Ok(value.as_bytes().to_vec())
+        }
         (ColumnType::Vector(dim), Datum::Vector(value)) if value.len() == dim as usize => {
             let mut bytes = Vec::with_capacity(value.len() * 4);
             for component in value {
@@ -192,6 +201,13 @@ fn decode_payload(column: ColumnType, payload: Vec<u8>) -> Result<Datum> {
             .map(Datum::Text)
             .map_err(|_| HeapError::Corrupted("TOAST text is not valid UTF-8".to_string())),
         ColumnType::Bytea => Ok(Datum::Bytea(payload)),
+        ColumnType::Jsonb => {
+            let value = String::from_utf8(payload)
+                .map_err(|_| HeapError::Corrupted("TOAST JSONB is not valid UTF-8".to_string()))?;
+            serde_json::from_str::<serde_json::Value>(&value)
+                .map_err(|error| HeapError::Corrupted(format!("invalid TOAST JSONB: {error}")))?;
+            Ok(Datum::Jsonb(value))
+        }
         ColumnType::Vector(dim) => {
             let expected = dim as usize * 4;
             if payload.len() != expected {
@@ -550,6 +566,19 @@ mod tests {
         // Tag 10 / 11 are not the external marker.
         assert!(!is_external(0x8000_0000 | 100));
         assert!(!is_external(0xC000_0000 | 100));
+    }
+
+    #[test]
+    fn jsonb_toast_payload_preserves_and_validates_json() {
+        let text = "{ \"large\": [1, 2, 3] }".to_string();
+        let payload = encode_payload(ColumnType::Jsonb, &Datum::Jsonb(text.clone())).unwrap();
+        assert_eq!(
+            decode_payload(ColumnType::Jsonb, payload).unwrap(),
+            Datum::Jsonb(text)
+        );
+        assert!(encode_payload(ColumnType::Jsonb, &Datum::Jsonb("not json".to_string())).is_err());
+        assert!(decode_payload(ColumnType::Jsonb, b"not json".to_vec()).is_err());
+        assert!(toastable(ColumnType::Jsonb));
     }
 
     #[test]

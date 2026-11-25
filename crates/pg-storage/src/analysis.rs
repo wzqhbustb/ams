@@ -272,9 +272,30 @@ fn for_each_touched_page(record: &WalRecord, f: &mut impl FnMut(PageId)) -> Resu
     let payload = record.payload.as_slice();
     match record.record_type {
         // All of these carry `page_id` as the first payload field.
-        PageAlloc | PageFree | FullPageImage | HeapInsert | BTreeInsert | BTreeDelete => {
+        PageAlloc | FullPageImage | HeapInsert | BTreeInsert | BTreeDelete => {
             let mut off = 0;
             f(decode_prefix::<PageId>(payload, &mut off)?);
+        }
+        PageFree => {
+            // Legacy PageFree is exactly one PageId. Anything longer is the
+            // self-versioned V2 payload; exact consumption prevents a V2
+            // leading `version = 2` from being mistaken for legacy PageId(2).
+            let mut off = 0;
+            let legacy_page = decode_prefix::<PageId>(payload, &mut off)?;
+            if off == payload.len() {
+                f(legacy_page);
+            } else {
+                let record = crate::wal::record::PageFreeV2Record::decode(payload)?;
+                f(record.page_id);
+            }
+        }
+        BTreePageCleanup => {
+            // Parent separator/downlink update and the left sibling whose
+            // next pointer is relinked are both dirty. The payload is small
+            // and bounded, so validation remains inexpensive.
+            let record = crate::wal::record::BTreePageCleanupRecord::decode(payload)?;
+            f(record.parent_page_id);
+            f(record.sibling_page_id);
         }
         HeapDelete => {
             let mut off = 0;
@@ -807,6 +828,58 @@ mod tests {
                 WalRecord::heap_cleanup(PageId(20), vec![0], PageId(19), PageId(21)).unwrap(),
                 vec![PageId(20), PageId(19)],
             ),
+            (
+                WalRecord {
+                    lsn: Lsn::INVALID,
+                    prev_lsn: Lsn::INVALID,
+                    txn_id: TxnId::INVALID,
+                    record_type: WalRecordType::BTreePageCleanup,
+                    flags: 0,
+                    payload: crate::wal::record::BTreePageCleanupRecord {
+                        parent_page_id: PageId(22),
+                        parent_slot: 0,
+                        new_separator_key: vec![7],
+                        new_child_page_id: PageId(21),
+                        sibling_page_id: PageId(19),
+                        base_generation: 3,
+                        post_unlink_generation: 4,
+                        operation_id: crate::gc::GcOperationId {
+                            relation_oid: crate::types::Oid(42),
+                            base_generation: 3,
+                            page_id: PageId(20),
+                        },
+                    }
+                    .encode()
+                    .unwrap(),
+                },
+                vec![PageId(22), PageId(19)],
+            ),
+            (
+                WalRecord {
+                    lsn: Lsn::INVALID,
+                    prev_lsn: Lsn::INVALID,
+                    txn_id: TxnId::INVALID,
+                    record_type: WalRecordType::PageFree,
+                    flags: 0,
+                    payload: crate::wal::record::PageFreeV2Record {
+                        version: crate::wal::record::PAGE_FREE_V2_VERSION,
+                        relation_oid: crate::types::Oid(42),
+                        page_id: PageId(23),
+                        prev_page_id: PageId(22),
+                        next_page_id: PageId(24),
+                        base_generation: 3,
+                        post_unlink_generation: 4,
+                        operation_id: crate::gc::GcOperationId {
+                            relation_oid: crate::types::Oid(42),
+                            base_generation: 3,
+                            page_id: PageId(23),
+                        },
+                    }
+                    .encode()
+                    .unwrap(),
+                },
+                vec![PageId(23)],
+            ),
             // Phase 2 M5 Stage 0: the seven HNSW records. meta_page_id (1) is
             // validation context, never touched; only the node/meta/directory
             // page is tracked per record.
@@ -902,6 +975,7 @@ mod tests {
             BTreeSplitPrepare,
             BTreeSplitCopy,
             BTreeSplitCommit,
+            BTreePageCleanup,
             HeapHotUpdate,
             BTreeSplitCLR,
             // Phase 2 M5 Stage 0: all seven HNSW records are page-modifying

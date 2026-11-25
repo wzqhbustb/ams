@@ -354,11 +354,14 @@ fn validate_content(
     }
     for ty in crate::builtin_types::BUILTIN_TYPES {
         let Some(row) = types.iter().find(|t| t.oid == ty.oid) else {
-            // Phase 4a Stage B added FLOAT8 after M6 directories were already
-            // deployed. It is a computed-result type, so an older catalog can
-            // safely serve SQL distances without a pg_type rewrite; fresh
-            // bootstraps still register the row.
-            if ty.oid == crate::builtin_types::FLOAT8_OID {
+            // FLOAT8 and JSONB postdate deployed catalogs. Older directories
+            // can serve computed distances and existing rows without a pg_type
+            // rewrite; fresh bootstraps register both rows. New storage of the
+            // missing type is rejected by the engine's migration gate.
+            if matches!(
+                ty.oid,
+                crate::builtin_types::FLOAT8_OID | crate::builtin_types::JSONB_OID
+            ) {
                 continue;
             }
             return Err(CatalogError::Corrupted(format!(
@@ -391,14 +394,17 @@ fn validate_content(
         (crate::system_tables::BTREE_AM_OID, "btree"),
         (crate::system_tables::HNSW_AM_OID, "hnsw"),
         (crate::system_tables::INVERTED_AM_OID, "inverted"),
+        (crate::system_tables::GRAPH_AM_OID, "graph"),
     ] {
         let Some(row) = access_methods.iter().find(|am| am.oid == am_oid) else {
-            // Phase 3 added INVERTED after Phase 4a directories were already
-            // deployed. Those directories cannot contain an inverted index;
-            // let them open unchanged. If an index row nevertheless references
-            // an unregistered AM, Engine::build_index_registry rejects it as
-            // unknown instead of falling back to B+Tree.
-            if am_oid == crate::system_tables::INVERTED_AM_OID {
+            // INVERTED (Phase 3) and GRAPH (Phase 5b-1) postdate deployed
+            // directories. Legacy directories cannot contain those indexes;
+            // let them open unchanged. Any actual reference to an unknown AM
+            // is still rejected by Engine::build_index_registry.
+            if matches!(
+                am_oid,
+                crate::system_tables::INVERTED_AM_OID | crate::system_tables::GRAPH_AM_OID
+            ) {
                 continue;
             }
             return Err(CatalogError::Corrupted(format!(
@@ -709,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_catalog_without_float8_is_accepted() {
+    fn legacy_catalog_without_newer_builtin_types_is_accepted() {
         let relations: Vec<RelationRow> = crate::system_tables::SYSTEM_TABLES
             .iter()
             .map(|def| RelationRow {
@@ -770,7 +776,12 @@ mod tests {
         ];
         let legacy: Vec<TypeRow> = types
             .iter()
-            .filter(|ty| ty.oid != crate::builtin_types::FLOAT8_OID)
+            .filter(|ty| {
+                !matches!(
+                    ty.oid,
+                    crate::builtin_types::FLOAT8_OID | crate::builtin_types::JSONB_OID
+                )
+            })
             .cloned()
             .collect();
         validate_content(&relations, &attributes, &legacy, &access_methods).unwrap();

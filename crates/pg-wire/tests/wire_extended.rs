@@ -899,6 +899,19 @@ fn extended_ddl_is_rejected_before_any_side_effect() {
     send(&mut session, bind("pci", "ci", vec![], vec![], vec![]));
     assert_error(&send(&mut session, execute("pci", 0)), "0A000");
     sync(&mut session, STATUS_IDLE);
+
+    send(
+        &mut session,
+        parse("cg", "CREATE GRAPH extended_graph", vec![]),
+    );
+    send(&mut session, bind("pcg", "cg", vec![], vec![], vec![]));
+    let out = send(&mut session, execute("pcg", 0));
+    assert_error(&out, "0A000");
+    let messages = scan_messages(&out);
+    assert!(
+        error_field(&messages[0].body, b'M').contains("DDL in an extended implicit transaction")
+    );
+    sync(&mut session, STATUS_IDLE);
 }
 
 #[test]

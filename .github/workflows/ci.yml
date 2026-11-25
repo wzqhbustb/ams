@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-am-inverted, pg-engine, pg-wire]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-am-inverted, pg-am-graph, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-am-inverted, pg-engine, pg-wire]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-am-inverted, pg-am-graph, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -67,7 +67,8 @@ jobs:
       # `test-harness` probe feature stays ON in the default test build via
       # the dev-dependency self-reference, so the exclusion loses nothing.
       # Phase 3 Stage 0: pg-am-inverted declares NO loom feature and therefore
-      # uses the all-features branch below, not the default-feature exceptions.)
+      # uses the all-features branch below, not the default-feature exceptions.
+      # Phase 5b-1: pg-am-graph likewise has no loom feature.)
       - name: Test (default features — loom-gated crates)
         if: matrix.crate == 'pg-storage' || matrix.crate == 'pg-am-btree' || matrix.crate == 'pg-am-hnsw'
         run: cargo test -p ${{ matrix.crate }}
@@ -154,7 +155,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-am-inverted, pg-engine, pg-wire]
+        crate: [pg-storage, pg-txn, pg-catalog, pg-am-heap, pg-am-btree, pg-am-hnsw, pg-am-inverted, pg-am-graph, pg-engine, pg-wire]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

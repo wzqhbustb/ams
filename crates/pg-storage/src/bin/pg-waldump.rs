@@ -37,13 +37,13 @@ use std::process::ExitCode;
 use pg_storage::types::WAL_SEGMENT_SIZE;
 use pg_storage::wal::reader::WalReader;
 use pg_storage::wal::record::{
-    BTreeDeleteRecord, BTreeInsertRecord, BTreeSplitCLRRecord, BTreeSplitCommitRecord,
-    BTreeSplitCopyRecord, BTreeSplitPrepareRecord, CheckpointEndRecord, FullPageImageRecord,
-    HeapCleanupRecord, HeapDeleteRecord, HeapHotUpdateRecord, HeapInsertRecord, HeapUpdateRecord,
-    HnswDirAppendRecord, HnswDirLinkRecord, HnswMetaUpdateRecord, HnswNodeInitRecord,
-    HnswNodeTombstoneRecord, HnswPublishLiveRecord, HnswSetNeighborsRecord, PageAllocRecord,
-    PageFreeRecord, SequenceAdvanceRecord, TxnAbortRecord, TxnCommitRecord, WalRecord,
-    WalRecordType,
+    BTreeDeleteRecord, BTreeInsertRecord, BTreePageCleanupRecord, BTreeSplitCLRRecord,
+    BTreeSplitCommitRecord, BTreeSplitCopyRecord, BTreeSplitPrepareRecord, CheckpointEndRecord,
+    FullPageImageRecord, HeapCleanupRecord, HeapDeleteRecord, HeapHotUpdateRecord,
+    HeapInsertRecord, HeapUpdateRecord, HnswDirAppendRecord, HnswDirLinkRecord,
+    HnswMetaUpdateRecord, HnswNodeInitRecord, HnswNodeTombstoneRecord, HnswPublishLiveRecord,
+    HnswSetNeighborsRecord, PageAllocRecord, PageFreeRecord, SequenceAdvanceRecord, TxnAbortRecord,
+    TxnCommitRecord, WalRecord, WalRecordType,
 };
 
 fn main() -> ExitCode {
@@ -224,8 +224,31 @@ fn payload_fields(record: &WalRecord) -> String {
             decoded::<PageAllocRecord>(p, |r| format!("page={}", r.page_id.0))
         }
         WalRecordType::PageFree => {
-            decoded::<PageFreeRecord>(p, |r| format!("page={}", r.page_id.0))
+            if let Ok(record) = pg_storage::wal::record::PageFreeV2Record::decode(p) {
+                format!(
+                    "version=2 relation={} page={} base_generation={} post_unlink_generation={}",
+                    record.relation_oid.0,
+                    record.page_id.0,
+                    record.base_generation,
+                    record.post_unlink_generation
+                )
+            } else {
+                decoded::<PageFreeRecord>(p, |r| format!("page={}", r.page_id.0))
+            }
         }
+        WalRecordType::BTreePageCleanup => match BTreePageCleanupRecord::decode(p) {
+            Ok(r) => format!(
+                "parent={} slot={} child={} sibling={} separator={}B base_generation={} post_unlink_generation={}",
+                r.parent_page_id.0,
+                r.parent_slot,
+                r.new_child_page_id.0,
+                r.sibling_page_id.0,
+                r.new_separator_key.len(),
+                r.base_generation,
+                r.post_unlink_generation
+            ),
+            Err(e) => undecodable(p, &e),
+        },
         WalRecordType::FullPageImage => decoded::<FullPageImageRecord>(p, |r| {
             format!("page={} image={}B", r.page_id.0, r.image.len())
         }),

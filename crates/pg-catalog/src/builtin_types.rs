@@ -1,6 +1,6 @@
 //! Built-in type definitions (tech-selection §5.2).
 //!
-//! M2 hardcodes the seven built-in types here; there is no `CREATE TYPE` at
+//! The engine hardcodes eight built-in types here; there is no `CREATE TYPE` at
 //! runtime. OIDs use the PostgreSQL conventional values so dumps and mental
 //! models transfer directly. `timestamptz` is 1184 (1114 is `timestamp`
 //! without time zone in PostgreSQL, which M2 does not have).
@@ -20,6 +20,8 @@ pub const FLOAT8_OID: TypeOid = TypeOid(Oid(701));
 pub const TEXT_OID: TypeOid = TypeOid(Oid(25));
 /// PostgreSQL-conventional OID of `bytea`.
 pub const BYTEA_OID: TypeOid = TypeOid(Oid(17));
+/// PostgreSQL-conventional OID of `jsonb`.
+pub const JSONB_OID: TypeOid = TypeOid(Oid(114));
 /// PostgreSQL-conventional OID of `timestamptz`.
 pub const TIMESTAMPTZ_OID: TypeOid = TypeOid(Oid(1184));
 /// PostgreSQL-conventional OID of `uuid`.
@@ -60,7 +62,7 @@ pub struct BuiltinType {
 }
 
 /// All built-in types, in bootstrap write order.
-pub const BUILTIN_TYPES: [BuiltinType; 7] = [
+pub const BUILTIN_TYPES: [BuiltinType; 8] = [
     BuiltinType {
         oid: INT4_OID,
         name: "int4",
@@ -90,6 +92,12 @@ pub const BUILTIN_TYPES: [BuiltinType; 7] = [
         name: "bytea",
         len: -1,
         column_type: ColumnType::Bytea,
+    },
+    BuiltinType {
+        oid: JSONB_OID,
+        name: "jsonb",
+        len: -1,
+        column_type: ColumnType::Jsonb,
     },
     BuiltinType {
         oid: TIMESTAMPTZ_OID,

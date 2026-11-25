@@ -1,0 +1,25 @@
+[package]
+name = "pg-am-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust lightweight graph access method — adjacency lists and deterministic traversal"
+
+[lib]
+bench = false
+
+[dependencies]
+pg-storage = { path = "../pg-storage" }
+pg-txn = { path = "../pg-txn" }
+pg-am-heap = { path = "../pg-am-heap" }
+pg-am-btree = { path = "../pg-am-btree" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+bincode = "2"
+crc32fast = "1"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

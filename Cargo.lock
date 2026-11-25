@@ -2775,6 +2775,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg-am-graph"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "pg-am-btree",
+ "pg-am-heap",
+ "pg-storage",
+ "pg-txn",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "pg-am-heap"
 version = "0.1.0"
 dependencies = [
@@ -2783,6 +2799,7 @@ dependencies = [
  "pg-txn",
  "proptest",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
@@ -2856,6 +2873,7 @@ dependencies = [
  "pg-storage",
  "pg-txn",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
@@ -2901,6 +2919,7 @@ dependencies = [
  "pg-catalog",
  "pg-engine",
  "postgres",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",

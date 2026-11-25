@@ -1,7 +1,9 @@
 //! PostgreSQL text/binary value encoding and type-OID mapping.
 //!
-//! Stage C supports Int4, Int8, Float8, Text and pg_rust VECTOR parameters
-//! and results. Integer and f64 binary payloads use network byte order.
+//! The extended protocol supports Int4, Int8, Float8, Text, JSONB and pg_rust
+//! VECTOR parameters and results. Integer and f64 binary payloads use network
+//! byte order. JSONB uses OID 114 and text format only; its binary form is not
+//! implemented.
 //! VECTOR text is `[v0,v1,…]`; its binary payload is `dim:u16`,
 //! `unused:u16 = 0`, then `dim` big-endian f32 values. The catalog-owned
 //! VECTOR OID is reported instead of disguising vectors as TEXT.
@@ -34,6 +36,7 @@ pub fn wire_type(ty: ColumnType) -> WireType {
         ColumnType::Float8 => WireType { oid: 701, len: 8 },
         ColumnType::Text => WireType { oid: 25, len: -1 },
         ColumnType::Bytea => WireType { oid: 17, len: -1 },
+        ColumnType::Jsonb => WireType { oid: 114, len: -1 },
         // Reported as INT8 / TEXT so the declared OID matches the bytes
         // (module docs). `typlen` 8 for the µs integer.
         ColumnType::Timestamptz => WireType { oid: 20, len: 8 },
@@ -55,6 +58,7 @@ pub fn column_type_of(d: &Datum) -> ColumnType {
         Datum::Float8(_) => ColumnType::Float8,
         Datum::Text(_) => ColumnType::Text,
         Datum::Bytea(_) => ColumnType::Bytea,
+        Datum::Jsonb(_) => ColumnType::Jsonb,
         Datum::Timestamptz(_) => ColumnType::Timestamptz,
         Datum::Uuid(_) => ColumnType::Uuid,
         Datum::Vector(v) => ColumnType::Vector(v.len() as u32),
@@ -121,7 +125,7 @@ pub fn encode_text(d: &Datum) -> Result<Vec<u8>> {
         Datum::Float8(v) => encode_float8_text(*v).into_bytes(),
         Datum::Timestamptz(us) => us.to_string().into_bytes(),
         Datum::Uuid(u) => u.to_string().into_bytes(),
-        Datum::Text(s) => s.as_bytes().to_vec(),
+        Datum::Text(s) | Datum::Jsonb(s) => s.as_bytes().to_vec(),
         Datum::Vector(v) => {
             let mut out = Vec::with_capacity(v.len() * 8 + 2);
             out.push(b'[');
@@ -203,6 +207,13 @@ pub fn decode_parameter(ty: ColumnType, format: i16, bytes: Option<&[u8]>) -> Re
                 .map_err(|_| invalid_text("TEXT parameter is not UTF-8"))?
                 .to_string(),
         ),
+        (ColumnType::Jsonb, FORMAT_TEXT) => {
+            let value = std::str::from_utf8(bytes)
+                .map_err(|_| invalid_text("JSONB parameter is not UTF-8"))?;
+            serde_json::from_str::<serde_json::Value>(value)
+                .map_err(|error| invalid_text(format!("invalid JSONB parameter: {error}")))?;
+            Datum::Jsonb(value.to_string())
+        }
         (ColumnType::Vector(dim), FORMAT_TEXT) => {
             let vector = parse_vector_text(
                 std::str::from_utf8(bytes)
@@ -282,6 +293,7 @@ pub fn column_type_for_oid(oid: u32, vector_dim: u32) -> Result<ColumnType> {
         20 => Ok(ColumnType::Int8),
         701 => Ok(ColumnType::Float8),
         25 => Ok(ColumnType::Text),
+        114 => Ok(ColumnType::Jsonb),
         oid if u64::from(oid) == VECTOR_OID.raw().0 => {
             ColumnType::vector(vector_dim).map_err(|error| WireError::Encode(error.to_string()))
         }
@@ -405,5 +417,27 @@ fn encode_float8_text(value: f64) -> String {
         format!("{mantissa}e{exponent:+03}")
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jsonb_uses_oid_114_and_text_roundtrip() {
+        assert_eq!(wire_type(ColumnType::Jsonb).oid, 114);
+        assert_eq!(column_type_for_oid(114, 0).unwrap(), ColumnType::Jsonb);
+        let original = "{ \"z\": 1, \"a\": true }";
+        let datum = Datum::Jsonb(original.to_string());
+        assert_eq!(encode_text(&datum).unwrap(), original.as_bytes());
+        assert_eq!(column_type_of(&datum), ColumnType::Jsonb);
+        assert_eq!(
+            decode_parameter(ColumnType::Jsonb, FORMAT_TEXT, Some(original.as_bytes())).unwrap(),
+            Some(datum)
+        );
+        assert!(decode_parameter(ColumnType::Jsonb, FORMAT_TEXT, Some(b"not json")).is_err());
+        assert!(decode_parameter(ColumnType::Jsonb, FORMAT_BINARY, Some(b"{}")).is_err());
+        assert!(encode_binary(&Datum::Jsonb("{}".to_string())).is_err());
     }
 }

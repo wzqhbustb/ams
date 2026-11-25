@@ -55,8 +55,10 @@ pub enum ExecutionPath {
     Update,
     /// DELETE (same seq-scan-lookup note as `Update`).
     Delete,
-    /// CREATE TABLE / CREATE INDEX.
+    /// CREATE TABLE / CREATE INDEX / CREATE GRAPH.
     Ddl,
+    /// GRAPH BFS / GRAPH DFS.
+    GraphTraversal,
     /// BEGIN / COMMIT / ROLLBACK as SQL text. `exec` rejects these
     /// (transaction control is programmatic only), so entries with this
     /// path always record a failed statement (`rows` = 0).
@@ -75,7 +77,12 @@ impl ExecutionPath {
             Statement::Delete { .. } => Self::Delete,
             Statement::CreateTable { .. }
             | Statement::CreateIndex { .. }
-            | Statement::CreateSequence { .. } => Self::Ddl,
+            | Statement::CreateSequence { .. }
+            | Statement::CreateGraph { .. } => Self::Ddl,
+            Statement::GraphAddNode { .. } | Statement::GraphAddEdge { .. } => Self::Insert,
+            Statement::GraphUpdateNode { .. } => Self::Update,
+            Statement::GraphDeleteNode { .. } | Statement::GraphDeleteEdge { .. } => Self::Delete,
+            Statement::GraphBfs(_) | Statement::GraphDfs(_) => Self::GraphTraversal,
             Statement::SequenceQuery { .. } => Self::SeqScan,
             Statement::Begin | Statement::Commit | Statement::Rollback => Self::TxnControl,
         }
@@ -91,6 +98,7 @@ impl ExecutionPath {
             Self::Update => "update",
             Self::Delete => "delete",
             Self::Ddl => "ddl",
+            Self::GraphTraversal => "graph_traversal",
             Self::TxnControl => "txn_control",
         }
     }

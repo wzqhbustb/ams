@@ -20,8 +20,11 @@ use std::path::Path;
 use std::process::Command;
 
 use pg_storage::config::StorageConfig;
+use pg_storage::gc::GcOperationId;
 use pg_storage::types::{Lsn, Oid, PageId, Tid, TxnId};
-use pg_storage::wal::record::{BTreeSplitCLRRecord, WalRecord, WalRecordType};
+use pg_storage::wal::record::{
+    BTreePageCleanupRecord, BTreeSplitCLRRecord, PageFreeV2Record, WalRecord, WalRecordType,
+};
 use pg_storage::wal::writer::WalWriter;
 use tempfile::TempDir;
 
@@ -98,6 +101,44 @@ fn write_full_family_wal(tmp: &TempDir) -> Vec<Lsn> {
         WalRecord::btree_split_copy(PageId(20), PageId(21), 3, Lsn(1_000)).unwrap(),
         WalRecord::btree_split_commit(PageId(20), PageId(21), PageId(22), vec![0x02], 0).unwrap(),
         WalRecord::btree_split_clr(&clr).unwrap(),
+        reserved_record(
+            WalRecordType::BTreePageCleanup,
+            BTreePageCleanupRecord {
+                parent_page_id: PageId(22),
+                parent_slot: 0,
+                new_separator_key: vec![0x02],
+                new_child_page_id: PageId(21),
+                sibling_page_id: PageId(19),
+                base_generation: 3,
+                post_unlink_generation: 4,
+                operation_id: GcOperationId {
+                    relation_oid: Oid(42),
+                    base_generation: 3,
+                    page_id: PageId(20),
+                },
+            }
+            .encode()
+            .unwrap(),
+        ),
+        reserved_record(
+            WalRecordType::PageFree,
+            PageFreeV2Record {
+                version: 2,
+                relation_oid: Oid(42),
+                page_id: PageId(20),
+                prev_page_id: PageId(19),
+                next_page_id: PageId(21),
+                base_generation: 3,
+                post_unlink_generation: 4,
+                operation_id: GcOperationId {
+                    relation_oid: Oid(42),
+                    base_generation: 3,
+                    page_id: PageId(20),
+                },
+            }
+            .encode()
+            .unwrap(),
+        ),
         WalRecord::txn_commit(TxnId(42)).unwrap(),
         WalRecord::txn_abort(TxnId(43)).unwrap(),
         // Phase 2 M5 Stage 0 round 2 (P3-2): the seven HNSW records must be
@@ -191,6 +232,7 @@ fn dump_covers_every_record_family() {
         "type=BTreeSplitCopy(51)",
         "type=BTreeSplitCommit(52)",
         "type=BTreeSplitCLR(50)",
+        "type=BTreePageCleanup(60)",
         "type=TxnCommit(21)",
         "type=TxnAbort(22)",
         "type=HnswNodeInit(121)",
@@ -218,6 +260,23 @@ fn dump_covers_every_record_family() {
     assert!(commit.contains("commit_xid=42"), "{commit}");
     let fpi = lines.iter().find(|l| l.contains("FullPageImage")).unwrap();
     assert!(fpi.contains("page=5 image=8192B"), "{fpi}");
+    let cleanup60 = lines
+        .iter()
+        .find(|l| l.contains("BTreePageCleanup(60)"))
+        .unwrap();
+    assert!(
+        cleanup60.contains("parent=22 slot=0 child=21 sibling=19 separator=1B"),
+        "{cleanup60}"
+    );
+    let free_v2 = lines
+        .iter()
+        .filter(|l| l.contains("PageFree(41)"))
+        .find(|l| l.contains("version=2"))
+        .unwrap();
+    assert!(
+        free_v2.contains("relation=42 page=20 base_generation=3 post_unlink_generation=4"),
+        "{free_v2}"
+    );
 
     // HNSW arms (M5 Stage 0 round 2 P3-2): fields decoded, not reserved-hex.
     let node_init = lines.iter().find(|l| l.contains("HnswNodeInit")).unwrap();
